@@ -61,6 +61,8 @@ copy are marked `do_not_specialize`, so Triton cannot silently remove parameters
 whose build-time value happens to be one; its C++ driver launcher has a stable
 ABI without disabling useful alignment specialization for the hot model kernels.
 
+See [AOT_KERNEL_PIPELINE.md](AOT_KERNEL_PIPELINE.md) for the reproducible Denglin generation flow, package layout, module loading, Launcher ABI, `GGML_OP_SCALE` binding example, validation steps, and the checklist for adding an operator.
+
 The source boundary is:
 
 ```text
