@@ -1,0 +1,279 @@
+{
+  "format": 2,
+  "dtype": "f32",
+  "module": "flagos_kernels.cubin",
+  "kernels": [
+    {
+      "file": "flagos_add_f32.cubin",
+      "name": "flagos_add_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_mul_f32.cubin",
+      "name": "flagos_mul_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_scale_f32.cubin",
+      "name": "flagos_scale_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_copy_f32.cubin",
+      "name": "flagos_copy_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_copy_strided_f32.cubin",
+      "name": "flagos_copy_strided_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_swiglu_split_f32.cubin",
+      "name": "flagos_swiglu_split_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_set_rows_f32_f16.cubin",
+      "name": "flagos_set_rows_f32_f16",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_flash_attn_decode_f32_f16.cubin",
+      "name": "flagos_flash_attn_decode_f32_f16",
+      "shared": 16384,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 32
+    },
+    {
+      "file": "flagos_rope_neox_f32.cubin",
+      "name": "flagos_rope_neox_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_rms_norm_f32.cubin",
+      "name": "flagos_rms_norm_f32",
+      "shared": 16,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 4096
+    },
+    {
+      "file": "flagos_rms_norm_mul_f32.cubin",
+      "name": "flagos_rms_norm_mul_f32",
+      "shared": 16,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 4096
+    },
+    {
+      "file": "flagos_cast_f32_f16.cubin",
+      "name": "flagos_cast_f32_f16",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_cast_f16_f32.cubin",
+      "name": "flagos_cast_f16_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_dequant_q4_k_f16.cubin",
+      "name": "flagos_dequant_q4_k_f16",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_dequant_q6_k_f16.cubin",
+      "name": "flagos_dequant_q6_k_f16",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_mul_mat_q4_k_f32.cubin",
+      "name": "flagos_mul_mat_q4_k_f32",
+      "shared": 0,
+      "num_warps": 1,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_mul_mat_q4_k_f32_batched.cubin",
+      "name": "flagos_mul_mat_q4_k_f32_batched",
+      "shared": 1024,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_mul_mat_q6_k_f32.cubin",
+      "name": "flagos_mul_mat_q6_k_f32",
+      "shared": 0,
+      "num_warps": 1,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_mul_mat_q6_k_f32_batched.cubin",
+      "name": "flagos_mul_mat_q6_k_f32_batched",
+      "shared": 1024,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_get_rows_q4_k_f32.cubin",
+      "name": "flagos_get_rows_q4_k_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_get_rows_q6_k_f32.cubin",
+      "name": "flagos_get_rows_q6_k_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_get_rows_f32.cubin",
+      "name": "flagos_get_rows_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_ssm_conv_f32.cubin",
+      "name": "flagos_ssm_conv_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_sub_f32.cubin",
+      "name": "flagos_sub_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_div_f32.cubin",
+      "name": "flagos_div_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_sigmoid_f32.cubin",
+      "name": "flagos_sigmoid_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_exp_f32.cubin",
+      "name": "flagos_exp_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_softplus_f32.cubin",
+      "name": "flagos_softplus_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_fill_f32.cubin",
+      "name": "flagos_fill_f32",
+      "shared": 0,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 256
+    },
+    {
+      "file": "flagos_sum_rows_f32.cubin",
+      "name": "flagos_sum_rows_f32",
+      "shared": 16,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 1024
+    },
+    {
+      "file": "flagos_l2_norm_f32.cubin",
+      "name": "flagos_l2_norm_f32",
+      "shared": 16,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 1024
+    },
+    {
+      "file": "flagos_norm_f32.cubin",
+      "name": "flagos_norm_f32",
+      "shared": 16,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 1024
+    },
+    {
+      "file": "flagos_cumsum_f32.cubin",
+      "name": "flagos_cumsum_f32",
+      "shared": 32,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 1024
+    },
+    {
+      "file": "flagos_soft_max_f32.cubin",
+      "name": "flagos_soft_max_f32",
+      "shared": 16,
+      "num_warps": 4,
+      "warp_size": 32,
+      "block_size": 1024
+    }
+  ]
+}
