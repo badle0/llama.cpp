@@ -1835,6 +1835,25 @@ static flagos_lowering_choice flagos_denglin_query_lowering(
     return choice;
 }
 
+static bool flagos_denglin_execute_fusion(
+        void * user_data, ggml_cgraph * cgraph, const flagos_plan_step & step) {
+    auto * context = static_cast<ggml_backend_flagos_context *>(user_data);
+    if (context == nullptr || cgraph == nullptr || step.candidate.id != flagos_pattern_id::rms_norm_mul ||
+        step.candidate.node_indices.size() != 2) {
+        return false;
+    }
+    ggml_tensor * norm = cgraph->nodes[step.candidate.node_indices[0]];
+    ggml_tensor * mul = cgraph->nodes[step.candidate.node_indices[1]];
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const bool launched = context->kernels->launch_rms_norm_mul(
+        norm->src[0], norm, mul,
+        flagos_resolve_data(context, weight), context->stream);
+    if (launched) {
+        ++context->rms_norm_mul_calls;
+    }
+    return launched;
+}
+
 static enum ggml_status flagos_graph_evaluate(
         ggml_backend_flagos_context * context,
         ggml_cgraph * cgraph,
@@ -1856,20 +1875,8 @@ static enum ggml_status flagos_graph_evaluate(
             continue;
         }
         if (step.kind == flagos_execution_kind::pattern) {
-            if (step.candidate.id != flagos_pattern_id::rms_norm_mul || step.candidate.node_indices.size() != 2) {
-                GGML_LOG_ERROR("FlagOS: no executor for graph pattern %s\n",
-                    flagos_pattern_name(step.candidate.id));
-                context->weight_aliases.clear();
-                return GGML_STATUS_FAILED;
-            }
-            ggml_tensor * mul = cgraph->nodes[step.candidate.node_indices[1]];
-            const ggml_tensor * weight = mul->src[0] == node ? mul->src[1] : mul->src[0];
-            launched = context->kernels->launch_rms_norm_mul(
-                node->src[0], node, mul,
-                flagos_resolve_data(context, weight), context->stream);
-            if (launched) {
-                ++context->rms_norm_mul_calls;
-            }
+            launched = flagos_execute_fusion_step(
+                flagos_denglin_execute_fusion, context, cgraph, step);
         } else {
             switch (node->op) {
             case GGML_OP_NONE:
@@ -2660,8 +2667,9 @@ static bool flagos_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_te
         case GGML_OP_FLASH_ATTN_EXT: {
             float max_bias = 0.0f;
             float logit_softcap = 0.0f;
-            std::memcpy(&max_bias, op->op_params + sizeof(float), sizeof(float));
-            std::memcpy(&logit_softcap, op->op_params + 2 * sizeof(float), sizeof(float));
+            const auto * op_params_bytes = reinterpret_cast<const uint8_t *>(op->op_params);
+            std::memcpy(&max_bias, op_params_bytes + sizeof(float), sizeof(float));
+            std::memcpy(&logit_softcap, op_params_bytes + 2 * sizeof(float), sizeof(float));
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];

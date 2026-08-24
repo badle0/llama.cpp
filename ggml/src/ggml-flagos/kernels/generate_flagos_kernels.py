@@ -29,17 +29,23 @@ MERGED_MODULE_NAME = "flagos_kernels.cubin"
 
 BLOCK_SIZE = 256
 NUM_WARPS = 4
-# Decode GEMV assigns one program to one output row. On KS20-A, using one warp
-# lets each thread process eight lanes and is materially faster than scheduling
-# four or eight warps for the same 256-value reduction. Keep this separate from
-# attention, reductions, and batched GEMM, which retain NUM_WARPS.
-GEMV_NUM_WARPS = 1
+# Decode GEMV assigns one program to one output row. KS20-A was tuned with one
+# warp; keep this target-selectable so providers can benchmark a different
+# resident-lane count without changing the common kernel ABI.
+GEMV_NUM_WARPS = int(os.environ.get("FLAGOS_GEMV_NUM_WARPS", "1"))
 # Must be >= the widest row we accept in supports_op. Qwen3.5-9B has a
 # 4096-wide hidden state; at 2048 every RMS norm was declined to the CPU.
 RMS_NORM_BLOCK_SIZE = 4096
 # Columns processed per program by the batched (prefill) quantized GEMMs.
 # The dequantized weight row is reused across the whole tile.
 MUL_MAT_COLS_PER_BLOCK = 16
+# Experimental tiled quantized prefill kernels.  These use MFMA-friendly
+# tl.dot tiles after decoding a small K slice, avoiding the one-output-element
+# program used by the legacy batched path.  Keep the shape explicit in the
+# manifest so providers can tune it per target without changing the ABI.
+QUANT_TILE_BLOCK_M = int(os.environ.get("FLAGOS_QUANT_TILE_BLOCK_M", "16"))
+QUANT_TILE_BLOCK_N = int(os.environ.get("FLAGOS_QUANT_TILE_BLOCK_N", "32"))
+QUANT_TILE_NUM_WARPS = int(os.environ.get("FLAGOS_QUANT_TILE_NUM_WARPS", "4"))
 # Row-wise kernels use one program per row with BLOCK spanning the whole row.
 ROW_BLOCK_SIZE = 1024
 QK_K = 256
@@ -698,6 +704,115 @@ def flagos_mul_mat_q4_k_f32(weights_u8, weights_f16, x, output, k, rows):
 
 
 @triton.jit
+def flagos_mul_mat_q4_k_f32_narrow(weights_u8, weights_f16, x, output, k, rows):
+    """Q4_K decode GEMV tuned for wave32 targets.
+
+    The legacy kernel exposes a 128-lane logical vector.  On AMD wave32 this
+    makes the compiler carry four subchunks through the reduction and leaves
+    the activation loads interleaved with quant unpacking.  This variant keeps
+    one physical wave (32 lanes), explicitly walks the four Q4_K subchunks,
+    and computes four output rows per program.  The provider only selects it
+    for row counts divisible by four; the same ABI is retained for fallback.
+    """
+    pid = tl.program_id(0)
+    row_ids = pid * 4 + tl.arange(0, 4)
+    lanes = tl.arange(0, 32)
+    accumulator = tl.zeros((4, 32), dtype=tl.float32)
+    blocks_per_row = k // 256
+    for block in tl.range(0, blocks_per_row):
+        block_byte = (row_ids[:, None] * blocks_per_row + block) * 144
+        block_half = block_byte // 2
+        d = tl.load(weights_f16 + block_half).to(tl.float32)
+        dmin = tl.load(weights_f16 + block_half + 1).to(tl.float32)
+        for chunk in tl.range(0, 4):
+            low_group = chunk * 2
+            high_group = low_group + 1
+            low_index = chunk * 64 + lanes
+            high_index = low_index + 32
+            low_scale_byte = tl.load(weights_u8 + block_byte + 4 +
+                                      (low_group if low_group < 4 else low_group + 4))
+            low_scale_hi = tl.load(weights_u8 + block_byte + 4 +
+                                   (low_group - 4 if low_group >= 4 else 0))
+            low_scale = (low_scale_byte & 63 if low_group < 4 else
+                         (low_scale_byte & 15) | ((low_scale_hi >> 6) << 4)).to(tl.float32)
+            low_min_byte = tl.load(weights_u8 + block_byte + 4 + low_group + 4)
+            low_min_hi = tl.load(weights_u8 + block_byte + 4 + low_group)
+            low_minimum = (low_min_byte & 63 if low_group < 4 else
+                           (low_min_byte >> 4) | ((low_min_hi >> 6) << 4)).to(tl.float32)
+            high_scale_byte = tl.load(weights_u8 + block_byte + 4 +
+                                       (high_group if high_group < 4 else high_group + 4))
+            high_scale_hi = tl.load(weights_u8 + block_byte + 4 +
+                                    (high_group - 4 if high_group >= 4 else 0))
+            high_scale = (high_scale_byte & 63 if high_group < 4 else
+                          (high_scale_byte & 15) | ((high_scale_hi >> 6) << 4)).to(tl.float32)
+            high_min_byte = tl.load(weights_u8 + block_byte + 4 + high_group + 4)
+            high_min_hi = tl.load(weights_u8 + block_byte + 4 + high_group)
+            high_minimum = (high_min_byte & 63 if high_group < 4 else
+                            (high_min_byte >> 4) | ((high_min_hi >> 6) << 4)).to(tl.float32)
+            qbyte = tl.load(weights_u8 + block_byte + 16 + chunk * 32 + lanes[None, :])
+            low_value = d * low_scale * (qbyte & 15).to(tl.float32) - dmin * low_minimum
+            high_value = d * high_scale * (qbyte >> 4).to(tl.float32) - dmin * high_minimum
+            low_activation = tl.load(x + block * 256 + low_index).to(tl.float32)
+            high_activation = tl.load(x + block * 256 + high_index).to(tl.float32)
+            accumulator += low_value * low_activation[None, :] + high_value * high_activation[None, :]
+    tl.store(output + row_ids, tl.sum(accumulator, axis=1), mask=row_ids < rows)
+
+
+@triton.jit
+def flagos_mul_mat_q4_k_f32_narrow8(weights_u8, weights_f16, x, output, k, rows):
+    """Q4_K GEMV variant for AMD wave32 targets with an eight-row tile.
+
+    This is intentionally a separate symbol from the validated four-row
+    variant.  Radeon 890M microbenchmarks show that eight rows amortize the
+    quant/activation address arithmetic better for the large Qwen projection
+    shapes, while the separate symbol lets the runtime keep a safe fallback
+    when a package or another target does not contain this experiment.
+    """
+    pid = tl.program_id(0)
+    row_ids = pid * 8 + tl.arange(0, 8)
+    lanes = tl.arange(0, 32)
+    accumulator = tl.zeros((8, 32), dtype=tl.float32)
+    blocks_per_row = k // 256
+    for block in tl.range(0, blocks_per_row):
+        block_byte = (row_ids[:, None] * blocks_per_row + block) * 144
+        block_half = block_byte // 2
+        d = tl.load(weights_f16 + block_half).to(tl.float32)
+        dmin = tl.load(weights_f16 + block_half + 1).to(tl.float32)
+        for chunk in tl.range(0, 4):
+            low_group = chunk * 2
+            high_group = low_group + 1
+            low_index = chunk * 64 + lanes
+            high_index = low_index + 32
+            low_scale_byte = tl.load(weights_u8 + block_byte + 4 +
+                                      (low_group if low_group < 4 else low_group + 4))
+            low_scale_hi = tl.load(weights_u8 + block_byte + 4 +
+                                   (low_group - 4 if low_group >= 4 else 0))
+            low_scale = (low_scale_byte & 63 if low_group < 4 else
+                         (low_scale_byte & 15) | ((low_scale_hi >> 6) << 4)).to(tl.float32)
+            low_min_byte = tl.load(weights_u8 + block_byte + 4 + low_group + 4)
+            low_min_hi = tl.load(weights_u8 + block_byte + 4 + low_group)
+            low_minimum = (low_min_byte & 63 if low_group < 4 else
+                           (low_min_byte >> 4) | ((low_min_hi >> 6) << 4)).to(tl.float32)
+            high_scale_byte = tl.load(weights_u8 + block_byte + 4 +
+                                       (high_group if high_group < 4 else high_group + 4))
+            high_scale_hi = tl.load(weights_u8 + block_byte + 4 +
+                                    (high_group - 4 if high_group >= 4 else 0))
+            high_scale = (high_scale_byte & 63 if high_group < 4 else
+                          (high_scale_byte & 15) | ((high_scale_hi >> 6) << 4)).to(tl.float32)
+            high_min_byte = tl.load(weights_u8 + block_byte + 4 + high_group + 4)
+            high_min_hi = tl.load(weights_u8 + block_byte + 4 + high_group)
+            high_minimum = (high_min_byte & 63 if high_group < 4 else
+                            (high_min_byte >> 4) | ((high_min_hi >> 6) << 4)).to(tl.float32)
+            qbyte = tl.load(weights_u8 + block_byte + 16 + chunk * 32 + lanes[None, :])
+            low_value = d * low_scale * (qbyte & 15).to(tl.float32) - dmin * low_minimum
+            high_value = d * high_scale * (qbyte >> 4).to(tl.float32) - dmin * high_minimum
+            low_activation = tl.load(x + block * 256 + low_index).to(tl.float32)
+            high_activation = tl.load(x + block * 256 + high_index).to(tl.float32)
+            accumulator += low_value * low_activation[None, :] + high_value * high_activation[None, :]
+    tl.store(output + row_ids, tl.sum(accumulator, axis=1), mask=row_ids < rows)
+
+
+@triton.jit
 def flagos_mul_mat_q6_k_f32(weights_u8, weights_f16, x, output, k, rows):
     row = tl.program_id(0)
     # One Q6 high-bit byte supplies four two-bit fields. Decode all four
@@ -793,6 +908,95 @@ def flagos_mul_mat_q6_k_f32_batched(weights_u8, weights_f16, x, output, k, rows,
         accumulator += values[None, :] * activations
 
     tl.store(output + cols * rows + row, tl.sum(accumulator, axis=1))
+
+
+@triton.jit
+def flagos_mul_mat_q4_k_f32_tiled(weights_u8, weights_f16, x, output, k, rows, columns,
+                                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Tiled Q4_K prefill GEMM.
+
+    Decode 64 values at a time and feed the resulting F16 tile to tl.dot.
+    The explicit tile is provider-neutral at the ABI level; only the manifest
+    tile metadata and launch grid are target-specific.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    row_ids = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_ids = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_rows = row_ids < rows
+    valid_cols = col_ids < columns
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    blocks_per_row = k // 256
+    for block in tl.range(0, blocks_per_row):
+        block_base = (row_ids[:, None] * blocks_per_row + block) * 144
+        block_half = block_base // 2
+        d = tl.load(weights_f16 + block_half, mask=valid_rows[:, None], other=0.0).to(tl.float32)
+        dmin = tl.load(weights_f16 + block_half + 1, mask=valid_rows[:, None], other=0.0).to(tl.float32)
+        for sub in range(4):
+            lanes = sub * 64 + tl.arange(0, 64)
+            group = lanes // 32
+            scale_lo_index = tl.where(group < 4, group, group + 4)
+            scale_lo = tl.load(weights_u8 + block_base + 4 + scale_lo_index[None, :],
+                               mask=valid_rows[:, None], other=0)
+            scale_hi = tl.load(weights_u8 + block_base + 4 + tl.maximum(group - 4, 0)[None, :],
+                               mask=valid_rows[:, None], other=0)
+            scale = tl.where(group[None, :] < 4, scale_lo & 63,
+                             (scale_lo & 15) | ((scale_hi >> 6) << 4)).to(tl.float32)
+            min_lo = tl.load(weights_u8 + block_base + 4 + group[None, :] + 4,
+                             mask=valid_rows[:, None], other=0)
+            min_hi = tl.load(weights_u8 + block_base + 4 + group[None, :],
+                             mask=valid_rows[:, None], other=0)
+            minimum = tl.where(group[None, :] < 4, min_lo & 63,
+                               (min_lo >> 4) | ((min_hi >> 6) << 4)).to(tl.float32)
+            qbyte = tl.load(weights_u8 + block_base + 16 + (lanes[None, :] // 64) * 32 + lanes[None, :] % 32,
+                            mask=valid_rows[:, None], other=0)
+            quant = tl.where((lanes % 64)[None, :] < 32, qbyte & 15, qbyte >> 4).to(tl.float32)
+            values = (d * scale * quant - dmin * minimum).to(tl.float16)
+            act = tl.load(x + col_ids[None, :] * k + block * 256 + lanes[:, None],
+                          mask=valid_cols[None, :] & (lanes[:, None] < k), other=0.0).to(tl.float16)
+            acc += tl.dot(values, act)
+    tl.store(output + col_ids[None, :] * rows + row_ids[:, None], acc,
+             mask=valid_rows[:, None] & valid_cols[None, :])
+
+
+@triton.jit
+def flagos_mul_mat_q6_k_f32_tiled(weights_u8, weights_f16, x, output, k, rows, columns,
+                                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Tiled Q6_K counterpart of flagos_mul_mat_q4_k_f32_tiled."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    row_ids = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_ids = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_rows = row_ids < rows
+    valid_cols = col_ids < columns
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    blocks_per_row = k // 256
+    for block in tl.range(0, blocks_per_row):
+        block_base = (row_ids[:, None] * blocks_per_row + block) * 210
+        d = tl.load(weights_f16 + block_base // 2 + 104,
+                    mask=valid_rows[:, None], other=0.0).to(tl.float32)
+        for sub in range(4):
+            global_lanes = sub * 64 + tl.arange(0, 64)
+            half = global_lanes // 128
+            quadrant = (global_lanes % 128) // 32
+            lane = global_lanes % 32
+            ql_index = half * 64 + lane + (quadrant % 2) * 32
+            ql_byte = tl.load(weights_u8 + block_base + ql_index[None, :],
+                              mask=valid_rows[:, None], other=0)
+            qh_byte = tl.load(weights_u8 + block_base + 128 + half[None, :] * 32 + lane[None, :],
+                              mask=valid_rows[:, None], other=0)
+            ql = tl.where(quadrant[None, :] < 2, ql_byte & 15, ql_byte >> 4)
+            qh = (qh_byte >> (quadrant[None, :] * 2)) & 3
+            quant = ((ql | (qh << 4)).to(tl.int32) - 32).to(tl.float32)
+            scale_index = half * 8 + quadrant * 2 + lane // 16
+            scale = tl.load(weights_u8 + block_base + 192 + scale_index[None, :],
+                            mask=valid_rows[:, None], other=0).to(tl.int8).to(tl.float32)
+            values = (d * scale * quant).to(tl.float16)
+            act = tl.load(x + col_ids[None, :] * k + block * 256 + global_lanes[:, None],
+                          mask=valid_cols[None, :] & (global_lanes[:, None] < k), other=0.0).to(tl.float16)
+            acc += tl.dot(values, act)
+    tl.store(output + col_ids[None, :] * rows + row_ids[:, None], acc,
+             mask=valid_rows[:, None] & valid_cols[None, :])
 
 
 @triton.jit
@@ -1376,6 +1580,41 @@ def compile_kernels() -> None:
         num_warps=GEMV_NUM_WARPS,
     )
     torch.testing.assert_close(mat_output, q4_dequantized @ activation, rtol=2e-5, atol=2e-4)
+    # These wave32 GEMV experiments are AMD-specific.  Keep them out of the
+    # shared Denglin/CUDA package unless the AMD generator explicitly opts in.
+    if os.environ.get("FLAGOS_Q4_GEMV_NARROW_ENABLE", "0") == "1":
+        narrow_rows = 16
+        narrow_output = torch.empty(narrow_rows, device="cuda", dtype=torch.float32)
+        flagos_mul_mat_q4_k_f32_narrow[(narrow_rows // 4,)](
+            q4_packed,
+            q4_packed.view(torch.float16),
+            activation,
+            narrow_output,
+            mat_k,
+            narrow_rows,
+            num_warps=1,
+        )
+        torch.testing.assert_close(
+            narrow_output, q4_dequantized[:narrow_rows] @ activation,
+            rtol=2e-5, atol=2e-3,
+        )
+
+    if os.environ.get("FLAGOS_Q4_GEMV_NARROW8_ENABLE", "0") == "1":
+        narrow8_rows = 16
+        narrow8_output = torch.empty(narrow8_rows, device="cuda", dtype=torch.float32)
+        flagos_mul_mat_q4_k_f32_narrow8[(narrow8_rows // 8,)](
+            q4_packed,
+            q4_packed.view(torch.float16),
+            activation,
+            narrow8_output,
+            mat_k,
+            narrow8_rows,
+            num_warps=1,
+        )
+        torch.testing.assert_close(
+            narrow8_output, q4_dequantized[:narrow8_rows] @ activation,
+            rtol=2e-5, atol=2e-3,
+        )
 
     # Test batched (multi-column) GEMM for prefill
     # Deliberately not a multiple of MUL_MAT_COLS_PER_BLOCK so the tail path
@@ -1444,6 +1683,37 @@ def compile_kernels() -> None:
         num_warps=GEMV_NUM_WARPS,
     )
     torch.testing.assert_close(mat_output, q6_dequantized @ activation, rtol=2e-5, atol=2e-3)
+
+    if os.environ.get("FLAGOS_QUANT_TILE_ENABLE", "0") == "1":
+        # MFMA-friendly tiled prefill variants.  Keep the dimensions small
+        # enough for the AMD conformance generator while exercising tails.
+        tiled_rows, tiled_columns = mat_rows, 35
+        tiled_out = torch.zeros(tiled_columns * tiled_rows, device="cuda", dtype=torch.float32)
+        flagos_mul_mat_q4_k_f32_tiled[(triton.cdiv(tiled_rows, QUANT_TILE_BLOCK_M),
+                                       triton.cdiv(tiled_columns, QUANT_TILE_BLOCK_N))](
+            q4_packed, q4_packed.view(torch.float16), activation_batched, tiled_out,
+            mat_k, tiled_rows, tiled_columns,
+            BLOCK_M=QUANT_TILE_BLOCK_M, BLOCK_N=QUANT_TILE_BLOCK_N,
+            num_warps=QUANT_TILE_NUM_WARPS,
+        )
+        torch.testing.assert_close(
+            tiled_out.view(tiled_columns, tiled_rows).T,
+            q4_dequantized[:tiled_rows] @ activation_batched[:tiled_columns].T,
+            rtol=3e-2, atol=3e-2,
+        )
+        tiled_q6_out = torch.zeros(tiled_columns * tiled_rows, device="cuda", dtype=torch.float32)
+        flagos_mul_mat_q6_k_f32_tiled[(triton.cdiv(tiled_rows, QUANT_TILE_BLOCK_M),
+                                       triton.cdiv(tiled_columns, QUANT_TILE_BLOCK_N))](
+            q6_packed, q6_packed.view(torch.float16), q6_activation_cols, tiled_q6_out,
+            mat_k, tiled_rows, tiled_columns,
+            BLOCK_M=QUANT_TILE_BLOCK_M, BLOCK_N=QUANT_TILE_BLOCK_N,
+            num_warps=QUANT_TILE_NUM_WARPS,
+        )
+        torch.testing.assert_close(
+            tiled_q6_out.view(tiled_columns, tiled_rows).T,
+            q6_dequantized[:tiled_rows] @ q6_activation_cols[:tiled_columns].T,
+            rtol=3e-2, atol=3e-2,
+        )
     torch.cuda.synchronize()
 
 

@@ -1,0 +1,1098 @@
+#include "flagos-provider.h"
+#include "flagos-graph-plan.h"
+#include "ggml-flagos.h"
+#include "providers/amd/flagos-amd-api.h"
+
+#include "../../ggml-backend-impl.h"
+#include "../../ggml-impl.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+static void check(bool condition, const char * expression, int line) {
+    if (!condition) {
+        std::fprintf(stderr, "check failed at line %d: %s\n", line, expression);
+        std::abort();
+    }
+}
+
+#define CHECK(expression) check((expression), #expression, __LINE__)
+
+int main() {
+    ggml_backend_reg_t reg = ggml_backend_flagos_reg();
+    CHECK(reg != nullptr);
+
+    const size_t n_devices = ggml_backend_reg_dev_count(reg);
+    if (n_devices == 0) {
+        std::puts("FlagOS AMD checks skipped: no HIP device visible");
+        return 0;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    CHECK(dev != nullptr);
+    CHECK(ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+    CHECK(ggml_backend_dev_name(dev) != nullptr);
+    CHECK(ggml_backend_dev_description(dev) != nullptr);
+
+    ggml_backend_dev_props props {};
+    ggml_backend_dev_get_props(dev, &props);
+    CHECK(props.name != nullptr);
+    CHECK(props.description != nullptr);
+    CHECK(props.caps.async);
+    CHECK(props.caps.events);
+    CHECK(props.type == ggml_backend_dev_type(dev));
+
+    flagos_device_identity identity {};
+    const flagos_provider_v1 * provider = flagos_amd_provider();
+    CHECK(provider != nullptr);
+    CHECK(provider->probe(reg));
+    CHECK(provider->device_count() >= 1);
+    CHECK(provider->device_identity(0, &identity));
+    CHECK(flagos_device_identity_is_valid(provider, 0, &identity));
+    CHECK(ggml_backend_flagos_get_device() == 0);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_flagos_buffer_type(0);
+    CHECK(buft != nullptr);
+    CHECK(ggml_backend_dev_supports_buft(dev, buft));
+    CHECK(ggml_backend_buft_get_alignment(buft) >= 1);
+
+    ggml_init_params params {
+        /* .mem_size   = */ 1u << 20,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+    CHECK(tensor != nullptr);
+
+    const size_t tensor_size = ggml_nbytes(tensor);
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, tensor_size);
+    CHECK(buffer != nullptr);
+    CHECK(ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer)) == GGML_STATUS_SUCCESS);
+
+    ggml_backend_buffer_clear(buffer, 0);
+    std::vector<float> input(16);
+    std::vector<float> output(16, -1.0f);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<float>(i) + 0.25f;
+    }
+    // The backend owns a stream; synchronize before checking asynchronous copies.
+    ggml_backend_t backend = ggml_backend_flagos_init(0);
+    CHECK(backend != nullptr);
+    ggml_backend_tensor_set_async(backend, tensor, input.data(), 0, tensor_size);
+    ggml_backend_synchronize(backend);
+    ggml_backend_tensor_get_async(backend, tensor, output.data(), 0, tensor_size);
+    ggml_backend_synchronize(backend);
+    for (size_t i = 0; i < output.size(); ++i) {
+        CHECK(std::fabs(output[i] - input[i]) < 1e-6f);
+    }
+
+    ggml_backend_event_t event = ggml_backend_event_new(dev);
+    CHECK(event != nullptr);
+    ggml_backend_event_record(event, backend);
+    ggml_backend_event_synchronize(event);
+    ggml_backend_event_wait(backend, event);
+    ggml_backend_synchronize(backend);
+    ggml_backend_event_free(event);
+
+    ggml_tensor view = *tensor;
+    view.op = GGML_OP_VIEW;
+    ggml_tensor add = *tensor;
+    add.op = GGML_OP_ADD;
+    ggml_tensor standalone_mul = *tensor;
+    standalone_mul.op = GGML_OP_MUL;
+    ggml_tensor rms_without_aot = *tensor;
+    rms_without_aot.op = GGML_OP_RMS_NORM;
+    rms_without_aot.src[0] = tensor;
+    CHECK(ggml_backend_dev_supports_op(dev, &view));
+    CHECK(!ggml_backend_dev_supports_op(dev, &add));
+    CHECK(!ggml_backend_dev_supports_op(dev, &standalone_mul));
+
+    const char * aot_dir = std::getenv("FLAGOS_AMD_KERNEL_DIR");
+    if (aot_dir == nullptr || aot_dir[0] == '\0') {
+        CHECK(!ggml_backend_dev_supports_op(dev, &rms_without_aot));
+    }
+    if (aot_dir != nullptr && aot_dir[0] != '\0') {
+        // The provider keeps experimental multi-node fusions opt-in for real
+        // model runs; conformance tests explicitly exercise that path.
+        setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS", "1", 1);
+        // Keep this executable deterministic even when the caller has selected
+        // a narrower runtime bisect such as FLAGOS_AMD_FUSIONS=add_rms_norm_mul.
+        // The conformance graph below covers all implemented fusion ABIs.
+        setenv("FLAGOS_AMD_FUSIONS", "all", 1);
+        ggml_tensor * lhs = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+        ggml_tensor * rhs = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+        ggml_tensor * sum = ggml_add(ctx, lhs, rhs);
+        CHECK(lhs != nullptr && rhs != nullptr && sum != nullptr);
+        ggml_backend_buffer_t lhs_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(lhs));
+        ggml_backend_buffer_t rhs_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rhs));
+        ggml_backend_buffer_t sum_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(sum));
+        CHECK(lhs_buffer != nullptr && rhs_buffer != nullptr && sum_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(lhs_buffer, lhs, ggml_backend_buffer_get_base(lhs_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(rhs_buffer, rhs, ggml_backend_buffer_get_base(rhs_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(sum_buffer, sum, ggml_backend_buffer_get_base(sum_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, sum));
+
+        std::vector<float> lhs_host(256);
+        std::vector<float> rhs_host(256);
+        std::vector<float> sum_host(256, -1.0f);
+        for (size_t i = 0; i < lhs_host.size(); ++i) {
+            lhs_host[i] = static_cast<float>(i) * 0.5f;
+            rhs_host[i] = static_cast<float>(i) * -0.25f + 3.0f;
+        }
+        ggml_backend_tensor_set_async(backend, lhs, lhs_host.data(), 0, ggml_nbytes(lhs));
+        ggml_backend_tensor_set_async(backend, rhs, rhs_host.data(), 0, ggml_nbytes(rhs));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * nodes[] = { sum };
+        ggml_cgraph graph {};
+        graph.n_nodes = 1;
+        graph.nodes = nodes;
+        CHECK(ggml_backend_graph_compute(backend, &graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, sum, sum_host.data(), 0, ggml_nbytes(sum));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < sum_host.size(); ++i) {
+            CHECK(std::fabs(sum_host[i] - (lhs_host[i] + rhs_host[i])) < 1e-5f);
+        }
+        ggml_backend_buffer_free(lhs_buffer);
+        ggml_backend_buffer_free(rhs_buffer);
+        ggml_backend_buffer_free(sum_buffer);
+
+        const int64_t rms_rows = 3;
+        const int64_t rms_cols = 1536;
+        const float rms_eps = 1e-5f;
+        ggml_tensor * rms_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rms_cols, rms_rows);
+        ggml_tensor * rms_output = ggml_rms_norm(ctx, rms_input, rms_eps);
+        CHECK(rms_input != nullptr && rms_output != nullptr);
+        ggml_backend_buffer_t rms_input_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rms_input));
+        ggml_backend_buffer_t rms_output_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rms_output));
+        CHECK(rms_input_buffer != nullptr && rms_output_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(rms_input_buffer, rms_input,
+            ggml_backend_buffer_get_base(rms_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(rms_output_buffer, rms_output,
+            ggml_backend_buffer_get_base(rms_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, rms_output));
+
+        std::vector<float> rms_input_host(static_cast<size_t>(rms_rows * rms_cols));
+        std::vector<float> rms_output_host(rms_input_host.size(), -1.0f);
+        std::vector<float> rms_expected(rms_input_host.size(), 0.0f);
+        for (int64_t row = 0; row < rms_rows; ++row) {
+            double sum_sq = 0.0;
+            for (int64_t col = 0; col < rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * rms_cols + col);
+                rms_input_host[index] = static_cast<float>((row + 1) * 0.03125 + col * 0.001 - 0.75);
+                sum_sq += static_cast<double>(rms_input_host[index]) * rms_input_host[index];
+            }
+            const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / rms_cols) + rms_eps);
+            for (int64_t col = 0; col < rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * rms_cols + col);
+                rms_expected[index] = rms_input_host[index] * scale;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, rms_input, rms_input_host.data(), 0, ggml_nbytes(rms_input));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * rms_nodes[] = { rms_output };
+        ggml_cgraph rms_graph {};
+        rms_graph.n_nodes = 1;
+        rms_graph.nodes = rms_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &rms_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, rms_output, rms_output_host.data(), 0, ggml_nbytes(rms_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < rms_output_host.size(); ++i) {
+            CHECK(std::fabs(rms_output_host[i] - rms_expected[i]) < 3e-5f);
+        }
+        ggml_backend_buffer_free(rms_input_buffer);
+        ggml_backend_buffer_free(rms_output_buffer);
+
+        ggml_tensor * fused_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rms_cols, rms_rows);
+        ggml_tensor * fused_weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rms_cols);
+        ggml_tensor * fused_norm = ggml_rms_norm(ctx, fused_input, rms_eps);
+        ggml_tensor * fused_mul = ggml_mul(ctx, fused_norm, fused_weight);
+        CHECK(fused_input != nullptr && fused_weight != nullptr && fused_norm != nullptr && fused_mul != nullptr);
+        ggml_backend_buffer_t fused_input_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(fused_input));
+        ggml_backend_buffer_t fused_weight_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(fused_weight));
+        ggml_backend_buffer_t fused_norm_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(fused_norm));
+        ggml_backend_buffer_t fused_mul_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(fused_mul));
+        CHECK(fused_input_buffer != nullptr && fused_weight_buffer != nullptr &&
+            fused_norm_buffer != nullptr && fused_mul_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(fused_input_buffer, fused_input,
+            ggml_backend_buffer_get_base(fused_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(fused_weight_buffer, fused_weight,
+            ggml_backend_buffer_get_base(fused_weight_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(fused_norm_buffer, fused_norm,
+            ggml_backend_buffer_get_base(fused_norm_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(fused_mul_buffer, fused_mul,
+            ggml_backend_buffer_get_base(fused_mul_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, fused_norm));
+        CHECK(ggml_backend_dev_supports_op(dev, fused_mul));
+        std::vector<float> fused_input_host(static_cast<size_t>(rms_rows * rms_cols));
+        std::vector<float> fused_weight_host(static_cast<size_t>(rms_cols));
+        std::vector<float> fused_output_host(fused_input_host.size(), -1.0f);
+        std::vector<float> fused_expected(fused_input_host.size(), 0.0f);
+        for (int64_t col = 0; col < rms_cols; ++col) {
+            fused_weight_host[static_cast<size_t>(col)] = 0.5f + static_cast<float>(col % 17) * 0.01f;
+        }
+        for (int64_t row = 0; row < rms_rows; ++row) {
+            double sum_sq = 0.0;
+            for (int64_t col = 0; col < rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * rms_cols + col);
+                fused_input_host[index] = static_cast<float>((row + 1) * 0.07 + col * 0.0007 - 0.5);
+                sum_sq += static_cast<double>(fused_input_host[index]) * fused_input_host[index];
+            }
+            const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / rms_cols) + rms_eps);
+            for (int64_t col = 0; col < rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * rms_cols + col);
+                fused_expected[index] = fused_input_host[index] * scale * fused_weight_host[static_cast<size_t>(col)];
+            }
+        }
+        ggml_backend_tensor_set_async(backend, fused_input, fused_input_host.data(), 0, ggml_nbytes(fused_input));
+        ggml_backend_tensor_set_async(backend, fused_weight, fused_weight_host.data(), 0, ggml_nbytes(fused_weight));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * fused_nodes[] = { fused_norm, fused_mul };
+        ggml_cgraph fused_graph {};
+        fused_graph.n_nodes = 2;
+        fused_graph.nodes = fused_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &fused_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, fused_mul, fused_output_host.data(), 0, ggml_nbytes(fused_mul));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < fused_output_host.size(); ++i) {
+            CHECK(std::fabs(fused_output_host[i] - fused_expected[i]) < 4e-5f);
+        }
+        ggml_backend_buffer_free(fused_input_buffer);
+        ggml_backend_buffer_free(fused_norm_buffer);
+        ggml_backend_buffer_free(fused_mul_buffer);
+
+        const int64_t add_rows = 1;
+        ggml_tensor * add_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rms_cols, add_rows);
+        ggml_tensor * add_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rms_cols, add_rows);
+        ggml_tensor * add_node = ggml_add(ctx, add_input, add_bias);
+        ggml_tensor * add_norm = ggml_rms_norm(ctx, add_node, rms_eps);
+        ggml_tensor * add_mul = ggml_mul(ctx, add_norm, fused_weight);
+        CHECK(add_input != nullptr && add_bias != nullptr && add_node != nullptr && add_norm != nullptr && add_mul != nullptr);
+        ggml_backend_buffer_t add_input_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(add_input));
+        ggml_backend_buffer_t add_bias_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(add_bias));
+        ggml_backend_buffer_t add_node_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(add_node));
+        ggml_backend_buffer_t add_norm_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(add_norm));
+        ggml_backend_buffer_t add_mul_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(add_mul));
+        CHECK(add_input_buffer && add_bias_buffer && add_node_buffer && add_norm_buffer && add_mul_buffer);
+        CHECK(ggml_backend_tensor_alloc(add_input_buffer, add_input, ggml_backend_buffer_get_base(add_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(add_bias_buffer, add_bias, ggml_backend_buffer_get_base(add_bias_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(add_node_buffer, add_node, ggml_backend_buffer_get_base(add_node_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(add_norm_buffer, add_norm, ggml_backend_buffer_get_base(add_norm_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(add_mul_buffer, add_mul, ggml_backend_buffer_get_base(add_mul_buffer)) == GGML_STATUS_SUCCESS);
+        std::vector<float> add_input_host(static_cast<size_t>(rms_cols * add_rows));
+        std::vector<float> add_bias_host(add_input_host.size());
+        std::vector<float> add_output_host(add_input_host.size(), -1.0f);
+        std::vector<float> add_expected(add_input_host.size());
+        for (size_t i = 0; i < add_input_host.size(); ++i) {
+            add_input_host[i] = static_cast<float>(i % 101) * 0.003f - 0.2f;
+            add_bias_host[i] = static_cast<float>(i % 37) * 0.002f - 0.05f;
+        }
+        for (int64_t row = 0; row < add_rows; ++row) {
+            double sum_sq = 0.0;
+            for (int64_t col = 0; col < rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * rms_cols + col);
+                const float value = add_input_host[index] + add_bias_host[index];
+                sum_sq += static_cast<double>(value) * value;
+            }
+            const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / rms_cols) + rms_eps);
+            for (int64_t col = 0; col < rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * rms_cols + col);
+                add_expected[index] = (add_input_host[index] + add_bias_host[index]) * scale * fused_weight_host[static_cast<size_t>(col)];
+            }
+        }
+        ggml_backend_tensor_set_async(backend, add_input, add_input_host.data(), 0, ggml_nbytes(add_input));
+        ggml_backend_tensor_set_async(backend, add_bias, add_bias_host.data(), 0, ggml_nbytes(add_bias));
+        ggml_backend_tensor_set_async(backend, fused_weight, fused_weight_host.data(), 0, ggml_nbytes(fused_weight));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * add_nodes[] = { add_node, add_norm, add_mul };
+        ggml_cgraph add_graph {};
+        add_graph.n_nodes = 3;
+        add_graph.nodes = add_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &add_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, add_mul, add_output_host.data(), 0, ggml_nbytes(add_mul));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < add_output_host.size(); ++i) {
+            const float diff = std::fabs(add_output_host[i] - add_expected[i]);
+            CHECK(diff < 2e-4f);
+        }
+        ggml_backend_buffer_free(add_input_buffer);
+        ggml_backend_buffer_free(add_bias_buffer);
+        ggml_backend_buffer_free(add_node_buffer);
+        ggml_backend_buffer_free(add_norm_buffer);
+        ggml_backend_buffer_free(add_mul_buffer);
+        ggml_backend_buffer_free(fused_weight_buffer);
+
+        // SET_ROWS is the KV-cache write used by Qwen-style decode graphs.
+        // The destination is a view of the cache tensor, so initialize the
+        // view through the backend rather than allocating a second buffer.
+        const int64_t set_rows_cols = 256;
+        const int64_t set_rows_src_count = 3;
+        const int64_t set_rows_dst_count = 32;
+        ggml_tensor * set_rows_dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+            set_rows_cols, set_rows_dst_count);
+        ggml_tensor * set_rows_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            set_rows_cols, set_rows_src_count);
+        ggml_tensor * set_rows_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64,
+            set_rows_src_count);
+        ggml_tensor * set_rows_out = ggml_set_rows(ctx, set_rows_dst, set_rows_src, set_rows_indices);
+        CHECK(set_rows_dst && set_rows_src && set_rows_indices && set_rows_out);
+        ggml_backend_buffer_t set_rows_dst_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(set_rows_dst));
+        ggml_backend_buffer_t set_rows_src_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(set_rows_src));
+        ggml_backend_buffer_t set_rows_indices_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(set_rows_indices));
+        CHECK(set_rows_dst_buffer && set_rows_src_buffer && set_rows_indices_buffer);
+        CHECK(ggml_backend_tensor_alloc(set_rows_dst_buffer, set_rows_dst,
+            ggml_backend_buffer_get_base(set_rows_dst_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_view_init(set_rows_out) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(set_rows_src_buffer, set_rows_src,
+            ggml_backend_buffer_get_base(set_rows_src_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(set_rows_indices_buffer, set_rows_indices,
+            ggml_backend_buffer_get_base(set_rows_indices_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, set_rows_out));
+        std::vector<float> set_rows_src_host(static_cast<size_t>(set_rows_cols * set_rows_src_count));
+        std::vector<int64_t> set_rows_indices_host { 19, 7, 23 };
+        std::vector<ggml_fp16_t> set_rows_dst_host(static_cast<size_t>(set_rows_cols * set_rows_dst_count),
+            ggml_fp32_to_fp16(0.0f));
+        for (size_t i = 0; i < set_rows_src_host.size(); ++i) {
+            set_rows_src_host[i] = static_cast<float>(i % 37) * 0.03125f - 0.4f;
+        }
+        ggml_backend_buffer_clear(set_rows_dst_buffer, 0);
+        ggml_backend_tensor_set_async(backend, set_rows_src, set_rows_src_host.data(),
+            0, ggml_nbytes(set_rows_src));
+        ggml_backend_tensor_set_async(backend, set_rows_indices, set_rows_indices_host.data(),
+            0, ggml_nbytes(set_rows_indices));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * set_rows_nodes[] = { set_rows_out };
+        ggml_cgraph set_rows_graph {};
+        set_rows_graph.n_nodes = 1;
+        set_rows_graph.nodes = set_rows_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &set_rows_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, set_rows_dst, set_rows_dst_host.data(),
+            0, ggml_nbytes(set_rows_dst));
+        ggml_backend_synchronize(backend);
+        for (int64_t row = 0; row < set_rows_src_count; ++row) {
+            const int64_t destination = set_rows_indices_host[static_cast<size_t>(row)];
+            for (int64_t col = 0; col < set_rows_cols; ++col) {
+                const size_t src_index = static_cast<size_t>(row * set_rows_cols + col);
+                const size_t dst_index = static_cast<size_t>(destination * set_rows_cols + col);
+                CHECK(std::fabs(ggml_fp16_to_fp32(set_rows_dst_host[dst_index]) - set_rows_src_host[src_index]) < 5e-3f);
+            }
+        }
+        ggml_backend_buffer_free(set_rows_dst_buffer);
+        ggml_backend_buffer_free(set_rows_src_buffer);
+        ggml_backend_buffer_free(set_rows_indices_buffer);
+
+        auto check_quantized_matmul = [&](ggml_type quant_type, int64_t rows, int64_t columns,
+                                          int64_t k = 512) {
+            ggml_tensor * quant_weights = ggml_new_tensor_2d(ctx, quant_type, k, rows);
+            ggml_tensor * quant_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns);
+            ggml_tensor * quant_output = ggml_mul_mat(ctx, quant_weights, quant_input);
+            CHECK(quant_weights && quant_input && quant_output);
+            ggml_backend_buffer_t quant_weights_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(quant_weights));
+            ggml_backend_buffer_t quant_input_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(quant_input));
+            ggml_backend_buffer_t quant_output_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(quant_output));
+            CHECK(quant_weights_buffer && quant_input_buffer && quant_output_buffer);
+            CHECK(ggml_backend_tensor_alloc(quant_weights_buffer, quant_weights,
+                ggml_backend_buffer_get_base(quant_weights_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(quant_input_buffer, quant_input,
+                ggml_backend_buffer_get_base(quant_input_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(quant_output_buffer, quant_output,
+                ggml_backend_buffer_get_base(quant_output_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_dev_supports_op(dev, quant_output));
+            flagos_quantized_matmul_signature quant_signature;
+            CHECK(flagos_describe_quantized_matmul(quant_output, &quant_signature));
+            CHECK(quant_signature.k == k && quant_signature.rows == rows &&
+                quant_signature.columns == columns);
+
+            std::vector<float> weights_host(static_cast<size_t>(rows * k));
+            std::vector<uint8_t> weights_quantized(ggml_nbytes(quant_weights));
+            std::vector<float> input_host(static_cast<size_t>(columns * k));
+            for (size_t i = 0; i < weights_host.size(); ++i) {
+                weights_host[i] = static_cast<float>((i * 17) % 101) * 0.011f - 0.52f;
+            }
+            for (size_t i = 0; i < input_host.size(); ++i) {
+                input_host[i] = static_cast<float>((i * 13) % 79) * 0.017f - 0.63f;
+            }
+            ggml_quantize_chunk(quant_type, weights_host.data(), weights_quantized.data(),
+                0, rows, k, nullptr);
+            ggml_backend_tensor_set_async(backend, quant_weights, weights_quantized.data(),
+                0, weights_quantized.size());
+            ggml_backend_tensor_set_async(backend, quant_input, input_host.data(),
+                0, ggml_nbytes(quant_input));
+            ggml_backend_synchronize(backend);
+            ggml_tensor * quant_nodes[] = { quant_output };
+            ggml_cgraph quant_graph {};
+            quant_graph.n_nodes = 1;
+            quant_graph.nodes = quant_nodes;
+            CHECK(ggml_backend_graph_compute(backend, &quant_graph) == GGML_STATUS_SUCCESS);
+            std::vector<float> output_host(static_cast<size_t>(rows * columns), -1.0f);
+            ggml_backend_tensor_get_async(backend, quant_output, output_host.data(),
+                0, ggml_nbytes(quant_output));
+            ggml_backend_synchronize(backend);
+
+            const size_t row_bytes = ggml_row_size(quant_type, k);
+            std::vector<float> dequantized(static_cast<size_t>(k));
+            const auto * traits = ggml_get_type_traits(quant_type);
+            for (int64_t row = 0; row < rows; ++row) {
+                traits->to_float(weights_quantized.data() + static_cast<size_t>(row) * row_bytes,
+                    dequantized.data(), k);
+                for (int64_t column = 0; column < columns; ++column) {
+                    float expected = 0.0f;
+                    for (int64_t col = 0; col < k; ++col) {
+                        expected += dequantized[static_cast<size_t>(col)] *
+                            input_host[static_cast<size_t>(column * k + col)];
+                    }
+                    const float actual = output_host[static_cast<size_t>(column * rows + row)];
+                    CHECK(std::fabs(actual - expected) < 3e-2f);
+                }
+            }
+            ggml_backend_buffer_free(quant_weights_buffer);
+            ggml_backend_buffer_free(quant_input_buffer);
+            ggml_backend_buffer_free(quant_output_buffer);
+
+        };
+        check_quantized_matmul(GGML_TYPE_Q4_K, 7, 1);
+        check_quantized_matmul(GGML_TYPE_Q4_K, 7, 5);
+        check_quantized_matmul(GGML_TYPE_Q6_K, 7, 1);
+        check_quantized_matmul(GGML_TYPE_Q6_K, 7, 5);
+        // Exercise the opt-in dequant-cache + dense F16 prefill path for both
+        // quantized formats.  The production Qwen projections are much wider
+        // than this regression case, but keeping K=1024 and rows=64 catches
+        // cache reuse, Q6 decode, and the tiled GEMM ABI without a large test
+        // allocation.
+        check_quantized_matmul(GGML_TYPE_Q4_K, 64, 5, 1024);
+        check_quantized_matmul(GGML_TYPE_Q6_K, 64, 5, 1024);
+        // Exercise the Qwen output projection geometry.  Small row counts can
+        // hide launch/grid or address arithmetic bugs that only appear when a
+        // vocabulary-sized Q6_K matrix is dispatched.
+        check_quantized_matmul(GGML_TYPE_Q6_K, 151936, 1);
+
+        auto check_quantized_get_rows = [&](ggml_type quant_type) {
+            const int64_t k = 512;
+            const int64_t table_rows = 9;
+            const int64_t tokens = 3;
+            ggml_tensor * table = ggml_new_tensor_2d(ctx, quant_type, k, table_rows);
+            ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+            ggml_tensor * gathered = ggml_get_rows(ctx, table, indices);
+            CHECK(table && indices && gathered);
+            ggml_backend_buffer_t table_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(table));
+            ggml_backend_buffer_t indices_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(indices));
+            ggml_backend_buffer_t gathered_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(gathered));
+            CHECK(table_buffer && indices_buffer && gathered_buffer);
+            CHECK(ggml_backend_tensor_alloc(table_buffer, table,
+                ggml_backend_buffer_get_base(table_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(indices_buffer, indices,
+                ggml_backend_buffer_get_base(indices_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(gathered_buffer, gathered,
+                ggml_backend_buffer_get_base(gathered_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_dev_supports_op(dev, gathered));
+            std::vector<float> table_host(static_cast<size_t>(table_rows * k));
+            std::vector<uint8_t> table_quantized(ggml_nbytes(table));
+            std::vector<int32_t> index_host { 7, 2, 5 };
+            for (size_t i = 0; i < table_host.size(); ++i) {
+                table_host[i] = static_cast<float>((i * 19) % 113) * 0.009f - 0.48f;
+            }
+            ggml_quantize_chunk(quant_type, table_host.data(), table_quantized.data(),
+                0, table_rows, k, nullptr);
+            ggml_backend_tensor_set_async(backend, table, table_quantized.data(), 0, table_quantized.size());
+            ggml_backend_tensor_set_async(backend, indices, index_host.data(), 0, ggml_nbytes(indices));
+            ggml_backend_synchronize(backend);
+            ggml_tensor * gather_nodes[] = { gathered };
+            ggml_cgraph gather_graph {};
+            gather_graph.n_nodes = 1;
+            gather_graph.nodes = gather_nodes;
+            CHECK(ggml_backend_graph_compute(backend, &gather_graph) == GGML_STATUS_SUCCESS);
+            std::vector<float> gathered_host(static_cast<size_t>(tokens * k), -1.0f);
+            ggml_backend_tensor_get_async(backend, gathered, gathered_host.data(), 0, ggml_nbytes(gathered));
+            ggml_backend_synchronize(backend);
+            const size_t row_bytes = ggml_row_size(quant_type, k);
+            std::vector<float> dequantized(static_cast<size_t>(k));
+            const auto * traits = ggml_get_type_traits(quant_type);
+            for (int64_t token = 0; token < tokens; ++token) {
+                const int32_t source_row = index_host[static_cast<size_t>(token)];
+                traits->to_float(table_quantized.data() + static_cast<size_t>(source_row) * row_bytes,
+                    dequantized.data(), k);
+                for (int64_t col = 0; col < k; ++col) {
+                    CHECK(std::fabs(gathered_host[static_cast<size_t>(token * k + col)] -
+                        dequantized[static_cast<size_t>(col)]) < 3e-2f);
+                }
+            }
+            ggml_backend_buffer_free(table_buffer);
+            ggml_backend_buffer_free(indices_buffer);
+            ggml_backend_buffer_free(gathered_buffer);
+        };
+        check_quantized_get_rows(GGML_TYPE_Q4_K);
+        check_quantized_get_rows(GGML_TYPE_Q6_K);
+
+        const int64_t rope_ne0 = 128;
+        const int64_t rope_ne1 = 3;
+        const int64_t rope_ne2 = 4;
+        ggml_tensor * rope_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rope_ne0, rope_ne1, rope_ne2);
+        ggml_tensor * rope_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_ne2);
+        ggml_tensor * rope_output = ggml_rope(ctx, rope_input, rope_positions,
+            static_cast<int>(rope_ne0), GGML_ROPE_TYPE_NEOX);
+        CHECK(rope_input != nullptr && rope_positions != nullptr && rope_output != nullptr);
+        ggml_backend_buffer_t rope_input_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rope_input));
+        ggml_backend_buffer_t rope_positions_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rope_positions));
+        ggml_backend_buffer_t rope_output_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rope_output));
+        CHECK(rope_input_buffer != nullptr && rope_positions_buffer != nullptr && rope_output_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(rope_input_buffer, rope_input,
+            ggml_backend_buffer_get_base(rope_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(rope_positions_buffer, rope_positions,
+            ggml_backend_buffer_get_base(rope_positions_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(rope_output_buffer, rope_output,
+            ggml_backend_buffer_get_base(rope_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, rope_output));
+
+        const size_t rope_elements = static_cast<size_t>(rope_ne0 * rope_ne1 * rope_ne2);
+        std::vector<float> rope_input_host(rope_elements);
+        std::vector<float> rope_output_host(rope_elements, -1.0f);
+        std::vector<float> rope_expected(rope_elements, 0.0f);
+        std::vector<int32_t> rope_positions_host { 0, 1, 5, 17 };
+        const float rope_base = 10000.0f;
+        const int64_t rope_half = rope_ne0 / 2;
+        for (int64_t token = 0; token < rope_ne2; ++token) {
+            const float position = static_cast<float>(rope_positions_host[static_cast<size_t>(token)]);
+            for (int64_t head = 0; head < rope_ne1; ++head) {
+                const size_t row_start = static_cast<size_t>((token * rope_ne1 + head) * rope_ne0);
+                for (int64_t dim = 0; dim < rope_half; ++dim) {
+                    const size_t first = row_start + static_cast<size_t>(dim);
+                    const size_t second = row_start + static_cast<size_t>(dim + rope_half);
+                    rope_input_host[first] = static_cast<float>(0.1 + first * 0.002);
+                    rope_input_host[second] = static_cast<float>(-0.2 + second * 0.001);
+                    const float theta = position * std::pow(rope_base,
+                        -2.0f * static_cast<float>(dim) / static_cast<float>(rope_ne0));
+                    const float c = std::cos(theta);
+                    const float s = std::sin(theta);
+                    rope_expected[first] = rope_input_host[first] * c - rope_input_host[second] * s;
+                    rope_expected[second] = rope_input_host[first] * s + rope_input_host[second] * c;
+                }
+            }
+        }
+        ggml_backend_tensor_set_async(backend, rope_input, rope_input_host.data(), 0, ggml_nbytes(rope_input));
+        ggml_backend_tensor_set_async(backend, rope_positions, rope_positions_host.data(), 0, ggml_nbytes(rope_positions));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * rope_nodes[] = { rope_output };
+        ggml_cgraph rope_graph {};
+        rope_graph.n_nodes = 1;
+        rope_graph.nodes = rope_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &rope_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, rope_output, rope_output_host.data(), 0, ggml_nbytes(rope_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < rope_output_host.size(); ++i) {
+            CHECK(std::fabs(rope_output_host[i] - rope_expected[i]) < 5e-5f);
+        }
+
+        ggml_tensor * rope_store_view = ggml_view_2d(ctx, rope_output,
+            rope_ne0 * rope_ne1, rope_ne2, rope_output->nb[2], 0);
+        ggml_tensor * rope_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+            rope_ne0 * rope_ne1, 32);
+        ggml_tensor * rope_store_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, rope_ne2);
+        ggml_tensor * rope_store = ggml_set_rows(ctx, rope_cache, rope_store_view, rope_store_indices);
+        CHECK(rope_store_view && rope_cache && rope_store_indices && rope_store);
+        ggml_backend_buffer_t rope_cache_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(rope_cache));
+        ggml_backend_buffer_t rope_store_indices_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(rope_store_indices));
+        CHECK(rope_cache_buffer && rope_store_indices_buffer);
+        CHECK(ggml_backend_tensor_alloc(rope_cache_buffer, rope_cache,
+            ggml_backend_buffer_get_base(rope_cache_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_view_init(rope_store_view) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_view_init(rope_store) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(rope_store_indices_buffer, rope_store_indices,
+            ggml_backend_buffer_get_base(rope_store_indices_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, rope_store));
+        const std::vector<int64_t> rope_store_indices_host { 3, 7, 11, 19 };
+        ggml_backend_buffer_clear(rope_cache_buffer, 0);
+        ggml_backend_tensor_set_async(backend, rope_store_indices, rope_store_indices_host.data(),
+            0, ggml_nbytes(rope_store_indices));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * rope_store_nodes[] = { rope_output, rope_store_view, rope_store };
+        ggml_cgraph rope_store_graph {};
+        rope_store_graph.n_nodes = 3;
+        rope_store_graph.nodes = rope_store_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &rope_store_graph) == GGML_STATUS_SUCCESS);
+        std::vector<ggml_fp16_t> rope_cache_host(static_cast<size_t>(rope_ne0 * rope_ne1 * 32),
+            ggml_fp32_to_fp16(0.0f));
+        ggml_backend_tensor_get_async(backend, rope_cache, rope_cache_host.data(), 0, ggml_nbytes(rope_cache));
+        ggml_backend_synchronize(backend);
+        for (int64_t token = 0; token < rope_ne2; ++token) {
+            const int64_t destination = rope_store_indices_host[static_cast<size_t>(token)];
+            for (int64_t col = 0; col < rope_ne0 * rope_ne1; ++col) {
+                const size_t expected_index = static_cast<size_t>(token * rope_ne0 * rope_ne1 + col);
+                const size_t cache_index = static_cast<size_t>(destination * rope_ne0 * rope_ne1 + col);
+                CHECK(std::fabs(ggml_fp16_to_fp32(rope_cache_host[cache_index]) - rope_expected[expected_index]) < 5e-3f);
+            }
+        }
+        ggml_backend_buffer_free(rope_cache_buffer);
+        ggml_backend_buffer_free(rope_store_indices_buffer);
+        ggml_backend_buffer_free(rope_input_buffer);
+        ggml_backend_buffer_free(rope_positions_buffer);
+        ggml_backend_buffer_free(rope_output_buffer);
+
+        ggml_tensor * silu_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 513);
+        ggml_tensor * silu_output = ggml_silu(ctx, silu_input);
+        CHECK(silu_input != nullptr && silu_output != nullptr);
+        ggml_backend_buffer_t silu_input_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(silu_input));
+        ggml_backend_buffer_t silu_output_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(silu_output));
+        CHECK(silu_input_buffer != nullptr && silu_output_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(silu_input_buffer, silu_input,
+            ggml_backend_buffer_get_base(silu_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(silu_output_buffer, silu_output,
+            ggml_backend_buffer_get_base(silu_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, silu_output));
+        std::vector<float> silu_input_host(513);
+        std::vector<float> silu_output_host(513, -1.0f);
+        for (size_t i = 0; i < silu_input_host.size(); ++i) {
+            silu_input_host[i] = static_cast<float>(i) * 0.03125f - 8.0f;
+        }
+        ggml_backend_tensor_set_async(backend, silu_input, silu_input_host.data(), 0, ggml_nbytes(silu_input));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * silu_nodes[] = { silu_output };
+        ggml_cgraph silu_graph {};
+        silu_graph.n_nodes = 1;
+        silu_graph.nodes = silu_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &silu_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, silu_output, silu_output_host.data(), 0, ggml_nbytes(silu_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < silu_output_host.size(); ++i) {
+            const float x = silu_input_host[i];
+            CHECK(std::fabs(silu_output_host[i] - x / (1.0f + std::exp(-x))) < 4e-5f);
+        }
+        ggml_backend_buffer_free(silu_input_buffer);
+        ggml_backend_buffer_free(silu_output_buffer);
+
+        ggml_tensor * gate_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
+        ggml_tensor * up_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
+        ggml_tensor * swiglu_tensor = ggml_swiglu_split(ctx, gate_tensor, up_tensor);
+        CHECK(gate_tensor != nullptr && up_tensor != nullptr && swiglu_tensor != nullptr);
+        ggml_backend_buffer_t gate_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(gate_tensor));
+        ggml_backend_buffer_t up_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(up_tensor));
+        ggml_backend_buffer_t swiglu_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(swiglu_tensor));
+        CHECK(gate_buffer != nullptr && up_buffer != nullptr && swiglu_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(gate_buffer, gate_tensor, ggml_backend_buffer_get_base(gate_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(up_buffer, up_tensor, ggml_backend_buffer_get_base(up_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(swiglu_buffer, swiglu_tensor, ggml_backend_buffer_get_base(swiglu_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, swiglu_tensor));
+        const size_t swiglu_elements = static_cast<size_t>(ggml_nelements(swiglu_tensor));
+        std::vector<float> gate_host(swiglu_elements);
+        std::vector<float> up_host(swiglu_elements);
+        std::vector<float> swiglu_host(swiglu_elements, -1.0f);
+        for (size_t i = 0; i < swiglu_elements; ++i) {
+            gate_host[i] = static_cast<float>(i % 257) * 0.025f - 3.0f;
+            up_host[i] = static_cast<float>(i % 113) * 0.017f - 0.8f;
+        }
+        ggml_backend_tensor_set_async(backend, gate_tensor, gate_host.data(), 0, ggml_nbytes(gate_tensor));
+        ggml_backend_tensor_set_async(backend, up_tensor, up_host.data(), 0, ggml_nbytes(up_tensor));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * swiglu_nodes[] = { swiglu_tensor };
+        ggml_cgraph swiglu_graph {};
+        swiglu_graph.n_nodes = 1;
+        swiglu_graph.nodes = swiglu_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &swiglu_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, swiglu_tensor, swiglu_host.data(), 0, ggml_nbytes(swiglu_tensor));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < swiglu_elements; ++i) {
+            const float expected = gate_host[i] / (1.0f + std::exp(-gate_host[i])) * up_host[i];
+            CHECK(std::fabs(swiglu_host[i] - expected) < 5e-5f);
+        }
+        ggml_backend_buffer_free(gate_buffer);
+        ggml_backend_buffer_free(up_buffer);
+        ggml_backend_buffer_free(swiglu_buffer);
+
+        // Softmax is a direct FlagOS operator.  Exercise both ABI variants:
+        // an unmasked F32 matrix and the F16 mask layout used by attention.
+        const int64_t softmax_cols = 4096;
+        const int64_t softmax_rows = 3;
+        ggml_tensor * softmax_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            softmax_cols, softmax_rows);
+        ggml_tensor * softmax_output = ggml_soft_max(ctx, softmax_input);
+        CHECK(softmax_input && softmax_output);
+        ggml_backend_buffer_t softmax_input_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(softmax_input));
+        ggml_backend_buffer_t softmax_output_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(softmax_output));
+        CHECK(softmax_input_buffer && softmax_output_buffer);
+        CHECK(ggml_backend_tensor_alloc(softmax_input_buffer, softmax_input,
+            ggml_backend_buffer_get_base(softmax_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(softmax_output_buffer, softmax_output,
+            ggml_backend_buffer_get_base(softmax_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, softmax_output));
+        std::vector<float> softmax_input_host(static_cast<size_t>(softmax_cols * softmax_rows));
+        std::vector<float> softmax_output_host(softmax_input_host.size(), -1.0f);
+        std::vector<float> softmax_expected(softmax_input_host.size(), 0.0f);
+        for (int64_t row = 0; row < softmax_rows; ++row) {
+            float max_value = -INFINITY;
+            for (int64_t col = 0; col < softmax_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * softmax_cols + col);
+                softmax_input_host[index] = static_cast<float>((col * 17 + row * 3) % 101) * 0.021f - 1.0f;
+                max_value = std::max(max_value, softmax_input_host[index]);
+            }
+            float sum = 0.0f;
+            for (int64_t col = 0; col < softmax_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * softmax_cols + col);
+                softmax_expected[index] = std::exp(softmax_input_host[index] - max_value);
+                sum += softmax_expected[index];
+            }
+            for (int64_t col = 0; col < softmax_cols; ++col) {
+                softmax_expected[static_cast<size_t>(row * softmax_cols + col)] /= sum;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, softmax_input, softmax_input_host.data(),
+            0, ggml_nbytes(softmax_input));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * softmax_nodes[] = { softmax_output };
+        ggml_cgraph softmax_graph {};
+        softmax_graph.n_nodes = 1;
+        softmax_graph.nodes = softmax_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &softmax_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, softmax_output, softmax_output_host.data(),
+            0, ggml_nbytes(softmax_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < softmax_output_host.size(); ++i) {
+            CHECK(std::fabs(softmax_output_host[i] - softmax_expected[i]) < 5e-5f);
+        }
+        ggml_backend_buffer_free(softmax_input_buffer);
+        ggml_backend_buffer_free(softmax_output_buffer);
+
+        ggml_tensor * masked_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            softmax_cols, softmax_rows);
+        ggml_tensor * masked_values = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+            softmax_cols, softmax_rows);
+        ggml_tensor * masked_output = ggml_soft_max_ext(ctx, masked_input, masked_values,
+            0.125f, 0.0f);
+        CHECK(masked_input && masked_values && masked_output);
+        ggml_backend_buffer_t masked_input_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(masked_input));
+        ggml_backend_buffer_t masked_values_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(masked_values));
+        ggml_backend_buffer_t masked_output_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(masked_output));
+        CHECK(masked_input_buffer && masked_values_buffer && masked_output_buffer);
+        CHECK(ggml_backend_tensor_alloc(masked_input_buffer, masked_input,
+            ggml_backend_buffer_get_base(masked_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(masked_values_buffer, masked_values,
+            ggml_backend_buffer_get_base(masked_values_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(masked_output_buffer, masked_output,
+            ggml_backend_buffer_get_base(masked_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, masked_output));
+        std::vector<ggml_fp16_t> masked_values_host(static_cast<size_t>(softmax_cols * softmax_rows));
+        std::vector<float> masked_input_host(softmax_input_host.size());
+        std::vector<float> masked_output_host(masked_input_host.size(), -1.0f);
+        std::vector<float> masked_expected(masked_input_host.size(), 0.0f);
+        for (size_t i = 0; i < masked_input_host.size(); ++i) {
+            masked_input_host[i] = static_cast<float>((i * 29) % 131) * 0.013f - 0.8f;
+            const float bias = static_cast<float>((i * 7) % 19) * 0.011f - 0.1f;
+            masked_values_host[i] = ggml_fp32_to_fp16(bias);
+        }
+        for (int64_t row = 0; row < softmax_rows; ++row) {
+            float max_value = -INFINITY;
+            for (int64_t col = 0; col < softmax_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * softmax_cols + col);
+                const float value = masked_input_host[index] * 0.125f +
+                    ggml_fp16_to_fp32(masked_values_host[index]);
+                max_value = std::max(max_value, value);
+                masked_expected[index] = value;
+            }
+            float sum = 0.0f;
+            for (int64_t col = 0; col < softmax_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * softmax_cols + col);
+                masked_expected[index] = std::exp(masked_expected[index] - max_value);
+                sum += masked_expected[index];
+            }
+            for (int64_t col = 0; col < softmax_cols; ++col) {
+                masked_expected[static_cast<size_t>(row * softmax_cols + col)] /= sum;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, masked_input, masked_input_host.data(),
+            0, ggml_nbytes(masked_input));
+        ggml_backend_tensor_set_async(backend, masked_values, masked_values_host.data(),
+            0, ggml_nbytes(masked_values));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * masked_nodes[] = { masked_output };
+        ggml_cgraph masked_graph {};
+        masked_graph.n_nodes = 1;
+        masked_graph.nodes = masked_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &masked_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, masked_output, masked_output_host.data(),
+            0, ggml_nbytes(masked_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < masked_output_host.size(); ++i) {
+            CHECK(std::fabs(masked_output_host[i] - masked_expected[i]) < 7e-5f);
+        }
+        ggml_backend_buffer_free(masked_input_buffer);
+        ggml_backend_buffer_free(masked_values_buffer);
+        ggml_backend_buffer_free(masked_output_buffer);
+
+        const int64_t attn_dim = 128;
+        const int64_t attn_q_heads = 4;
+        const int64_t attn_kv_heads = 2;
+        const int64_t attn_keys = 37;
+        ggml_tensor * attn_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, attn_dim, 1, attn_q_heads);
+        ggml_tensor * attn_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, attn_dim, attn_keys, attn_kv_heads);
+        ggml_tensor * attn_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, attn_dim, attn_keys, attn_kv_heads);
+        ggml_tensor * attn_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, attn_keys);
+        CHECK(attn_q != nullptr && attn_k != nullptr && attn_v != nullptr && attn_mask != nullptr);
+        // Match the permuted [head_dim, token, head] layout produced by the
+        // llama graph before FLASH_ATTN_EXT.
+        attn_q->nb[1] = attn_dim * attn_q_heads * sizeof(float);
+        attn_q->nb[2] = attn_dim * sizeof(float);
+        attn_k->nb[1] = attn_dim * attn_kv_heads * sizeof(ggml_fp16_t);
+        attn_k->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+        attn_v->nb[1] = attn_dim * attn_kv_heads * sizeof(ggml_fp16_t);
+        attn_v->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(attn_dim));
+        ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, attn_q, attn_k, attn_v, attn_mask,
+            attn_scale, 0.0f, 0.0f);
+        CHECK(attn_out != nullptr);
+        ggml_backend_buffer_t attn_q_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_q));
+        ggml_backend_buffer_t attn_k_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_k));
+        ggml_backend_buffer_t attn_v_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_v));
+        ggml_backend_buffer_t attn_mask_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_mask));
+        ggml_backend_buffer_t attn_out_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_out));
+        CHECK(attn_q_buffer && attn_k_buffer && attn_v_buffer && attn_mask_buffer && attn_out_buffer);
+        CHECK(ggml_backend_tensor_alloc(attn_q_buffer, attn_q, ggml_backend_buffer_get_base(attn_q_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(attn_k_buffer, attn_k, ggml_backend_buffer_get_base(attn_k_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(attn_v_buffer, attn_v, ggml_backend_buffer_get_base(attn_v_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(attn_mask_buffer, attn_mask, ggml_backend_buffer_get_base(attn_mask_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(attn_out_buffer, attn_out, ggml_backend_buffer_get_base(attn_out_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, attn_out));
+        std::vector<float> attn_q_host(ggml_nbytes(attn_q) / sizeof(float), 0.0f);
+        std::vector<ggml_fp16_t> attn_k_host(ggml_nbytes(attn_k) / sizeof(ggml_fp16_t));
+        std::vector<ggml_fp16_t> attn_v_host(ggml_nbytes(attn_v) / sizeof(ggml_fp16_t));
+        std::vector<ggml_fp16_t> attn_mask_host(attn_keys, ggml_fp32_to_fp16(0.0f));
+        std::vector<float> attn_expected(static_cast<size_t>(attn_dim * attn_q_heads), 0.0f);
+        std::vector<float> attn_output(attn_expected.size(), -1.0f);
+        auto q_at = [&](int64_t dim, int64_t head) -> float & {
+            return attn_q_host[static_cast<size_t>((dim * sizeof(float) + head * attn_q->nb[2]) / sizeof(float))];
+        };
+        auto kv_at = [&](std::vector<ggml_fp16_t> & data, int64_t dim, int64_t token, int64_t head) -> ggml_fp16_t & {
+            const size_t byte_offset = static_cast<size_t>(dim * sizeof(ggml_fp16_t) + token * attn_k->nb[1] + head * attn_k->nb[2]);
+            return data[byte_offset / sizeof(ggml_fp16_t)];
+        };
+        for (int64_t head = 0; head < attn_q_heads; ++head) {
+            for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                q_at(dim, head) = static_cast<float>((dim + 3 * head) % 29) * 0.01f - 0.12f;
+            }
+        }
+        for (int64_t head = 0; head < attn_kv_heads; ++head) {
+            for (int64_t token = 0; token < attn_keys; ++token) {
+                for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                    kv_at(attn_k_host, dim, token, head) = ggml_fp32_to_fp16(static_cast<float>((dim + token + head) % 23) * 0.01f - 0.1f);
+                    kv_at(attn_v_host, dim, token, head) = ggml_fp32_to_fp16(static_cast<float>((2 * dim + token + 3 * head) % 31) * 0.008f - 0.09f);
+                }
+            }
+        }
+        for (int64_t head = 0; head < attn_q_heads; ++head) {
+            const int64_t kv_head = head / (attn_q_heads / attn_kv_heads);
+            std::vector<float> scores(attn_keys);
+            float max_score = -INFINITY;
+            for (int64_t token = 0; token < attn_keys; ++token) {
+                float score = 0.0f;
+                for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                    score += q_at(dim, head) * ggml_fp16_to_fp32(kv_at(attn_k_host, dim, token, kv_head));
+                }
+                scores[static_cast<size_t>(token)] = score * attn_scale;
+                max_score = std::max(max_score, scores[static_cast<size_t>(token)]);
+            }
+            float sum = 0.0f;
+            for (float & score : scores) { score = std::exp(score - max_score); sum += score; }
+            for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                float value = 0.0f;
+                for (int64_t token = 0; token < attn_keys; ++token) {
+                    value += scores[static_cast<size_t>(token)] / sum * ggml_fp16_to_fp32(kv_at(attn_v_host, dim, token, kv_head));
+                }
+                attn_expected[static_cast<size_t>(head * attn_dim + dim)] = value;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, attn_q, attn_q_host.data(), 0, ggml_nbytes(attn_q));
+        ggml_backend_tensor_set_async(backend, attn_k, attn_k_host.data(), 0, ggml_nbytes(attn_k));
+        ggml_backend_tensor_set_async(backend, attn_v, attn_v_host.data(), 0, ggml_nbytes(attn_v));
+        ggml_backend_tensor_set_async(backend, attn_mask, attn_mask_host.data(), 0, ggml_nbytes(attn_mask));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * attn_nodes[] = { attn_out };
+        ggml_cgraph attn_graph {};
+        attn_graph.n_nodes = 1;
+        attn_graph.nodes = attn_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &attn_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, attn_out, attn_output.data(), 0, ggml_nbytes(attn_out));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < attn_output.size(); ++i) {
+            CHECK(std::fabs(attn_output[i] - attn_expected[i]) < 4e-3f);
+        }
+        ggml_backend_buffer_free(attn_q_buffer);
+        ggml_backend_buffer_free(attn_k_buffer);
+        ggml_backend_buffer_free(attn_v_buffer);
+        ggml_backend_buffer_free(attn_mask_buffer);
+        ggml_backend_buffer_free(attn_out_buffer);
+
+        // Prefill attention uses a tiled query dimension and the same
+        // provider-neutral FLASH_ATTN_EXT pattern with a distinct selector.
+        const int64_t prefill_query_length = 5;
+        const int64_t prefill_key_length = 9;
+        const int64_t prefill_q_heads = 4;
+        const int64_t prefill_kv_heads = 2;
+        ggml_tensor * prefill_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+            attn_dim, prefill_query_length, prefill_q_heads);
+        ggml_tensor * prefill_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+            attn_dim, prefill_key_length, prefill_kv_heads);
+        ggml_tensor * prefill_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+            attn_dim, prefill_key_length, prefill_kv_heads);
+        ggml_tensor * prefill_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+            prefill_key_length, prefill_query_length);
+        // Use the [token, head, dim] physical layout emitted by the llama
+        // attention graph; the provider ABI carries explicit strides.
+        prefill_q->nb[1] = attn_dim * prefill_q_heads * sizeof(float);
+        prefill_q->nb[2] = attn_dim * sizeof(float);
+        prefill_k->nb[1] = attn_dim * prefill_kv_heads * sizeof(ggml_fp16_t);
+        prefill_k->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+        prefill_v->nb[1] = attn_dim * prefill_kv_heads * sizeof(ggml_fp16_t);
+        prefill_v->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+        ggml_tensor * prefill_out = ggml_flash_attn_ext(ctx, prefill_q, prefill_k, prefill_v,
+            prefill_mask, attn_scale, 0.0f, 0.0f);
+        CHECK(prefill_q && prefill_k && prefill_v && prefill_mask && prefill_out);
+        CHECK(prefill_out->ne[0] == attn_dim && prefill_out->ne[1] == prefill_q_heads &&
+            prefill_out->ne[2] == prefill_query_length);
+        ggml_backend_buffer_t prefill_q_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(prefill_q));
+        ggml_backend_buffer_t prefill_k_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(prefill_k));
+        ggml_backend_buffer_t prefill_v_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(prefill_v));
+        ggml_backend_buffer_t prefill_mask_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(prefill_mask));
+        ggml_backend_buffer_t prefill_out_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(prefill_out));
+        CHECK(prefill_q_buffer && prefill_k_buffer && prefill_v_buffer &&
+            prefill_mask_buffer && prefill_out_buffer);
+        CHECK(ggml_backend_tensor_alloc(prefill_q_buffer, prefill_q,
+            ggml_backend_buffer_get_base(prefill_q_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(prefill_k_buffer, prefill_k,
+            ggml_backend_buffer_get_base(prefill_k_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(prefill_v_buffer, prefill_v,
+            ggml_backend_buffer_get_base(prefill_v_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(prefill_mask_buffer, prefill_mask,
+            ggml_backend_buffer_get_base(prefill_mask_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(prefill_out_buffer, prefill_out,
+            ggml_backend_buffer_get_base(prefill_out_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, prefill_out));
+
+        const size_t prefill_q_elements = static_cast<size_t>(attn_dim * prefill_query_length * prefill_q_heads);
+        const size_t prefill_kv_elements = static_cast<size_t>(attn_dim * prefill_key_length * prefill_kv_heads);
+        std::vector<float> prefill_q_host(prefill_q_elements);
+        std::vector<ggml_fp16_t> prefill_k_host(prefill_kv_elements);
+        std::vector<ggml_fp16_t> prefill_v_host(prefill_kv_elements);
+        std::vector<ggml_fp16_t> prefill_mask_host(
+            static_cast<size_t>(prefill_key_length * prefill_query_length));
+        std::vector<float> prefill_output_host(
+            static_cast<size_t>(attn_dim * prefill_q_heads * prefill_query_length), -1.0f);
+        std::vector<float> prefill_expected(prefill_output_host.size(), 0.0f);
+        auto prefill_q_at = [&](int64_t query, int64_t head, int64_t dim) -> float & {
+            return prefill_q_host[static_cast<size_t>(
+                query * prefill_q_heads * attn_dim + head * attn_dim + dim)];
+        };
+        auto prefill_kv_at = [&](std::vector<ggml_fp16_t> & data, int64_t token,
+                                 int64_t head, int64_t dim) -> ggml_fp16_t & {
+            return data[static_cast<size_t>(
+                token * prefill_kv_heads * attn_dim + head * attn_dim + dim)];
+        };
+        for (int64_t query = 0; query < prefill_query_length; ++query) {
+            for (int64_t head = 0; head < prefill_q_heads; ++head) {
+                for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                    prefill_q_at(query, head, dim) =
+                        static_cast<float>((query * 11 + head * 7 + dim) % 37) * 0.013f - 0.2f;
+                }
+            }
+        }
+        for (int64_t head = 0; head < prefill_kv_heads; ++head) {
+            for (int64_t token = 0; token < prefill_key_length; ++token) {
+                for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                    prefill_kv_at(prefill_k_host, token, head, dim) = ggml_fp32_to_fp16(
+                        static_cast<float>((head * 5 + token * 3 + dim) % 43) * 0.009f - 0.15f);
+                    prefill_kv_at(prefill_v_host, token, head, dim) = ggml_fp32_to_fp16(
+                        static_cast<float>((head * 3 + token * 7 + dim * 2) % 47) * 0.008f - 0.12f);
+                }
+            }
+        }
+        for (int64_t query = 0; query < prefill_query_length; ++query) {
+            const int64_t query_position = prefill_key_length - prefill_query_length + query;
+            for (int64_t token = 0; token < prefill_key_length; ++token) {
+                const float value = token > query_position ? -INFINITY : 0.0f;
+                prefill_mask_host[static_cast<size_t>(token + query * prefill_key_length)] =
+                    ggml_fp32_to_fp16(value);
+            }
+        }
+        for (int64_t query = 0; query < prefill_query_length; ++query) {
+            for (int64_t head = 0; head < prefill_q_heads; ++head) {
+                const int64_t kv_head = head / (prefill_q_heads / prefill_kv_heads);
+                std::vector<float> scores(static_cast<size_t>(prefill_key_length));
+                float max_score = -INFINITY;
+                for (int64_t token = 0; token < prefill_key_length; ++token) {
+                    float score = 0.0f;
+                    for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                        score += prefill_q_at(query, head, dim) * ggml_fp16_to_fp32(
+                            prefill_kv_at(prefill_k_host, token, kv_head, dim));
+                    }
+                    score *= attn_scale;
+                    score += ggml_fp16_to_fp32(prefill_mask_host[static_cast<size_t>(
+                        token + query * prefill_key_length)]);
+                    scores[static_cast<size_t>(token)] = score;
+                    max_score = std::max(max_score, score);
+                }
+                float sum = 0.0f;
+                for (float & score : scores) {
+                    score = std::exp(score - max_score);
+                    sum += score;
+                }
+                for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                    float value = 0.0f;
+                    for (int64_t token = 0; token < prefill_key_length; ++token) {
+                        value += scores[static_cast<size_t>(token)] / sum * ggml_fp16_to_fp32(
+                            prefill_kv_at(prefill_v_host, token, kv_head, dim));
+                    }
+                    prefill_expected[static_cast<size_t>(
+                        query * prefill_q_heads * attn_dim + head * attn_dim + dim)] = value;
+                }
+            }
+        }
+        ggml_backend_tensor_set_async(backend, prefill_q, prefill_q_host.data(),
+            0, ggml_nbytes(prefill_q));
+        ggml_backend_tensor_set_async(backend, prefill_k, prefill_k_host.data(),
+            0, ggml_nbytes(prefill_k));
+        ggml_backend_tensor_set_async(backend, prefill_v, prefill_v_host.data(),
+            0, ggml_nbytes(prefill_v));
+        ggml_backend_tensor_set_async(backend, prefill_mask, prefill_mask_host.data(),
+            0, ggml_nbytes(prefill_mask));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * prefill_nodes[] = { prefill_out };
+        ggml_cgraph prefill_graph {};
+        prefill_graph.n_nodes = 1;
+        prefill_graph.nodes = prefill_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &prefill_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, prefill_out, prefill_output_host.data(),
+            0, ggml_nbytes(prefill_out));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < prefill_output_host.size(); ++i) {
+            CHECK(std::fabs(prefill_output_host[i] - prefill_expected[i]) < 1e-2f);
+        }
+        ggml_backend_buffer_free(prefill_q_buffer);
+        ggml_backend_buffer_free(prefill_k_buffer);
+        ggml_backend_buffer_free(prefill_v_buffer);
+        ggml_backend_buffer_free(prefill_mask_buffer);
+        ggml_backend_buffer_free(prefill_out_buffer);
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    std::printf("FlagOS AMD checks passed: %s (%s)\n", props.name, props.description);
+    return 0;
+}

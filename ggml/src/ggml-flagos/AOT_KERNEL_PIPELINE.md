@@ -324,6 +324,9 @@ Do not select a package by filename suffix alone. A production Manifest must ide
 
 The implementation is a validated vertical slice, not the final package system:
 
+- The target matcher is available to providers, but the current AMD manifest
+  still exposes a flat kernel catalog; variant requirements and tuning scores
+  are not yet serialized in the package.
 - Manifest v2 has no provider target, compiler identity, runtime ABI, argument schema, constraints, ABI hash, or file hashes.
 - `supports_op` and C++ launch binding are manually synchronized with the generator.
 - CMake maintains a separate AOT filename preflight list.

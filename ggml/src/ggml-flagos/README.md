@@ -1,15 +1,24 @@
 # GGML FlagOS multi-provider backend
 
 This directory contains the provider-neutral FlagOS registry, graph planner, and
-the first production provider for Denglin GPGPU. llama.cpp remains responsible
+the Denglin and AMD/HIP providers. llama.cpp remains responsible
 for GGUF loading, graph construction, scheduling, and CPU fallback. Each FlagOS
 provider owns its device buffers, queues, events, AOT dispatch, vendor libraries,
 and native execution plan.
 
-This is a target-first implementation for a KS20-A, validated with
-Qwen2.5-1.5B and Qwen3-4B. Its
+The Denglin path is target-first for a KS20-A, validated with Qwen2.5-1.5B and
+Qwen3-4B. The AMD path targets the Radeon 890M (`gfx1150`) and has a validated
+Qwen3-1.7B Q4_K_M run. Its
 `supports_op` checks are intentionally strict. Unsupported operations and shapes
 remain on the CPU through the normal GGML scheduler.
+
+On the local Radeon 890M, the current opt-in 29-kernel AMD experiment combines
+the retuned F16 prefill path, an eight-row wave32 Q4 decode kernel, and a
+provider-neutral `ffn_swiglu` lowering that fuses both Q4 decode projections
+with SwiGLU. Qwen3-1.7B measures about `1308/53.8` t/s for `pp512/tg32`, versus
+`1802/60.7` t/s for the native ROCm MMQ backend. The AMD-specific kernels stay
+behind manifest capability checks and runtime selectors; the graph pattern and
+lowering interface remain reusable by other providers.
 
 The execution boundary is:
 
@@ -68,14 +77,84 @@ The source boundary is:
 ```text
 flagos-provider.*              versioned provider contract and identity
 flagos-registry.cpp            aggregate FlagOS registry and global device mapping
+flagos-target.*                engine profiles, feature bits, and variant matcher
 flagos-graph-plan.*            provider-neutral graph patterns and plan cache
 providers/denglin/             Denglin runtime, memory, launcher, DLBLAS, and graph
 providers/amd/                 HIP/gfx1150 contract and fail-closed build entry
 ```
 
+Out-of-tree providers can call `flagos_registry_register_provider()` before
+the first `ggml_backend_flagos_reg()` call. The descriptor and profile remain
+the only common contract, so an ARM CPU accelerator, NPU, or DSP provider can
+be added without changing the registry's built-in provider list. Registration
+after registry initialization is rejected; provider-owned storage must remain
+alive for the lifetime of the registry.
+
+The immutable profile query is also exposed through the standard backend
+registry `get_proc_address` hook as `flagos_registry_get_device_profile`, which
+lets a dynamically loaded consumer generate a capability report without
+including provider headers.
+
+`flagos_registry_get_device_info()` provides the profile together with provider
+identity, engine identity, memory capabilities, and execution capabilities in
+one immutable snapshot.
+
+For heterogeneous SoCs, enumerate CPU, GPU, NPU, and DSP engines as separate
+GGML devices with engine-unique UUIDs. Give engines that share system memory
+the same `memory_domain_id`; the registry keeps those engines distinct while
+planners can use the shared-domain information for placement and transfer
+decisions.
+
 Each provider owns its `provider.cmake`, SDK discovery, vendor libraries, and AOT
 package checks. Enabling or modifying AMD therefore does not add HIP branches to
 the common CMake file or the Denglin provider.
+
+`flagos-provider.h` contains only the generic versioned ABI. Built-in factory
+symbols are kept in the registry implementation or provider-local headers, so
+adding an ARM provider does not add AMD/Denglin declarations to the public
+provider contract.
+
+### Target capability and variant selection
+
+The provider ABI keeps its original v1 prefix and adds an optional profile
+callback at the ABI tail. Older providers remain valid; the registry derives a
+conservative profile from standard GGML device properties when the callback is
+not present. A profile describes an execution engine, stable feature bits,
+vector/lane width, matrix shape, memory domain, target architecture, runtime,
+and AOT format. It does not require a product-name switch in the common layer.
+
+Kernel variants declare required/forbidden features, engine masks, target
+constraints, shape ranges, and a score. `flagos_select_kernel_variant()` picks
+the highest-scoring matching variant, then prefers the stronger support state
+when scores tie. This allows an ARM CPU provider to select
+NEON, SVE2, I8MM, or SME2 kernels independently for different Apple, CIX, or
+Qualcomm profiles, while GPU and NPU providers use the same matcher. The AMD
+provider now describes its HIP engine and uses the matcher for the validated
+wave32 grouped F16 variants; the `gfx1150` target constraint remains provider
+data rather than a public planner branch.
+
+`flagos_check_kernel_variant()` also returns a support state and a stable
+failure reason. The `flagos_support_state_name()` and
+`flagos_support_reason_name()` helpers are intended for provider diagnostics and
+capability reports, not for product-name dispatch in the common layer.
+
+### AMD/HIP provider
+
+The AMD provider is enabled independently of Denglin and keeps HIP types private
+to `providers/amd/`. On ROCm, configure it with:
+
+```sh
+cmake -S . -B build-flagos-amd \
+    -DGGML_FLAGOS=ON -DGGML_FLAGOS_AMD=ON -DGGML_FLAGOS_DENGLIN=OFF \
+    -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON
+cmake --build build-flagos-amd -j4 --target flagos-check-amd llama-cli
+```
+
+Set `FLAGOS_AMD_KERNEL_DIR` to a FlagTree/Triton HSACO package and use the
+`FlagOS:AMD:0` device. The Radeon 890M package and its direct/fused/F16-cache
+validation, including the native ROCm comparison, are documented in
+[`providers/amd/README.md`](providers/amd/README.md). The AMD implementation is
+fail-closed: unsupported GGML operators remain on the normal CPU scheduler path.
 
 Build and run the opt-in module/launcher smoke test with:
 
@@ -204,6 +283,24 @@ finds legal pattern candidates, asks the active provider whether it can lower ea
 candidate, and greedily selects non-overlapping candidates by provider cost. Plan
 cache hits use a structural fingerprint followed by full canonical equality; a
 nonzero GGML graph UID is only a last-plan fast path.
+
+The common pattern ABI explicitly labels each candidate as either
+`single_operator` or `graph`. A single-operator candidate is a composite GGML
+operation such as decode `FLASH_ATTN_EXT`; a graph candidate is an adjacent
+subgraph such as `ADD + RMS_NORM + MUL` or the parallel FFN projections plus
+`SwiGLU`, or Qwen's `ROPE + VIEW + SET_ROWS` KV-cache write. Providers implement the same `query_lowering` and
+`execute_fusion_step` callbacks for both scopes. The planner owns candidate
+discovery, overlap resolution, cost ordering, structural cache keys, and
+capture-safety propagation; a provider owns only shape/type validation,
+implementation selection, temporary storage, and launch. A provider can
+decline a candidate without affecting other hardware or forcing a graph
+rewrite, so future HIP, CUDA-compatible, CPU, or accelerator implementations
+can reuse the catalog incrementally.
+
+Candidates are rejected when an intermediate result fans out to an uncovered
+consumer or when a non-contiguous match crosses an external producer that has
+not executed at the candidate's entry node. This prevents a fused provider
+kernel from dropping a live branch or reading a late-produced input too early.
 
 The first Denglin lowering is adjacent RMS_NORM plus channel-wise MUL. It launches
 the existing Triton AOT macro-kernel and preserves both GGML outputs. The common
@@ -344,6 +441,14 @@ default or a production cold-start result.
 
 - `FLAGOS_LOG_KERNELS=1` prints kernel, cache, capture, and replay counters at
   backend destruction.
+- `FLAGOS_PROFILE_KERNELS=1` enables opt-in HIP-event timing for each AMD AOT
+  HSACO symbol; it prints launch counts, total device milliseconds, and average
+  microseconds, ordered by total time, when either the backend or provider
+  registry is destroyed. `FLAGOS_PROFILE_DUMP_SYNC_INTERVAL=N` can also emit a
+  cumulative snapshot every N backend synchronizations, while
+  `FLAGOS_PROFILE_DUMP_LAUNCH_INTERVAL=N` does so every N timed launches.
+  Profiling synchronizes each sampled launch and is for diagnosis, not
+  throughput measurement.
 - `FLAGOS_LOG_GRAPH_PLAN=1` prints newly built structural plans and selected patterns.
 - `FLAGOS_NO_GRAPH_FUSION=1` keeps the planner active but makes Denglin decline all
   fused patterns, providing a direct-op correctness and performance control.

@@ -1,5 +1,6 @@
 #include "ggml-flagos.h"
 #include "flagos-provider.h"
+#include "flagos-registry.h"
 
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"
@@ -9,17 +10,29 @@
 #include <mutex>
 #include <vector>
 
+#ifdef GGML_FLAGOS_HAVE_DENGLIN
+const flagos_provider_v1 * flagos_denglin_provider();
+#endif
+
+#ifdef GGML_FLAGOS_HAVE_AMD
+const flagos_provider_v1 * flagos_amd_provider();
+#endif
+
 struct flagos_registered_device {
     const flagos_provider_v1 * provider;
     size_t local_index;
     ggml_backend_dev_t device;
     flagos_device_identity identity;
     flagos_device_caps caps;
+    flagos_device_profile profile;
 };
 
 static std::vector<const flagos_provider_v1 *> flagos_providers;
+static std::vector<const flagos_provider_v1 *> flagos_extra_providers;
 static std::vector<flagos_registered_device> flagos_devices;
 static std::atomic<int> flagos_active_device { -1 };
+static std::atomic<bool> flagos_registry_initialized { false };
+static std::mutex flagos_provider_mutex;
 
 static bool flagos_provider_id_is_registered(uint64_t provider_id) {
     for (const flagos_provider_v1 * provider : flagos_providers) {
@@ -41,7 +54,7 @@ static bool flagos_device_identity_is_registered(const flagos_device_identity & 
     return false;
 }
 
-static std::vector<const flagos_provider_v1 *> flagos_builtin_providers() {
+static std::vector<const flagos_provider_v1 *> flagos_compiled_providers() {
     std::vector<const flagos_provider_v1 *> providers;
 #ifdef GGML_FLAGOS_HAVE_DENGLIN
     providers.push_back(flagos_denglin_provider());
@@ -49,6 +62,15 @@ static std::vector<const flagos_provider_v1 *> flagos_builtin_providers() {
 #ifdef GGML_FLAGOS_HAVE_AMD
     providers.push_back(flagos_amd_provider());
 #endif
+    return providers;
+}
+
+static std::vector<const flagos_provider_v1 *> flagos_all_providers() {
+    std::vector<const flagos_provider_v1 *> providers = flagos_compiled_providers();
+    {
+        std::lock_guard<std::mutex> lock(flagos_provider_mutex);
+        providers.insert(providers.end(), flagos_extra_providers.begin(), flagos_extra_providers.end());
+    }
     return providers;
 }
 
@@ -76,6 +98,12 @@ static void * ggml_backend_flagos_reg_proc_address(ggml_backend_reg_t reg, const
     if (std::strcmp(name, "ggml_backend_flagos_buffer_type") == 0) {
         return reinterpret_cast<void *>(ggml_backend_flagos_buffer_type);
     }
+    if (std::strcmp(name, "flagos_registry_get_device_profile") == 0) {
+        return reinterpret_cast<void *>(flagos_registry_get_device_profile);
+    }
+    if (std::strcmp(name, "flagos_registry_get_device_info") == 0) {
+        return reinterpret_cast<void *>(flagos_registry_get_device_info);
+    }
     return nullptr;
 }
 
@@ -94,9 +122,13 @@ ggml_backend_reg_t ggml_backend_flagos_reg() {
     };
     static std::once_flag once;
     std::call_once(once, [&]() {
-        for (const flagos_provider_v1 * provider : flagos_builtin_providers()) {
+        // Mark the registry closed before taking the provider snapshot. This
+        // prevents a concurrent out-of-tree registration from being accepted
+        // after enumeration has already started.
+        flagos_registry_initialized.store(true, std::memory_order_release);
+        for (const flagos_provider_v1 * provider : flagos_all_providers()) {
             if (!flagos_provider_is_valid(provider)) {
-                GGML_LOG_ERROR("FlagOS: invalid built-in provider descriptor\n");
+                GGML_LOG_ERROR("FlagOS: invalid provider descriptor\n");
                 continue;
             }
             if (flagos_provider_id_is_registered(provider->identity.id)) {
@@ -113,17 +145,19 @@ ggml_backend_reg_t ggml_backend_flagos_reg() {
                 ggml_backend_dev_t device = provider->device_get(local_index);
                 flagos_device_identity identity {};
                 flagos_device_caps caps {};
+                flagos_device_profile profile {};
                 if (device == nullptr ||
                     !provider->device_identity(local_index, &identity) ||
                     !flagos_device_identity_is_valid(provider, local_index, &identity) ||
                     flagos_device_identity_is_registered(identity) ||
                     !provider->device_caps(local_index, &caps) ||
-                    !flagos_device_caps_are_valid(&caps)) {
+                    !flagos_device_caps_are_valid(&caps) ||
+                    !flagos_provider_get_device_profile(provider, local_index, &profile)) {
                     GGML_LOG_ERROR("FlagOS: provider %s returned an invalid device at index %zu\n", provider->identity.name, local_index);
                     continue;
                 }
                 device->reg = &reg;
-                flagos_devices.push_back({ provider, local_index, device, identity, caps });
+                flagos_devices.push_back({ provider, local_index, device, identity, caps, profile });
             }
         }
         if (!flagos_devices.empty()) {
@@ -131,6 +165,64 @@ ggml_backend_reg_t ggml_backend_flagos_reg() {
         }
     });
     return &reg;
+}
+
+bool flagos_registry_register_provider(const flagos_provider_v1 * provider) {
+    if (!flagos_provider_is_valid(provider) ||
+        flagos_registry_initialized.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(flagos_provider_mutex);
+    if (flagos_registry_initialized.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    for (const flagos_provider_v1 * existing : flagos_compiled_providers()) {
+        if (existing != nullptr && existing->identity.id == provider->identity.id) {
+            return false;
+        }
+    }
+    for (const flagos_provider_v1 * existing : flagos_extra_providers) {
+        if (existing->identity.id == provider->identity.id) {
+            return false;
+        }
+    }
+    flagos_extra_providers.push_back(provider);
+    return true;
+}
+
+bool flagos_registry_get_device_profile(
+        size_t global_index, flagos_device_profile * profile) {
+    flagos_device_info info {};
+    if (!flagos_registry_get_device_info(global_index, &info) || profile == nullptr) {
+        return false;
+    }
+    *profile = info.profile;
+    return true;
+}
+
+bool flagos_registry_get_device_info(
+        size_t global_index, flagos_device_info * info) {
+    ggml_backend_flagos_reg();
+    if (info == nullptr || global_index >= flagos_devices.size()) {
+        return false;
+    }
+    const flagos_registered_device & registered = flagos_devices[global_index];
+    *info = {};
+    info->struct_size = sizeof(flagos_device_info);
+    info->version = 1;
+    info->global_index = global_index;
+    info->local_index = registered.local_index;
+    if (registered.device->iface.get_name != nullptr) {
+        info->name = registered.device->iface.get_name(registered.device);
+    }
+    if (registered.device->iface.get_description != nullptr) {
+        info->description = registered.device->iface.get_description(registered.device);
+    }
+    info->provider = registered.provider->identity;
+    info->identity = registered.identity;
+    info->caps = registered.caps;
+    info->profile = registered.profile;
+    return true;
 }
 
 ggml_backend_t ggml_backend_flagos_init(int device) {
@@ -192,12 +284,14 @@ int ggml_backend_flagos_get_device() {
 }
 
 void ggml_backend_flagos_reg_devices() {
+#ifndef GGML_BACKEND_DL
     ggml_backend_register(ggml_backend_flagos_reg());
+#endif
 }
 
 static int ggml_backend_flagos_score() {
     int score = 0;
-    for (const flagos_provider_v1 * provider : flagos_builtin_providers()) {
+    for (const flagos_provider_v1 * provider : flagos_all_providers()) {
         if (flagos_provider_is_valid(provider)) {
             score += provider->score();
         }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "flagos-target.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -34,8 +35,13 @@ struct flagos_provider_identity {
 
 struct flagos_device_identity {
     uint64_t provider_id;
+    // The UUID identifies an execution engine as exposed by this provider.
+    // A SoC with CPU/GPU/NPU engines may therefore use one UUID per engine,
+    // while memory_domain_id remains shared when the engines use one pool.
     uint64_t uuid_hi;
     uint64_t uuid_lo;
+    // Shared physical memory domain. Zero is valid when the provider cannot
+    // describe sharing; it is not used for device de-duplication.
     uint64_t memory_domain_id;
     uint32_t ordinal;
 };
@@ -46,6 +52,9 @@ struct flagos_device_caps {
     uint64_t execution;
     const char * aot_format;
 };
+
+using flagos_get_device_profile_fn = bool (*) (
+        size_t index, flagos_device_profile * profile);
 
 struct flagos_provider_v1 {
     uint32_t api_version;
@@ -62,21 +71,24 @@ struct flagos_provider_v1 {
     bool (*set_device)(size_t index);
     int (*get_device)();
     int (*score)();
+
+    // Optional ABI tail. Providers built against the original v1 header have
+    // a shorter struct_size and are still valid; the registry derives a
+    // conservative profile from the standard GGML device properties.
+    flagos_get_device_profile_fn get_device_profile;
 };
 
 static constexpr uint32_t FLAGOS_PROVIDER_API_VERSION = 1;
+static constexpr size_t FLAGOS_PROVIDER_V1_REQUIRED_SIZE =
+    offsetof(flagos_provider_v1, get_device_profile);
 
-bool flagos_provider_is_valid(const flagos_provider_v1 * provider);
-bool flagos_device_identity_is_valid(
+GGML_BACKEND_API bool flagos_provider_is_valid(const flagos_provider_v1 * provider);
+GGML_BACKEND_API bool flagos_device_identity_is_valid(
     const flagos_provider_v1 * provider,
     size_t local_index,
     const flagos_device_identity * identity);
-bool flagos_device_caps_are_valid(const flagos_device_caps * caps);
-
-#ifdef GGML_FLAGOS_HAVE_DENGLIN
-const flagos_provider_v1 * flagos_denglin_provider();
-#endif
-
-#ifdef GGML_FLAGOS_HAVE_AMD
-const flagos_provider_v1 * flagos_amd_provider();
-#endif
+GGML_BACKEND_API bool flagos_device_caps_are_valid(const flagos_device_caps * caps);
+GGML_BACKEND_API bool flagos_provider_get_device_profile(
+    const flagos_provider_v1 * provider,
+    size_t local_index,
+    flagos_device_profile * profile);
