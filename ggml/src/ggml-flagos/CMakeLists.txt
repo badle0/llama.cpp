@@ -19,7 +19,11 @@ if (GGML_FLAGOS_DENGLIN)
     include(providers/denglin/provider.cmake)
 endif()
 
-if (NOT GGML_FLAGOS_DENGLIN)
+if (GGML_FLAGOS_AMD)
+    include(providers/amd/provider.cmake)
+endif()
+
+if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD)
     message(STATUS "FlagOS: building provider-neutral core with no device provider")
 endif()
 
@@ -75,4 +79,7 @@ install(FILES
     DESTINATION include)
 if (GGML_FLAGOS_DENGLIN)
     install(DIRECTORY "${FLAGOS_DENGLIN_AOT_KERNEL_DIR}/" DESTINATION share/ggml/flagos/denglin)
+endif()
+if (GGML_FLAGOS_AMD AND FLAGOS_AMD_AOT_KERNEL_DIR)
+    install(DIRECTORY "${FLAGOS_AMD_AOT_KERNEL_DIR}/" DESTINATION "${CMAKE_INSTALL_DATADIR}/ggml/flagos/amd")
 endif()
