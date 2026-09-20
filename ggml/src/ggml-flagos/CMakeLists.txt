@@ -1,11 +1,55 @@
 cmake_minimum_required(VERSION 3.18)
 
-ggml_add_backend_library(ggml-flagos
+set(FLAGOS_SOURCES
+    flagos-provider.cpp
+    flagos-provider.h
+    flagos-registry.h
     flagos-registry.cpp
+    flagos-target.cpp
+    flagos-target.h
     ggml-flagos.h)
+
+set(FLAGOS_PRIVATE_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/vendor")
+set(FLAGOS_PRIVATE_LIBRARIES)
+set(FLAGOS_PRIVATE_DEFINITIONS)
+
+message(STATUS "FlagOS: building provider-neutral core with no device provider")
+
+ggml_add_backend_library(ggml-flagos ${FLAGOS_SOURCES})
+target_include_directories(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
+target_link_libraries(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_LIBRARIES})
+target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
 
 if (NOT GGML_BACKEND_DL)
     target_include_directories(ggml PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
-install(FILES ggml-flagos.h DESTINATION include)
+add_executable(flagos-check-provider EXCLUDE_FROM_ALL
+    flagos-provider.cpp
+    flagos-target.cpp
+    tests/check_provider.cpp)
+target_include_directories(flagos-check-provider PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(flagos-check-provider PRIVATE ggml-base)
+
+add_executable(flagos-check-target EXCLUDE_FROM_ALL
+    flagos-target.cpp
+    tests/check_target.cpp)
+target_include_directories(flagos-check-target PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/ggml/include")
+
+add_executable(flagos-check-registry EXCLUDE_FROM_ALL
+    flagos-provider.cpp
+    flagos-target.cpp
+    flagos-registry.cpp
+    tests/check_registry.cpp)
+target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_compile_definitions(flagos-check-registry PRIVATE GGML_FLAGOS_HAVE_DENGLIN GGML_FLAGOS_HAVE_AMD)
+target_link_libraries(flagos-check-registry PRIVATE ggml)
+
+install(FILES
+    ggml-flagos.h
+    flagos-provider.h
+    flagos-registry.h
+    flagos-target.h
+    DESTINATION include)
