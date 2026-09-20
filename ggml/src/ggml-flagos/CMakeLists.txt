@@ -15,7 +15,13 @@ set(FLAGOS_PRIVATE_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/vendor")
 set(FLAGOS_PRIVATE_LIBRARIES)
 set(FLAGOS_PRIVATE_DEFINITIONS)
 
-message(STATUS "FlagOS: building provider-neutral core with no device provider")
+if (GGML_FLAGOS_DENGLIN)
+    include(providers/denglin/provider.cmake)
+endif()
+
+if (NOT GGML_FLAGOS_DENGLIN)
+    message(STATUS "FlagOS: building provider-neutral core with no device provider")
+endif()
 
 ggml_add_backend_library(ggml-flagos ${FLAGOS_SOURCES})
 target_include_directories(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
@@ -24,6 +30,12 @@ target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
 
 if (NOT GGML_BACKEND_DL)
     target_include_directories(ggml PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+if (GGML_FLAGOS_DENGLIN)
+    add_executable(flagos-check-kernels EXCLUDE_FROM_ALL kernels/check_merged_module.cpp)
+    target_include_directories(flagos-check-kernels PRIVATE "${FLAGOS_DENGLIN_CUDA_INCLUDE_DIR}")
+    target_link_libraries(flagos-check-kernels PRIVATE "${FLAGOS_DENGLIN_CURT_LIBRARY}")
 endif()
 
 add_executable(flagos-check-graph-plan EXCLUDE_FROM_ALL
@@ -61,3 +73,6 @@ install(FILES
     flagos-registry.h
     flagos-target.h
     DESTINATION include)
+if (GGML_FLAGOS_DENGLIN)
+    install(DIRECTORY "${FLAGOS_DENGLIN_AOT_KERNEL_DIR}/" DESTINATION share/ggml/flagos/denglin)
+endif()
