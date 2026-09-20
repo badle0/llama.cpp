@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 
 set(FLAGOS_SOURCES
+    flagos-graph-plan.cpp
+    flagos-graph-plan.h
     flagos-provider.cpp
     flagos-provider.h
     flagos-registry.h
@@ -23,6 +25,12 @@ target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
 if (NOT GGML_BACKEND_DL)
     target_include_directories(ggml PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
+
+add_executable(flagos-check-graph-plan EXCLUDE_FROM_ALL
+    flagos-graph-plan.cpp
+    tests/check_graph_plan.cpp)
+target_include_directories(flagos-check-graph-plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(flagos-check-graph-plan PRIVATE ggml-base)
 
 add_executable(flagos-check-provider EXCLUDE_FROM_ALL
     flagos-provider.cpp
