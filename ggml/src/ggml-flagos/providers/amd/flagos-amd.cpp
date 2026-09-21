@@ -1590,6 +1590,12 @@ static ggml_backend_buffer_t amd_buffer_alloc(ggml_backend_buffer_type_t buft, s
             GGML_ASSERT(guard.synchronize());
             amd_hip_check(hipSetDevice(context->device->ordinal), "hipSetDevice");
             GGML_ASSERT(amd_hip_check(hipMemset(static_cast<char *>(tensor->data) + offset, value, size), "hipMemset"));
+            // Backend streams are created with hipStreamNonBlocking, so a
+            // default-stream memset is not ordered before later provider
+            // launches. Make this synchronous buffer callback complete the
+            // clear before releasing the device execution guard.
+            GGML_ASSERT(amd_hip_check(
+                hipDeviceSynchronize(), "hipDeviceSynchronize after hipMemset"));
             amd_mark_buffer_modified(context);
         },
         /* .set_tensor     = */ [](ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -1663,6 +1669,8 @@ static ggml_backend_buffer_t amd_buffer_alloc(ggml_backend_buffer_type_t buft, s
             GGML_ASSERT(guard.synchronize());
             amd_hip_check(hipSetDevice(context->device->ordinal), "hipSetDevice");
             GGML_ASSERT(amd_hip_check(hipMemset(context->data, value, context->size), "hipMemset buffer"));
+            GGML_ASSERT(amd_hip_check(
+                hipDeviceSynchronize(), "hipDeviceSynchronize after buffer clear"));
             amd_mark_buffer_modified(context);
         },
         /* .reset         = */ nullptr,

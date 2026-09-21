@@ -874,17 +874,53 @@ int main() {
             std::vector<float> gdn_fused_output(gdn_direct_output.size(), -1.0f);
             std::vector<float> gdn_fused_cache(gdn_direct_cache.size(), -1.0f);
 
+            // Compute one element of the final recurrent state independently.
+            // Repeating clear -> compute catches missing ordering between the
+            // synchronous buffer clear callback and the backend's nonblocking
+            // HIP stream.
+            std::vector<float> gdn_expected_state_row(
+                gdn_state_host.begin(), gdn_state_host.begin() + gdn_state_size);
+            for (int64_t token = 0; token < gdn_tokens; ++token) {
+                const size_t qk_base = static_cast<size_t>(
+                    token * gdn_q_heads * gdn_state_size);
+                const size_t v_base = static_cast<size_t>(
+                    token * gdn_heads * gdn_state_size);
+                const size_t scalar_index = static_cast<size_t>(token * gdn_heads);
+                const float decay = std::exp(gdn_gate_host[scalar_index]);
+                float projected_key = 0.0f;
+                for (int64_t lane = 0; lane < gdn_state_size; ++lane) {
+                    gdn_expected_state_row[static_cast<size_t>(lane)] *= decay;
+                    projected_key += gdn_expected_state_row[static_cast<size_t>(lane)] *
+                        gdn_k_host[qk_base + static_cast<size_t>(lane)];
+                }
+                const float delta =
+                    (gdn_v_host[v_base] - projected_key) * gdn_beta_host[scalar_index];
+                for (int64_t lane = 0; lane < gdn_state_size; ++lane) {
+                    gdn_expected_state_row[static_cast<size_t>(lane)] +=
+                        delta * gdn_k_host[qk_base + static_cast<size_t>(lane)];
+                }
+            }
+
             // Build the reference in two direct graphs.  Keeping the cache
             // copy in a separate graph prevents the provider-neutral
             // GDN+VIEW+CPY candidate from matching, without mutating process
             // environment or provider policy from inside the test.
-            ggml_backend_buffer_clear(gdn_buffers[6], 0);
             ggml_backend_buffer_clear(gdn_buffers[7], 0);
             ggml_tensor * gdn_direct_nodes[] = { gdn_output };
             ggml_cgraph gdn_direct_graph {};
             gdn_direct_graph.n_nodes = 1;
             gdn_direct_graph.nodes = gdn_direct_nodes;
-            CHECK(ggml_backend_graph_compute(backend, &gdn_direct_graph) == GGML_STATUS_SUCCESS);
+            const int clear_order_trials =
+                gdn_tokens == 4 && gdn_snapshots == 3 && gdn_state_size == 128 ? 16 : 1;
+            for (int trial = 0; trial < clear_order_trials; ++trial) {
+                ggml_backend_buffer_clear(gdn_buffers[6], 0);
+                CHECK(ggml_backend_graph_compute(backend, &gdn_direct_graph) == GGML_STATUS_SUCCESS);
+                float first_snapshot_value = 0.0f;
+                ggml_backend_tensor_get(
+                    gdn_output, &first_snapshot_value,
+                    static_cast<size_t>(gdn_attention_elements) * sizeof(float), sizeof(float));
+                CHECK(std::fabs(first_snapshot_value - gdn_expected_state_row[0]) < 5e-4f);
+            }
             ggml_tensor * gdn_copy_nodes[] = { gdn_snapshot_view, gdn_copy };
             ggml_cgraph gdn_copy_graph {};
             gdn_copy_graph.n_nodes = 2;
