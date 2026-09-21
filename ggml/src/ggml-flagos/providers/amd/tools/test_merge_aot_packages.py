@@ -173,6 +173,18 @@ class MergePackageTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("requires v2 metadata", result.stderr)
 
+    def test_qwen35_profile_is_known_and_requires_exact_membership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_package(root / "base", "base", True)
+            _write_package(root / "extension", "extension", True)
+            result = self._merge(
+                root / "base", root / "extension", root / "out",
+                "gfx1150-qwen35-q4km-v2")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("incomplete gfx1150-qwen35-q4km-v2 package", result.stderr)
+            self.assertNotIn("unsupported tuning profile", result.stderr)
+
     def test_add_missing_preserves_base_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -629,7 +629,8 @@ bool kernel_registry::initialize(
             }
             tuning_profile_ = package.value("tuning_profile", "");
             if (!tuning_profile_.empty() &&
-                tuning_profile_ != tuning_profile_gfx1150_q4ffn_v1) {
+                tuning_profile_ != tuning_profile_gfx1150_q4ffn_v1 &&
+                tuning_profile_ != tuning_profile_gfx1150_qwen35_q4km_v2) {
                 GGML_LOG_ERROR("FlagOS AMD AOT: unsupported tuning profile: %s\n",
                     tuning_profile_.c_str());
                 reset();
@@ -647,7 +648,7 @@ bool kernel_registry::initialize(
             reset();
             return false;
         }
-        if (tuning_profile_ == tuning_profile_gfx1150_q4ffn_v1 && manifest_arch != "gfx1150") {
+        if (!tuning_profile_.empty() && manifest_arch != "gfx1150") {
             GGML_LOG_ERROR("FlagOS AMD AOT: tuning profile %s requires gfx1150\n",
                 tuning_profile_.c_str());
             reset();
@@ -747,47 +748,60 @@ bool kernel_registry::initialize(
         for (auto & pair : kernels_) {
             kernel_index_.emplace(pair.first, &pair.second);
         }
-        for (const tuned_kernel_abi & abi : tuning_profile_gfx1150_q4ffn_v1_kernels) {
-            const auto kernel = kernels_.find(std::string(abi.name));
-            if (kernel == kernels_.end()) {
-                continue;
+        const auto apply_known_abis = [this](const auto & contracts) {
+            for (const tuned_kernel_abi & abi : contracts) {
+                const auto kernel = kernels_.find(std::string(abi.name));
+                if (kernel == kernels_.end()) {
+                    continue;
+                }
+                if (kernel->second.metadata.argument_count >= 0 &&
+                    kernel->second.metadata.argument_count != static_cast<int>(abi.argument_count)) {
+                    GGML_LOG_ERROR("FlagOS AMD AOT: kernel ABI contract mismatch for %.*s\n",
+                        static_cast<int>(abi.name.size()), abi.name.data());
+                    return false;
+                }
+                kernel->second.metadata.argument_count = static_cast<int>(abi.argument_count);
             }
-            if (kernel->second.metadata.argument_count >= 0 &&
-                kernel->second.metadata.argument_count != static_cast<int>(abi.argument_count)) {
-                GGML_LOG_ERROR("FlagOS AMD AOT: kernel ABI contract mismatch for %.*s\n",
-                    static_cast<int>(abi.name.size()), abi.name.data());
-                reset();
-                return false;
-            }
-            kernel->second.metadata.argument_count = static_cast<int>(abi.argument_count);
+            return true;
+        };
+        if (!apply_known_abis(tuning_profile_gfx1150_q4ffn_v1_kernels) ||
+            !apply_known_abis(tuning_profile_gfx1150_qwen35_q4km_v2_kernels)) {
+            reset();
+            return false;
         }
-        if (tuning_profile_ == tuning_profile_gfx1150_q4ffn_v1) {
-            if (kernels_.size() != std::size(tuning_profile_gfx1150_q4ffn_v1_kernels)) {
+        const auto validate_profile = [this](const auto & contracts) {
+            if (kernels_.size() != std::size(contracts)) {
                 GGML_LOG_ERROR("FlagOS AMD AOT: tuning profile %s has %zu kernels, expected %zu\n",
                     tuning_profile_.c_str(), kernels_.size(),
-                    std::size(tuning_profile_gfx1150_q4ffn_v1_kernels));
-                reset();
+                    std::size(contracts));
                 return false;
             }
-            for (const tuned_kernel_abi & abi : tuning_profile_gfx1150_q4ffn_v1_kernels) {
+            for (const tuned_kernel_abi & abi : contracts) {
                 const auto kernel = kernels_.find(std::string(abi.name));
                 if (kernel == kernels_.end()) {
                     GGML_LOG_ERROR("FlagOS AMD AOT: tuning profile %s lacks kernel %.*s\n",
                         tuning_profile_.c_str(), static_cast<int>(abi.name.size()), abi.name.data());
-                    reset();
                     return false;
                 }
                 const auto & metadata = kernel->second.metadata;
-                if (metadata.exact_block_size || metadata.block_size != abi.block_size ||
+                if (metadata.exact_block_size != abi.exact_block_size ||
+                    metadata.block_size != abi.block_size ||
                     metadata.tile_m != abi.tile_m || metadata.tile_n != abi.tile_n ||
                     metadata.tile_k != abi.tile_k || metadata.num_warps != abi.num_warps ||
                     metadata.warp_size != abi.warp_size) {
                     GGML_LOG_ERROR("FlagOS AMD AOT: tuning profile launch contract mismatch for %.*s\n",
                         static_cast<int>(abi.name.size()), abi.name.data());
-                    reset();
                     return false;
                 }
             }
+            return true;
+        };
+        if ((tuning_profile_ == tuning_profile_gfx1150_q4ffn_v1 &&
+             !validate_profile(tuning_profile_gfx1150_q4ffn_v1_kernels)) ||
+            (tuning_profile_ == tuning_profile_gfx1150_qwen35_q4km_v2 &&
+             !validate_profile(tuning_profile_gfx1150_qwen35_q4km_v2_kernels))) {
+            reset();
+            return false;
         }
     } catch (const std::exception & error) {
         GGML_LOG_ERROR("FlagOS AMD AOT: cannot parse manifest: %s\n", error.what());

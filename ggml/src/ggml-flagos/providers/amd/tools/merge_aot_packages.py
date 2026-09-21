@@ -11,9 +11,8 @@ import tempfile
 from pathlib import Path
 
 from flagos_amd_profiles import (
-    TUNING_PROFILE_GFX1150_Q4FFN_V1,
-    TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS,
-    TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS,
+    TUNING_PROFILES,
+    tuning_profile_contracts,
 )
 from flagos_amd_hsaco import validate_hsaco
 
@@ -22,6 +21,13 @@ MAX_HSACO_BYTES = 256 * 1024 * 1024
 MAX_PACKAGE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_KERNELS = 4096
 MAX_SIZE_T = (1 << 64) - 1
+
+KNOWN_KERNEL_ABIS = {}
+for _, profile_contracts in TUNING_PROFILES.values():
+    for kernel_name, kernel_contract in profile_contracts.items():
+        previous = KNOWN_KERNEL_ABIS.setdefault(kernel_name, kernel_contract)
+        if previous.argument_count != kernel_contract.argument_count:
+            raise RuntimeError(f"conflicting tuned kernel ABI contracts for {kernel_name}")
 
 
 def integer_field(value: dict, name: str, default: int, minimum: int = 0) -> int:
@@ -131,8 +137,8 @@ def load_manifest(package_dir: Path, artifacts: dict[str, tuple[int, str]] | Non
             (not isinstance(package["tuning_profile"], str) or
              "\0" in package["tuning_profile"])):
         raise RuntimeError(f"invalid tuning profile in {package_dir}")
-    if (isinstance(package, dict) and package.get("tuning_profile") not in
-            (None, "", TUNING_PROFILE_GFX1150_Q4FFN_V1)):
+    tuning_profile = package.get("tuning_profile") if isinstance(package, dict) else None
+    if tuning_profile not in (None, "") and tuning_profile not in TUNING_PROFILES:
         raise RuntimeError(f"unsupported tuning profile in {package_dir}")
     if isinstance(package, dict):
         for field in ("provenance", "source_sha256", "generator", "python_version"):
@@ -147,8 +153,11 @@ def load_manifest(package_dir: Path, artifacts: dict[str, tuple[int, str]] | Non
                         for field in ("name", "version"))):
                 raise RuntimeError(f"invalid package compiler metadata in {package_dir}")
     tuned = isinstance(package, dict) and bool(package.get("tuning_profile"))
-    known_profile = (isinstance(package, dict) and
-                     package.get("tuning_profile") == TUNING_PROFILE_GFX1150_Q4FFN_V1)
+    known_profile = tuning_profile in TUNING_PROFILES
+    profile_arch = ""
+    profile_contracts = {}
+    if known_profile:
+        profile_arch, profile_contracts = tuning_profile_contracts(tuning_profile)
     names = set()
     files = set()
     package_bytes = 0
@@ -197,15 +206,15 @@ def load_manifest(package_dir: Path, artifacts: dict[str, tuple[int, str]] | Non
                 global_scratch_align > MAX_SIZE_T or profile_scratch_align > MAX_SIZE_T or
                 global_scratch_size or profile_scratch_size):
             raise RuntimeError(f"unsupported kernel metadata in {package_dir}: {name}")
-        contract = TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS.get(name)
+        contract = KNOWN_KERNEL_ABIS.get(name)
         if (contract is not None and argument_count >= 0 and
                 argument_count != contract.argument_count):
             raise RuntimeError(f"kernel ABI contract mismatch in {package_dir}: {name}")
         if known_profile:
-            if exact_block_size:
-                raise RuntimeError(f"tuned kernel has an undeclared exact block contract: {name}")
-            actual = (argument_count, block_size, tile_m, tile_n, tile_k, num_warps, warp_size)
-            if contract is None or actual[1:] != contract[1:]:
+            actual = (argument_count, block_size, exact_block_size,
+                      tile_m, tile_n, tile_k, num_warps, warp_size)
+            contract = profile_contracts.get(name)
+            if contract is None or actual != contract:
                 raise RuntimeError(f"tuned kernel launch contract mismatch in {package_dir}: {name}")
         artifact = package_dir / filename
         hsaco = validate_hsaco(artifact, manifest["arch"], kernel)
@@ -214,7 +223,7 @@ def load_manifest(package_dir: Path, artifacts: dict[str, tuple[int, str]] | Non
             # preserving an unknown call ABI in its newly written manifest.
             argument_count = len(hsaco.arguments) - 2
             kernel["argument_count"] = argument_count
-            contract = TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS.get(name)
+            contract = KNOWN_KERNEL_ABIS.get(name)
             if contract is not None and argument_count != contract.argument_count:
                 raise RuntimeError(f"kernel ABI contract mismatch in {package_dir}: {name}")
         actual_size, actual_sha256 = file_integrity(artifact)
@@ -239,18 +248,18 @@ def load_manifest(package_dir: Path, artifacts: dict[str, tuple[int, str]] | Non
         files.add(filename)
         if artifacts is not None:
             artifacts[filename] = (actual_size, actual_sha256)
-    if (isinstance(package, dict) and
-            package.get("tuning_profile") == TUNING_PROFILE_GFX1150_Q4FFN_V1):
-        missing = TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS - names
-        extra = names - TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS
-        if manifest["arch"] != "gfx1150" or missing or extra:
+    if known_profile:
+        expected_names = frozenset(profile_contracts)
+        missing = expected_names - names
+        extra = names - expected_names
+        if manifest["arch"] != profile_arch or missing or extra:
             detail = "wrong architecture"
             if missing:
                 detail = "missing " + ", ".join(sorted(missing))
             elif extra:
                 detail = "extra " + ", ".join(sorted(extra))
             raise RuntimeError(
-                f"incomplete {TUNING_PROFILE_GFX1150_Q4FFN_V1} package: {detail}")
+                f"incomplete {tuning_profile} package: {detail}")
     return manifest
 
 
@@ -279,8 +288,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.tuning_profile and args.tuning_profile != TUNING_PROFILE_GFX1150_Q4FFN_V1:
-        raise RuntimeError(f"unsupported tuning profile: {args.tuning_profile}")
+    if args.tuning_profile:
+        tuning_profile_contracts(args.tuning_profile)
 
     base_artifacts: dict[str, tuple[int, str]] = {}
     additional_artifacts: dict[str, tuple[int, str]] = {}
@@ -417,17 +426,19 @@ def main() -> None:
             if merged_bytes > MAX_PACKAGE_BYTES:
                 raise RuntimeError(
                     f"merged package binaries exceed {MAX_PACKAGE_BYTES} bytes")
-        if args.tuning_profile == TUNING_PROFILE_GFX1150_Q4FFN_V1:
+        if args.tuning_profile:
+            profile_arch, profile_contracts = tuning_profile_contracts(args.tuning_profile)
+            expected_names = frozenset(profile_contracts)
             names = {kernel["name"] for kernel in base["kernels"]}
-            missing = TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS - names
-            extra = names - TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS
-            if base.get("arch") != "gfx1150" or missing or extra:
+            missing = expected_names - names
+            extra = names - expected_names
+            if base.get("arch") != profile_arch or missing or extra:
                 detail = "wrong architecture"
                 if missing:
                     detail = "missing " + ", ".join(sorted(missing))
                 elif extra:
                     detail = "extra " + ", ".join(sorted(extra))
-                raise RuntimeError(f"incomplete {TUNING_PROFILE_GFX1150_Q4FFN_V1} package: {detail}")
+                raise RuntimeError(f"incomplete {args.tuning_profile} package: {detail}")
         for kernel in base["kernels"]:
             artifact = staging_dir / kernel["file"]
             kernel["size_bytes"] = artifact.stat().st_size

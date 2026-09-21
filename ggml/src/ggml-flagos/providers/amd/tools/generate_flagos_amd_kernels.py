@@ -65,10 +65,9 @@ if str(HERE) not in sys.path:
 
 import generate_flagos_kernels as common  # noqa: E402
 from flagos_amd_profiles import (  # noqa: E402
-    TUNING_PROFILE_GFX1150_Q4FFN_V1,
-    TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS,
-    TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS,
-    TUNING_PROFILE_KERNEL_LIST,
+    TUNING_PROFILE_KERNEL_LISTS,
+    TUNING_PROFILES,
+    tuning_profile_contracts,
 )
 from flagos_amd_hsaco import validate_hsaco  # noqa: E402
 
@@ -149,8 +148,8 @@ def package_metadata() -> dict:
         (Path(common.__file__).name, Path(common.__file__).resolve()),
         ("flagos_amd_profiles.py", Path(__file__).resolve().parent / "flagos_amd_profiles.py"),
         ("flagos_amd_hsaco.py", Path(__file__).resolve().parent / "flagos_amd_hsaco.py"),
-        (TUNING_PROFILE_KERNEL_LIST.name, TUNING_PROFILE_KERNEL_LIST),
     ]
+    sources.extend((path.name, path) for path in TUNING_PROFILE_KERNEL_LISTS)
     if FLAGGEMS_AOT_EXPORT is not None:
         for source in FLAGGEMS_AOT_EXPORT.source_files:
             source_path = Path(source).resolve()
@@ -190,18 +189,20 @@ def package_metadata() -> dict:
         }]
     tuning_profile = os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME", "")
     if tuning_profile:
-        if tuning_profile != TUNING_PROFILE_GFX1150_Q4FFN_V1:
-            raise RuntimeError(f"unsupported AMD tuning profile: {tuning_profile}")
+        tuning_profile_contracts(tuning_profile)
         metadata["tuning_profile"] = tuning_profile
     return metadata
 
 
-def validate_tuning_profile_manifest(arch: str, kernels: list[dict]) -> None:
+def validate_tuning_profile_manifest(
+        profile: str, arch: str, kernels: list[dict]) -> None:
+    profile_arch, contracts = tuning_profile_contracts(profile)
+    expected_names = frozenset(contracts)
     names = {kernel.get("name") for kernel in kernels}
-    missing = TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS - names
-    extra = names - TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNELS
+    missing = expected_names - names
+    extra = names - expected_names
     duplicate = len(names) != len(kernels)
-    if arch != "gfx1150" or missing or extra or duplicate:
+    if arch != profile_arch or missing or extra or duplicate:
         detail = "wrong architecture"
         if missing:
             detail = "missing " + ", ".join(sorted(missing))
@@ -209,12 +210,12 @@ def validate_tuning_profile_manifest(arch: str, kernels: list[dict]) -> None:
             detail = "extra " + ", ".join(sorted(extra))
         elif duplicate:
             detail = "duplicate kernel name"
-        raise RuntimeError(f"incomplete {TUNING_PROFILE_GFX1150_Q4FFN_V1} package: {detail}")
+        raise RuntimeError(f"incomplete {profile} package: {detail}")
     for kernel in kernels:
-        contract = TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS[kernel["name"]]
+        contract = contracts[kernel["name"]]
         actual = (
             kernel.get("argument_count", contract.argument_count),
-            kernel["block_size"], kernel.get("tile_m", 0),
+            kernel["block_size"], kernel.get("exact_block_size", False), kernel.get("tile_m", 0),
             kernel.get("tile_n", 0), kernel.get("tile_k", 0),
             kernel["num_warps"], kernel["warp_size"],
         )
@@ -226,8 +227,8 @@ def validate_tuning_profile_manifest(arch: str, kernels: list[dict]) -> None:
 
 def write_manifest(output_dir: Path, arch: str, kernels: list[dict]) -> None:
     package = package_metadata()
-    if package.get("tuning_profile") == TUNING_PROFILE_GFX1150_Q4FFN_V1:
-        validate_tuning_profile_manifest(arch, kernels)
+    if package.get("tuning_profile"):
+        validate_tuning_profile_manifest(package["tuning_profile"], arch, kernels)
     for kernel in kernels:
         artifact = output_dir / kernel["file"]
         validate_hsaco(artifact, arch, kernel)
@@ -2271,7 +2272,13 @@ def compile_gdn_cache_package_without_launch(
 
 def validate_tuning_profile_kernel_abis() -> None:
     """Keep the launcher argument contract tied to the Triton signatures."""
-    for name, contract in TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS.items():
+    known_contracts = {}
+    for _, contracts in TUNING_PROFILES.values():
+        for name, contract in contracts.items():
+            previous = known_contracts.setdefault(name, contract)
+            if previous.argument_count != contract.argument_count:
+                raise RuntimeError(f"conflicting tuned kernel ABI contracts for {name}")
+    for name, contract in known_contracts.items():
         function = globals().get(name)
         if function is None:
             function = getattr(common, name, None)
@@ -2558,17 +2565,23 @@ def main() -> None:
     # default package may carry optional mixed-quant symbols, but profiled
     # builds must contain exactly the canonical entries expected by the C++
     # loader.
-    if os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME", ""):
+    tuning_profile = os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME", "")
+    if tuning_profile:
+        _, contracts = tuning_profile_contracts(tuning_profile)
         names = [
-            (name, contract.block_size, contract.tile_m, contract.tile_n, contract.tile_k)
-            for name, contract in TUNING_PROFILE_GFX1150_Q4FFN_V1_KERNEL_ABIS.items()
+            (name, contract.block_size, contract.tile_m, contract.tile_n, contract.tile_k,
+             contract.exact_block_size)
+            for name, contract in contracts.items()
         ]
     manifest_kernels = []
     for entry in names:
         name, block = entry[:2]
         tile_m, tile_n, tile_k = (tuple(entry[2:]) + (0, 0, 0))[:3]
-        manifest_kernels.append(copy_artifact(
-            args.cache_dir, args.output_dir, name, block, tile_m, tile_n, tile_k))
+        kernel = copy_artifact(
+            args.cache_dir, args.output_dir, name, block, tile_m, tile_n, tile_k)
+        if len(entry) > 5 and entry[5]:
+            kernel["exact_block_size"] = True
+        manifest_kernels.append(kernel)
     arch = args.arch or triton.runtime.driver.active.get_current_target().arch
     write_manifest(args.output_dir, arch, manifest_kernels)
     commit_output()

@@ -356,6 +356,7 @@ static bool amd_env_enabled(const char * name) {
 }
 
 static bool amd_auto_tuning_enabled(const amd_device_context * device);
+static bool amd_qwen35_v2_profile(const amd_device_context * device);
 
 static bool amd_graph_capture_enabled() {
     return amd_env_enabled("FLAGOS_AMD_GRAPH_CAPTURE");
@@ -405,7 +406,10 @@ static bool amd_fusion_enabled(const amd_device_context * device, const char * n
             "rms_norm_mul_rope", "rms_norm_mul", "add_rms_norm_mul", "rope_kv_store",
             "flash_attn_decode", "flash_attn_prefill", "ffn_swiglu", "ffn_swiglu_down",
         };
-        if (std::find(std::begin(VALIDATED), std::end(VALIDATED), name) == std::end(VALIDATED)) {
+        const bool validated_gdn = std::strcmp(name, "gated_delta_net_cache") == 0 &&
+            amd_qwen35_v2_profile(device);
+        if (!validated_gdn &&
+            std::find(std::begin(VALIDATED), std::end(VALIDATED), name) == std::end(VALIDATED)) {
             return false;
         }
     }
@@ -755,6 +759,11 @@ struct amd_device_context {
     flagos_device_profile profile {};
 };
 
+static bool amd_qwen35_v2_profile(const amd_device_context * device) {
+    return device != nullptr && device->aot != nullptr &&
+        device->aot->tuning_profile() == flagos_amd::tuning_profile_gfx1150_qwen35_q4km_v2;
+}
+
 class amd_device_execution_guard {
 public:
     explicit amd_device_execution_guard(amd_device_context * device):
@@ -927,9 +936,14 @@ static const flagos_kernel_variant AMD_GROUPED_F16_FFN_VARIANT = {
 };
 
 static bool amd_is_tuned_package(const amd_device_context * device) {
-    return device != nullptr && device->aot != nullptr &&
-        device->aot->tuning_profile() == AMD_TUNED_PACKAGE_VARIANT.name &&
-        flagos_kernel_variant_matches(&device->profile, &AMD_TUNED_PACKAGE_VARIANT, nullptr);
+    if (device == nullptr || device->aot == nullptr) {
+        return false;
+    }
+    const std::string & profile = device->aot->tuning_profile();
+    const flagos_kernel_shape shape {};
+    return (profile == AMD_TUNED_PACKAGE_VARIANT.name ||
+            profile == flagos_amd::tuning_profile_gfx1150_qwen35_q4km_v2) &&
+        flagos_kernel_variant_matches(&device->profile, &AMD_TUNED_PACKAGE_VARIANT, &shape);
 }
 
 static bool amd_grouped_f16_gemm_enabled(const amd_device_context * device, int columns) {
@@ -996,8 +1010,11 @@ static unsigned int amd_q40_gemv_narrow_row_tile(const amd_device_context * devi
 }
 
 static unsigned int amd_q5_gemv_narrow_row_tile(const amd_device_context * device) {
-    if (!amd_env_enabled("FLAGOS_AMD_Q5_GEMV_NARROW") ||
-        device == nullptr || device->aot == nullptr) {
+    const char * configured = std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW");
+    const bool enabled = configured != nullptr
+        ? amd_env_enabled("FLAGOS_AMD_Q5_GEMV_NARROW")
+        : amd_auto_tuning_enabled(device) && amd_qwen35_v2_profile(device);
+    if (!enabled || device == nullptr || device->aot == nullptr) {
         return 1U;
     }
     const auto * metadata = device->aot->find("flagos_mul_mat_q5_k_f32_narrow16");
@@ -5514,7 +5531,7 @@ static bool amd_probe_impl(ggml_backend_reg_t, bool log_device_count_error) {
         device.tuned_package = amd_is_tuned_package(&device);
         if (amd_auto_tuning_enabled(&device)) {
             GGML_LOG_INFO("FlagOS AMD: selected tuned profile %s for %s\n",
-                AMD_TUNED_PACKAGE_VARIANT.name, device.arch.c_str());
+                device.aot->tuning_profile().c_str(), device.arch.c_str());
         }
     }
     return !g_devices.empty();

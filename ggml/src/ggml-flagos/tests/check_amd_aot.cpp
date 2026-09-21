@@ -88,19 +88,25 @@ int main(int argc, char ** argv) {
         return 1;
     }
     CHECK(registry.size() >= 1);
-    if (registry.tuning_profile() == flagos_amd::tuning_profile_gfx1150_q4ffn_v1) {
-        CHECK(registry.size() == std::size(flagos_amd::tuning_profile_gfx1150_q4ffn_v1_kernels));
-        for (const auto & abi : flagos_amd::tuning_profile_gfx1150_q4ffn_v1_kernels) {
+    const auto check_tuning_profile = [&registry](const auto & contracts) {
+        CHECK(registry.size() == std::size(contracts));
+        for (const auto & abi : contracts) {
             const auto * tuned = registry.find(abi.name);
             CHECK(tuned != nullptr);
             CHECK(tuned->argument_count == static_cast<int>(abi.argument_count));
             CHECK(tuned->block_size == abi.block_size);
+            CHECK(tuned->exact_block_size == abi.exact_block_size);
             CHECK(tuned->tile_m == abi.tile_m);
             CHECK(tuned->tile_n == abi.tile_n);
             CHECK(tuned->tile_k == abi.tile_k);
             CHECK(tuned->num_warps == abi.num_warps);
             CHECK(tuned->warp_size == abi.warp_size);
         }
+    };
+    if (registry.tuning_profile() == flagos_amd::tuning_profile_gfx1150_q4ffn_v1) {
+        check_tuning_profile(flagos_amd::tuning_profile_gfx1150_q4ffn_v1_kernels);
+    } else if (registry.tuning_profile() == flagos_amd::tuning_profile_gfx1150_qwen35_q4km_v2) {
+        check_tuning_profile(flagos_amd::tuning_profile_gfx1150_qwen35_q4km_v2_kernels);
     }
 
     const char * smoke_kernel = registry.find("double") != nullptr ? "double" :
