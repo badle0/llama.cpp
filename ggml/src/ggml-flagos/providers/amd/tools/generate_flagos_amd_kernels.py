@@ -47,6 +47,8 @@ os.environ.setdefault("FLAGOS_GEMV_NUM_WARPS", "1")
 os.environ.setdefault("FLAGOS_Q4_GEMV_NARROW_ENABLE", "1")
 if os.environ.get("FLAGOS_AMD_EMIT_Q4_GEMV_NARROW8", "0") == "1":
     os.environ["FLAGOS_Q4_GEMV_NARROW8_ENABLE"] = "1"
+if os.environ.get("FLAGOS_AMD_EMIT_Q5_GEMV_NARROW16", "0") == "1":
+    os.environ["FLAGOS_Q5_GEMV_NARROW16_ENABLE"] = "1"
 if os.environ.get("FLAGOS_AMD_EMIT_Q40_GEMV_NARROW", "0") == "1":
     os.environ["FLAGOS_Q40_GEMV_NARROW_ENABLE"] = "1"
 # The common generator is also used by the Denglin provider.  Keep the
@@ -299,6 +301,8 @@ Q40_FFN_DECODE_STAGED_WAVES_PER_EU = int(os.environ.get(
     "FLAGOS_Q40_FFN_DECODE_STAGED_WAVES_PER_EU", "4"))
 Q4_GEMV_NARROW8_NUM_WARPS = int(os.environ.get(
     "FLAGOS_Q4_GEMV_NARROW8_NUM_WARPS", "1"))
+Q5_GEMV_NARROW16_NUM_WARPS = int(os.environ.get(
+    "FLAGOS_Q5_GEMV_NARROW16_NUM_WARPS", "1"))
 Q40_GEMV_NARROW_BLOCK_M = int(os.environ.get(
     "FLAGOS_Q40_GEMV_NARROW_BLOCK_M", "8"))
 Q40_GEMV_NARROW_NUM_WARPS = int(os.environ.get(
@@ -2003,6 +2007,57 @@ def compile_q4_narrow8_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_q5_narrow16_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the gfx1150 sixteen-row Q5_K GEMV without a device launch."""
+    if not arch:
+        raise RuntimeError("--compile-only requires --arch")
+    if Q5_GEMV_NARROW16_NUM_WARPS not in (1, 2, 4, 8):
+        raise RuntimeError(
+            "FLAGOS_Q5_GEMV_NARROW16_NUM_WARPS must be 1, 2, 4, or 8")
+    name = "flagos_mul_mat_q5_k_f32_narrow16"
+    signature = {
+        "weights_u8": "*u8", "weights_f16": "*fp16",
+        "x": "*fp32", "output": "*fp32", "k": "i32", "rows": "i32",
+        "BLOCK_M": "constexpr",
+    }
+    source = ASTSource(
+        common.flagos_mul_mat_q5_k_f32_narrow16,
+        signature,
+        {"BLOCK_M": 16},
+        attrs=amd_jit_specialization_attrs(4, (4, 5)),
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", arch, 32),
+        options={"num_warps": Q5_GEMV_NARROW16_NUM_WARPS},
+    )
+    metadata = compiled.metadata
+    global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+    if global_scratch_size or metadata.profile_scratch_size:
+        raise RuntimeError(
+            f"{name} requires unsupported Triton scratch storage "
+            f"(global={global_scratch_size}, profile={metadata.profile_scratch_size})")
+    output = output_dir / f"{name}.hsaco"
+    output.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{
+        "name": name,
+        "symbol": name,
+        "file": output.name,
+        "shared": metadata.shared,
+        "num_warps": metadata.num_warps,
+        "warp_size": metadata.warp_size,
+        "block_size": 16,
+        "tile_m": 0,
+        "tile_n": 0,
+        "tile_k": 0,
+        "argument_count": 6,
+        "global_scratch_size": global_scratch_size,
+        "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+        "profile_scratch_size": metadata.profile_scratch_size,
+        "profile_scratch_align": metadata.profile_scratch_align,
+    }])
+
+
 def compile_q40_narrow_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile one row-tiled Q4_0 GEMV without dispatching it."""
     if not arch:
@@ -2240,7 +2295,7 @@ def main() -> None:
     parser.add_argument("--arch", default=os.environ.get("FLAGOS_AMD_ARCH", ""))
     parser.add_argument(
         "--compile-only", action="store_true",
-        help="compile a selected Q4 FFN tuning symbol without launching it")
+        help="compile one selected AMD tuning symbol without launching it")
     args = parser.parse_args()
     validate_tuning_profile_kernel_abis()
     if args.cache_dir is None:
@@ -2270,6 +2325,7 @@ def main() -> None:
     only_q4_ffn_decode_staged = os.environ.get("FLAGOS_AMD_ONLY_Q4_FFN_DECODE_STAGED") == "1"
     only_q40_ffn_decode_staged = os.environ.get("FLAGOS_AMD_ONLY_Q40_FFN_DECODE_STAGED") == "1"
     only_q4_gemv_narrow8 = os.environ.get("FLAGOS_AMD_ONLY_Q4_GEMV_NARROW8") == "1"
+    only_q5_gemv_narrow16 = os.environ.get("FLAGOS_AMD_ONLY_Q5_GEMV_NARROW16") == "1"
     only_q40_gemv_narrow = os.environ.get("FLAGOS_AMD_ONLY_Q40_GEMV_NARROW") == "1"
     only_q41_q80 = os.environ.get("FLAGOS_AMD_ONLY_Q41_Q80") == "1"
     only_gdn_cache = os.environ.get("FLAGOS_AMD_ONLY_GDN_CACHE") == "1"
@@ -2282,7 +2338,7 @@ def main() -> None:
     only_scale = os.environ.get("FLAGOS_AMD_ONLY_SCALE") == "1"
     if sum((only_residual, only_residual_narrow, only_q4_ffn_decode, only_q40_ffn_decode,
             only_q4_ffn_decode_staged, only_q40_ffn_decode_staged,
-            only_q4_gemv_narrow8, only_q40_gemv_narrow,
+            only_q4_gemv_narrow8, only_q5_gemv_narrow16, only_q40_gemv_narrow,
             only_q41_q80, only_gdn_cache, only_gdn_cache_only,
             only_gdn_cache_only_decode, only_f16_gemm, only_ffn_fusion,
             only_ffn_down_f16, only_scale)) > 1:
@@ -2291,7 +2347,8 @@ def main() -> None:
         if not (only_residual or only_residual_narrow or
                 only_q4_ffn_decode or only_q40_ffn_decode or only_q4_ffn_decode_staged or
                 only_q40_ffn_decode_staged or
-                only_q4_gemv_narrow8 or only_q40_gemv_narrow or only_q41_q80 or
+                only_q4_gemv_narrow8 or only_q5_gemv_narrow16 or
+                only_q40_gemv_narrow or only_q41_q80 or
                 only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode or
                 only_scale):
             raise RuntimeError(
@@ -2302,6 +2359,7 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_Q4_FFN_DECODE_STAGED=1, "
                 "FLAGOS_AMD_ONLY_Q40_FFN_DECODE_STAGED=1, "
                 "FLAGOS_AMD_ONLY_Q4_GEMV_NARROW8=1, "
+                "FLAGOS_AMD_ONLY_Q5_GEMV_NARROW16=1, "
                 "FLAGOS_AMD_ONLY_Q40_GEMV_NARROW=1, "
                 "FLAGOS_AMD_ONLY_Q41_Q80=1, "
                 "FLAGOS_AMD_ONLY_GDN_CACHE=1, "
@@ -2314,6 +2372,8 @@ def main() -> None:
                 args.output_dir, args.arch, only_residual_narrow)
         elif only_q4_gemv_narrow8:
             compile_q4_narrow8_package_without_launch(args.output_dir, args.arch)
+        elif only_q5_gemv_narrow16:
+            compile_q5_narrow16_package_without_launch(args.output_dir, args.arch)
         elif only_q40_gemv_narrow:
             compile_q40_narrow_package_without_launch(args.output_dir, args.arch)
         elif only_q41_q80:
@@ -2336,6 +2396,8 @@ def main() -> None:
         return
     if only_q4_gemv_narrow8:
         raise RuntimeError("FLAGOS_AMD_ONLY_Q4_GEMV_NARROW8 requires --compile-only")
+    if only_q5_gemv_narrow16:
+        raise RuntimeError("FLAGOS_AMD_ONLY_Q5_GEMV_NARROW16 requires --compile-only")
     if only_q40_gemv_narrow:
         raise RuntimeError("FLAGOS_AMD_ONLY_Q40_GEMV_NARROW requires --compile-only")
     if only_gdn_cache:
@@ -2462,6 +2524,8 @@ def main() -> None:
         # Eight output rows per physical wave is a gfx1150 experiment.  Keep
         # it out of the stable manifest unless explicitly requested.
         names.insert(20, ("flagos_mul_mat_q4_k_f32_narrow8", 8))
+    if not only_tuning and os.environ.get("FLAGOS_AMD_EMIT_Q5_GEMV_NARROW16", "0") == "1":
+        names.insert(20, ("flagos_mul_mat_q5_k_f32_narrow16", 16))
     if not only_tuning and os.environ.get("FLAGOS_AMD_EMIT_Q40_GEMV_NARROW", "0") == "1":
         names.insert(20, ("flagos_mul_mat_q4_0_f32_narrow", Q40_GEMV_NARROW_BLOCK_M))
     if not only_tuning and os.environ.get("FLAGOS_AMD_EMIT_Q4_FFN_DECODE", "0") == "1":

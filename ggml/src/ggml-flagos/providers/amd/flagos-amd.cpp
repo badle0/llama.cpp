@@ -474,6 +474,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_GROUPED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
+    add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q40_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q40_FFN_DECODE_STAGED"));
     add(std::getenv("FLAGOS_AMD_TUNING_PROFILE"));
@@ -992,6 +993,18 @@ static unsigned int amd_q40_gemv_narrow_row_tile(const amd_device_context * devi
         return 1U;
     }
     return static_cast<unsigned int>(metadata->block_size);
+}
+
+static unsigned int amd_q5_gemv_narrow_row_tile(const amd_device_context * device) {
+    if (!amd_env_enabled("FLAGOS_AMD_Q5_GEMV_NARROW") ||
+        device == nullptr || device->aot == nullptr) {
+        return 1U;
+    }
+    const auto * metadata = device->aot->find("flagos_mul_mat_q5_k_f32_narrow16");
+    if (metadata == nullptr || metadata->block_size != 16) {
+        return 1U;
+    }
+    return 16U;
 }
 
 static bool amd_quant_tiled_enabled() {
@@ -4626,6 +4639,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                     amd_q4_gemv_narrow_row_tile(backend_context->device);
                 const unsigned int requested_q40_narrow_tile =
                     amd_q40_gemv_narrow_row_tile(backend_context->device);
+                const unsigned int requested_q5_narrow_tile =
+                    amd_q5_gemv_narrow_row_tile(backend_context->device);
                 const bool narrow_q4 = q4 && requested_narrow_tile > 1U;
                 const char * narrow_kernel = nullptr;
                 unsigned int row_tile = 1U;
@@ -4634,6 +4649,10 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                     rows % requested_q40_narrow_tile == 0) {
                     narrow_kernel = "flagos_mul_mat_q4_0_f32_narrow";
                     row_tile = requested_q40_narrow_tile;
+                } else if (kind == flagos_quantized_matmul_kind::q5_k &&
+                           requested_q5_narrow_tile == 16U && rows % 16 == 0) {
+                    narrow_kernel = "flagos_mul_mat_q5_k_f32_narrow16";
+                    row_tile = 16U;
                 } else if (narrow_q4 && requested_narrow_tile >= 8U && rows % 8 == 0 &&
                     backend_context->device->aot->find("flagos_mul_mat_q4_k_f32_narrow8") != nullptr) {
                     narrow_kernel = "flagos_mul_mat_q4_k_f32_narrow8";
@@ -4672,7 +4691,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 }
                 amd_trace_op(backend_context, node, narrow_kernel != nullptr
                     ? (kind == flagos_quantized_matmul_kind::q4_0
-                        ? "q40_matmul_narrow" : row_tile == 8U
+                        ? "q40_matmul_narrow" : kind == flagos_quantized_matmul_kind::q5_k
+                        ? "q5_matmul_narrow16" : row_tile == 8U
                         ? "q4_matmul_narrow8" : "q4_matmul_narrow4")
                     : kind == flagos_quantized_matmul_kind::q4_0
                     ? "q40_matmul" : kind == flagos_quantized_matmul_kind::q5_k

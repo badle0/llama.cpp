@@ -173,6 +173,7 @@ int main(int argc, char ** argv) {
         { "flagos_mul_mat_q4_0_f32_narrow", 6 },
         { "flagos_mul_mat_q4_1_f32", 6 },
         { "flagos_mul_mat_q5_k_f32", 6 },
+        { "flagos_mul_mat_q5_k_f32_narrow16", 6 },
         { "flagos_mul_mat_q8_0_f32", 6 },
         { "flagos_mul_mat_q4_0_f32_batched", 7 },
         { "flagos_mul_mat_q4_1_f32_batched", 7 },
@@ -233,6 +234,9 @@ int main(int argc, char ** argv) {
         CHECK(registry.find("flagos_get_rows_q5_k_f32") != nullptr);
         CHECK(registry.find("flagos_mul_mat_q5_k_f32") != nullptr);
         CHECK(registry.find("flagos_mul_mat_q5_k_f32_batched") != nullptr);
+    }
+    if (registry.find("flagos_mul_mat_q5_k_f32_narrow16") != nullptr) {
+        CHECK(registry.find("flagos_mul_mat_q5_k_f32") != nullptr);
     }
     if (registry.find("flagos_dequant_q8_0_f16") != nullptr) {
         CHECK(registry.find("flagos_get_rows_q8_0_f32") != nullptr);

@@ -557,6 +557,7 @@ int main() {
         check_quantized_matmul(GGML_TYPE_Q4_K, 7, 5);
         check_quantized_matmul(GGML_TYPE_Q5_K, 7, 1);
         check_quantized_matmul(GGML_TYPE_Q5_K, 7, 5);
+        check_quantized_matmul(GGML_TYPE_Q5_K, 16, 1);
         check_quantized_matmul(GGML_TYPE_Q6_K, 7, 1);
         check_quantized_matmul(GGML_TYPE_Q6_K, 7, 5);
         // Exercise the opt-in dequant-cache + dense F16 prefill path for both

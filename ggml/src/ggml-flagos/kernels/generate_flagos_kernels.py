@@ -1252,6 +1252,59 @@ def flagos_mul_mat_q5_k_f32(weights_u8, weights_f16, x, output, k, rows):
 
 
 @triton.jit
+def flagos_mul_mat_q5_k_f32_narrow16(
+        weights_u8, weights_f16, x, output, k, rows,
+        BLOCK_M: tl.constexpr,
+):
+    """Q5_K decode GEMV using one wave32 program for a row tile."""
+    pid = tl.program_id(0)
+    row_ids = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    lanes = tl.arange(0, 32)
+    accumulator = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+    blocks_per_row = k // 256
+    for block in tl.range(0, blocks_per_row):
+        block_byte = (row_ids[:, None] * blocks_per_row + block) * 176
+        block_half = block_byte // 2
+        d = tl.load(weights_f16 + block_half).to(tl.float32)
+        dmin = tl.load(weights_f16 + block_half + 1).to(tl.float32)
+        qh = tl.load(weights_u8 + block_byte + 16 + lanes[None, :])
+        for chunk in tl.range(0, 4):
+            low_group = chunk * 2
+            high_group = low_group + 1
+            low_index = chunk * 64 + lanes
+            high_index = low_index + 32
+            low_scale_byte = tl.load(weights_u8 + block_byte + 4 +
+                                      (low_group if low_group < 4 else low_group + 4))
+            low_scale_hi = tl.load(weights_u8 + block_byte + 4 +
+                                   (low_group - 4 if low_group >= 4 else 0))
+            low_scale = (low_scale_byte & 63 if low_group < 4 else
+                         (low_scale_byte & 15) | ((low_scale_hi >> 6) << 4)).to(tl.float32)
+            low_min_byte = tl.load(weights_u8 + block_byte + 4 + low_group + 4)
+            low_min_hi = tl.load(weights_u8 + block_byte + 4 + low_group)
+            low_minimum = (low_min_byte & 63 if low_group < 4 else
+                           (low_min_byte >> 4) | ((low_min_hi >> 6) << 4)).to(tl.float32)
+            high_scale_byte = tl.load(weights_u8 + block_byte + 4 +
+                                       (high_group if high_group < 4 else high_group + 4))
+            high_scale_hi = tl.load(weights_u8 + block_byte + 4 +
+                                    (high_group - 4 if high_group >= 4 else 0))
+            high_scale = (high_scale_byte & 63 if high_group < 4 else
+                          (high_scale_byte & 15) | ((high_scale_hi >> 6) << 4)).to(tl.float32)
+            high_min_byte = tl.load(weights_u8 + block_byte + 4 + high_group + 4)
+            high_min_hi = tl.load(weights_u8 + block_byte + 4 + high_group)
+            high_minimum = (high_min_byte & 63 if high_group < 4 else
+                            (high_min_byte >> 4) | ((high_min_hi >> 6) << 4)).to(tl.float32)
+            qbyte = tl.load(weights_u8 + block_byte + 48 + chunk * 32 + lanes[None, :])
+            low_quant = (qbyte & 15) + ((qh >> low_group) & 1) * 16
+            high_quant = (qbyte >> 4) + ((qh >> high_group) & 1) * 16
+            low_value = d * low_scale * low_quant.to(tl.float32) - dmin * low_minimum
+            high_value = d * high_scale * high_quant.to(tl.float32) - dmin * high_minimum
+            low_activation = tl.load(x + block * 256 + low_index).to(tl.float32)
+            high_activation = tl.load(x + block * 256 + high_index).to(tl.float32)
+            accumulator += low_value * low_activation[None, :] + high_value * high_activation[None, :]
+    tl.store(output + row_ids, tl.sum(accumulator, axis=1), mask=row_ids < rows)
+
+
+@triton.jit
 def flagos_mul_mat_q4_k_f32(weights_u8, weights_f16, x, output, k, rows):
     row = tl.program_id(0)
     # Decode two weights from each packed byte together. This halves the vector
@@ -2761,6 +2814,25 @@ def compile_kernels(assert_close=None) -> None:
         num_warps=GEMV_NUM_WARPS,
     )
     assert_close(mat_output, q5_dequantized @ activation, rtol=2e-5, atol=2e-4)
+
+    if os.environ.get("FLAGOS_Q5_GEMV_NARROW16_ENABLE", "0") == "1":
+        q5_narrow_rows = 16
+        q5_narrow_output = torch.empty(
+            q5_narrow_rows, device="cuda", dtype=torch.float32)
+        flagos_mul_mat_q5_k_f32_narrow16[(1,)](
+            q5_packed,
+            q5_packed.view(torch.float16),
+            activation,
+            q5_narrow_output,
+            mat_k,
+            q5_narrow_rows,
+            BLOCK_M=16,
+            num_warps=1,
+        )
+        assert_close(
+            q5_narrow_output, q5_dequantized[:q5_narrow_rows] @ activation,
+            rtol=2e-5, atol=2e-3,
+        )
 
     # These wave32 GEMV experiments are AMD-specific.  Keep them out of the
     # shared Denglin/CUDA package unless the AMD generator explicitly opts in.
