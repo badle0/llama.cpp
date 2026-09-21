@@ -185,6 +185,7 @@ struct flagos_canonical_node {
 
 struct flagos_graph_plan {
     uint64_t structural_fingerprint = 0;
+    bool binding_sensitive = false;
     std::vector<flagos_canonical_node> canonical_nodes;
     std::vector<flagos_plan_step> steps;
     std::vector<flagos_graph_binding_slot> binding_slots;

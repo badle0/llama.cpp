@@ -396,6 +396,33 @@ int main() {
     CHECK(created);
     CHECK(cache.misses() == 2);
 
+    ggml_tensor direct_node {};
+    init_tensor(direct_node, GGML_OP_ADD, 16);
+    uint8_t direct_data_a = 0;
+    uint8_t direct_data_b = 0;
+    direct_node.data = &direct_data_a;
+    ggml_tensor * direct_nodes[] = { &direct_node };
+    ggml_cgraph direct_graph {};
+    direct_graph.n_nodes = 1;
+    direct_graph.nodes = direct_nodes;
+    interface_state direct_state;
+    flagos_fusion_interface direct_interface {
+        query_pattern_interface,
+        query_pattern_interface,
+        nullptr,
+        &direct_state,
+        1,
+        resolve_interface_binding,
+    };
+    flagos_graph_plan_cache direct_cache(2);
+    direct_cache.get_or_create(&direct_graph, direct_interface, &created);
+    CHECK(created);
+    direct_node.data = &direct_data_b;
+    direct_cache.get_or_create(&direct_graph, direct_interface, &created);
+    CHECK(!created);
+    CHECK(direct_cache.hits() == 1);
+    CHECK(direct_cache.misses() == 1);
+
     flagos_graph_plan_cache policy_cache(4);
     const auto & capture_safe_plan = policy_cache.get_or_create(
         &graph.graph, query_pattern, &supported, &created);

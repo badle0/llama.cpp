@@ -304,7 +304,7 @@ struct amd_backend_context {
     } stats;
 
     amd_backend_context(amd_device_context * device_, hipStream_t stream_):
-        device(device_), stream(stream_), graph_plans(32) {
+        device(device_), stream(stream_), graph_plans(128) {
         graph_captures.reserve(8);
         graph_capture_candidates.reserve(16);
         dequant_cache.reserve(64);

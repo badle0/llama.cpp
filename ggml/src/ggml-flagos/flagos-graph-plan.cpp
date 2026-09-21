@@ -1194,7 +1194,9 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
 
     std::vector<selected_candidate> supported;
     if (query_lowering != nullptr) {
-        for (auto candidate : flagos_enumerate_candidates(cgraph)) {
+        const auto candidates = flagos_enumerate_candidates(cgraph);
+        plan->binding_sensitive = !candidates.empty();
+        for (auto candidate : candidates) {
             if (!flagos_populate_required_outputs(cgraph, candidate) ||
                 !flagos_candidate_inputs_available_at_entry(cgraph, candidate) ||
                 !flagos_candidate_early_writes_are_safe(
@@ -1309,6 +1311,13 @@ bool flagos_graph_plan_cache::plan_is_valid(entry & entry, const ggml_cgraph * c
     if (entry.bindings_captured && flagos_graph_binding_snapshot_matches(
             cgraph, *entry.plan, entry.validated_bindings,
             entry.resolve_tensor_data, entry.user_data)) {
+        return true;
+    }
+    // A graph with no recognized fusion candidate cannot change its plan when
+    // scheduler buffers rotate. Direct steps consume the current tensor
+    // bindings at execution time, so rebuilding the canonical plan adds no
+    // safety and can thrash on multi-buffer decode schedules.
+    if (!entry.plan->binding_sensitive) {
         return true;
     }
     if (entry.validate_lowering == nullptr) {
