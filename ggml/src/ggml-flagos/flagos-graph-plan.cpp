@@ -753,15 +753,14 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
             }
             if (copy_index >= 0) {
                 const ggml_tensor * copy = cgraph->nodes[copy_index];
-                int snapshot_view_index = -1;
-                for (int j = i + 1; j < copy_index; ++j) {
-                    if (cgraph->nodes[j] == copy->src[0]) {
-                        snapshot_view_index = j;
-                        break;
-                    }
-                }
-                if (snapshot_view_index >= 0 && flagos_is_gated_delta_net_cache_copy(
-                        node, cgraph->nodes[snapshot_view_index], copy)) {
+                const ggml_tensor * snapshot_view = copy->src[0];
+                // Zero-work views are not guaranteed to appear in cgraph->nodes.
+                // llama.cpp's Qwen3.5 graph keeps the snapshot view only as the
+                // CPY source, so validate the tensor edge itself and cover the
+                // view node only when the graph materializes one.
+                const bool cache_copy =
+                    flagos_is_gated_delta_net_cache_copy(node, snapshot_view, copy);
+                if (cache_copy) {
                     flagos_pattern_candidate candidate;
                     candidate.id = node->src[2]->ne[2] == 1
                         ? flagos_pattern_id::gated_delta_net_decode
@@ -775,7 +774,8 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                         // any externally consumed attention or snapshot view.  A
                         // mere src[0] dependency is not sufficient: a zero-launch
                         // node may still own distinct storage.
-                        if (cgraph->nodes[j]->view_src == node) {
+                        if (cgraph->nodes[j]->view_src == node ||
+                            cgraph->nodes[j] == copy->src[1]) {
                             candidate.node_indices.push_back(j);
                         }
                     }

@@ -2302,6 +2302,51 @@ static bool amd_gated_delta_net_cache_only_outputs_are_safe(
     }
     const uintptr_t attention_end = attention_begin + attention_bytes;
     const int copy_index = candidate.node_indices.back();
+    const ggml_tensor * destination = copy->src[1];
+    if (destination == nullptr) {
+        return false;
+    }
+    std::vector<bool> covered(static_cast<size_t>(cgraph->n_nodes), false);
+    for (const int index : candidate.node_indices) {
+        if (index < 0 || index >= cgraph->n_nodes || covered[static_cast<size_t>(index)]) {
+            return false;
+        }
+        covered[static_cast<size_t>(index)] = true;
+    }
+    const auto alias_is_in_attention = [&](const ggml_tensor * tensor) {
+        if (tensor == nullptr || tensor->data == nullptr || tensor->view_src != gdn) {
+            return false;
+        }
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(tensor->data);
+        const size_t bytes = ggml_nbytes(tensor);
+        return bytes > 0 && begin >= attention_begin && begin <= UINTPTR_MAX - bytes &&
+            begin + bytes <= attention_end;
+    };
+    // A zero-work view may be absent from cgraph->nodes and appear only as a
+    // later node's source.  Required-output bookkeeping is node based, so
+    // audit those implicit aliases here before omitting the snapshot suffix.
+    // The covered CPY is allowed to read the suffix because this kernel writes
+    // its destination directly; every other consumer must stay in the
+    // materialized attention prefix.
+    for (int consumer_index = 0; consumer_index < cgraph->n_nodes; ++consumer_index) {
+        if (covered[static_cast<size_t>(consumer_index)]) {
+            continue;
+        }
+        const ggml_tensor * consumer = cgraph->nodes[consumer_index];
+        if (consumer == nullptr ||
+            (consumer->view_src == gdn && !alias_is_in_attention(consumer))) {
+            return false;
+        }
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            const ggml_tensor * input = consumer->src[source];
+            const bool attention_view_input = input == gdn &&
+                consumer->view_src == gdn && alias_is_in_attention(consumer);
+            if ((input == gdn && !attention_view_input) ||
+                (input != nullptr && input->view_src == gdn && !alias_is_in_attention(input))) {
+                return false;
+            }
+        }
+    }
     bool copy_required = false;
     for (const int index : candidate.required_output_node_indices) {
         if (index == copy_index) {
@@ -2319,6 +2364,18 @@ static bool amd_gated_delta_net_cache_only_outputs_are_safe(
         const ggml_tensor * output = cgraph->nodes[index];
         if (output == nullptr || output->data == nullptr) {
             return false;
+        }
+        // A scheduled destination VIEW and the terminal CPY expose the same
+        // cache storage.  The cache-only kernel materializes both contracts
+        // with its direct cache write.
+        if (output == destination) {
+            continue;
+        }
+        // Common records a producer node, not the byte range observed through
+        // a later view.  The external-alias audit above proves that every
+        // consumer of this GDN output stays inside the attention prefix.
+        if (output == gdn && (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            continue;
         }
         const uintptr_t begin = reinterpret_cast<uintptr_t>(output->data);
         const size_t bytes = ggml_nbytes(output);

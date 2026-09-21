@@ -931,6 +931,41 @@ int main() {
     CHECK(plan->steps[0].candidate.eliminated_read_bytes == 32 * sizeof(float));
     CHECK(plan->steps[1].candidate.node_indices[0] == 4);
 
+    // llama.cpp may omit zero-work view tensors from cgraph->nodes while
+    // retaining them as CPY and consumer sources.  The cache-write pattern
+    // must follow those tensor edges instead of requiring an explicit VIEW
+    // node in the schedule.
+    ggml_tensor * gdn_implicit_view_nodes[] = {
+        &gdn, &gdn_copy, &gdn_attention_consumer,
+    };
+    ggml_cgraph gdn_implicit_view_graph {};
+    gdn_implicit_view_graph.n_nodes = 3;
+    gdn_implicit_view_graph.nodes = gdn_implicit_view_nodes;
+    plan = flagos_build_graph_plan(&gdn_implicit_view_graph, query_pattern, &supported);
+    CHECK(plan->steps.size() == 2);
+    CHECK(plan->steps[0].kind == flagos_execution_kind::pattern);
+    CHECK(plan->steps[0].candidate.id == flagos_pattern_id::gated_delta_net_decode);
+    CHECK(plan->steps[0].candidate.node_indices.size() == 2);
+    CHECK(plan->steps[0].candidate.node_indices[0] == 0);
+    CHECK(plan->steps[0].candidate.node_indices[1] == 1);
+    CHECK(plan->steps[1].candidate.node_indices[0] == 2);
+
+    ggml_tensor * gdn_scheduled_destination_nodes[] = {
+        &gdn, &gdn_cache, &gdn_copy, &gdn_attention_consumer,
+    };
+    ggml_cgraph gdn_scheduled_destination_graph {};
+    gdn_scheduled_destination_graph.n_nodes = 4;
+    gdn_scheduled_destination_graph.nodes = gdn_scheduled_destination_nodes;
+    plan = flagos_build_graph_plan(
+        &gdn_scheduled_destination_graph, query_pattern, &supported);
+    CHECK(plan->steps.size() == 2);
+    CHECK(plan->steps[0].kind == flagos_execution_kind::pattern);
+    CHECK(plan->steps[0].candidate.node_indices.size() == 3);
+    CHECK(plan->steps[0].candidate.node_indices[0] == 0);
+    CHECK(plan->steps[0].candidate.node_indices[1] == 1);
+    CHECK(plan->steps[0].candidate.node_indices[2] == 2);
+    CHECK(plan->steps[1].candidate.node_indices[0] == 3);
+
     gdn.flags |= GGML_TENSOR_FLAG_OUTPUT;
     plan = flagos_build_graph_plan(&gdn_graph, query_pattern, &supported);
     CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 3);

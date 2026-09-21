@@ -799,9 +799,12 @@ int main() {
             ggml_tensor * gdn_copy = ggml_cpy(ctx, gdn_snapshot_view, gdn_cache_view);
             ggml_tensor * gdn_attention_view = ggml_view_1d(
                 ctx, gdn_output, gdn_attention_elements, 0);
+            ggml_tensor * gdn_snapshot_observer = ggml_view_1d(
+                ctx, gdn_output, gdn_state_elements,
+                gdn_attention_elements * sizeof(float));
             CHECK(gdn_q && gdn_k && gdn_v && gdn_gate && gdn_beta && gdn_state &&
                 gdn_output && gdn_snapshot_view && gdn_cache && gdn_cache_view &&
-                gdn_copy && gdn_attention_view);
+                gdn_copy && gdn_attention_view && gdn_snapshot_observer);
 
             ggml_tensor * gdn_allocated[] = {
                 gdn_q, gdn_k, gdn_v, gdn_gate, gdn_beta, gdn_state, gdn_output, gdn_cache,
@@ -819,6 +822,7 @@ int main() {
             CHECK(ggml_backend_view_init(gdn_cache_view) == GGML_STATUS_SUCCESS);
             CHECK(ggml_backend_view_init(gdn_copy) == GGML_STATUS_SUCCESS);
             CHECK(ggml_backend_view_init(gdn_attention_view) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_view_init(gdn_snapshot_observer) == GGML_STATUS_SUCCESS);
             CHECK(ggml_backend_dev_supports_op(dev, gdn_output));
             CHECK(ggml_backend_dev_supports_op(dev, gdn_copy));
 
@@ -956,6 +960,63 @@ int main() {
             // copy destination. The attention prefix and cache are the
             // required observable outputs of this graph.
             for (size_t i = 0; i < static_cast<size_t>(gdn_attention_elements); ++i) {
+                CHECK(std::fabs(gdn_fused_output[i] - gdn_direct_output[i]) < 5e-4f);
+            }
+            for (size_t i = 0; i < gdn_fused_cache.size(); ++i) {
+                CHECK(std::fabs(gdn_fused_cache[i] - gdn_direct_cache[i]) < 5e-4f);
+            }
+
+            // Production llama.cpp graphs omit the zero-work snapshot source
+            // view but schedule the cache destination view. Exercise that
+            // exact form while retaining the source view as the CPY tensor
+            // edge and the attention view as an external prefix consumer.
+            std::fill(gdn_fused_output.begin(), gdn_fused_output.end(), -1.0f);
+            std::fill(gdn_fused_cache.begin(), gdn_fused_cache.end(), -1.0f);
+            ggml_backend_buffer_clear(gdn_buffers[6], 0);
+            ggml_backend_buffer_clear(gdn_buffers.back(), 0);
+            ggml_tensor * gdn_scheduled_view_nodes[] = {
+                gdn_output, gdn_cache_view, gdn_copy, gdn_attention_view,
+            };
+            ggml_cgraph gdn_scheduled_view_graph {};
+            gdn_scheduled_view_graph.n_nodes = 4;
+            gdn_scheduled_view_graph.nodes = gdn_scheduled_view_nodes;
+            CHECK(ggml_backend_graph_compute(
+                backend, &gdn_scheduled_view_graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(backend, gdn_output, gdn_fused_output.data(),
+                0, ggml_nbytes(gdn_output));
+            ggml_backend_tensor_get_async(backend, gdn_cache, gdn_fused_cache.data(),
+                0, ggml_nbytes(gdn_cache));
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < static_cast<size_t>(gdn_attention_elements); ++i) {
+                CHECK(std::fabs(gdn_fused_output[i] - gdn_direct_output[i]) < 5e-4f);
+            }
+            for (size_t i = 0; i < gdn_fused_cache.size(); ++i) {
+                CHECK(std::fabs(gdn_fused_cache[i] - gdn_direct_cache[i]) < 5e-4f);
+            }
+
+            // A consumer of the snapshot suffix makes cache-only execution
+            // illegal. The provider must select the full-output implementation
+            // so the observer still sees the recurrent state materialized in
+            // the GDN output tensor.
+            std::fill(gdn_fused_output.begin(), gdn_fused_output.end(), -1.0f);
+            std::fill(gdn_fused_cache.begin(), gdn_fused_cache.end(), -1.0f);
+            ggml_backend_buffer_clear(gdn_buffers[6], 0);
+            ggml_backend_buffer_clear(gdn_buffers.back(), 0);
+            ggml_tensor * gdn_snapshot_observer_nodes[] = {
+                gdn_output, gdn_cache_view, gdn_copy,
+                gdn_attention_view, gdn_snapshot_observer,
+            };
+            ggml_cgraph gdn_snapshot_observer_graph {};
+            gdn_snapshot_observer_graph.n_nodes = 5;
+            gdn_snapshot_observer_graph.nodes = gdn_snapshot_observer_nodes;
+            CHECK(ggml_backend_graph_compute(
+                backend, &gdn_snapshot_observer_graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(backend, gdn_output, gdn_fused_output.data(),
+                0, ggml_nbytes(gdn_output));
+            ggml_backend_tensor_get_async(backend, gdn_cache, gdn_fused_cache.data(),
+                0, ggml_nbytes(gdn_cache));
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < gdn_fused_output.size(); ++i) {
                 CHECK(std::fabs(gdn_fused_output[i] - gdn_direct_output[i]) < 5e-4f);
             }
             for (size_t i = 0; i < gdn_fused_cache.size(); ++i) {
