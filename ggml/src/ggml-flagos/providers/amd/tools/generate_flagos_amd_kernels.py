@@ -1759,6 +1759,51 @@ def amd_jit_specialization_attrs(pointer_count: int, scalar_indices: tuple[int, 
     return attrs
 
 
+def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the common SCALE kernel for an AMD package without a device launch."""
+    if not arch:
+        raise RuntimeError("--compile-only requires --arch")
+    name = "flagos_scale_f32"
+    signature = {
+        "x": "*fp32", "output": "*fp32", "scale": "fp32", "bias": "fp32",
+        "n_elements": "i32", "BLOCK": "constexpr",
+    }
+    source = ASTSource(
+        common.flagos_scale_f32,
+        signature,
+        {"BLOCK": common.BLOCK_SIZE},
+        attrs=amd_jit_specialization_attrs(2, ()),
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", arch, 32),
+        options={"num_warps": NUM_WARPS},
+    )
+    metadata = compiled.metadata
+    global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+    if global_scratch_size or metadata.profile_scratch_size:
+        raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+    output = output_dir / f"{name}.hsaco"
+    output.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{
+        "name": name,
+        "symbol": name,
+        "file": output.name,
+        "shared": metadata.shared,
+        "num_warps": metadata.num_warps,
+        "warp_size": metadata.warp_size,
+        "block_size": common.BLOCK_SIZE,
+        "tile_m": 0,
+        "tile_n": 0,
+        "tile_k": 0,
+        "argument_count": 5,
+        "global_scratch_size": global_scratch_size,
+        "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+        "profile_scratch_size": metadata.profile_scratch_size,
+        "profile_scratch_align": metadata.profile_scratch_align,
+    }])
+
+
 def compile_residual_package_without_launch(output_dir: Path, arch: str, narrow: bool) -> None:
     """Compile one residual-aware ADD+RMSNorm export without dispatching it."""
     if not arch:
@@ -2234,19 +2279,21 @@ def main() -> None:
     only_f16_gemm = os.environ.get("FLAGOS_AMD_ONLY_F16_GEMM") == "1"
     only_ffn_fusion = os.environ.get("FLAGOS_AMD_ONLY_FFN_FUSION") == "1"
     only_ffn_down_f16 = os.environ.get("FLAGOS_AMD_ONLY_FFN_DOWN_F16") == "1"
+    only_scale = os.environ.get("FLAGOS_AMD_ONLY_SCALE") == "1"
     if sum((only_residual, only_residual_narrow, only_q4_ffn_decode, only_q40_ffn_decode,
             only_q4_ffn_decode_staged, only_q40_ffn_decode_staged,
             only_q4_gemv_narrow8, only_q40_gemv_narrow,
             only_q41_q80, only_gdn_cache, only_gdn_cache_only,
             only_gdn_cache_only_decode, only_f16_gemm, only_ffn_fusion,
-            only_ffn_down_f16)) > 1:
+            only_ffn_down_f16, only_scale)) > 1:
         raise RuntimeError("select only one FLAGOS_AMD_ONLY_* tuning mode")
     if args.compile_only:
         if not (only_residual or only_residual_narrow or
                 only_q4_ffn_decode or only_q40_ffn_decode or only_q4_ffn_decode_staged or
                 only_q40_ffn_decode_staged or
                 only_q4_gemv_narrow8 or only_q40_gemv_narrow or only_q41_q80 or
-                only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode):
+                only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode or
+                only_scale):
             raise RuntimeError(
                 "--compile-only requires FLAGOS_AMD_ONLY_RESIDUAL=1, "
                 "FLAGOS_AMD_ONLY_RESIDUAL_NARROW=1, "
@@ -2259,7 +2306,8 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_Q41_Q80=1, "
                 "FLAGOS_AMD_ONLY_GDN_CACHE=1, "
                 "FLAGOS_AMD_ONLY_GDN_CACHE_ONLY=1 or "
-                "FLAGOS_AMD_ONLY_GDN_CACHE_ONLY_DECODE=1")
+                "FLAGOS_AMD_ONLY_GDN_CACHE_ONLY_DECODE=1 or "
+                "FLAGOS_AMD_ONLY_SCALE=1")
         os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir)
         if only_residual or only_residual_narrow:
             compile_residual_package_without_launch(
@@ -2270,6 +2318,8 @@ def main() -> None:
             compile_q40_narrow_package_without_launch(args.output_dir, args.arch)
         elif only_q41_q80:
             compile_q41_q80_package_without_launch(args.output_dir, args.arch)
+        elif only_scale:
+            compile_scale_package_without_launch(args.output_dir, args.arch)
         elif only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode:
             compile_gdn_cache_package_without_launch(
                 args.output_dir, args.arch,
@@ -2295,6 +2345,8 @@ def main() -> None:
     if only_gdn_cache_only_decode:
         raise RuntimeError(
             "FLAGOS_AMD_ONLY_GDN_CACHE_ONLY_DECODE requires --compile-only")
+    if only_scale:
+        raise RuntimeError("FLAGOS_AMD_ONLY_SCALE requires --compile-only")
     compile_common = (os.environ.get("FLAGOS_AMD_SKIP_COMMON", "0") != "1" and
                       not only_residual and not only_residual_narrow and
                       not only_q4_ffn_decode and not only_q40_ffn_decode and
@@ -2308,6 +2360,7 @@ def main() -> None:
         ("flagos_add_f32", common.BLOCK_SIZE),
         ("flagos_add_repeat_f32", common.BLOCK_SIZE),
         ("flagos_mul_f32", common.BLOCK_SIZE),
+        ("flagos_scale_f32", common.BLOCK_SIZE),
         ("flagos_copy_strided_f32", common.BLOCK_SIZE),
         ("flagos_concat_f32", common.BLOCK_SIZE),
         ("flagos_rms_norm_f32", common.RMS_NORM_BLOCK_SIZE),

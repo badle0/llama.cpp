@@ -274,6 +274,7 @@ struct amd_backend_context {
         std::atomic<uint64_t> q4_get_rows { 0 };
         std::atomic<uint64_t> q6_get_rows { 0 };
         std::atomic<uint64_t> mul { 0 };
+        std::atomic<uint64_t> scale { 0 };
         std::atomic<uint64_t> rope { 0 };
         std::atomic<uint64_t> rope_kv_store { 0 };
         std::atomic<uint64_t> flash_attn_decode { 0 };
@@ -636,7 +637,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         "q4_tiled=%llu q6_tiled=%llu "
         "weight_dequantizations=%llu f16_batched=%llu "
         "q40_get_rows=%llu q41_get_rows=%llu q80_get_rows=%llu q5_get_rows=%llu q4_get_rows=%llu q6_get_rows=%llu rope=%llu rope_kv_store=%llu "
-        "mul=%llu flash_decode=%llu flash_prefill=%llu soft_max=%llu "
+        "mul=%llu scale=%llu flash_decode=%llu flash_prefill=%llu soft_max=%llu "
         "dequant_cache_mib=%zu/%zu arena_mib=%zu blocks=%zu "
         "host_to_device=%llu device_to_device=%llu "
         "plan_builds=%llu plan_direct=%llu plan_patterns=%llu "
@@ -676,6 +677,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.rope.load(),
         (unsigned long long) s.rope_kv_store.load(),
         (unsigned long long) s.mul.load(),
+        (unsigned long long) s.scale.load(),
         (unsigned long long) s.flash_attn_decode.load(),
         (unsigned long long) s.flash_attn_prefill.load(),
         (unsigned long long) s.soft_max.load(),
@@ -2078,13 +2080,16 @@ static bool amd_supports_copy_f32(const amd_device_context * device, const ggml_
         op->nb[0] != sizeof(float) || op->src[0]->nb[0] != sizeof(float) ||
         !amd_tensor_element_offsets_fit_i32(op, sizeof(float)) ||
         !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
-        ggml_nelements(op) <= 0 || ggml_nelements(op) > INT32_MAX ||
+        ggml_nelements(op) > INT32_MAX ||
         ggml_nelements(op) != ggml_nelements(op->src[0])) {
         return false;
     }
     if (op->op == GGML_OP_CPY && (op->src[1] == nullptr ||
         op->src[1]->type != GGML_TYPE_F32 || op->data != op->src[1]->data)) {
         return false;
+    }
+    if (ggml_nelements(op) == 0) {
+        return true;
     }
     return !amd_tensor_data_overlaps(op, op->src[0]);
 }
@@ -4030,6 +4035,16 @@ static bool amd_supports_mul(const amd_device_context * device, const ggml_tenso
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
+static bool amd_supports_scale(const amd_device_context * device, const ggml_tensor * op) {
+    return device != nullptr && device->aot != nullptr && op != nullptr &&
+        op->op == GGML_OP_SCALE && op->src[0] != nullptr &&
+        device->aot->find("flagos_scale_f32") != nullptr &&
+        amd_tensor_is_contiguous_f32(op) && amd_tensor_is_contiguous_f32(op->src[0]) &&
+        ggml_are_same_shape(op, op->src[0]) &&
+        ggml_nelements(op) <= INT32_MAX &&
+        amd_tensor_output_can_reuse_input(op, op->src[0]);
+}
+
 static bool amd_supports_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_RMS_NORM || op->src[0] == nullptr ||
@@ -4241,6 +4256,11 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         const int i = step.candidate.node_indices[0];
         ggml_tensor * node = cgraph->nodes[i];
         if (amd_tensor_is_view_op(node)) {
+            continue;
+        }
+        if (ggml_nelements(node) == 0 &&
+            (amd_supports_copy_f32(backend_context->device, node) ||
+             amd_supports_scale(backend_context->device, node))) {
             continue;
         }
         if (!amd_tensor_bindings_ready(node)) {
@@ -4673,6 +4693,31 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.mul.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(backend_context, node, "mul");
+            continue;
+        }
+        if (node->op == GGML_OP_SCALE && amd_supports_scale(backend_context->device, node)) {
+            const auto * metadata = backend_context->device->aot->find("flagos_scale_f32");
+            float scale = 1.0f;
+            float bias = 0.0f;
+            std::memcpy(&scale, reinterpret_cast<const float *>(node->op_params), sizeof(float));
+            std::memcpy(&bias, reinterpret_cast<const float *>(node->op_params) + 1, sizeof(float));
+            int n_elements = static_cast<int>(ggml_nelements(node));
+            void * input_data = node->src[0]->data;
+            void * output_data = node->data;
+            flagos_amd::kernel_arguments arguments = {
+                &input_data, &output_data, &scale, &bias, &n_elements,
+            };
+            const unsigned int grid_x = static_cast<unsigned int>(
+                (static_cast<uint64_t>(n_elements) + metadata->block_size - 1) /
+                metadata->block_size);
+            if (!backend_context->device->aot->launch("flagos_scale_f32", backend_context->stream,
+                    grid_x, 1, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.scale.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "scale");
             continue;
         }
         if (node->op == GGML_OP_SET_ROWS && amd_supports_set_rows(backend_context->device, node)) {
@@ -5138,6 +5183,7 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
          (op->op == GGML_OP_MUL_MAT && amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_ADD && amd_supports_add(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_MUL && amd_supports_mul(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_SCALE && amd_supports_scale(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SET_ROWS && amd_supports_set_rows(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_RMS_NORM && amd_supports_rms_norm(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_ROPE &&

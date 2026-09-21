@@ -121,6 +121,20 @@ int main() {
     CHECK(!ggml_backend_dev_supports_op(dev, &standalone_mul));
 
     CHECK(!ggml_backend_dev_supports_op(dev, &unsupported_unary));
+
+    ggml_tensor * empty_src = ggml_view_1d(ctx, tensor, 0, 0);
+    ggml_tensor * empty_dst = ggml_view_1d(ctx, tensor, 0, 0);
+    ggml_tensor * empty_scale = ggml_scale_inplace(ctx, empty_src, 0.0f);
+    ggml_tensor * empty_copy = ggml_cpy(ctx, empty_src, empty_dst);
+    CHECK(empty_src != nullptr && empty_dst != nullptr &&
+        empty_scale != nullptr && empty_copy != nullptr);
+    CHECK(ggml_backend_dev_supports_op(dev, empty_scale));
+    CHECK(ggml_backend_dev_supports_op(dev, empty_copy));
+    ggml_tensor * empty_nodes[] = { empty_src, empty_scale, empty_dst, empty_copy };
+    ggml_cgraph empty_graph {};
+    empty_graph.n_nodes = 4;
+    empty_graph.nodes = empty_nodes;
+    CHECK(ggml_backend_graph_compute(backend, &empty_graph) == GGML_STATUS_SUCCESS);
 #if defined(FLAGOS_AMD_CONFIGURED_KERNEL_DIR)
     {
         flagos_device_profile device_profile {};
@@ -176,6 +190,48 @@ int main() {
         ggml_backend_buffer_free(lhs_buffer);
         ggml_backend_buffer_free(rhs_buffer);
         ggml_backend_buffer_free(sum_buffer);
+
+        if (package_metadata.find("flagos_scale_f32") != nullptr) {
+            constexpr float scale_value = 0.75f;
+            constexpr float bias_value = -0.25f;
+            ggml_tensor * scale_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+            ggml_tensor * scale_output = ggml_scale_bias(
+                ctx, scale_input, scale_value, bias_value);
+            CHECK(scale_input != nullptr && scale_output != nullptr);
+            ggml_backend_buffer_t scale_input_buffer =
+                ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(scale_input));
+            ggml_backend_buffer_t scale_output_buffer =
+                ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(scale_output));
+            CHECK(scale_input_buffer != nullptr && scale_output_buffer != nullptr);
+            CHECK(ggml_backend_tensor_alloc(scale_input_buffer, scale_input,
+                ggml_backend_buffer_get_base(scale_input_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(scale_output_buffer, scale_output,
+                ggml_backend_buffer_get_base(scale_output_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_dev_supports_op(dev, scale_output));
+
+            std::vector<float> scale_input_host(256);
+            std::vector<float> scale_output_host(256, -1.0f);
+            for (size_t i = 0; i < scale_input_host.size(); ++i) {
+                scale_input_host[i] = static_cast<float>(i) * 0.125f - 5.0f;
+            }
+            ggml_backend_tensor_set_async(
+                backend, scale_input, scale_input_host.data(), 0, ggml_nbytes(scale_input));
+            ggml_backend_synchronize(backend);
+            ggml_tensor * scale_nodes[] = { scale_output };
+            ggml_cgraph scale_graph {};
+            scale_graph.n_nodes = 1;
+            scale_graph.nodes = scale_nodes;
+            CHECK(ggml_backend_graph_compute(backend, &scale_graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(
+                backend, scale_output, scale_output_host.data(), 0, ggml_nbytes(scale_output));
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < scale_output_host.size(); ++i) {
+                CHECK(std::fabs(scale_output_host[i] -
+                    (scale_input_host[i] * scale_value + bias_value)) < 1e-6f);
+            }
+            ggml_backend_buffer_free(scale_input_buffer);
+            ggml_backend_buffer_free(scale_output_buffer);
+        }
 
         const int64_t rms_rows = 3;
         const int64_t rms_cols = 1536;
