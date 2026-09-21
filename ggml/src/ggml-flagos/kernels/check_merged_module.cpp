@@ -36,6 +36,7 @@ int main(int argc, char ** argv) {
         "flagos_get_rows_q6_k_f32",
         "flagos_get_rows_f32",
         "flagos_ssm_conv_f32",
+        "flagos_ssm_conv_silu_f32",
         "flagos_sub_f32",
         "flagos_div_f32",
         "flagos_sigmoid_f32",

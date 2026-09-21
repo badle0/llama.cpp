@@ -159,6 +159,7 @@ int main(int argc, char ** argv) {
         { "flagos_copy_strided_f32", 19 },
         { "flagos_concat_f32", 21 },
         { "flagos_ssm_conv_f32", 12 },
+        { "flagos_ssm_conv_silu_f32", 12 },
         { "flagos_l2_norm_strided_f32", 9 },
         { "flagos_gated_delta_net_scalar_f32", 24 },
         { "flagos_gated_delta_net_scalar_f32_cache", 26 },

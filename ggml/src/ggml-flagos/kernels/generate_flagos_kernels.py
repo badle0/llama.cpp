@@ -29,6 +29,13 @@ MERGED_MODULE_NAME = "flagos_kernels.cubin"
 
 BLOCK_SIZE = 256
 NUM_WARPS = 4
+# SSM_CONV+SiLU is launch-bound for single-token decode. Providers may tune
+# this independently from the generic elementwise launch without changing the
+# kernel ABI. The common Denglin package keeps the historical 256x4 default.
+SSM_CONV_SILU_BLOCK_SIZE = int(os.environ.get(
+    "FLAGOS_SSM_CONV_SILU_BLOCK_SIZE", str(BLOCK_SIZE)))
+SSM_CONV_SILU_NUM_WARPS = int(os.environ.get(
+    "FLAGOS_SSM_CONV_SILU_NUM_WARPS", str(NUM_WARPS)))
 # Decode GEMV assigns one program to one output row. KS20-A was tuned with one
 # warp; keep this target-selectable so providers can benchmark a different
 # resident-lane count without changing the common kernel ABI.
@@ -307,6 +314,33 @@ def flagos_ssm_conv_f32(
         total += state * weight
 
     tl.store(output + seq * so1 + token * so0 + channels, total, mask=mask)
+
+
+@triton.jit
+def flagos_ssm_conv_silu_f32(
+        s, c, output,
+        d_conv, d_inner, n_tokens, n_seqs,
+        ss1, ss2,
+        sc1,
+        so0, so1,
+        BLOCK: tl.constexpr):
+    # SSM_CONV followed by SiLU. The graph planner proves that the unfused
+    # convolution output has no external consumer before selecting this path.
+    token = tl.program_id(0)
+    seq = tl.program_id(1)
+    base = tl.program_id(2) * BLOCK
+    channels = base + tl.arange(0, BLOCK)
+    mask = channels < d_inner
+
+    total = tl.zeros([BLOCK], dtype=tl.float32)
+    for tap in range(d_conv):
+        state = tl.load(s + seq * ss2 + channels * ss1 + (token + tap),
+                        mask=mask, other=0.0)
+        weight = tl.load(c + channels * sc1 + tap, mask=mask, other=0.0)
+        total += state * weight
+
+    tl.store(output + seq * so1 + token * so0 + channels,
+             total * tl.sigmoid(total), mask=mask)
 
 
 @triton.jit
@@ -2035,6 +2069,16 @@ def make_q6_k_weights(rows: int, blocks: int) -> tuple[torch.Tensor, torch.Tenso
     return packed.reshape(-1).cuda(), dequantized.reshape(rows, blocks * QK_K).cuda()
 
 
+def validate_ssm_conv_silu_launch_contract() -> None:
+    if (SSM_CONV_SILU_BLOCK_SIZE <= 0 or
+            SSM_CONV_SILU_BLOCK_SIZE & (SSM_CONV_SILU_BLOCK_SIZE - 1)):
+        raise RuntimeError(
+            "FLAGOS_SSM_CONV_SILU_BLOCK_SIZE must be a positive power of two")
+    if SSM_CONV_SILU_NUM_WARPS not in (1, 2, 4, 8):
+        raise RuntimeError(
+            "FLAGOS_SSM_CONV_SILU_NUM_WARPS must be one of 1, 2, 4, or 8")
+
+
 def compile_kernels(assert_close=None) -> None:
     """Compile, launch, and numerically validate the common kernel set.
 
@@ -2043,6 +2087,7 @@ def compile_kernels(assert_close=None) -> None:
     PyTorch default.  The validation itself remains mandatory: callers must
     not replace it with a no-op merely to collect compiler artifacts.
     """
+    validate_ssm_conv_silu_launch_contract()
     if assert_close is None:
         assert_close = torch.testing.assert_close
     n_elements = 1009
@@ -2599,6 +2644,29 @@ def compile_kernels(assert_close=None) -> None:
         conv_expected[:, conv_t, :] = (window * conv_weight[None, :, :]).sum(dim=-1)
     assert_close(conv_output, conv_expected, rtol=2e-5, atol=2e-5)
 
+    conv_silu_output = torch.empty_like(conv_output)
+    flagos_ssm_conv_silu_f32[(
+            conv_tokens, conv_seqs,
+            triton.cdiv(conv_d_inner, SSM_CONV_SILU_BLOCK_SIZE))](
+        conv_state,
+        conv_weight,
+        conv_silu_output,
+        conv_d_conv,
+        conv_d_inner,
+        conv_tokens,
+        conv_seqs,
+        conv_state.stride(1),
+        conv_state.stride(0),
+        conv_weight.stride(0),
+        conv_silu_output.stride(1),
+        conv_silu_output.stride(0),
+        BLOCK=SSM_CONV_SILU_BLOCK_SIZE,
+        num_warps=SSM_CONV_SILU_NUM_WARPS,
+    )
+    assert_close(
+        conv_silu_output, torch.nn.functional.silu(conv_expected),
+        rtol=2e-5, atol=2e-5)
+
     gdn_state_size = 128
     gdn_q_heads, gdn_heads = 2, 4
     gdn_tokens, gdn_seqs, gdn_q_seqs = 4, 2, 1
@@ -3141,6 +3209,9 @@ def main() -> None:
             copy_artifact(cache_dir, args.output_dir, "flagos_get_rows_q6_k_f32", QK_K),
             copy_artifact(cache_dir, args.output_dir, "flagos_get_rows_f32", BLOCK_SIZE),
             copy_artifact(cache_dir, args.output_dir, "flagos_ssm_conv_f32", BLOCK_SIZE),
+            copy_artifact(
+                cache_dir, args.output_dir, "flagos_ssm_conv_silu_f32",
+                SSM_CONV_SILU_BLOCK_SIZE),
             copy_artifact(cache_dir, args.output_dir, "flagos_sub_f32", BLOCK_SIZE),
             copy_artifact(cache_dir, args.output_dir, "flagos_div_f32", BLOCK_SIZE),
             copy_artifact(cache_dir, args.output_dir, "flagos_sigmoid_f32", BLOCK_SIZE),

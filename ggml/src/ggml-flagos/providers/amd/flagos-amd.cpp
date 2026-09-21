@@ -248,6 +248,7 @@ struct amd_backend_context {
         std::atomic<uint64_t> fusion_gated_delta_net_cache { 0 };
         std::atomic<uint64_t> fusion_gated_delta_net_cache_only { 0 };
         std::atomic<uint64_t> fusion_gated_delta_net_cache_only_decode { 0 };
+        std::atomic<uint64_t> fusion_ssm_conv_silu { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu_q40_staged { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu_down { 0 };
@@ -652,6 +653,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         "fusion_add_rms_mul=%llu fusion_rope_store=%llu "
         "fusion_flash_decode=%llu fusion_flash_prefill=%llu "
         "fusion_gdn_cache=%llu fusion_gdn_cache_only=%llu fusion_gdn_cache_only_decode=%llu "
+        "fusion_ssm_conv_silu=%llu "
         "fusion_ffn_swiglu=%llu fusion_ffn_q40_staged=%llu fusion_ffn_swiglu_down=%llu "
         "graph_captures=%llu graph_replays=%llu graph_replay_failures=%llu graph_capture_failures=%llu\n",
         (unsigned long long) s.kernel_launches.load(),
@@ -708,6 +710,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.fusion_gated_delta_net_cache.load(),
         (unsigned long long) s.fusion_gated_delta_net_cache_only.load(),
         (unsigned long long) s.fusion_gated_delta_net_cache_only_decode.load(),
+        (unsigned long long) s.fusion_ssm_conv_silu.load(),
         (unsigned long long) s.fusion_ffn_swiglu.load(),
         (unsigned long long) s.fusion_ffn_swiglu_q40_staged.load(),
         (unsigned long long) s.fusion_ffn_swiglu_down.load(),
@@ -2055,10 +2058,12 @@ static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_t
         !amd_tensor_data_overlaps(op, op->src[0]);
 }
 
-static bool amd_supports_ssm_conv(const amd_device_context * device, const ggml_tensor * op) {
+static bool amd_supports_ssm_conv(
+        const amd_device_context * device, const ggml_tensor * op,
+        const char * kernel_name = "flagos_ssm_conv_f32") {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_SSM_CONV || op->src[0] == nullptr || op->src[1] == nullptr ||
-        device->aot->find("flagos_ssm_conv_f32") == nullptr ||
+        kernel_name == nullptr || device->aot->find(kernel_name) == nullptr ||
         op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
         op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
         op->src[0]->nb[0] != sizeof(float) || op->src[1]->nb[0] != sizeof(float) ||
@@ -2078,6 +2083,62 @@ static bool amd_supports_ssm_conv(const amd_device_context * device, const ggml_
     }
     return !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
+}
+
+static bool amd_supports_ssm_conv_silu(
+        const amd_device_context * device,
+        const ggml_tensor * conv,
+        const ggml_tensor * activation) {
+    return amd_supports_ssm_conv(device, conv, "flagos_ssm_conv_silu_f32") &&
+        activation != nullptr && activation->op == GGML_OP_UNARY &&
+        ggml_get_unary_op(activation) == GGML_UNARY_OP_SILU &&
+        amd_tensor_is_contiguous_f32(activation) &&
+        ggml_are_same_shape(activation, conv) && ggml_nelements(activation) > 0 &&
+        ggml_nelements(activation) <= INT32_MAX &&
+        activation->src[0] == conv &&
+        amd_tensor_output_can_reuse_input(activation, conv) &&
+        !amd_tensor_data_overlaps(activation, conv->src[0]) &&
+        !amd_tensor_data_overlaps(activation, conv->src[1]);
+}
+
+static bool amd_launch_ssm_conv(
+        amd_backend_context * context,
+        const ggml_tensor * conv,
+        ggml_tensor * output,
+        const char * kernel_name) {
+    if (context == nullptr || context->device == nullptr || context->device->aot == nullptr ||
+        conv == nullptr || conv->src[0] == nullptr || conv->src[1] == nullptr ||
+        output == nullptr || kernel_name == nullptr) {
+        return false;
+    }
+    const auto * metadata = context->device->aot->find(kernel_name);
+    if (metadata == nullptr) {
+        return false;
+    }
+    int d_conv = static_cast<int>(conv->src[1]->ne[0]);
+    int d_inner = static_cast<int>(conv->ne[0]);
+    int n_tokens = static_cast<int>(conv->ne[1]);
+    int n_seqs = static_cast<int>(conv->ne[2]);
+    int ss1 = static_cast<int>(conv->src[0]->nb[1] / sizeof(float));
+    int ss2 = static_cast<int>(conv->src[0]->nb[2] / sizeof(float));
+    int sc1 = static_cast<int>(conv->src[1]->nb[1] / sizeof(float));
+    int so0 = static_cast<int>(output->nb[1] / sizeof(float));
+    int so1 = static_cast<int>(output->nb[2] / sizeof(float));
+    void * state_data = conv->src[0]->data;
+    void * weight_data = conv->src[1]->data;
+    void * output_data = output->data;
+    flagos_amd::kernel_arguments arguments = {
+        &state_data, &weight_data, &output_data,
+        &d_conv, &d_inner, &n_tokens, &n_seqs,
+        &ss1, &ss2, &sc1, &so0, &so1,
+    };
+    const unsigned int grid_z = static_cast<unsigned int>(
+        (static_cast<uint64_t>(d_inner) + metadata->block_size - 1) /
+        metadata->block_size);
+    return context->device->aot->launch(
+        kernel_name, context->stream,
+        static_cast<unsigned int>(n_tokens),
+        static_cast<unsigned int>(n_seqs), grid_z, arguments);
 }
 
 static bool amd_supports_concat(const amd_device_context * device, const ggml_tensor * op) {
@@ -3312,6 +3373,17 @@ static flagos_lowering_choice amd_query_fusion(
             choice.capture_safe = true;
             choice.implementation_id = residual_and_terminal ? 10 : 2;
         }
+    } else if (candidate.id == flagos_pattern_id::ssm_conv_silu &&
+               candidate.node_indices.size() == 2) {
+        const ggml_tensor * conv = cgraph->nodes[candidate.node_indices[0]];
+        const ggml_tensor * activation = cgraph->nodes[candidate.node_indices[1]];
+        if (amd_candidate_outputs_are(candidate, { 1 }) &&
+            amd_fusion_enabled(context->device, "ssm_conv_silu") &&
+            amd_supports_ssm_conv_silu(context->device, conv, activation)) {
+            choice.supported = true;
+            choice.capture_safe = true;
+            choice.implementation_id = 15;
+        }
     } else if (candidate.id == flagos_pattern_id::rope_kv_store && candidate.node_indices.size() == 3) {
         const ggml_tensor * rope = cgraph->nodes[candidate.node_indices[0]];
         const ggml_tensor * view = cgraph->nodes[candidate.node_indices[1]];
@@ -3518,6 +3590,27 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             amd_trace_op(context, gdn,
                 cache_only_decode ? "gated_delta_net_cache_only_decode" :
                 cache_only ? "gated_delta_net_cache_only" : "gated_delta_net_cache");
+        }
+        return launched;
+    }
+    if (step.candidate.id == flagos_pattern_id::ssm_conv_silu &&
+        step.candidate.node_indices.size() == 2) {
+        if (step.implementation_id != 15 ||
+            !amd_candidate_outputs_are(step.candidate, { 1 })) {
+            return false;
+        }
+        ggml_tensor * conv = cgraph->nodes[step.candidate.node_indices[0]];
+        ggml_tensor * activation = cgraph->nodes[step.candidate.node_indices[1]];
+        if (!amd_supports_ssm_conv_silu(context->device, conv, activation)) {
+            return false;
+        }
+        const bool launched = amd_launch_ssm_conv(
+            context, conv, activation, "flagos_ssm_conv_silu_f32");
+        if (launched) {
+            context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
+            context->stats.fusion_ssm_conv_silu.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(context, activation, "ssm_conv_silu");
         }
         return launched;
     }
@@ -4437,31 +4530,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (node->op == GGML_OP_SSM_CONV && amd_supports_ssm_conv(backend_context->device, node)) {
-            const auto * metadata = backend_context->device->aot->find("flagos_ssm_conv_f32");
-            int d_conv = static_cast<int>(node->src[1]->ne[0]);
-            int d_inner = static_cast<int>(node->ne[0]);
-            int n_tokens = static_cast<int>(node->ne[1]);
-            int n_seqs = static_cast<int>(node->ne[2]);
-            int ss1 = static_cast<int>(node->src[0]->nb[1] / sizeof(float));
-            int ss2 = static_cast<int>(node->src[0]->nb[2] / sizeof(float));
-            int sc1 = static_cast<int>(node->src[1]->nb[1] / sizeof(float));
-            int so0 = static_cast<int>(node->nb[1] / sizeof(float));
-            int so1 = static_cast<int>(node->nb[2] / sizeof(float));
-            void * state_data = node->src[0]->data;
-            void * weight_data = node->src[1]->data;
-            void * output_data = node->data;
-            flagos_amd::kernel_arguments arguments = {
-                &state_data, &weight_data, &output_data,
-                &d_conv, &d_inner, &n_tokens, &n_seqs,
-                &ss1, &ss2, &sc1, &so0, &so1,
-            };
-            const unsigned int grid_z = static_cast<unsigned int>(
-                (static_cast<uint64_t>(d_inner) + metadata->block_size - 1) /
-                metadata->block_size);
-            if (!backend_context->device->aot->launch(
-                    "flagos_ssm_conv_f32", backend_context->stream,
-                    static_cast<unsigned int>(n_tokens),
-                    static_cast<unsigned int>(n_seqs), grid_z, arguments)) {
+            if (!amd_launch_ssm_conv(
+                    backend_context, node, node, "flagos_ssm_conv_f32")) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);

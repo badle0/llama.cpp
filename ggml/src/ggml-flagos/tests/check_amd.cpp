@@ -24,7 +24,15 @@ static void check(bool condition, const char * expression, int line) {
 
 #define CHECK(expression) check((expression), #expression, __LINE__)
 
-int main() {
+int main(int argc, char ** argv) {
+    bool require_ssm_conv_silu = false;
+    if (argc == 2 && std::strcmp(argv[1], "--require-ssm-conv-silu") == 0) {
+        require_ssm_conv_silu = true;
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: %s [--require-ssm-conv-silu]\n", argv[0]);
+        return 2;
+    }
+
     ggml_backend_reg_t reg = ggml_backend_flagos_reg();
     CHECK(reg != nullptr);
 
@@ -1027,6 +1035,101 @@ int main() {
                 ggml_backend_buffer_free(gdn_buffer);
             }
         }
+
+        constexpr int64_t ssm_d_conv = 4;
+        constexpr int64_t ssm_d_inner = 513;
+        constexpr int64_t ssm_tokens = 3;
+        constexpr int64_t ssm_sequences = 2;
+        constexpr float ssm_intermediate_sentinel = -123.25f;
+        ggml_tensor * ssm_state = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, ssm_d_conv - 1 + ssm_tokens,
+            ssm_d_inner, ssm_sequences);
+        ggml_tensor * ssm_weight = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, ssm_d_conv, ssm_d_inner);
+        ggml_tensor * ssm_conv = ggml_ssm_conv(ctx, ssm_state, ssm_weight);
+        ggml_tensor * ssm_silu = ggml_silu(ctx, ssm_conv);
+        CHECK(ssm_state != nullptr && ssm_weight != nullptr &&
+            ssm_conv != nullptr && ssm_silu != nullptr);
+        ggml_backend_buffer_t ssm_state_buffer =
+            ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(ssm_state));
+        ggml_backend_buffer_t ssm_weight_buffer =
+            ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(ssm_weight));
+        ggml_backend_buffer_t ssm_conv_buffer =
+            ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(ssm_conv));
+        ggml_backend_buffer_t ssm_silu_buffer =
+            ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(ssm_silu));
+        CHECK(ssm_state_buffer != nullptr && ssm_weight_buffer != nullptr &&
+            ssm_conv_buffer != nullptr && ssm_silu_buffer != nullptr);
+        CHECK(ggml_backend_tensor_alloc(ssm_state_buffer, ssm_state,
+            ggml_backend_buffer_get_base(ssm_state_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(ssm_weight_buffer, ssm_weight,
+            ggml_backend_buffer_get_base(ssm_weight_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(ssm_conv_buffer, ssm_conv,
+            ggml_backend_buffer_get_base(ssm_conv_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(ssm_silu_buffer, ssm_silu,
+            ggml_backend_buffer_get_base(ssm_silu_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, ssm_conv));
+        CHECK(ggml_backend_dev_supports_op(dev, ssm_silu));
+
+        std::vector<float> ssm_state_host(ggml_nelements(ssm_state));
+        std::vector<float> ssm_weight_host(ggml_nelements(ssm_weight));
+        std::vector<float> ssm_conv_host(
+            ggml_nelements(ssm_conv), ssm_intermediate_sentinel);
+        std::vector<float> ssm_silu_host(ggml_nelements(ssm_silu), 0.0f);
+        std::vector<float> ssm_expected(ssm_silu_host.size(), 0.0f);
+        for (size_t i = 0; i < ssm_state_host.size(); ++i) {
+            ssm_state_host[i] = static_cast<float>(static_cast<int>(i * 17 % 43) - 21) * 0.013f;
+        }
+        for (size_t i = 0; i < ssm_weight_host.size(); ++i) {
+            ssm_weight_host[i] = static_cast<float>(static_cast<int>(i * 11 % 31) - 15) * 0.017f;
+        }
+        const int64_t ssm_state_columns = ssm_d_conv - 1 + ssm_tokens;
+        for (int64_t sequence = 0; sequence < ssm_sequences; ++sequence) {
+            for (int64_t token = 0; token < ssm_tokens; ++token) {
+                for (int64_t channel = 0; channel < ssm_d_inner; ++channel) {
+                    float sum = 0.0f;
+                    for (int64_t tap = 0; tap < ssm_d_conv; ++tap) {
+                        const size_t state_index = static_cast<size_t>(
+                            sequence * ssm_state_columns * ssm_d_inner +
+                            channel * ssm_state_columns + token + tap);
+                        const size_t weight_index = static_cast<size_t>(
+                            channel * ssm_d_conv + tap);
+                        sum += ssm_state_host[state_index] * ssm_weight_host[weight_index];
+                    }
+                    const size_t output_index = static_cast<size_t>(
+                        sequence * ssm_tokens * ssm_d_inner +
+                        token * ssm_d_inner + channel);
+                    ssm_expected[output_index] = sum / (1.0f + std::exp(-sum));
+                }
+            }
+        }
+        ggml_backend_tensor_set_async(
+            backend, ssm_state, ssm_state_host.data(), 0, ggml_nbytes(ssm_state));
+        ggml_backend_tensor_set_async(
+            backend, ssm_weight, ssm_weight_host.data(), 0, ggml_nbytes(ssm_weight));
+        ggml_backend_tensor_set_async(
+            backend, ssm_conv, ssm_conv_host.data(), 0, ggml_nbytes(ssm_conv));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * ssm_nodes[] = { ssm_conv, ssm_silu };
+        ggml_cgraph ssm_graph {};
+        ssm_graph.n_nodes = 2;
+        ssm_graph.nodes = ssm_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &ssm_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(
+            backend, ssm_conv, ssm_conv_host.data(), 0, ggml_nbytes(ssm_conv));
+        ggml_backend_tensor_get_async(
+            backend, ssm_silu, ssm_silu_host.data(), 0, ggml_nbytes(ssm_silu));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < ssm_silu_host.size(); ++i) {
+            CHECK(std::fabs(ssm_silu_host[i] - ssm_expected[i]) < 5e-5f);
+            if (require_ssm_conv_silu) {
+                CHECK(ssm_conv_host[i] == ssm_intermediate_sentinel);
+            }
+        }
+        ggml_backend_buffer_free(ssm_state_buffer);
+        ggml_backend_buffer_free(ssm_weight_buffer);
+        ggml_backend_buffer_free(ssm_conv_buffer);
+        ggml_backend_buffer_free(ssm_silu_buffer);
 
         ggml_tensor * silu_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 513);
         ggml_tensor * silu_output = ggml_silu(ctx, silu_input);

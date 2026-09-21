@@ -854,6 +854,22 @@ int main() {
     plan = flagos_build_graph_plan(&ssm_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
     CHECK(plan->steps[0].candidate.id == flagos_pattern_id::ssm_conv_silu);
+    CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 1);
+    CHECK(plan->steps[0].candidate.required_output_node_indices[0] == 1);
+
+    ggml_tensor ssm_observer {};
+    init_tensor(ssm_observer, GGML_OP_MUL, 256);
+    ssm_observer.src[0] = &ssm_conv;
+    ssm_observer.src[1] = &ssm_input;
+    ggml_tensor * ssm_fanout_nodes[] = { &ssm_conv, &silu, &ssm_observer };
+    ggml_cgraph ssm_fanout_graph {};
+    ssm_fanout_graph.n_nodes = 3;
+    ssm_fanout_graph.nodes = ssm_fanout_nodes;
+    plan = flagos_build_graph_plan(&ssm_fanout_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 3);
+    for (const auto & step : plan->steps) {
+        CHECK(step.kind == flagos_execution_kind::direct);
+    }
 
     ggml_tensor gdn_q {};
     ggml_tensor gdn_k {};
