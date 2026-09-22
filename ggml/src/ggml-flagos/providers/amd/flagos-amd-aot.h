@@ -21,6 +21,7 @@ inline std::string_view base_gcn_arch(std::string_view arch) {
 
 inline constexpr char tuning_profile_gfx1150_q4ffn_v1[] = "gfx1150-wave32-q4ffn-v1";
 inline constexpr char tuning_profile_gfx1150_qwen35_q4km_v2[] = "gfx1150-qwen35-q4km-v2";
+inline constexpr char tuning_profile_gfx1150_qwen35_q4km_v3[] = "gfx1150-qwen35-q4km-v3";
 struct tuned_kernel_abi {
     std::string_view name;
     size_t argument_count;
@@ -56,6 +57,13 @@ inline constexpr tuned_kernel_abi tuning_profile_gfx1150_qwen35_q4km_v2_kernels[
     { name, argument_count, block_size, exact_block_size, tile_m, tile_n, tile_k, num_warps, warp_size },
 #include "flagos-amd-tuning-profile-qwen35.inc"
 #undef FLAGOS_AMD_TUNED_KERNEL_V2
+};
+
+inline constexpr tuned_kernel_abi tuning_profile_gfx1150_qwen35_q4km_v3_kernels[] = {
+#define FLAGOS_AMD_TUNED_KERNEL_V3(name, argument_count, block_size, exact_block_size, tile_m, tile_n, tile_k, num_warps, warp_size) \
+    { name, argument_count, block_size, exact_block_size, tile_m, tile_n, tile_k, num_warps, warp_size },
+#include "flagos-amd-tuning-profile-qwen35-v3.inc"
+#undef FLAGOS_AMD_TUNED_KERNEL_V3
 };
 
 // The metadata is the ABI contract between FlagTree's Triton compiler and the

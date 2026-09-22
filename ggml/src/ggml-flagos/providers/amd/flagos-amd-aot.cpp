@@ -630,7 +630,8 @@ bool kernel_registry::initialize(
             tuning_profile_ = package.value("tuning_profile", "");
             if (!tuning_profile_.empty() &&
                 tuning_profile_ != tuning_profile_gfx1150_q4ffn_v1 &&
-                tuning_profile_ != tuning_profile_gfx1150_qwen35_q4km_v2) {
+                tuning_profile_ != tuning_profile_gfx1150_qwen35_q4km_v2 &&
+                tuning_profile_ != tuning_profile_gfx1150_qwen35_q4km_v3) {
                 GGML_LOG_ERROR("FlagOS AMD AOT: unsupported tuning profile: %s\n",
                     tuning_profile_.c_str());
                 reset();
@@ -765,7 +766,8 @@ bool kernel_registry::initialize(
             return true;
         };
         if (!apply_known_abis(tuning_profile_gfx1150_q4ffn_v1_kernels) ||
-            !apply_known_abis(tuning_profile_gfx1150_qwen35_q4km_v2_kernels)) {
+            !apply_known_abis(tuning_profile_gfx1150_qwen35_q4km_v2_kernels) ||
+            !apply_known_abis(tuning_profile_gfx1150_qwen35_q4km_v3_kernels)) {
             reset();
             return false;
         }
@@ -799,7 +801,9 @@ bool kernel_registry::initialize(
         if ((tuning_profile_ == tuning_profile_gfx1150_q4ffn_v1 &&
              !validate_profile(tuning_profile_gfx1150_q4ffn_v1_kernels)) ||
             (tuning_profile_ == tuning_profile_gfx1150_qwen35_q4km_v2 &&
-             !validate_profile(tuning_profile_gfx1150_qwen35_q4km_v2_kernels))) {
+             !validate_profile(tuning_profile_gfx1150_qwen35_q4km_v2_kernels)) ||
+            (tuning_profile_ == tuning_profile_gfx1150_qwen35_q4km_v3 &&
+             !validate_profile(tuning_profile_gfx1150_qwen35_q4km_v3_kernels))) {
             reset();
             return false;
         }

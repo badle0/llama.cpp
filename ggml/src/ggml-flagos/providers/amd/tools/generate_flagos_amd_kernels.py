@@ -1943,6 +1943,78 @@ def amd_jit_specialization_attrs(pointer_count: int, scalar_indices: tuple[int, 
     return attrs
 
 
+def amd_q4_dequant_num_warps(arch: str, tuning_profile: str = "") -> int:
+    """Choose the validated Q4_K cache-decode launch width for this target."""
+    configured = os.environ.get("FLAGOS_Q4_DEQUANT_NUM_WARPS")
+    if tuning_profile:
+        _, contracts = tuning_profile_contracts(tuning_profile)
+        num_warps = contracts["flagos_dequant_q4_k_f16"].num_warps
+        if configured is not None and int(configured) != num_warps:
+            raise RuntimeError(
+                "FLAGOS_Q4_DEQUANT_NUM_WARPS conflicts with the tuning profile")
+    else:
+        num_warps = int(configured) if configured is not None else (
+            2 if arch == "gfx1150" else NUM_WARPS
+        )
+    if num_warps not in (1, 2, 4, 8):
+        raise RuntimeError("FLAGOS_Q4_DEQUANT_NUM_WARPS must be 1, 2, 4, or 8")
+    return num_warps
+
+
+def compile_q4_dequant_kernel_without_launch(
+        output_dir: Path, arch: str, tuning_profile: str = "") -> dict:
+    """Compile the Q4_K-to-F16 cache fill with the target launch width."""
+    if not arch:
+        raise RuntimeError("--compile-only requires --arch")
+    name = "flagos_dequant_q4_k_f16"
+    signature = {
+        "weights_u8": "*u8", "weights_f16": "*fp16", "output": "*fp16",
+    }
+    source = ASTSource(
+        common.flagos_dequant_q4_k_f16,
+        signature,
+        {},
+        attrs=amd_jit_specialization_attrs(3, ()),
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", arch, 32),
+        options={"num_warps": amd_q4_dequant_num_warps(arch, tuning_profile)},
+    )
+    metadata = compiled.metadata
+    global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+    if global_scratch_size or metadata.profile_scratch_size:
+        raise RuntimeError(
+            f"{name} requires unsupported Triton scratch storage "
+            f"(global={global_scratch_size}, profile={metadata.profile_scratch_size})"
+        )
+    output = output_dir / f"{name}.hsaco"
+    output.write_bytes(compiled.asm["hsaco"])
+    return {
+        "name": name,
+        "symbol": name,
+        "file": output.name,
+        "shared": metadata.shared,
+        "num_warps": metadata.num_warps,
+        "warp_size": metadata.warp_size,
+        "block_size": common.QK_K,
+        "tile_m": 0,
+        "tile_n": 0,
+        "tile_k": 0,
+        "argument_count": 3,
+        "global_scratch_size": global_scratch_size,
+        "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+        "profile_scratch_size": metadata.profile_scratch_size,
+        "profile_scratch_align": metadata.profile_scratch_align,
+    }
+
+
+def compile_q4_dequant_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Write a one-kernel Q4_K cache-decode tuning package."""
+    kernel = compile_q4_dequant_kernel_without_launch(output_dir, arch)
+    write_manifest(output_dir, arch, [kernel])
+
+
 def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the common SCALE kernel for an AMD package without a device launch."""
     if not arch:
@@ -2823,6 +2895,7 @@ def main() -> None:
     only_q4_gemv_narrow8 = os.environ.get("FLAGOS_AMD_ONLY_Q4_GEMV_NARROW8") == "1"
     only_q5_gemv_narrow16 = os.environ.get("FLAGOS_AMD_ONLY_Q5_GEMV_NARROW16") == "1"
     only_q40_gemv_narrow = os.environ.get("FLAGOS_AMD_ONLY_Q40_GEMV_NARROW") == "1"
+    only_q4_dequant = os.environ.get("FLAGOS_AMD_ONLY_Q4_DEQUANT") == "1"
     only_q41_q80 = os.environ.get("FLAGOS_AMD_ONLY_Q41_Q80") == "1"
     only_gdn_cache = os.environ.get("FLAGOS_AMD_ONLY_GDN_CACHE") == "1"
     only_gdn_cache_only = os.environ.get("FLAGOS_AMD_ONLY_GDN_CACHE_ONLY") == "1"
@@ -2841,7 +2914,7 @@ def main() -> None:
     if sum((only_residual, only_residual_narrow, only_q4_ffn_decode, only_q40_ffn_decode,
             only_q4_ffn_decode_staged, only_q40_ffn_decode_staged,
             only_q4_gemv_narrow8, only_q5_gemv_narrow16, only_q40_gemv_narrow,
-            only_q41_q80, only_gdn_cache, only_gdn_cache_only,
+            only_q4_dequant, only_q41_q80, only_gdn_cache, only_gdn_cache_only,
             only_gdn_cache_only_decode, only_f16_gemm, only_ffn_fusion,
             only_ffn_down_f16, only_scale, only_ssm_conv_silu, only_silu_mul,
             only_unary_mul, only_gdn_alpha_gate, only_gdn_q8_gate,
@@ -2852,7 +2925,7 @@ def main() -> None:
                 only_q4_ffn_decode or only_q40_ffn_decode or only_q4_ffn_decode_staged or
                 only_q40_ffn_decode_staged or
                 only_q4_gemv_narrow8 or only_q5_gemv_narrow16 or
-                only_q40_gemv_narrow or only_q41_q80 or
+                only_q40_gemv_narrow or only_q4_dequant or only_q41_q80 or
                 only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode or
                 only_scale or only_ssm_conv_silu or only_silu_mul or only_unary_mul or
                 only_gdn_alpha_gate or only_gdn_q8_gate or
@@ -2867,6 +2940,7 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_Q4_GEMV_NARROW8=1, "
                 "FLAGOS_AMD_ONLY_Q5_GEMV_NARROW16=1, "
                 "FLAGOS_AMD_ONLY_Q40_GEMV_NARROW=1, "
+                "FLAGOS_AMD_ONLY_Q4_DEQUANT=1, "
                 "FLAGOS_AMD_ONLY_Q41_Q80=1, "
                 "FLAGOS_AMD_ONLY_GDN_CACHE=1, "
                 "FLAGOS_AMD_ONLY_GDN_CACHE_ONLY=1 or "
@@ -2888,6 +2962,8 @@ def main() -> None:
             compile_q5_narrow16_package_without_launch(args.output_dir, args.arch)
         elif only_q40_gemv_narrow:
             compile_q40_narrow_package_without_launch(args.output_dir, args.arch)
+        elif only_q4_dequant:
+            compile_q4_dequant_package_without_launch(args.output_dir, args.arch)
         elif only_q41_q80:
             compile_q41_q80_package_without_launch(args.output_dir, args.arch)
         elif only_scale:
@@ -2924,6 +3000,8 @@ def main() -> None:
         raise RuntimeError("FLAGOS_AMD_ONLY_Q5_GEMV_NARROW16 requires --compile-only")
     if only_q40_gemv_narrow:
         raise RuntimeError("FLAGOS_AMD_ONLY_Q40_GEMV_NARROW requires --compile-only")
+    if only_q4_dequant:
+        raise RuntimeError("FLAGOS_AMD_ONLY_Q4_DEQUANT requires --compile-only")
     if only_gdn_cache:
         raise RuntimeError("FLAGOS_AMD_ONLY_GDN_CACHE requires --compile-only")
     if only_gdn_cache_only:
@@ -3110,16 +3188,20 @@ def main() -> None:
              contract.exact_block_size)
             for name, contract in contracts.items()
         ]
+    arch = args.arch or triton.runtime.driver.active.get_current_target().arch
     manifest_kernels = []
     for entry in names:
         name, block = entry[:2]
         tile_m, tile_n, tile_k = (tuple(entry[2:]) + (0, 0, 0))[:3]
-        kernel = copy_artifact(
-            args.cache_dir, args.output_dir, name, block, tile_m, tile_n, tile_k)
+        if name == "flagos_dequant_q4_k_f16":
+            kernel = compile_q4_dequant_kernel_without_launch(
+                args.output_dir, arch, tuning_profile)
+        else:
+            kernel = copy_artifact(
+                args.cache_dir, args.output_dir, name, block, tile_m, tile_n, tile_k)
         if len(entry) > 5 and entry[5]:
             kernel["exact_block_size"] = True
         manifest_kernels.append(kernel)
-    arch = args.arch or triton.runtime.driver.active.get_current_target().arch
     write_manifest(args.output_dir, arch, manifest_kernels)
     commit_output()
     print(f"wrote {len(manifest_kernels)} AMD kernels for {arch} to {final_output_dir}")
