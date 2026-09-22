@@ -27,14 +27,18 @@ static void check(bool condition, const char * expression, int line) {
 int main(int argc, char ** argv) {
     bool require_ssm_conv_silu = false;
     bool require_attention_output_gate = false;
+    bool require_gdn_gate_projections = false;
     for (int argument = 1; argument < argc; ++argument) {
         if (std::strcmp(argv[argument], "--require-ssm-conv-silu") == 0) {
             require_ssm_conv_silu = true;
         } else if (std::strcmp(argv[argument], "--require-attention-output-gate") == 0) {
             require_attention_output_gate = true;
+        } else if (std::strcmp(argv[argument], "--require-gdn-gate-projections") == 0) {
+            require_gdn_gate_projections = true;
         } else {
             std::fprintf(stderr,
-                "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate]\n",
+                "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate] "
+                "[--require-gdn-gate-projections]\n",
                 argv[0]);
             return 2;
         }
@@ -1491,6 +1495,174 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_free(alpha_add_buffer);
         ggml_backend_buffer_free(alpha_softplus_buffer);
         ggml_backend_buffer_free(alpha_output_buffer);
+
+        constexpr int64_t gate_projection_k = 2560;
+        constexpr int64_t gate_projection_rows = 32;
+        constexpr float gate_projection_sentinel = -91.25f;
+        ggml_tensor * beta_projection_weights = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_Q8_0, gate_projection_k, gate_projection_rows);
+        ggml_tensor * alpha_projection_weights = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_Q8_0, gate_projection_k, gate_projection_rows);
+        ggml_tensor * gate_projection_input = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, gate_projection_k, 1);
+        ggml_tensor * beta_projection = ggml_mul_mat(
+            ctx, beta_projection_weights, gate_projection_input);
+        ggml_tensor * beta_projection_view = ggml_reshape_2d(
+            ctx, beta_projection, 1, gate_projection_rows);
+        ggml_tensor * beta_sigmoid = ggml_sigmoid(ctx, beta_projection_view);
+        ggml_tensor * alpha_projection = ggml_mul_mat(
+            ctx, alpha_projection_weights, gate_projection_input);
+        ggml_tensor * alpha_projection_view = ggml_reshape_3d(
+            ctx, alpha_projection, gate_projection_rows, 1, 1);
+        ggml_tensor * gate_projection_bias = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, gate_projection_rows);
+        ggml_tensor * gate_projection_scale = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, gate_projection_rows);
+        ggml_tensor * gate_projection_add = ggml_add(
+            ctx, alpha_projection_view, gate_projection_bias);
+        ggml_tensor * gate_projection_softplus = ggml_softplus(
+            ctx, gate_projection_add);
+        ggml_tensor * gate_projection_alpha = ggml_mul(
+            ctx, gate_projection_softplus, gate_projection_scale);
+        CHECK(beta_projection_weights && alpha_projection_weights &&
+            gate_projection_input && beta_projection && beta_projection_view &&
+            beta_sigmoid && alpha_projection && alpha_projection_view &&
+            gate_projection_bias && gate_projection_scale &&
+            gate_projection_add && gate_projection_softplus && gate_projection_alpha);
+        beta_sigmoid->flags |= GGML_TENSOR_FLAG_OUTPUT;
+        const ggml_tensor * gate_projection_tensors[] = {
+            beta_projection_weights, alpha_projection_weights, gate_projection_input,
+            beta_projection, beta_sigmoid, alpha_projection, gate_projection_bias,
+            gate_projection_scale, gate_projection_add, gate_projection_softplus,
+            gate_projection_alpha,
+        };
+        std::vector<ggml_backend_buffer_t> gate_projection_buffers;
+        for (const ggml_tensor * tensor : gate_projection_tensors) {
+            ggml_backend_buffer_t tensor_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(tensor));
+            CHECK(tensor_buffer != nullptr);
+            CHECK(ggml_backend_tensor_alloc(tensor_buffer,
+                const_cast<ggml_tensor *>(tensor), ggml_backend_buffer_get_base(tensor_buffer)) ==
+                GGML_STATUS_SUCCESS);
+            gate_projection_buffers.push_back(tensor_buffer);
+        }
+        CHECK(ggml_backend_view_init(beta_projection_view) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_view_init(alpha_projection_view) == GGML_STATUS_SUCCESS);
+        const size_t gate_weight_elements = static_cast<size_t>(
+            gate_projection_k * gate_projection_rows);
+        std::vector<float> beta_weights_host(gate_weight_elements);
+        std::vector<float> alpha_weights_host(gate_weight_elements);
+        std::vector<uint8_t> beta_weights_quantized(
+            ggml_nbytes(beta_projection_weights));
+        std::vector<uint8_t> alpha_weights_quantized(
+            ggml_nbytes(alpha_projection_weights));
+        std::vector<float> gate_projection_input_host(
+            static_cast<size_t>(gate_projection_k));
+        std::vector<float> gate_projection_bias_host(
+            static_cast<size_t>(gate_projection_rows));
+        std::vector<float> gate_projection_scale_host(
+            static_cast<size_t>(gate_projection_rows));
+        for (size_t i = 0; i < gate_weight_elements; ++i) {
+            beta_weights_host[i] =
+                static_cast<float>(static_cast<int>(i * 17 % 127) - 63) * 0.004f;
+            alpha_weights_host[i] =
+                static_cast<float>(static_cast<int>(i * 29 % 131) - 65) * 0.0035f;
+        }
+        for (size_t i = 0; i < gate_projection_input_host.size(); ++i) {
+            gate_projection_input_host[i] =
+                static_cast<float>(static_cast<int>(i * 11 % 97) - 48) * 0.006f;
+        }
+        for (size_t i = 0; i < gate_projection_bias_host.size(); ++i) {
+            gate_projection_bias_host[i] =
+                static_cast<float>(static_cast<int>(i * 7 % 23) - 11) * 0.013f;
+            gate_projection_scale_host[i] =
+                static_cast<float>(static_cast<int>(i * 5 % 19) - 9) * 0.021f;
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, beta_weights_host.data(),
+            beta_weights_quantized.data(), 0, gate_projection_rows,
+            gate_projection_k, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, alpha_weights_host.data(),
+            alpha_weights_quantized.data(), 0, gate_projection_rows,
+            gate_projection_k, nullptr);
+        ggml_backend_tensor_set_async(backend, beta_projection_weights,
+            beta_weights_quantized.data(), 0, beta_weights_quantized.size());
+        ggml_backend_tensor_set_async(backend, alpha_projection_weights,
+            alpha_weights_quantized.data(), 0, alpha_weights_quantized.size());
+        ggml_backend_tensor_set_async(backend, gate_projection_input,
+            gate_projection_input_host.data(), 0, ggml_nbytes(gate_projection_input));
+        ggml_backend_tensor_set_async(backend, gate_projection_bias,
+            gate_projection_bias_host.data(), 0, ggml_nbytes(gate_projection_bias));
+        ggml_backend_tensor_set_async(backend, gate_projection_scale,
+            gate_projection_scale_host.data(), 0, ggml_nbytes(gate_projection_scale));
+        const ggml_tensor * gate_projection_intermediates[] = {
+            beta_projection, alpha_projection, gate_projection_add,
+            gate_projection_softplus,
+        };
+        std::vector<float> gate_projection_intermediate_host(
+            static_cast<size_t>(gate_projection_rows), gate_projection_sentinel);
+        for (const ggml_tensor * tensor : gate_projection_intermediates) {
+            ggml_backend_tensor_set_async(backend, const_cast<ggml_tensor *>(tensor),
+                gate_projection_intermediate_host.data(), 0, ggml_nbytes(tensor));
+        }
+        ggml_backend_synchronize(backend);
+        ggml_tensor * gate_projection_nodes[] = {
+            beta_projection, beta_projection_view, beta_sigmoid,
+            alpha_projection, alpha_projection_view, gate_projection_add,
+            gate_projection_softplus, gate_projection_alpha,
+        };
+        ggml_cgraph gate_projection_graph {};
+        gate_projection_graph.n_nodes = 8;
+        gate_projection_graph.nodes = gate_projection_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &gate_projection_graph) ==
+            GGML_STATUS_SUCCESS);
+        std::vector<float> beta_gate_host(
+            static_cast<size_t>(gate_projection_rows));
+        std::vector<float> alpha_gate_host(
+            static_cast<size_t>(gate_projection_rows));
+        ggml_backend_tensor_get_async(backend, beta_sigmoid,
+            beta_gate_host.data(), 0, ggml_nbytes(beta_sigmoid));
+        ggml_backend_tensor_get_async(backend, gate_projection_alpha,
+            alpha_gate_host.data(), 0, ggml_nbytes(gate_projection_alpha));
+        ggml_backend_synchronize(backend);
+        const size_t gate_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, gate_projection_k);
+        const auto * q8_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        std::vector<float> beta_dequantized(static_cast<size_t>(gate_projection_k));
+        std::vector<float> alpha_dequantized(static_cast<size_t>(gate_projection_k));
+        for (int64_t row = 0; row < gate_projection_rows; ++row) {
+            q8_traits->to_float(beta_weights_quantized.data() +
+                static_cast<size_t>(row) * gate_row_bytes,
+                beta_dequantized.data(), gate_projection_k);
+            q8_traits->to_float(alpha_weights_quantized.data() +
+                static_cast<size_t>(row) * gate_row_bytes,
+                alpha_dequantized.data(), gate_projection_k);
+            float beta_value = 0.0f;
+            float alpha_value = 0.0f;
+            for (int64_t column = 0; column < gate_projection_k; ++column) {
+                const float input_value = gate_projection_input_host[static_cast<size_t>(column)];
+                beta_value += beta_dequantized[static_cast<size_t>(column)] * input_value;
+                alpha_value += alpha_dequantized[static_cast<size_t>(column)] * input_value;
+            }
+            const float beta_expected = 1.0f / (1.0f + std::exp(-beta_value));
+            const float biased = alpha_value + gate_projection_bias_host[static_cast<size_t>(row)];
+            const float alpha_expected =
+                (biased > 20.0f ? biased : std::log1p(std::exp(biased))) *
+                gate_projection_scale_host[static_cast<size_t>(row)];
+            CHECK(std::fabs(beta_gate_host[static_cast<size_t>(row)] - beta_expected) < 3e-2f);
+            CHECK(std::fabs(alpha_gate_host[static_cast<size_t>(row)] - alpha_expected) < 3e-2f);
+        }
+        if (require_gdn_gate_projections) {
+            for (const ggml_tensor * tensor : gate_projection_intermediates) {
+                ggml_backend_tensor_get_async(backend, const_cast<ggml_tensor *>(tensor),
+                    gate_projection_intermediate_host.data(), 0, ggml_nbytes(tensor));
+                ggml_backend_synchronize(backend);
+                for (float value : gate_projection_intermediate_host) {
+                    CHECK(value == gate_projection_sentinel);
+                }
+            }
+        }
+        for (ggml_backend_buffer_t tensor_buffer : gate_projection_buffers) {
+            ggml_backend_buffer_free(tensor_buffer);
+        }
 
         ggml_tensor * gate_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
         ggml_tensor * up_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);

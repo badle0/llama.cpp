@@ -29,6 +29,8 @@ enum class flagos_pattern_id : uint32_t {
     rms_norm_mul_rope_kv_store = 14,
     // Gate/up projections, SwiGLU, and down projection with private GLU scratch.
     ffn_swiglu_down      = 15,
+    // Parallel GDN alpha/beta projections and their decode gate epilogues.
+    gdn_gate_projections = 16,
 };
 
 const char * flagos_pattern_name(flagos_pattern_id id);

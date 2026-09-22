@@ -164,6 +164,7 @@ int main(int argc, char ** argv) {
         { "flagos_sigmoid_mul_f32", 4 },
         { "flagos_softplus_mul_f32", 4 },
         { "flagos_gdn_alpha_gate_f32", 5 },
+        { "flagos_gdn_q8_gate_projections_f32", 11 },
         { "flagos_rms_norm_mul_inplace_f32_narrow", 5 },
         { "flagos_l2_norm_strided_f32", 9 },
         { "flagos_gated_delta_net_scalar_f32", 24 },
@@ -222,6 +223,16 @@ int main(int argc, char ** argv) {
         CHECK(alpha_gate->num_warps == 1 || alpha_gate->num_warps == 2 ||
             alpha_gate->num_warps == 4 || alpha_gate->num_warps == 8);
         CHECK(alpha_gate->warp_size == 32);
+    }
+    if (const auto * gate_projections = registry.find(
+            "flagos_gdn_q8_gate_projections_f32")) {
+        CHECK(gate_projections->argument_count == 11);
+        CHECK(gate_projections->block_size == 4);
+        CHECK(gate_projections->tile_m == 4);
+        CHECK(gate_projections->tile_n == 32);
+        CHECK(gate_projections->tile_k == 2560);
+        CHECK(gate_projections->num_warps == 1);
+        CHECK(gate_projections->warp_size == 32);
     }
     if (const auto * gdn_cache = registry.find("flagos_gated_delta_net_scalar_f32_cache")) {
         CHECK(gdn_cache->block_size == 128);

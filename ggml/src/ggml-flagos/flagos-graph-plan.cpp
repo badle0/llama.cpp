@@ -30,6 +30,7 @@ const char * flagos_pattern_name(flagos_pattern_id id) {
         case flagos_pattern_id::flash_attn_decode:       return "flash_attn_decode";
         case flagos_pattern_id::flash_attn_prefill:      return "flash_attn_prefill";
         case flagos_pattern_id::attention_output_gate:   return "attention_output_gate";
+        case flagos_pattern_id::gdn_gate_projections:    return "gdn_gate_projections";
     }
     return "unknown";
 }
@@ -101,6 +102,7 @@ flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id) {
         case flagos_pattern_id::rope_kv_store:
         case flagos_pattern_id::qkv_mrope_kv_store:
         case flagos_pattern_id::attention_output_gate:
+        case flagos_pattern_id::gdn_gate_projections:
             return flagos_fusion_scope::graph;
     }
     return flagos_fusion_scope::graph;
@@ -400,6 +402,67 @@ static bool flagos_is_view_or_noop(const ggml_tensor * node) {
     return node != nullptr && (ggml_is_empty(node) || node->op == GGML_OP_NONE ||
         node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
         node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+}
+
+static const ggml_tensor * flagos_unwrap_alias_source(const ggml_tensor * tensor) {
+    while (tensor != nullptr && flagos_is_view_or_noop(tensor) &&
+           tensor->src[0] != nullptr) {
+        tensor = tensor->src[0];
+    }
+    return tensor;
+}
+
+static int flagos_find_node_index(
+        const ggml_cgraph * cgraph,
+        const ggml_tensor * tensor,
+        int begin,
+        int end) {
+    if (cgraph == nullptr || tensor == nullptr || begin < 0 || end < begin ||
+        end > cgraph->n_nodes) {
+        return -1;
+    }
+    for (int index = begin; index < end; ++index) {
+        if (cgraph->nodes[index] == tensor) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+// Follow a source tensor backwards through zero-launch graph aliases to a
+// specific producer. Append materialized alias nodes in execution order. A
+// view can also be elided from cgraph->nodes; in that case its src[0] edge is
+// still safe to follow but there is no index to cover.
+static bool flagos_collect_alias_path(
+        const ggml_cgraph * cgraph,
+        int producer_index,
+        int consumer_index,
+        const ggml_tensor * source,
+        std::vector<int> & indices) {
+    if (cgraph == nullptr || producer_index < 0 || consumer_index <= producer_index ||
+        consumer_index > cgraph->n_nodes || source == nullptr) {
+        return false;
+    }
+    const ggml_tensor * producer = cgraph->nodes[producer_index];
+    std::vector<int> reverse_indices;
+    const ggml_tensor * current = source;
+    while (current != producer) {
+        if (!flagos_is_view_or_noop(current) || current->src[0] == nullptr) {
+            return false;
+        }
+        const int current_index = flagos_find_node_index(
+            cgraph, current, 0, cgraph->n_nodes);
+        if (current_index >= 0) {
+            if (current_index <= producer_index || current_index >= consumer_index) {
+                return false;
+            }
+            reverse_indices.push_back(current_index);
+        }
+        current = current->src[0];
+    }
+    std::reverse(reverse_indices.begin(), reverse_indices.end());
+    indices.insert(indices.end(), reverse_indices.begin(), reverse_indices.end());
+    return true;
 }
 
 static bool flagos_is_gated_delta_net_cache_copy(
@@ -1026,6 +1089,111 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                         candidates.push_back(biased_candidate);
                     }
                 }
+            }
+        }
+
+        // Qwen GDN decode uses two small projections from the same activation:
+        // beta -> Sigmoid and alpha -> Add(bias) -> Softplus -> Mul(scale).
+        // Match backwards from the terminal alpha gate to avoid a broad
+        // combinatorial search across unrelated matrix multiplications.
+        if (node->op == GGML_OP_MUL) {
+            const ggml_tensor * alpha_softplus =
+                node->src[0] != nullptr && node->src[0]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(node->src[0]) == GGML_UNARY_OP_SOFTPLUS
+                ? node->src[0]
+                : node->src[1] != nullptr && node->src[1]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(node->src[1]) == GGML_UNARY_OP_SOFTPLUS
+                ? node->src[1] : nullptr;
+            const ggml_tensor * alpha_add = alpha_softplus != nullptr
+                ? alpha_softplus->src[0] : nullptr;
+            const int alpha_softplus_index = flagos_find_node_index(
+                cgraph, alpha_softplus, 0, i);
+            const int alpha_add_index = flagos_find_node_index(
+                cgraph, alpha_add, 0, alpha_softplus_index);
+            int alpha_projection_index = -1;
+            const ggml_tensor * alpha_projection = nullptr;
+            std::vector<int> alpha_aliases;
+            if (alpha_add != nullptr && alpha_add->op == GGML_OP_ADD &&
+                alpha_add_index >= 0 && alpha_softplus_index > alpha_add_index &&
+                flagos_is_mul_of(node, alpha_softplus)) {
+                for (int source = 0; source < 2 && alpha_projection == nullptr; ++source) {
+                    const ggml_tensor * root = flagos_unwrap_alias_source(
+                        alpha_add->src[source]);
+                    const int root_index = flagos_find_node_index(
+                        cgraph, root, 0, alpha_add_index);
+                    std::vector<int> aliases;
+                    if (root != nullptr && root->op == GGML_OP_MUL_MAT && root_index >= 0 &&
+                        flagos_collect_alias_path(
+                            cgraph, root_index, alpha_add_index, alpha_add->src[source], aliases)) {
+                        alpha_projection = root;
+                        alpha_projection_index = root_index;
+                        alpha_aliases = std::move(aliases);
+                    }
+                }
+            }
+
+            int beta_projection_index = -1;
+            int beta_sigmoid_index = -1;
+            std::vector<int> beta_aliases;
+            if (alpha_projection != nullptr && alpha_projection->src[1] != nullptr) {
+                for (int sigmoid_index = 0;
+                     sigmoid_index < alpha_projection_index; ++sigmoid_index) {
+                    const ggml_tensor * sigmoid = cgraph->nodes[sigmoid_index];
+                    if (sigmoid->op != GGML_OP_UNARY ||
+                        ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID) {
+                        continue;
+                    }
+                    const ggml_tensor * beta_projection = flagos_unwrap_alias_source(
+                        sigmoid->src[0]);
+                    const int projection_index = flagos_find_node_index(
+                        cgraph, beta_projection, 0, sigmoid_index);
+                    std::vector<int> aliases;
+                    if (beta_projection != nullptr && beta_projection->op == GGML_OP_MUL_MAT &&
+                        projection_index >= 0 && beta_projection != alpha_projection &&
+                        beta_projection->src[1] == alpha_projection->src[1] &&
+                        flagos_collect_alias_path(
+                            cgraph, projection_index, sigmoid_index,
+                            sigmoid->src[0], aliases)) {
+                        beta_projection_index = projection_index;
+                        beta_sigmoid_index = sigmoid_index;
+                        beta_aliases = std::move(aliases);
+                        break;
+                    }
+                }
+            }
+            bool crosses_barrier = false;
+            for (int index = beta_projection_index;
+                 index >= 0 && index <= i; ++index) {
+                if (flagos_is_graph_barrier(cgraph->nodes[index])) {
+                    crosses_barrier = true;
+                    break;
+                }
+            }
+            if (beta_projection_index >= 0 && !crosses_barrier) {
+                flagos_pattern_candidate candidate;
+                candidate.id = flagos_pattern_id::gdn_gate_projections;
+                candidate.scope = flagos_pattern_scope(candidate.id);
+                candidate.node_indices = { beta_projection_index };
+                candidate.node_indices.insert(
+                    candidate.node_indices.end(), beta_aliases.begin(), beta_aliases.end());
+                candidate.node_indices.push_back(beta_sigmoid_index);
+                candidate.node_indices.push_back(alpha_projection_index);
+                candidate.node_indices.insert(
+                    candidate.node_indices.end(), alpha_aliases.begin(), alpha_aliases.end());
+                candidate.node_indices.push_back(alpha_add_index);
+                candidate.node_indices.push_back(alpha_softplus_index);
+                candidate.node_indices.push_back(i);
+                std::sort(candidate.node_indices.begin(), candidate.node_indices.end());
+                candidate.node_indices.erase(
+                    std::unique(candidate.node_indices.begin(), candidate.node_indices.end()),
+                    candidate.node_indices.end());
+                candidate.eliminated_read_bytes =
+                    flagos_tensor_bytes(cgraph->nodes[beta_projection_index]) +
+                    flagos_tensor_bytes(alpha_projection) +
+                    flagos_tensor_bytes(alpha_add) +
+                    flagos_tensor_bytes(alpha_softplus);
+                candidate.eliminated_launches = 5;
+                candidates.push_back(std::move(candidate));
             }
         }
 

@@ -98,6 +98,25 @@ static flagos_lowering_choice query_pattern_terminal_only(
     return result;
 }
 
+static flagos_lowering_choice query_pattern_gdn_gate_outputs(
+        void * user_data,
+        const ggml_cgraph * cgraph,
+        const flagos_pattern_candidate & candidate) {
+    auto result = query_pattern(user_data, cgraph, candidate);
+    if (!result.supported || candidate.required_output_node_indices.size() != 2 ||
+        candidate.required_output_node_indices.back() != candidate.node_indices.back()) {
+        return {};
+    }
+    const int beta_index = candidate.required_output_node_indices.front();
+    const ggml_tensor * beta = beta_index >= 0 && beta_index < cgraph->n_nodes
+        ? cgraph->nodes[beta_index] : nullptr;
+    if (beta == nullptr || beta->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(beta) != GGML_UNARY_OP_SIGMOID) {
+        return {};
+    }
+    return result;
+}
+
 struct interface_state {
     flagos_pattern_id supported = flagos_pattern_id::none;
     int execute_count = 0;
@@ -145,6 +164,7 @@ int main() {
     static_assert(static_cast<uint32_t>(flagos_pattern_id::rms_norm_mul) == 1);
     static_assert(static_cast<uint32_t>(flagos_pattern_id::attention_output_gate) == 12);
     static_assert(static_cast<uint32_t>(flagos_pattern_id::rms_norm_mul_rope) == 13);
+    static_assert(static_cast<uint32_t>(flagos_pattern_id::gdn_gate_projections) == 16);
     static_assert(static_cast<uint32_t>(flagos_quantized_matmul_kind::q4_k) == 1);
     static_assert(static_cast<uint32_t>(flagos_quantized_matmul_kind::q6_k) == 2);
     static_assert(static_cast<uint32_t>(flagos_quantized_matmul_kind::q4_0) == 3);
@@ -962,6 +982,92 @@ int main() {
     CHECK(plan->steps[1].kind == flagos_execution_kind::pattern);
     CHECK(plan->steps[1].candidate.node_indices.size() == 2);
     CHECK(plan->steps[2].kind == flagos_execution_kind::direct);
+
+    ggml_tensor gdn_gate_input {};
+    ggml_tensor gdn_beta_weight {};
+    ggml_tensor gdn_alpha_weight {};
+    ggml_tensor gdn_beta_projection {};
+    ggml_tensor gdn_beta_view {};
+    ggml_tensor gdn_beta_sigmoid {};
+    ggml_tensor gdn_alpha_projection {};
+    ggml_tensor gdn_alpha_view {};
+    ggml_tensor gdn_gate_bias {};
+    ggml_tensor gdn_gate_scale {};
+    ggml_tensor gdn_gate_add {};
+    ggml_tensor gdn_gate_softplus {};
+    ggml_tensor gdn_gate_alpha_output {};
+    ggml_tensor gdn_gate_consumer {};
+    init_tensor(gdn_gate_input, GGML_OP_NONE, 2560);
+    init_tensor(gdn_beta_weight, GGML_OP_NONE, 2560, 32);
+    init_tensor(gdn_alpha_weight, GGML_OP_NONE, 2560, 32);
+    init_tensor(gdn_beta_projection, GGML_OP_MUL_MAT, 32);
+    init_tensor(gdn_beta_view, GGML_OP_RESHAPE, 1, 32);
+    init_tensor(gdn_beta_sigmoid, GGML_OP_UNARY, 1, 32);
+    init_tensor(gdn_alpha_projection, GGML_OP_MUL_MAT, 32);
+    init_tensor(gdn_alpha_view, GGML_OP_RESHAPE, 32);
+    init_tensor(gdn_gate_bias, GGML_OP_NONE, 32);
+    init_tensor(gdn_gate_scale, GGML_OP_NONE, 32);
+    init_tensor(gdn_gate_add, GGML_OP_ADD, 32);
+    init_tensor(gdn_gate_softplus, GGML_OP_UNARY, 32);
+    init_tensor(gdn_gate_alpha_output, GGML_OP_MUL, 32);
+    init_tensor(gdn_gate_consumer, GGML_OP_ADD, 32);
+    gdn_beta_projection.src[0] = &gdn_beta_weight;
+    gdn_beta_projection.src[1] = &gdn_gate_input;
+    gdn_beta_view.src[0] = &gdn_beta_projection;
+    gdn_beta_view.view_src = &gdn_beta_projection;
+    gdn_beta_sigmoid.src[0] = &gdn_beta_view;
+    const int32_t sigmoid_op = GGML_UNARY_OP_SIGMOID;
+    std::memcpy(gdn_beta_sigmoid.op_params, &sigmoid_op, sizeof(sigmoid_op));
+    gdn_alpha_projection.src[0] = &gdn_alpha_weight;
+    gdn_alpha_projection.src[1] = &gdn_gate_input;
+    gdn_alpha_view.src[0] = &gdn_alpha_projection;
+    gdn_alpha_view.view_src = &gdn_alpha_projection;
+    gdn_gate_add.src[0] = &gdn_alpha_view;
+    gdn_gate_add.src[1] = &gdn_gate_bias;
+    gdn_gate_softplus.src[0] = &gdn_gate_add;
+    std::memcpy(gdn_gate_softplus.op_params, &softplus_op, sizeof(softplus_op));
+    gdn_gate_alpha_output.src[0] = &gdn_gate_softplus;
+    gdn_gate_alpha_output.src[1] = &gdn_gate_scale;
+    gdn_gate_consumer.src[0] = &gdn_gate_alpha_output;
+    gdn_gate_consumer.src[1] = &gdn_beta_sigmoid;
+    ggml_tensor * gdn_gate_nodes[] = {
+        &gdn_beta_projection, &gdn_beta_view, &gdn_beta_sigmoid,
+        &gdn_alpha_projection, &gdn_alpha_view, &gdn_gate_add,
+        &gdn_gate_softplus, &gdn_gate_alpha_output, &gdn_gate_consumer,
+    };
+    ggml_cgraph gdn_gate_graph {};
+    gdn_gate_graph.n_nodes = 9;
+    gdn_gate_graph.nodes = gdn_gate_nodes;
+    supported = flagos_pattern_id::gdn_gate_projections;
+    plan = flagos_build_graph_plan(
+        &gdn_gate_graph, query_pattern_gdn_gate_outputs, &supported);
+    CHECK(plan->steps.size() == 2);
+    CHECK(plan->steps[0].candidate.id == flagos_pattern_id::gdn_gate_projections);
+    CHECK(plan->steps[0].candidate.node_indices.size() == 8);
+    CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 2);
+    CHECK(plan->steps[0].candidate.required_output_node_indices[0] == 2);
+    CHECK(plan->steps[0].candidate.required_output_node_indices[1] == 7);
+    CHECK(plan->steps[1].kind == flagos_execution_kind::direct);
+
+    ggml_tensor gdn_gate_add_observer {};
+    init_tensor(gdn_gate_add_observer, GGML_OP_ADD, 32);
+    gdn_gate_add_observer.src[0] = &gdn_gate_add;
+    gdn_gate_add_observer.src[1] = &gdn_gate_bias;
+    ggml_tensor * gdn_gate_fanout_nodes[] = {
+        &gdn_beta_projection, &gdn_beta_view, &gdn_beta_sigmoid,
+        &gdn_alpha_projection, &gdn_alpha_view, &gdn_gate_add,
+        &gdn_gate_softplus, &gdn_gate_alpha_output, &gdn_gate_consumer,
+        &gdn_gate_add_observer,
+    };
+    ggml_cgraph gdn_gate_fanout_graph {};
+    gdn_gate_fanout_graph.n_nodes = 10;
+    gdn_gate_fanout_graph.nodes = gdn_gate_fanout_nodes;
+    plan = flagos_build_graph_plan(
+        &gdn_gate_fanout_graph, query_pattern_gdn_gate_outputs, &supported);
+    CHECK(plan->steps.size() == 10);
+    for (const auto & step : plan->steps) {
+        CHECK(step.kind == flagos_execution_kind::direct);
+    }
 
     ggml_tensor gate_observer {};
     init_tensor(gate_observer, GGML_OP_ADD, 128, 32);

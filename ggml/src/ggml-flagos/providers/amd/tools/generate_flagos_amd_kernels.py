@@ -267,6 +267,14 @@ AMD_GDN_ALPHA_GATE_BLOCK_SIZE = int(os.environ.get(
     "FLAGOS_AMD_GDN_ALPHA_GATE_BLOCK_SIZE", "256"))
 AMD_GDN_ALPHA_GATE_NUM_WARPS = int(os.environ.get(
     "FLAGOS_AMD_GDN_ALPHA_GATE_NUM_WARPS", "4"))
+AMD_GDN_Q8_GATE_ROWS = int(os.environ.get(
+    "FLAGOS_AMD_GDN_Q8_GATE_ROWS", "32"))
+AMD_GDN_Q8_GATE_K = int(os.environ.get(
+    "FLAGOS_AMD_GDN_Q8_GATE_K", "2560"))
+AMD_GDN_Q8_GATE_BLOCK_M = int(os.environ.get(
+    "FLAGOS_AMD_GDN_Q8_GATE_BLOCK_M", "4"))
+AMD_GDN_Q8_GATE_NUM_WARPS = int(os.environ.get(
+    "FLAGOS_AMD_GDN_Q8_GATE_NUM_WARPS", "1"))
 AMD_SOFTMAX_BLOCK_SIZE = 4096
 ATTENTION_HEAD_DIM = 128
 ATTENTION_BLOCK_M = 16
@@ -380,6 +388,41 @@ def flagos_gdn_alpha_gate_f32(
     factors = tl.load(scale + columns, mask=mask, other=0.0)
     activated = tl.where(values > 20.0, values, tl.log(1.0 + tl.exp(values)))
     tl.store(output + offsets, activated * factors, mask=mask)
+
+
+@triton.jit
+def flagos_gdn_q8_gate_projections_f32(
+    alpha_weights_u8, alpha_weights_f16,
+    beta_weights_u8, beta_weights_f16,
+    x, alpha_bias, alpha_scale, alpha_output, beta_output, k, rows,
+    BLOCK_M: tl.constexpr,
+):
+    """Two Q8_0 decode projections with Qwen GDN gate epilogues."""
+    row_ids = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    lanes = tl.arange(0, 32)
+    alpha_accumulator = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+    beta_accumulator = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+    blocks = k // 32
+    for block in tl.range(0, blocks):
+        packed_block = row_ids[:, None] * blocks + block
+        block_byte = packed_block * 34
+        alpha_d = tl.load(alpha_weights_f16 + packed_block * 17).to(tl.float32)
+        beta_d = tl.load(beta_weights_f16 + packed_block * 17).to(tl.float32)
+        alpha_q = tl.load(alpha_weights_u8 + block_byte + 2 + lanes[None, :])
+        beta_q = tl.load(beta_weights_u8 + block_byte + 2 + lanes[None, :])
+        activation = tl.load(x + block * 32 + lanes).to(tl.float32)
+        alpha_accumulator += (
+            alpha_d * alpha_q.to(tl.int8).to(tl.float32) * activation[None, :])
+        beta_accumulator += (
+            beta_d * beta_q.to(tl.int8).to(tl.float32) * activation[None, :])
+    mask = row_ids < rows
+    alpha = tl.sum(alpha_accumulator, axis=1)
+    alpha += tl.load(alpha_bias + row_ids, mask=mask, other=0.0)
+    alpha = tl.where(alpha > 20.0, alpha, tl.log(1.0 + tl.exp(alpha)))
+    alpha *= tl.load(alpha_scale + row_ids, mask=mask, other=0.0)
+    beta = tl.sigmoid(tl.sum(beta_accumulator, axis=1))
+    tl.store(alpha_output + row_ids, alpha, mask=mask)
+    tl.store(beta_output + row_ids, beta, mask=mask)
 
 
 @triton.jit
@@ -2151,6 +2194,58 @@ def compile_gdn_alpha_gate_package_without_launch(output_dir: Path, arch: str) -
     }])
 
 
+def compile_gdn_q8_gate_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the exact Qwen3.5 decode GDN projection fusion."""
+    if not arch:
+        raise RuntimeError("--compile-only requires --arch")
+    if AMD_GDN_Q8_GATE_ROWS != 32 or AMD_GDN_Q8_GATE_K != 2560:
+        raise RuntimeError("the initial GDN Q8 gate contract requires rows=32 and k=2560")
+    if AMD_GDN_Q8_GATE_BLOCK_M != 4 or AMD_GDN_Q8_GATE_NUM_WARPS != 1:
+        raise RuntimeError("the validated gfx1150 GDN Q8 gate contract requires block_m=4 and one warp")
+    name = "flagos_gdn_q8_gate_projections_f32"
+    signature = {
+        "alpha_weights_u8": "*u8", "alpha_weights_f16": "*fp16",
+        "beta_weights_u8": "*u8", "beta_weights_f16": "*fp16",
+        "x": "*fp32", "alpha_bias": "*fp32", "alpha_scale": "*fp32",
+        "alpha_output": "*fp32", "beta_output": "*fp32",
+        "k": "i32", "rows": "i32", "BLOCK_M": "constexpr",
+    }
+    source = ASTSource(
+        flagos_gdn_q8_gate_projections_f32,
+        signature,
+        {"BLOCK_M": AMD_GDN_Q8_GATE_BLOCK_M},
+        attrs=amd_jit_specialization_attrs(9, (9, 10)),
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", arch, 32),
+        options={"num_warps": AMD_GDN_Q8_GATE_NUM_WARPS},
+    )
+    metadata = compiled.metadata
+    global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+    if global_scratch_size or metadata.profile_scratch_size:
+        raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+    output = output_dir / f"{name}.hsaco"
+    output.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{
+        "name": name,
+        "symbol": name,
+        "file": output.name,
+        "shared": metadata.shared,
+        "num_warps": metadata.num_warps,
+        "warp_size": metadata.warp_size,
+        "block_size": AMD_GDN_Q8_GATE_BLOCK_M,
+        "tile_m": AMD_GDN_Q8_GATE_BLOCK_M,
+        "tile_n": AMD_GDN_Q8_GATE_ROWS,
+        "tile_k": AMD_GDN_Q8_GATE_K,
+        "argument_count": 11,
+        "global_scratch_size": global_scratch_size,
+        "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+        "profile_scratch_size": metadata.profile_scratch_size,
+        "profile_scratch_align": metadata.profile_scratch_align,
+    }])
+
+
 def compile_rms_norm_narrow_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the exact-width RMSNorm+scale kernel without a device launch."""
     if not arch:
@@ -2741,6 +2836,7 @@ def main() -> None:
     only_silu_mul = os.environ.get("FLAGOS_AMD_ONLY_SILU_MUL") == "1"
     only_unary_mul = os.environ.get("FLAGOS_AMD_ONLY_UNARY_MUL") == "1"
     only_gdn_alpha_gate = os.environ.get("FLAGOS_AMD_ONLY_GDN_ALPHA_GATE") == "1"
+    only_gdn_q8_gate = os.environ.get("FLAGOS_AMD_ONLY_GDN_Q8_GATE") == "1"
     only_rms_norm_narrow = os.environ.get("FLAGOS_AMD_ONLY_RMS_NORM_NARROW") == "1"
     if sum((only_residual, only_residual_narrow, only_q4_ffn_decode, only_q40_ffn_decode,
             only_q4_ffn_decode_staged, only_q40_ffn_decode_staged,
@@ -2748,7 +2844,7 @@ def main() -> None:
             only_q41_q80, only_gdn_cache, only_gdn_cache_only,
             only_gdn_cache_only_decode, only_f16_gemm, only_ffn_fusion,
             only_ffn_down_f16, only_scale, only_ssm_conv_silu, only_silu_mul,
-            only_unary_mul, only_gdn_alpha_gate,
+            only_unary_mul, only_gdn_alpha_gate, only_gdn_q8_gate,
             only_rms_norm_narrow)) > 1:
         raise RuntimeError("select only one FLAGOS_AMD_ONLY_* tuning mode")
     if args.compile_only:
@@ -2759,7 +2855,7 @@ def main() -> None:
                 only_q40_gemv_narrow or only_q41_q80 or
                 only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode or
                 only_scale or only_ssm_conv_silu or only_silu_mul or only_unary_mul or
-                only_gdn_alpha_gate or
+                only_gdn_alpha_gate or only_gdn_q8_gate or
                 only_rms_norm_narrow):
             raise RuntimeError(
                 "--compile-only requires FLAGOS_AMD_ONLY_RESIDUAL=1, "
@@ -2780,6 +2876,7 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_SILU_MUL=1 or "
                 "FLAGOS_AMD_ONLY_UNARY_MUL=1 or "
                 "FLAGOS_AMD_ONLY_GDN_ALPHA_GATE=1 or "
+                "FLAGOS_AMD_ONLY_GDN_Q8_GATE=1 or "
                 "FLAGOS_AMD_ONLY_RMS_NORM_NARROW=1")
         os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir)
         if only_residual or only_residual_narrow:
@@ -2803,6 +2900,8 @@ def main() -> None:
             compile_unary_mul_package_without_launch(args.output_dir, args.arch)
         elif only_gdn_alpha_gate:
             compile_gdn_alpha_gate_package_without_launch(args.output_dir, args.arch)
+        elif only_gdn_q8_gate:
+            compile_gdn_q8_gate_package_without_launch(args.output_dir, args.arch)
         elif only_rms_norm_narrow:
             compile_rms_norm_narrow_package_without_launch(args.output_dir, args.arch)
         elif only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode:
@@ -2842,6 +2941,8 @@ def main() -> None:
         raise RuntimeError("FLAGOS_AMD_ONLY_UNARY_MUL requires --compile-only")
     if only_gdn_alpha_gate:
         raise RuntimeError("FLAGOS_AMD_ONLY_GDN_ALPHA_GATE requires --compile-only")
+    if only_gdn_q8_gate:
+        raise RuntimeError("FLAGOS_AMD_ONLY_GDN_Q8_GATE requires --compile-only")
     if only_rms_norm_narrow:
         raise RuntimeError("FLAGOS_AMD_ONLY_RMS_NORM_NARROW requires --compile-only")
     compile_common = (os.environ.get("FLAGOS_AMD_SKIP_COMMON", "0") != "1" and

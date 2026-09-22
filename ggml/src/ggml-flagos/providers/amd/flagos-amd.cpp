@@ -252,6 +252,7 @@ struct amd_backend_context {
         std::atomic<uint64_t> fusion_ssm_conv_silu { 0 };
         std::atomic<uint64_t> fusion_attention_output_gate { 0 };
         std::atomic<uint64_t> fusion_gdn_alpha_gate { 0 };
+        std::atomic<uint64_t> fusion_gdn_gate_projections { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu_q40_staged { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu_down { 0 };
@@ -657,6 +658,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         "fusion_flash_decode=%llu fusion_flash_prefill=%llu "
         "fusion_gdn_cache=%llu fusion_gdn_cache_only=%llu fusion_gdn_cache_only_decode=%llu "
         "fusion_ssm_conv_silu=%llu fusion_attention_output_gate=%llu fusion_gdn_alpha_gate=%llu "
+        "fusion_gdn_gate_projections=%llu "
         "fusion_ffn_swiglu=%llu fusion_ffn_q40_staged=%llu fusion_ffn_swiglu_down=%llu "
         "graph_captures=%llu graph_replays=%llu graph_replay_failures=%llu graph_capture_failures=%llu\n",
         (unsigned long long) s.kernel_launches.load(),
@@ -717,6 +719,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.fusion_ssm_conv_silu.load(),
         (unsigned long long) s.fusion_attention_output_gate.load(),
         (unsigned long long) s.fusion_gdn_alpha_gate.load(),
+        (unsigned long long) s.fusion_gdn_gate_projections.load(),
         (unsigned long long) s.fusion_ffn_swiglu.load(),
         (unsigned long long) s.fusion_ffn_swiglu_q40_staged.load(),
         (unsigned long long) s.fusion_ffn_swiglu_down.load(),
@@ -2756,6 +2759,175 @@ static bool amd_supports_quantized_mul_mat(const amd_device_context * device, co
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
+struct amd_gdn_gate_projection_match {
+    const ggml_tensor * beta_projection = nullptr;
+    const ggml_tensor * beta_sigmoid = nullptr;
+    const ggml_tensor * alpha_projection = nullptr;
+    const ggml_tensor * alpha_add = nullptr;
+    const ggml_tensor * alpha_softplus = nullptr;
+    const ggml_tensor * alpha_mul = nullptr;
+    const ggml_tensor * alpha_bias = nullptr;
+    const ggml_tensor * alpha_scale = nullptr;
+    size_t beta_output_position = 0;
+    size_t alpha_output_position = 0;
+};
+
+static const ggml_tensor * amd_unwrap_graph_alias(const ggml_tensor * tensor) {
+    while (tensor != nullptr &&
+           (tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
+            tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE)) {
+        tensor = tensor->src[0];
+    }
+    return tensor;
+}
+
+static bool amd_match_gdn_gate_projections(
+        const ggml_cgraph * cgraph,
+        const flagos_pattern_candidate & candidate,
+        amd_gdn_gate_projection_match * match) {
+    if (cgraph == nullptr || match == nullptr || candidate.node_indices.size() < 6) {
+        return false;
+    }
+    *match = {};
+    const ggml_tensor * projections[2] = {};
+    size_t projection_count = 0;
+    for (size_t position = 0; position < candidate.node_indices.size(); ++position) {
+        const int index = candidate.node_indices[position];
+        if (index < 0 || index >= cgraph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * node = cgraph->nodes[index];
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+                if (projection_count >= 2) {
+                    return false;
+                }
+                projections[projection_count++] = node;
+                break;
+            case GGML_OP_ADD:
+                if (match->alpha_add != nullptr) {
+                    return false;
+                }
+                match->alpha_add = node;
+                break;
+            case GGML_OP_MUL:
+                if (match->alpha_mul != nullptr) {
+                    return false;
+                }
+                match->alpha_mul = node;
+                match->alpha_output_position = position;
+                break;
+            case GGML_OP_UNARY:
+                if (ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+                    match->beta_sigmoid == nullptr) {
+                    match->beta_sigmoid = node;
+                    match->beta_output_position = position;
+                } else if (ggml_get_unary_op(node) == GGML_UNARY_OP_SOFTPLUS &&
+                           match->alpha_softplus == nullptr) {
+                    match->alpha_softplus = node;
+                } else {
+                    return false;
+                }
+                break;
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                break;
+            default:
+                return false;
+        }
+    }
+    if (projection_count != 2 || match->beta_sigmoid == nullptr ||
+        match->alpha_add == nullptr || match->alpha_softplus == nullptr ||
+        match->alpha_mul == nullptr ||
+        match->alpha_softplus->src[0] != match->alpha_add ||
+        amd_attention_output_gate_other(match->alpha_softplus, match->alpha_mul) == nullptr) {
+        return false;
+    }
+    match->beta_projection = amd_unwrap_graph_alias(match->beta_sigmoid->src[0]);
+    const ggml_tensor * alpha_source0 = amd_unwrap_graph_alias(match->alpha_add->src[0]);
+    const ggml_tensor * alpha_source1 = amd_unwrap_graph_alias(match->alpha_add->src[1]);
+    if (match->beta_projection == nullptr ||
+        (match->beta_projection != projections[0] && match->beta_projection != projections[1])) {
+        return false;
+    }
+    if (alpha_source0 != match->beta_projection &&
+        (alpha_source0 == projections[0] || alpha_source0 == projections[1])) {
+        match->alpha_projection = alpha_source0;
+        match->alpha_bias = match->alpha_add->src[1];
+    } else if (alpha_source1 != match->beta_projection &&
+               (alpha_source1 == projections[0] || alpha_source1 == projections[1])) {
+        match->alpha_projection = alpha_source1;
+        match->alpha_bias = match->alpha_add->src[0];
+    } else {
+        return false;
+    }
+    match->alpha_scale = amd_attention_output_gate_other(
+        match->alpha_softplus, match->alpha_mul);
+    return match->alpha_projection != match->beta_projection &&
+        match->alpha_projection->src[1] != nullptr &&
+        match->alpha_projection->src[1] == match->beta_projection->src[1] &&
+        match->alpha_bias != nullptr && match->alpha_scale != nullptr;
+}
+
+static bool amd_supports_gdn_gate_projections(
+        const amd_device_context * device,
+        const amd_gdn_gate_projection_match & match) {
+    static constexpr const char * kernel_name = "flagos_gdn_q8_gate_projections_f32";
+    const auto * metadata = device != nullptr && device->aot != nullptr
+        ? device->aot->find(kernel_name) : nullptr;
+    if (metadata == nullptr || metadata->block_size != 4 || metadata->tile_m != 4 ||
+        metadata->tile_n != 32 || metadata->tile_k != 2560 || metadata->num_warps != 1) {
+        return false;
+    }
+    flagos_quantized_matmul_signature alpha_signature;
+    flagos_quantized_matmul_signature beta_signature;
+    if (!flagos_describe_quantized_matmul(match.alpha_projection, &alpha_signature) ||
+        !flagos_describe_quantized_matmul(match.beta_projection, &beta_signature) ||
+        !amd_i32_matrix_offsets_fit(alpha_signature) ||
+        !amd_i32_matrix_offsets_fit(beta_signature) ||
+        alpha_signature.weight_kind != flagos_quantized_matmul_kind::q8_0 ||
+        beta_signature.weight_kind != flagos_quantized_matmul_kind::q8_0 ||
+        alpha_signature.k != 2560 || alpha_signature.rows != 32 ||
+        alpha_signature.columns != 1 || beta_signature.k != alpha_signature.k ||
+        beta_signature.rows != alpha_signature.rows ||
+        beta_signature.columns != alpha_signature.columns) {
+        return false;
+    }
+    const ggml_tensor * activation = match.alpha_projection->src[1];
+    const ggml_tensor * alpha_weights = match.alpha_projection->src[0];
+    const ggml_tensor * beta_weights = match.beta_projection->src[0];
+    if (!amd_tensor_is_contiguous_f32(activation) ||
+        !ggml_is_contiguous(alpha_weights) || !ggml_is_contiguous(beta_weights) ||
+        !amd_tensor_is_contiguous_f32(match.alpha_bias) ||
+        !amd_tensor_is_contiguous_f32(match.alpha_scale) ||
+        !amd_tensor_is_contiguous_f32(match.alpha_mul) ||
+        !amd_tensor_is_contiguous_f32(match.beta_sigmoid) ||
+        ggml_nelements(activation) != alpha_signature.k ||
+        ggml_nelements(match.alpha_bias) != alpha_signature.rows ||
+        ggml_nelements(match.alpha_scale) != alpha_signature.rows ||
+        ggml_nelements(match.alpha_mul) != alpha_signature.rows ||
+        ggml_nelements(match.beta_sigmoid) != alpha_signature.rows) {
+        return false;
+    }
+    const ggml_tensor * outputs[] = { match.alpha_mul, match.beta_sigmoid };
+    const ggml_tensor * inputs[] = {
+        activation, alpha_weights, beta_weights, match.alpha_bias, match.alpha_scale,
+    };
+    if (amd_tensor_data_overlaps(outputs[0], outputs[1])) {
+        return false;
+    }
+    for (const ggml_tensor * output : outputs) {
+        for (const ggml_tensor * input : inputs) {
+            if (amd_tensor_data_overlaps(output, input)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The FFN fusion consumes the same quantized projections accepted by the
 // opt-in F16 dequant-cache path, but combines both projections and the
 // terminal split SwiGLU into one launch.  Keep this capability deliberately
@@ -3492,6 +3664,18 @@ static flagos_lowering_choice amd_query_fusion(
             choice.capture_safe = true;
             choice.implementation_id = 15;
         }
+    } else if (candidate.id == flagos_pattern_id::gdn_gate_projections) {
+        amd_gdn_gate_projection_match match;
+        if (amd_match_gdn_gate_projections(cgraph, candidate, &match) &&
+            match.beta_output_position < match.alpha_output_position &&
+            amd_candidate_outputs_are(candidate, {
+                match.beta_output_position, match.alpha_output_position }) &&
+            amd_fusion_enabled(context->device, "gdn_gate_projections") &&
+            amd_supports_gdn_gate_projections(context->device, match)) {
+            choice.supported = true;
+            choice.capture_safe = true;
+            choice.implementation_id = 18;
+        }
     } else if (candidate.id == flagos_pattern_id::attention_output_gate &&
                candidate.node_indices.size() == 3) {
         const ggml_tensor * add = cgraph->nodes[candidate.node_indices[0]];
@@ -3742,6 +3926,52 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_ssm_conv_silu.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(context, activation, "ssm_conv_silu");
+        }
+        return launched;
+    }
+    if (step.candidate.id == flagos_pattern_id::gdn_gate_projections) {
+        if (step.implementation_id != 18) {
+            return false;
+        }
+        amd_gdn_gate_projection_match match;
+        if (!amd_match_gdn_gate_projections(cgraph, step.candidate, &match) ||
+            match.beta_output_position >= match.alpha_output_position ||
+            !amd_candidate_outputs_are(step.candidate, {
+                match.beta_output_position, match.alpha_output_position }) ||
+            !amd_supports_gdn_gate_projections(context->device, match)) {
+            return false;
+        }
+        static constexpr const char * kernel_name =
+            "flagos_gdn_q8_gate_projections_f32";
+        const auto * metadata = context->device->aot->find(kernel_name);
+        void * alpha_weights_u8 = match.alpha_projection->src[0]->data;
+        void * alpha_weights_f16 = match.alpha_projection->src[0]->data;
+        void * beta_weights_u8 = match.beta_projection->src[0]->data;
+        void * beta_weights_f16 = match.beta_projection->src[0]->data;
+        void * activation = match.alpha_projection->src[1]->data;
+        void * alpha_bias = match.alpha_bias->data;
+        void * alpha_scale = match.alpha_scale->data;
+        void * alpha_output = match.alpha_mul->data;
+        void * beta_output = match.beta_sigmoid->data;
+        int k = static_cast<int>(match.alpha_projection->src[0]->ne[0]);
+        int rows = static_cast<int>(match.alpha_projection->src[0]->ne[1]);
+        flagos_amd::kernel_arguments arguments = {
+            &alpha_weights_u8, &alpha_weights_f16,
+            &beta_weights_u8, &beta_weights_f16,
+            &activation, &alpha_bias, &alpha_scale,
+            &alpha_output, &beta_output, &k, &rows,
+        };
+        const unsigned int grid_x = static_cast<unsigned int>(
+            (static_cast<uint64_t>(rows) + metadata->block_size - 1) /
+            metadata->block_size);
+        const bool launched = context->device->aot->launch(
+            kernel_name, context->stream, grid_x, 1, 1, arguments);
+        if (launched) {
+            context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
+            context->stats.fusion_gdn_gate_projections.fetch_add(
+                1, std::memory_order_relaxed);
+            amd_trace_op(context, match.alpha_mul, "gdn_gate_projections");
         }
         return launched;
     }
