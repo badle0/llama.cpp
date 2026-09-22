@@ -972,13 +972,17 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
             }
         }
 
-        // Gated residual/output paths commonly materialize SiLU first and
-        // multiply it by an already available tensor.  Keep the matmul that
-        // produces the gate outside this candidate: a side-plan executes at
-        // its first covered node, so only inputs available at the SiLU entry
-        // may be consumed by the fused lowering.
-        if (node->op == GGML_OP_UNARY &&
-            ggml_get_unary_op(node) == GGML_UNARY_OP_SILU) {
+        // Gated residual/output paths commonly materialize an activation first
+        // and multiply it by an already available tensor. These are the same
+        // three unary variants fused by the CUDA backend. Keep any producer
+        // outside this candidate: a side-plan executes at its first covered
+        // node, so only inputs available at the unary entry may be consumed by
+        // the fused lowering.
+        const bool is_gated_unary = node->op == GGML_OP_UNARY &&
+            (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU ||
+             ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID ||
+             ggml_get_unary_op(node) == GGML_UNARY_OP_SOFTPLUS);
+        if (is_gated_unary) {
             int mul_index = -1;
             for (int j = i + 1; j < cgraph->n_nodes; ++j) {
                 if (flagos_is_mul_of(cgraph->nodes[j], node)) {

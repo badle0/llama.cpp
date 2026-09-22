@@ -1315,6 +1315,80 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_free(gated_silu_buffer);
         ggml_backend_buffer_free(gated_output_buffer);
 
+        const auto check_unary_output_gate = [&](ggml_unary_op unary_op) {
+            constexpr int64_t columns = 37;
+            constexpr int64_t rows = 5;
+            constexpr float intermediate_sentinel = -73.25f;
+            ggml_tensor * input = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F32, columns, rows);
+            ggml_tensor * other = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F32, columns, rows);
+            ggml_tensor * activation = ggml_unary(ctx, input, unary_op);
+            ggml_tensor * output = ggml_mul(ctx, activation, other);
+            CHECK(input && other && activation && output);
+            ggml_backend_buffer_t input_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(input));
+            ggml_backend_buffer_t other_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(other));
+            ggml_backend_buffer_t activation_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(activation));
+            ggml_backend_buffer_t output_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(output));
+            CHECK(input_buffer && other_buffer && activation_buffer && output_buffer);
+            CHECK(ggml_backend_tensor_alloc(input_buffer, input,
+                ggml_backend_buffer_get_base(input_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(other_buffer, other,
+                ggml_backend_buffer_get_base(other_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(activation_buffer, activation,
+                ggml_backend_buffer_get_base(activation_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(output_buffer, output,
+                ggml_backend_buffer_get_base(output_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_dev_supports_op(dev, activation));
+            CHECK(ggml_backend_dev_supports_op(dev, output));
+            const size_t n = static_cast<size_t>(ggml_nelements(output));
+            std::vector<float> input_host(n);
+            std::vector<float> other_host(n);
+            std::vector<float> activation_host(n, intermediate_sentinel);
+            std::vector<float> output_host(n, 0.0f);
+            for (size_t i = 0; i < n; ++i) {
+                input_host[i] = static_cast<float>(static_cast<int>(i * 17 % 113) - 56) * 0.073f;
+                other_host[i] = static_cast<float>(static_cast<int>(i * 29 % 89) - 44) * 0.019f;
+            }
+            ggml_backend_tensor_set_async(
+                backend, input, input_host.data(), 0, ggml_nbytes(input));
+            ggml_backend_tensor_set_async(
+                backend, other, other_host.data(), 0, ggml_nbytes(other));
+            ggml_backend_tensor_set_async(
+                backend, activation, activation_host.data(), 0, ggml_nbytes(activation));
+            ggml_backend_synchronize(backend);
+            ggml_tensor * nodes[] = { activation, output };
+            ggml_cgraph graph {};
+            graph.n_nodes = 2;
+            graph.nodes = nodes;
+            CHECK(ggml_backend_graph_compute(backend, &graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(
+                backend, activation, activation_host.data(), 0, ggml_nbytes(activation));
+            ggml_backend_tensor_get_async(
+                backend, output, output_host.data(), 0, ggml_nbytes(output));
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < n; ++i) {
+                const float value = input_host[i];
+                const float activated = unary_op == GGML_UNARY_OP_SIGMOID
+                    ? 1.0f / (1.0f + std::exp(-value))
+                    : std::log1p(std::exp(value));
+                CHECK(std::fabs(output_host[i] - activated * other_host[i]) < 8e-5f);
+                if (require_attention_output_gate) {
+                    CHECK(activation_host[i] == intermediate_sentinel);
+                }
+            }
+            ggml_backend_buffer_free(input_buffer);
+            ggml_backend_buffer_free(other_buffer);
+            ggml_backend_buffer_free(activation_buffer);
+            ggml_backend_buffer_free(output_buffer);
+        };
+        check_unary_output_gate(GGML_UNARY_OP_SIGMOID);
+        check_unary_output_gate(GGML_UNARY_OP_SOFTPLUS);
+
         ggml_tensor * gate_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
         ggml_tensor * up_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
         ggml_tensor * swiglu_tensor = ggml_swiglu_split(ctx, gate_tensor, up_tensor);

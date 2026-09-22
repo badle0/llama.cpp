@@ -2119,16 +2119,27 @@ static const ggml_tensor * amd_attention_output_gate_other(
     return nullptr;
 }
 
+static const char * amd_attention_output_gate_kernel(const ggml_tensor * activation) {
+    if (activation == nullptr || activation->op != GGML_OP_UNARY) {
+        return nullptr;
+    }
+    switch (ggml_get_unary_op(activation)) {
+        case GGML_UNARY_OP_SILU:     return "flagos_silu_mul_f32";
+        case GGML_UNARY_OP_SIGMOID:  return "flagos_sigmoid_mul_f32";
+        case GGML_UNARY_OP_SOFTPLUS: return "flagos_softplus_mul_f32";
+        default:                     return nullptr;
+    }
+}
+
 static bool amd_supports_attention_output_gate(
         const amd_device_context * device,
         const ggml_tensor * activation,
         const ggml_tensor * mul) {
     const ggml_tensor * other = amd_attention_output_gate_other(activation, mul);
+    const char * kernel_name = amd_attention_output_gate_kernel(activation);
     if (device == nullptr || device->aot == nullptr || activation == nullptr ||
         activation->src[0] == nullptr || other == nullptr ||
-        activation->op != GGML_OP_UNARY ||
-        ggml_get_unary_op(activation) != GGML_UNARY_OP_SILU ||
-        device->aot->find("flagos_silu_mul_f32") == nullptr ||
+        kernel_name == nullptr || device->aot->find(kernel_name) == nullptr ||
         !amd_tensor_is_contiguous_f32(activation) ||
         !amd_tensor_is_contiguous_f32(activation->src[0]) ||
         !amd_tensor_is_contiguous_f32(other) || !amd_tensor_is_contiguous_f32(mul) ||
@@ -3697,7 +3708,14 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             other == nullptr) {
             return false;
         }
-        const auto * metadata = context->device->aot->find("flagos_silu_mul_f32");
+        const char * kernel_name = amd_attention_output_gate_kernel(activation);
+        if (kernel_name == nullptr) {
+            return false;
+        }
+        const auto * metadata = context->device->aot->find(kernel_name);
+        if (metadata == nullptr) {
+            return false;
+        }
         int n = static_cast<int>(ggml_nelements(mul));
         void * input_data = activation->src[0]->data;
         void * other_data = other->data;
@@ -3709,12 +3727,16 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             (static_cast<uint64_t>(n) + metadata->block_size - 1) /
             metadata->block_size);
         const bool launched = context->device->aot->launch(
-            "flagos_silu_mul_f32", context->stream, grid_x, 1, 1, arguments);
+            kernel_name, context->stream, grid_x, 1, 1, arguments);
         if (launched) {
             context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_attention_output_gate.fetch_add(1, std::memory_order_relaxed);
-            amd_trace_op(context, mul, "attention_output_gate");
+            const char * trace_path = ggml_get_unary_op(activation) == GGML_UNARY_OP_SILU
+                ? "attention_output_gate"
+                : ggml_get_unary_op(activation) == GGML_UNARY_OP_SIGMOID
+                    ? "attention_output_gate_sigmoid" : "attention_output_gate_softplus";
+            amd_trace_op(context, mul, trace_path);
         }
         return launched;
     }

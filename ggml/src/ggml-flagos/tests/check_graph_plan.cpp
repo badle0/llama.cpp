@@ -895,6 +895,25 @@ int main() {
     CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 1);
     CHECK(plan->steps[0].candidate.required_output_node_indices[0] == 1);
 
+    for (const int32_t gated_unary_op : {
+            static_cast<int32_t>(GGML_UNARY_OP_SIGMOID),
+            static_cast<int32_t>(GGML_UNARY_OP_SOFTPLUS) }) {
+        std::memcpy(gate_silu.op_params, &gated_unary_op, sizeof(gated_unary_op));
+        plan = flagos_build_graph_plan(
+            &gated_graph, query_pattern_terminal_only, &supported);
+        CHECK(plan->steps.size() == 1);
+        CHECK(plan->steps[0].candidate.id == flagos_pattern_id::attention_output_gate);
+    }
+    const int32_t unsupported_gated_unary_op = GGML_UNARY_OP_TANH;
+    std::memcpy(gate_silu.op_params, &unsupported_gated_unary_op,
+        sizeof(unsupported_gated_unary_op));
+    plan = flagos_build_graph_plan(
+        &gated_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 2);
+    CHECK(plan->steps[0].kind == flagos_execution_kind::direct);
+    CHECK(plan->steps[1].kind == flagos_execution_kind::direct);
+    std::memcpy(gate_silu.op_params, &unary_op, sizeof(unary_op));
+
     ggml_tensor gate_observer {};
     init_tensor(gate_observer, GGML_OP_ADD, 128, 32);
     gate_observer.src[0] = &gate_silu;

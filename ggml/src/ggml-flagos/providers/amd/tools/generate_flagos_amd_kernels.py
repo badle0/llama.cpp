@@ -343,6 +343,25 @@ def flagos_silu_mul_f32(x, other, output, n_elements, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def flagos_sigmoid_mul_f32(x, other, output, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(x + offsets, mask=mask, other=0.0)
+    multipliers = tl.load(other + offsets, mask=mask, other=0.0)
+    tl.store(output + offsets, tl.sigmoid(values) * multipliers, mask=mask)
+
+
+@triton.jit
+def flagos_softplus_mul_f32(x, other, output, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(x + offsets, mask=mask, other=0.0)
+    multipliers = tl.load(other + offsets, mask=mask, other=0.0)
+    activated = tl.where(values > 20.0, values, tl.log(1.0 + tl.exp(values)))
+    tl.store(output + offsets, activated * multipliers, mask=mask)
+
+
+@triton.jit
 def flagos_add_rms_norm_mul_f32(
     norm_output, mul_output, x, bias, weight, n_cols, eps, BLOCK: tl.constexpr
 ):
@@ -1524,6 +1543,15 @@ def compile_additional() -> None:
         num_warps=AMD_SILU_MUL_NUM_WARPS)
     torch.testing.assert_close(
         out, torch.nn.functional.silu(x) * y, rtol=2e-5, atol=2e-5)
+    flagos_sigmoid_mul_f32[(triton.cdiv(flat_n, AMD_SILU_MUL_BLOCK_SIZE),)](
+        x, y, out, flat_n, BLOCK=AMD_SILU_MUL_BLOCK_SIZE,
+        num_warps=AMD_SILU_MUL_NUM_WARPS)
+    torch.testing.assert_close(out, torch.sigmoid(x) * y, rtol=2e-5, atol=2e-5)
+    flagos_softplus_mul_f32[(triton.cdiv(flat_n, AMD_SILU_MUL_BLOCK_SIZE),)](
+        x, y, out, flat_n, BLOCK=AMD_SILU_MUL_BLOCK_SIZE,
+        num_warps=AMD_SILU_MUL_NUM_WARPS)
+    torch.testing.assert_close(
+        out, torch.nn.functional.softplus(x) * y, rtol=2e-5, atol=2e-5)
 
     norm_out = torch.empty_like(x)
     mul_out = torch.empty_like(x)
@@ -1970,6 +1998,61 @@ def compile_silu_mul_package_without_launch(output_dir: Path, arch: str) -> None
         "profile_scratch_size": metadata.profile_scratch_size,
         "profile_scratch_align": metadata.profile_scratch_align,
     }])
+
+
+def compile_unary_mul_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile all supported unary+Mul kernels without a device launch."""
+    if not arch:
+        raise RuntimeError("--compile-only requires --arch")
+    if (AMD_SILU_MUL_BLOCK_SIZE <= 0 or
+            AMD_SILU_MUL_BLOCK_SIZE & (AMD_SILU_MUL_BLOCK_SIZE - 1)):
+        raise RuntimeError("FLAGOS_AMD_SILU_MUL_BLOCK_SIZE must be a positive power of two")
+    if AMD_SILU_MUL_NUM_WARPS not in (1, 2, 4, 8):
+        raise RuntimeError("FLAGOS_AMD_SILU_MUL_NUM_WARPS must be 1, 2, 4, or 8")
+    signature = {
+        "x": "*fp32", "other": "*fp32", "output": "*fp32",
+        "n_elements": "i32", "BLOCK": "constexpr",
+    }
+    kernels = []
+    for name, kernel in (
+            ("flagos_silu_mul_f32", flagos_silu_mul_f32),
+            ("flagos_sigmoid_mul_f32", flagos_sigmoid_mul_f32),
+            ("flagos_softplus_mul_f32", flagos_softplus_mul_f32)):
+        source = ASTSource(
+            kernel,
+            signature,
+            {"BLOCK": AMD_SILU_MUL_BLOCK_SIZE},
+            attrs=amd_jit_specialization_attrs(3, ()),
+        )
+        compiled = triton.compile(
+            source,
+            target=GPUTarget("hip", arch, 32),
+            options={"num_warps": AMD_SILU_MUL_NUM_WARPS},
+        )
+        metadata = compiled.metadata
+        global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+        if global_scratch_size or metadata.profile_scratch_size:
+            raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+        output = output_dir / f"{name}.hsaco"
+        output.write_bytes(compiled.asm["hsaco"])
+        kernels.append({
+            "name": name,
+            "symbol": name,
+            "file": output.name,
+            "shared": metadata.shared,
+            "num_warps": metadata.num_warps,
+            "warp_size": metadata.warp_size,
+            "block_size": AMD_SILU_MUL_BLOCK_SIZE,
+            "tile_m": 0,
+            "tile_n": 0,
+            "tile_k": 0,
+            "argument_count": 4,
+            "global_scratch_size": global_scratch_size,
+            "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+            "profile_scratch_size": metadata.profile_scratch_size,
+            "profile_scratch_align": metadata.profile_scratch_align,
+        })
+    write_manifest(output_dir, arch, kernels)
 
 
 def compile_rms_norm_narrow_package_without_launch(output_dir: Path, arch: str) -> None:
@@ -2560,6 +2643,7 @@ def main() -> None:
     only_scale = os.environ.get("FLAGOS_AMD_ONLY_SCALE") == "1"
     only_ssm_conv_silu = os.environ.get("FLAGOS_AMD_ONLY_SSM_CONV_SILU") == "1"
     only_silu_mul = os.environ.get("FLAGOS_AMD_ONLY_SILU_MUL") == "1"
+    only_unary_mul = os.environ.get("FLAGOS_AMD_ONLY_UNARY_MUL") == "1"
     only_rms_norm_narrow = os.environ.get("FLAGOS_AMD_ONLY_RMS_NORM_NARROW") == "1"
     if sum((only_residual, only_residual_narrow, only_q4_ffn_decode, only_q40_ffn_decode,
             only_q4_ffn_decode_staged, only_q40_ffn_decode_staged,
@@ -2567,6 +2651,7 @@ def main() -> None:
             only_q41_q80, only_gdn_cache, only_gdn_cache_only,
             only_gdn_cache_only_decode, only_f16_gemm, only_ffn_fusion,
             only_ffn_down_f16, only_scale, only_ssm_conv_silu, only_silu_mul,
+            only_unary_mul,
             only_rms_norm_narrow)) > 1:
         raise RuntimeError("select only one FLAGOS_AMD_ONLY_* tuning mode")
     if args.compile_only:
@@ -2576,7 +2661,7 @@ def main() -> None:
                 only_q4_gemv_narrow8 or only_q5_gemv_narrow16 or
                 only_q40_gemv_narrow or only_q41_q80 or
                 only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode or
-                only_scale or only_ssm_conv_silu or only_silu_mul or
+                only_scale or only_ssm_conv_silu or only_silu_mul or only_unary_mul or
                 only_rms_norm_narrow):
             raise RuntimeError(
                 "--compile-only requires FLAGOS_AMD_ONLY_RESIDUAL=1, "
@@ -2595,6 +2680,7 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_SCALE=1 or "
                 "FLAGOS_AMD_ONLY_SSM_CONV_SILU=1 or "
                 "FLAGOS_AMD_ONLY_SILU_MUL=1 or "
+                "FLAGOS_AMD_ONLY_UNARY_MUL=1 or "
                 "FLAGOS_AMD_ONLY_RMS_NORM_NARROW=1")
         os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir)
         if only_residual or only_residual_narrow:
@@ -2614,6 +2700,8 @@ def main() -> None:
             compile_ssm_conv_silu_package_without_launch(args.output_dir, args.arch)
         elif only_silu_mul:
             compile_silu_mul_package_without_launch(args.output_dir, args.arch)
+        elif only_unary_mul:
+            compile_unary_mul_package_without_launch(args.output_dir, args.arch)
         elif only_rms_norm_narrow:
             compile_rms_norm_narrow_package_without_launch(args.output_dir, args.arch)
         elif only_gdn_cache or only_gdn_cache_only or only_gdn_cache_only_decode:
@@ -2649,6 +2737,8 @@ def main() -> None:
         raise RuntimeError("FLAGOS_AMD_ONLY_SSM_CONV_SILU requires --compile-only")
     if only_silu_mul:
         raise RuntimeError("FLAGOS_AMD_ONLY_SILU_MUL requires --compile-only")
+    if only_unary_mul:
+        raise RuntimeError("FLAGOS_AMD_ONLY_UNARY_MUL requires --compile-only")
     if only_rms_norm_narrow:
         raise RuntimeError("FLAGOS_AMD_ONLY_RMS_NORM_NARROW requires --compile-only")
     compile_common = (os.environ.get("FLAGOS_AMD_SKIP_COMMON", "0") != "1" and
@@ -2687,6 +2777,8 @@ def main() -> None:
         ("flagos_rms_norm_mul_rope_kv_store_neox_f32_f16", ATTENTION_HEAD_DIM),
         ("flagos_silu_f32", common.BLOCK_SIZE),
         ("flagos_silu_mul_f32", AMD_SILU_MUL_BLOCK_SIZE),
+        ("flagos_sigmoid_mul_f32", AMD_SILU_MUL_BLOCK_SIZE),
+        ("flagos_softplus_mul_f32", AMD_SILU_MUL_BLOCK_SIZE),
         ("flagos_sigmoid_f32", common.BLOCK_SIZE),
         ("flagos_softplus_f32", common.BLOCK_SIZE),
         ("flagos_ssm_conv_f32", common.BLOCK_SIZE),
