@@ -239,6 +239,7 @@ struct amd_backend_context {
         std::atomic<uint64_t> direct_ops { 0 };
         std::atomic<uint64_t> fusion_steps { 0 };
         std::atomic<uint64_t> fusion_rms_norm_mul { 0 };
+        std::atomic<uint64_t> fusion_rms_norm_mul_narrow { 0 };
         std::atomic<uint64_t> fusion_rms_norm_mul_rope { 0 };
         std::atomic<uint64_t> fusion_rms_norm_mul_rope_kv_store { 0 };
         std::atomic<uint64_t> fusion_add_rms_norm_mul { 0 };
@@ -649,7 +650,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         "host_to_device=%llu device_to_device=%llu "
         "plan_builds=%llu plan_direct=%llu plan_patterns=%llu "
         "plan_hits=%llu plan_misses=%llu plan_evictions=%llu "
-        "fusion_rms_mul=%llu fusion_rms_mul_rope=%llu "
+        "fusion_rms_mul=%llu fusion_rms_mul_narrow=%llu fusion_rms_mul_rope=%llu "
         "fusion_rms_mul_rope_store=%llu "
         "fusion_add_rms_mul=%llu fusion_rope_store=%llu "
         "fusion_flash_decode=%llu fusion_flash_prefill=%llu "
@@ -702,6 +703,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) context->graph_plans.misses(),
         (unsigned long long) context->graph_plans.evictions(),
         (unsigned long long) s.fusion_rms_norm_mul.load(),
+        (unsigned long long) s.fusion_rms_norm_mul_narrow.load(),
         (unsigned long long) s.fusion_rms_norm_mul_rope.load(),
         (unsigned long long) s.fusion_rms_norm_mul_rope_kv_store.load(),
         (unsigned long long) s.fusion_add_rms_norm_mul.load(),
@@ -3262,6 +3264,22 @@ static bool amd_supports_add_rms_norm_mul(const amd_device_context * device,
     return metadata->block_size >= norm->ne[0];
 }
 
+static const char * amd_rms_norm_mul_inplace_kernel(
+        const amd_device_context * device, int64_t n_cols) {
+    if (device == nullptr || device->aot == nullptr || n_cols <= 0) {
+        return nullptr;
+    }
+    if (const auto * narrow = device->aot->find(
+            "flagos_rms_norm_mul_inplace_f32_narrow")) {
+        if (narrow->exact_block_size && narrow->block_size == n_cols) {
+            return "flagos_rms_norm_mul_inplace_f32_narrow";
+        }
+    }
+    const auto * generic = device->aot->find("flagos_rms_norm_mul_inplace_f32");
+    return generic != nullptr && generic->block_size >= n_cols
+        ? "flagos_rms_norm_mul_inplace_f32" : nullptr;
+}
+
 static bool amd_supports_rms_norm_mul_inplace(const amd_device_context * device,
                                               const ggml_tensor * norm,
                                               const ggml_tensor * mul) {
@@ -3269,7 +3287,7 @@ static bool amd_supports_rms_norm_mul_inplace(const amd_device_context * device,
         (mul != nullptr ? mul->src[0] : nullptr);
     return device != nullptr && device->aot != nullptr && norm != nullptr && mul != nullptr &&
         norm->data != nullptr && norm->data == mul->data &&
-        device->aot->find("flagos_rms_norm_mul_inplace_f32") != nullptr &&
+        amd_rms_norm_mul_inplace_kernel(device, norm->ne[0]) != nullptr &&
         amd_supports_rms_norm_mul(device, norm, mul) &&
         norm->src[0]->data != norm->data && weight != nullptr && weight->data != norm->data;
 }
@@ -4155,7 +4173,12 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             (amd_tensor_data_overlaps(norm, mul) || !amd_supports_rms_norm_mul(context->device, norm, mul))) {
             return false;
         }
-        kernel_name = inplace ? "flagos_rms_norm_mul_inplace_f32" : "flagos_rms_norm_mul_f32";
+        kernel_name = inplace
+            ? amd_rms_norm_mul_inplace_kernel(context->device, norm->ne[0])
+            : "flagos_rms_norm_mul_f32";
+        if (kernel_name == nullptr) {
+            return false;
+        }
     } else if (step.candidate.id == flagos_pattern_id::add_rms_norm_mul && step.candidate.node_indices.size() == 3) {
         add = cgraph->nodes[step.candidate.node_indices[0]];
         norm = cgraph->nodes[step.candidate.node_indices[1]];
@@ -4197,7 +4220,10 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
     void * src_data = add == nullptr ? norm->src[0]->data : add->src[0]->data;
     void * bias_data = add == nullptr ? nullptr : add->src[1]->data;
     void * weight_data = weight->data;
-    const bool inplace = std::strcmp(kernel_name, "flagos_rms_norm_mul_inplace_f32") == 0 ||
+    const bool narrow_rms =
+        std::strcmp(kernel_name, "flagos_rms_norm_mul_inplace_f32_narrow") == 0;
+    const bool inplace = narrow_rms ||
+        std::strcmp(kernel_name, "flagos_rms_norm_mul_inplace_f32") == 0 ||
         std::strcmp(kernel_name, "flagos_add_rms_norm_mul_inplace_f32") == 0;
     if (write_residual) {
         void * residual_data = add->data;
@@ -4229,11 +4255,16 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             if (step.candidate.id == flagos_pattern_id::rms_norm_mul) {
                 context->stats.fusion_rms_norm_mul.fetch_add(1, std::memory_order_relaxed);
+                if (narrow_rms) {
+                    context->stats.fusion_rms_norm_mul_narrow.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
             } else {
                 context->stats.fusion_add_rms_norm_mul.fetch_add(1, std::memory_order_relaxed);
             }
-            amd_trace_op(context, mul, step.candidate.id == flagos_pattern_id::rms_norm_mul
-                ? "rms_norm_mul_inplace" : "add_rms_norm_mul_inplace");
+            amd_trace_op(context, mul, narrow_rms ? "rms_norm_mul_inplace_narrow" :
+                step.candidate.id == flagos_pattern_id::rms_norm_mul
+                    ? "rms_norm_mul_inplace" : "add_rms_norm_mul_inplace");
         }
         return launched;
     }

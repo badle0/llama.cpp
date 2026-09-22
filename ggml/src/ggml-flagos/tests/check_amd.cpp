@@ -352,6 +352,82 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_free(fused_norm_buffer);
         ggml_backend_buffer_free(fused_mul_buffer);
 
+        // Match the scheduler allocation used by Qwen3.5 GDN blocks: the
+        // dead RMSNorm output and terminal scale result share one buffer.
+        // This exercises the one-output ABI selected by the narrow kernel.
+        constexpr int64_t narrow_rms_cols = 128;
+        constexpr int64_t narrow_rms_rows = 33;
+        ggml_tensor * narrow_rms_input = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, narrow_rms_cols, narrow_rms_rows);
+        ggml_tensor * narrow_rms_weight = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, narrow_rms_cols);
+        ggml_tensor * narrow_rms_norm = ggml_rms_norm(
+            ctx, narrow_rms_input, rms_eps);
+        ggml_tensor * narrow_rms_mul = ggml_mul(
+            ctx, narrow_rms_norm, narrow_rms_weight);
+        CHECK(narrow_rms_input && narrow_rms_weight && narrow_rms_norm && narrow_rms_mul);
+        ggml_backend_buffer_t narrow_rms_input_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(narrow_rms_input));
+        ggml_backend_buffer_t narrow_rms_weight_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(narrow_rms_weight));
+        ggml_backend_buffer_t narrow_rms_shared_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(narrow_rms_mul));
+        CHECK(narrow_rms_input_buffer && narrow_rms_weight_buffer && narrow_rms_shared_buffer);
+        CHECK(ggml_backend_tensor_alloc(narrow_rms_input_buffer, narrow_rms_input,
+            ggml_backend_buffer_get_base(narrow_rms_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(narrow_rms_weight_buffer, narrow_rms_weight,
+            ggml_backend_buffer_get_base(narrow_rms_weight_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(narrow_rms_shared_buffer, narrow_rms_norm,
+            ggml_backend_buffer_get_base(narrow_rms_shared_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(narrow_rms_shared_buffer, narrow_rms_mul,
+            ggml_backend_buffer_get_base(narrow_rms_shared_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(narrow_rms_norm->data == narrow_rms_mul->data);
+        std::vector<float> narrow_rms_input_host(
+            static_cast<size_t>(narrow_rms_cols * narrow_rms_rows));
+        std::vector<float> narrow_rms_weight_host(static_cast<size_t>(narrow_rms_cols));
+        std::vector<float> narrow_rms_output_host(narrow_rms_input_host.size(), 0.0f);
+        std::vector<float> narrow_rms_expected(narrow_rms_input_host.size(), 0.0f);
+        for (int64_t col = 0; col < narrow_rms_cols; ++col) {
+            narrow_rms_weight_host[static_cast<size_t>(col)] =
+                0.75f + static_cast<float>(col % 13) * 0.015f;
+        }
+        for (int64_t row = 0; row < narrow_rms_rows; ++row) {
+            double sum_sq = 0.0;
+            for (int64_t col = 0; col < narrow_rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * narrow_rms_cols + col);
+                narrow_rms_input_host[index] =
+                    static_cast<float>(static_cast<int>(index * 29 % 113) - 56) * 0.009f;
+                sum_sq += static_cast<double>(narrow_rms_input_host[index]) *
+                    narrow_rms_input_host[index];
+            }
+            const float scale = 1.0f / std::sqrt(
+                static_cast<float>(sum_sq / narrow_rms_cols) + rms_eps);
+            for (int64_t col = 0; col < narrow_rms_cols; ++col) {
+                const size_t index = static_cast<size_t>(row * narrow_rms_cols + col);
+                narrow_rms_expected[index] = narrow_rms_input_host[index] * scale *
+                    narrow_rms_weight_host[static_cast<size_t>(col)];
+            }
+        }
+        ggml_backend_tensor_set_async(backend, narrow_rms_input,
+            narrow_rms_input_host.data(), 0, ggml_nbytes(narrow_rms_input));
+        ggml_backend_tensor_set_async(backend, narrow_rms_weight,
+            narrow_rms_weight_host.data(), 0, ggml_nbytes(narrow_rms_weight));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * narrow_rms_nodes[] = { narrow_rms_norm, narrow_rms_mul };
+        ggml_cgraph narrow_rms_graph {};
+        narrow_rms_graph.n_nodes = 2;
+        narrow_rms_graph.nodes = narrow_rms_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &narrow_rms_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(backend, narrow_rms_mul,
+            narrow_rms_output_host.data(), 0, ggml_nbytes(narrow_rms_mul));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < narrow_rms_output_host.size(); ++i) {
+            CHECK(std::fabs(narrow_rms_output_host[i] - narrow_rms_expected[i]) < 4e-5f);
+        }
+        ggml_backend_buffer_free(narrow_rms_input_buffer);
+        ggml_backend_buffer_free(narrow_rms_weight_buffer);
+        ggml_backend_buffer_free(narrow_rms_shared_buffer);
+
         const int64_t add_rows = 1;
         ggml_tensor * add_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rms_cols, add_rows);
         ggml_tensor * add_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rms_cols, add_rows);
