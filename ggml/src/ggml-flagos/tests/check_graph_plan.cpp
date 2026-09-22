@@ -914,6 +914,55 @@ int main() {
     CHECK(plan->steps[1].kind == flagos_execution_kind::direct);
     std::memcpy(gate_silu.op_params, &unary_op, sizeof(unary_op));
 
+    ggml_tensor alpha_input {};
+    ggml_tensor alpha_bias {};
+    ggml_tensor alpha_scale {};
+    ggml_tensor alpha_add {};
+    ggml_tensor alpha_softplus {};
+    ggml_tensor alpha_output {};
+    init_tensor(alpha_input, GGML_OP_NONE, 32, 4);
+    init_tensor(alpha_bias, GGML_OP_NONE, 32);
+    init_tensor(alpha_scale, GGML_OP_NONE, 32);
+    init_tensor(alpha_add, GGML_OP_ADD, 32, 4);
+    init_tensor(alpha_softplus, GGML_OP_UNARY, 32, 4);
+    init_tensor(alpha_output, GGML_OP_MUL, 32, 4);
+    alpha_add.src[0] = &alpha_input;
+    alpha_add.src[1] = &alpha_bias;
+    alpha_softplus.src[0] = &alpha_add;
+    const int32_t softplus_op = GGML_UNARY_OP_SOFTPLUS;
+    std::memcpy(alpha_softplus.op_params, &softplus_op, sizeof(softplus_op));
+    alpha_output.src[0] = &alpha_softplus;
+    alpha_output.src[1] = &alpha_scale;
+    ggml_tensor * alpha_nodes[] = { &alpha_add, &alpha_softplus, &alpha_output };
+    ggml_cgraph alpha_graph {};
+    alpha_graph.n_nodes = 3;
+    alpha_graph.nodes = alpha_nodes;
+    plan = flagos_build_graph_plan(
+        &alpha_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 1);
+    CHECK(plan->steps[0].candidate.id == flagos_pattern_id::attention_output_gate);
+    CHECK(plan->steps[0].candidate.node_indices.size() == 3);
+    CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 1);
+    CHECK(plan->steps[0].candidate.required_output_node_indices[0] == 2);
+
+    ggml_tensor alpha_add_observer {};
+    init_tensor(alpha_add_observer, GGML_OP_MUL, 32, 4);
+    alpha_add_observer.src[0] = &alpha_add;
+    alpha_add_observer.src[1] = &alpha_input;
+    ggml_tensor * alpha_fanout_nodes[] = {
+        &alpha_add, &alpha_softplus, &alpha_output, &alpha_add_observer,
+    };
+    ggml_cgraph alpha_fanout_graph {};
+    alpha_fanout_graph.n_nodes = 4;
+    alpha_fanout_graph.nodes = alpha_fanout_nodes;
+    plan = flagos_build_graph_plan(
+        &alpha_fanout_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 3);
+    CHECK(plan->steps[0].kind == flagos_execution_kind::direct);
+    CHECK(plan->steps[1].kind == flagos_execution_kind::pattern);
+    CHECK(plan->steps[1].candidate.node_indices.size() == 2);
+    CHECK(plan->steps[2].kind == flagos_execution_kind::direct);
+
     ggml_tensor gate_observer {};
     init_tensor(gate_observer, GGML_OP_ADD, 128, 32);
     gate_observer.src[0] = &gate_silu;

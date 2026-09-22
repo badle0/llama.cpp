@@ -163,6 +163,7 @@ int main(int argc, char ** argv) {
         { "flagos_silu_mul_f32", 4 },
         { "flagos_sigmoid_mul_f32", 4 },
         { "flagos_softplus_mul_f32", 4 },
+        { "flagos_gdn_alpha_gate_f32", 5 },
         { "flagos_rms_norm_mul_inplace_f32_narrow", 5 },
         { "flagos_l2_norm_strided_f32", 9 },
         { "flagos_gated_delta_net_scalar_f32", 24 },
@@ -212,6 +213,15 @@ int main(int argc, char ** argv) {
         CHECK(narrow->exact_block_size);
         CHECK(narrow->num_warps == 1);
         CHECK(narrow->warp_size == 32);
+    }
+    if (const auto * alpha_gate = registry.find("flagos_gdn_alpha_gate_f32")) {
+        CHECK(alpha_gate->argument_count == 5);
+        CHECK(alpha_gate->block_size > 0);
+        CHECK((alpha_gate->block_size & (alpha_gate->block_size - 1)) == 0);
+        CHECK(alpha_gate->tile_n > 0);
+        CHECK(alpha_gate->num_warps == 1 || alpha_gate->num_warps == 2 ||
+            alpha_gate->num_warps == 4 || alpha_gate->num_warps == 8);
+        CHECK(alpha_gate->warp_size == 32);
     }
     if (const auto * gdn_cache = registry.find("flagos_gated_delta_net_scalar_f32_cache")) {
         CHECK(gdn_cache->block_size == 128);

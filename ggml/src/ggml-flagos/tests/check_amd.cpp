@@ -1389,6 +1389,109 @@ int main(int argc, char ** argv) {
         check_unary_output_gate(GGML_UNARY_OP_SIGMOID);
         check_unary_output_gate(GGML_UNARY_OP_SOFTPLUS);
 
+        constexpr int64_t alpha_columns = 32;
+        constexpr int64_t alpha_rows = 33;
+        constexpr float alpha_add_sentinel = -61.5f;
+        constexpr float alpha_softplus_sentinel = -62.5f;
+        ggml_tensor * alpha_input = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, alpha_columns, alpha_rows);
+        ggml_tensor * alpha_bias = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, alpha_columns);
+        ggml_tensor * alpha_scale = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, alpha_columns);
+        ggml_tensor * alpha_add = ggml_add(ctx, alpha_input, alpha_bias);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx, alpha_add);
+        ggml_tensor * alpha_output = ggml_mul(ctx, alpha_softplus, alpha_scale);
+        CHECK(alpha_input && alpha_bias && alpha_scale && alpha_add &&
+            alpha_softplus && alpha_output);
+        ggml_backend_buffer_t alpha_input_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(alpha_input));
+        ggml_backend_buffer_t alpha_bias_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(alpha_bias));
+        ggml_backend_buffer_t alpha_scale_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(alpha_scale));
+        ggml_backend_buffer_t alpha_add_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(alpha_add));
+        ggml_backend_buffer_t alpha_softplus_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(alpha_softplus));
+        ggml_backend_buffer_t alpha_output_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(alpha_output));
+        CHECK(alpha_input_buffer && alpha_bias_buffer && alpha_scale_buffer &&
+            alpha_add_buffer && alpha_softplus_buffer && alpha_output_buffer);
+        CHECK(ggml_backend_tensor_alloc(alpha_input_buffer, alpha_input,
+            ggml_backend_buffer_get_base(alpha_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(alpha_bias_buffer, alpha_bias,
+            ggml_backend_buffer_get_base(alpha_bias_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(alpha_scale_buffer, alpha_scale,
+            ggml_backend_buffer_get_base(alpha_scale_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(alpha_add_buffer, alpha_add,
+            ggml_backend_buffer_get_base(alpha_add_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(alpha_softplus_buffer, alpha_softplus,
+            ggml_backend_buffer_get_base(alpha_softplus_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(alpha_output_buffer, alpha_output,
+            ggml_backend_buffer_get_base(alpha_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, alpha_add));
+        CHECK(ggml_backend_dev_supports_op(dev, alpha_softplus));
+        CHECK(ggml_backend_dev_supports_op(dev, alpha_output));
+        const size_t alpha_elements = static_cast<size_t>(ggml_nelements(alpha_output));
+        std::vector<float> alpha_input_host(alpha_elements);
+        std::vector<float> alpha_bias_host(alpha_columns);
+        std::vector<float> alpha_scale_host(alpha_columns);
+        std::vector<float> alpha_add_host(alpha_elements, alpha_add_sentinel);
+        std::vector<float> alpha_softplus_host(alpha_elements, alpha_softplus_sentinel);
+        std::vector<float> alpha_output_host(alpha_elements, 0.0f);
+        for (size_t i = 0; i < alpha_elements; ++i) {
+            alpha_input_host[i] = static_cast<float>(static_cast<int>(i * 13 % 97) - 48) * 0.061f;
+        }
+        alpha_input_host[0] = 100.0f;
+        alpha_input_host[1] = -100.0f;
+        for (size_t i = 0; i < static_cast<size_t>(alpha_columns); ++i) {
+            alpha_bias_host[i] = static_cast<float>(static_cast<int>(i * 7 % 29) - 14) * 0.037f;
+            alpha_scale_host[i] = static_cast<float>(static_cast<int>(i * 11 % 31) - 15) * 0.043f;
+        }
+        ggml_backend_tensor_set_async(
+            backend, alpha_input, alpha_input_host.data(), 0, ggml_nbytes(alpha_input));
+        ggml_backend_tensor_set_async(
+            backend, alpha_bias, alpha_bias_host.data(), 0, ggml_nbytes(alpha_bias));
+        ggml_backend_tensor_set_async(
+            backend, alpha_scale, alpha_scale_host.data(), 0, ggml_nbytes(alpha_scale));
+        ggml_backend_tensor_set_async(
+            backend, alpha_add, alpha_add_host.data(), 0, ggml_nbytes(alpha_add));
+        ggml_backend_tensor_set_async(
+            backend, alpha_softplus, alpha_softplus_host.data(), 0,
+            ggml_nbytes(alpha_softplus));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * alpha_nodes[] = { alpha_add, alpha_softplus, alpha_output };
+        ggml_cgraph alpha_graph {};
+        alpha_graph.n_nodes = 3;
+        alpha_graph.nodes = alpha_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &alpha_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(
+            backend, alpha_add, alpha_add_host.data(), 0, ggml_nbytes(alpha_add));
+        ggml_backend_tensor_get_async(
+            backend, alpha_softplus, alpha_softplus_host.data(), 0,
+            ggml_nbytes(alpha_softplus));
+        ggml_backend_tensor_get_async(
+            backend, alpha_output, alpha_output_host.data(), 0, ggml_nbytes(alpha_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < alpha_elements; ++i) {
+            const size_t column = i % static_cast<size_t>(alpha_columns);
+            const float biased = alpha_input_host[i] + alpha_bias_host[column];
+            const float softplus = biased > 20.0f ? biased : std::log1p(std::exp(biased));
+            const float expected = softplus * alpha_scale_host[column];
+            CHECK(std::fabs(alpha_output_host[i] - expected) < 8e-5f);
+            if (require_attention_output_gate) {
+                CHECK(alpha_add_host[i] == alpha_add_sentinel);
+                CHECK(alpha_softplus_host[i] == alpha_softplus_sentinel);
+            }
+        }
+        ggml_backend_buffer_free(alpha_input_buffer);
+        ggml_backend_buffer_free(alpha_bias_buffer);
+        ggml_backend_buffer_free(alpha_scale_buffer);
+        ggml_backend_buffer_free(alpha_add_buffer);
+        ggml_backend_buffer_free(alpha_softplus_buffer);
+        ggml_backend_buffer_free(alpha_output_buffer);
+
         ggml_tensor * gate_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
         ggml_tensor * up_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
         ggml_tensor * swiglu_tensor = ggml_swiglu_split(ctx, gate_tensor, up_tensor);

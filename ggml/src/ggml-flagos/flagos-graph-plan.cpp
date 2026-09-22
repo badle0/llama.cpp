@@ -1001,6 +1001,31 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                 candidate.eliminated_read_bytes = flagos_tensor_bytes(node);
                 candidate.eliminated_launches = 1;
                 candidates.push_back(candidate);
+
+                // Qwen GDN forms Add(repeated bias) -> Softplus ->
+                // Mul(repeated scale). Offer the closed three-node superset
+                // under the same gate semantic; providers that only implement
+                // unary+Mul continue to accept the smaller candidate.
+                if (ggml_get_unary_op(node) == GGML_UNARY_OP_SOFTPLUS &&
+                    node->src[0] != nullptr && node->src[0]->op == GGML_OP_ADD) {
+                    int add_index = -1;
+                    for (int j = i - 1; j >= 0; --j) {
+                        if (cgraph->nodes[j] == node->src[0]) {
+                            add_index = j;
+                            break;
+                        }
+                    }
+                    if (add_index >= 0) {
+                        flagos_pattern_candidate biased_candidate;
+                        biased_candidate.id = flagos_pattern_id::attention_output_gate;
+                        biased_candidate.scope = flagos_pattern_scope(biased_candidate.id);
+                        biased_candidate.node_indices = { add_index, i, mul_index };
+                        biased_candidate.eliminated_read_bytes =
+                            flagos_tensor_bytes(node->src[0]) + flagos_tensor_bytes(node);
+                        biased_candidate.eliminated_launches = 2;
+                        candidates.push_back(biased_candidate);
+                    }
+                }
             }
         }
 
