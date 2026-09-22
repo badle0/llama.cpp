@@ -26,11 +26,18 @@ static void check(bool condition, const char * expression, int line) {
 
 int main(int argc, char ** argv) {
     bool require_ssm_conv_silu = false;
-    if (argc == 2 && std::strcmp(argv[1], "--require-ssm-conv-silu") == 0) {
-        require_ssm_conv_silu = true;
-    } else if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--require-ssm-conv-silu]\n", argv[0]);
-        return 2;
+    bool require_attention_output_gate = false;
+    for (int argument = 1; argument < argc; ++argument) {
+        if (std::strcmp(argv[argument], "--require-ssm-conv-silu") == 0) {
+            require_ssm_conv_silu = true;
+        } else if (std::strcmp(argv[argument], "--require-attention-output-gate") == 0) {
+            require_attention_output_gate = true;
+        } else {
+            std::fprintf(stderr,
+                "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate]\n",
+                argv[0]);
+            return 2;
+        }
     }
 
     ggml_backend_reg_t reg = ggml_backend_flagos_reg();
@@ -1162,6 +1169,75 @@ int main(int argc, char ** argv) {
         }
         ggml_backend_buffer_free(silu_input_buffer);
         ggml_backend_buffer_free(silu_output_buffer);
+
+        constexpr int64_t gated_columns = 128;
+        constexpr int64_t gated_rows = 33;
+        constexpr float gated_intermediate_sentinel = -91.75f;
+        ggml_tensor * gated_input = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, gated_columns, gated_rows);
+        ggml_tensor * gated_other = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, gated_columns, gated_rows);
+        ggml_tensor * gated_silu = ggml_silu(ctx, gated_input);
+        ggml_tensor * gated_output = ggml_mul(ctx, gated_other, gated_silu);
+        CHECK(gated_input && gated_other && gated_silu && gated_output);
+        ggml_backend_buffer_t gated_input_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(gated_input));
+        ggml_backend_buffer_t gated_other_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(gated_other));
+        ggml_backend_buffer_t gated_silu_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(gated_silu));
+        ggml_backend_buffer_t gated_output_buffer = ggml_backend_buft_alloc_buffer(
+            buft, ggml_nbytes(gated_output));
+        CHECK(gated_input_buffer && gated_other_buffer &&
+            gated_silu_buffer && gated_output_buffer);
+        CHECK(ggml_backend_tensor_alloc(gated_input_buffer, gated_input,
+            ggml_backend_buffer_get_base(gated_input_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(gated_other_buffer, gated_other,
+            ggml_backend_buffer_get_base(gated_other_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(gated_silu_buffer, gated_silu,
+            ggml_backend_buffer_get_base(gated_silu_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_tensor_alloc(gated_output_buffer, gated_output,
+            ggml_backend_buffer_get_base(gated_output_buffer)) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_dev_supports_op(dev, gated_silu));
+        CHECK(ggml_backend_dev_supports_op(dev, gated_output));
+        const size_t gated_elements = static_cast<size_t>(ggml_nelements(gated_output));
+        std::vector<float> gated_input_host(gated_elements);
+        std::vector<float> gated_other_host(gated_elements);
+        std::vector<float> gated_silu_host(gated_elements, gated_intermediate_sentinel);
+        std::vector<float> gated_output_host(gated_elements, 0.0f);
+        for (size_t i = 0; i < gated_elements; ++i) {
+            gated_input_host[i] = static_cast<float>(static_cast<int>(i * 19 % 101) - 50) * 0.031f;
+            gated_other_host[i] = static_cast<float>(static_cast<int>(i * 23 % 83) - 41) * 0.017f;
+        }
+        ggml_backend_tensor_set_async(
+            backend, gated_input, gated_input_host.data(), 0, ggml_nbytes(gated_input));
+        ggml_backend_tensor_set_async(
+            backend, gated_other, gated_other_host.data(), 0, ggml_nbytes(gated_other));
+        ggml_backend_tensor_set_async(
+            backend, gated_silu, gated_silu_host.data(), 0, ggml_nbytes(gated_silu));
+        ggml_backend_synchronize(backend);
+        ggml_tensor * gated_nodes[] = { gated_silu, gated_output };
+        ggml_cgraph gated_graph {};
+        gated_graph.n_nodes = 2;
+        gated_graph.nodes = gated_nodes;
+        CHECK(ggml_backend_graph_compute(backend, &gated_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get_async(
+            backend, gated_silu, gated_silu_host.data(), 0, ggml_nbytes(gated_silu));
+        ggml_backend_tensor_get_async(
+            backend, gated_output, gated_output_host.data(), 0, ggml_nbytes(gated_output));
+        ggml_backend_synchronize(backend);
+        for (size_t i = 0; i < gated_elements; ++i) {
+            const float value = gated_input_host[i];
+            const float expected = value / (1.0f + std::exp(-value)) * gated_other_host[i];
+            CHECK(std::fabs(gated_output_host[i] - expected) < 6e-5f);
+            if (require_attention_output_gate) {
+                CHECK(gated_silu_host[i] == gated_intermediate_sentinel);
+            }
+        }
+        ggml_backend_buffer_free(gated_input_buffer);
+        ggml_backend_buffer_free(gated_other_buffer);
+        ggml_backend_buffer_free(gated_silu_buffer);
+        ggml_backend_buffer_free(gated_output_buffer);
 
         ggml_tensor * gate_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);
         ggml_tensor * up_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 3);

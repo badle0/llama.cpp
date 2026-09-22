@@ -871,6 +871,66 @@ int main() {
         CHECK(step.kind == flagos_execution_kind::direct);
     }
 
+    ggml_tensor gate_input {};
+    ggml_tensor gated_value {};
+    ggml_tensor gate_silu {};
+    ggml_tensor gated_output {};
+    init_tensor(gate_input, GGML_OP_NONE, 128, 32);
+    init_tensor(gated_value, GGML_OP_NONE, 128, 32);
+    init_tensor(gate_silu, GGML_OP_UNARY, 128, 32);
+    init_tensor(gated_output, GGML_OP_MUL, 128, 32);
+    gate_silu.src[0] = &gate_input;
+    std::memcpy(gate_silu.op_params, &unary_op, sizeof(unary_op));
+    gated_output.src[0] = &gated_value;
+    gated_output.src[1] = &gate_silu;
+    ggml_tensor * gated_nodes[] = { &gate_silu, &gated_output };
+    ggml_cgraph gated_graph {};
+    gated_graph.n_nodes = 2;
+    gated_graph.nodes = gated_nodes;
+    supported = flagos_pattern_id::attention_output_gate;
+    plan = flagos_build_graph_plan(&gated_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 1);
+    CHECK(plan->steps[0].candidate.id == flagos_pattern_id::attention_output_gate);
+    CHECK(plan->steps[0].candidate.node_indices.size() == 2);
+    CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 1);
+    CHECK(plan->steps[0].candidate.required_output_node_indices[0] == 1);
+
+    ggml_tensor gate_observer {};
+    init_tensor(gate_observer, GGML_OP_ADD, 128, 32);
+    gate_observer.src[0] = &gate_silu;
+    gate_observer.src[1] = &gated_value;
+    ggml_tensor * gated_fanout_nodes[] = { &gate_silu, &gated_output, &gate_observer };
+    ggml_cgraph gated_fanout_graph {};
+    gated_fanout_graph.n_nodes = 3;
+    gated_fanout_graph.nodes = gated_fanout_nodes;
+    plan = flagos_build_graph_plan(
+        &gated_fanout_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 3);
+    for (const auto & step : plan->steps) {
+        CHECK(step.kind == flagos_execution_kind::direct);
+    }
+
+    // A later producer cannot be pulled before the SiLU entry.  This is the
+    // dependency that prevents the current side-plan from claiming an entire
+    // RMSNorm -> gate matmul -> SiLU -> Mul region as one fused candidate.
+    ggml_tensor late_value {};
+    init_tensor(late_value, GGML_OP_ADD, 128, 32);
+    late_value.src[0] = &gated_value;
+    late_value.src[1] = &gated_value;
+    gated_output.src[0] = &late_value;
+    ggml_tensor * gated_late_input_nodes[] = {
+        &gate_silu, &late_value, &gated_output,
+    };
+    ggml_cgraph gated_late_input_graph {};
+    gated_late_input_graph.n_nodes = 3;
+    gated_late_input_graph.nodes = gated_late_input_nodes;
+    plan = flagos_build_graph_plan(
+        &gated_late_input_graph, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 3);
+    for (const auto & step : plan->steps) {
+        CHECK(step.kind == flagos_execution_kind::direct);
+    }
+
     ggml_tensor gdn_q {};
     ggml_tensor gdn_k {};
     ggml_tensor gdn_v {};

@@ -972,6 +972,34 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
             }
         }
 
+        // Gated residual/output paths commonly materialize SiLU first and
+        // multiply it by an already available tensor.  Keep the matmul that
+        // produces the gate outside this candidate: a side-plan executes at
+        // its first covered node, so only inputs available at the SiLU entry
+        // may be consumed by the fused lowering.
+        if (node->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(node) == GGML_UNARY_OP_SILU) {
+            int mul_index = -1;
+            for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                if (flagos_is_mul_of(cgraph->nodes[j], node)) {
+                    mul_index = j;
+                    break;
+                }
+                if (flagos_is_graph_barrier(cgraph->nodes[j])) {
+                    break;
+                }
+            }
+            if (mul_index >= 0) {
+                flagos_pattern_candidate candidate;
+                candidate.id = flagos_pattern_id::attention_output_gate;
+                candidate.scope = flagos_pattern_scope(candidate.id);
+                candidate.node_indices = { i, mul_index };
+                candidate.eliminated_read_bytes = flagos_tensor_bytes(node);
+                candidate.eliminated_launches = 1;
+                candidates.push_back(candidate);
+            }
+        }
+
         // Parallel FFN projections followed by a SwiGLU.  Providers may
         // lower this as a true fused projection/activation kernel, or decline
         // it and execute the individual nodes through their normal paths.

@@ -249,6 +249,7 @@ struct amd_backend_context {
         std::atomic<uint64_t> fusion_gated_delta_net_cache_only { 0 };
         std::atomic<uint64_t> fusion_gated_delta_net_cache_only_decode { 0 };
         std::atomic<uint64_t> fusion_ssm_conv_silu { 0 };
+        std::atomic<uint64_t> fusion_attention_output_gate { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu_q40_staged { 0 };
         std::atomic<uint64_t> fusion_ffn_swiglu_down { 0 };
@@ -653,7 +654,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         "fusion_add_rms_mul=%llu fusion_rope_store=%llu "
         "fusion_flash_decode=%llu fusion_flash_prefill=%llu "
         "fusion_gdn_cache=%llu fusion_gdn_cache_only=%llu fusion_gdn_cache_only_decode=%llu "
-        "fusion_ssm_conv_silu=%llu "
+        "fusion_ssm_conv_silu=%llu fusion_attention_output_gate=%llu "
         "fusion_ffn_swiglu=%llu fusion_ffn_q40_staged=%llu fusion_ffn_swiglu_down=%llu "
         "graph_captures=%llu graph_replays=%llu graph_replay_failures=%llu graph_capture_failures=%llu\n",
         (unsigned long long) s.kernel_launches.load(),
@@ -711,6 +712,7 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.fusion_gated_delta_net_cache_only.load(),
         (unsigned long long) s.fusion_gated_delta_net_cache_only_decode.load(),
         (unsigned long long) s.fusion_ssm_conv_silu.load(),
+        (unsigned long long) s.fusion_attention_output_gate.load(),
         (unsigned long long) s.fusion_ffn_swiglu.load(),
         (unsigned long long) s.fusion_ffn_swiglu_q40_staged.load(),
         (unsigned long long) s.fusion_ffn_swiglu_down.load(),
@@ -2101,6 +2103,45 @@ static bool amd_supports_ssm_conv_silu(
         !amd_tensor_data_overlaps(activation, conv->src[1]);
 }
 
+static const ggml_tensor * amd_attention_output_gate_other(
+        const ggml_tensor * activation, const ggml_tensor * mul) {
+    if (activation == nullptr || mul == nullptr || mul->op != GGML_OP_MUL) {
+        return nullptr;
+    }
+    if (mul->src[0] == activation && mul->src[1] != activation) {
+        return mul->src[1];
+    }
+    if (mul->src[1] == activation && mul->src[0] != activation) {
+        return mul->src[0];
+    }
+    return nullptr;
+}
+
+static bool amd_supports_attention_output_gate(
+        const amd_device_context * device,
+        const ggml_tensor * activation,
+        const ggml_tensor * mul) {
+    const ggml_tensor * other = amd_attention_output_gate_other(activation, mul);
+    if (device == nullptr || device->aot == nullptr || activation == nullptr ||
+        activation->src[0] == nullptr || other == nullptr ||
+        activation->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(activation) != GGML_UNARY_OP_SILU ||
+        device->aot->find("flagos_silu_mul_f32") == nullptr ||
+        !amd_tensor_is_contiguous_f32(activation) ||
+        !amd_tensor_is_contiguous_f32(activation->src[0]) ||
+        !amd_tensor_is_contiguous_f32(other) || !amd_tensor_is_contiguous_f32(mul) ||
+        !ggml_are_same_shape(activation, activation->src[0]) ||
+        !ggml_are_same_shape(mul, activation) || !ggml_are_same_shape(mul, other) ||
+        ggml_nelements(mul) <= 0 || ggml_nelements(mul) > INT32_MAX) {
+        return false;
+    }
+    // The fused elementwise kernel may overwrite either live input only at
+    // the exact same base and size. Reject partial overlap just as the direct
+    // unary and MUL paths do.
+    return amd_tensor_output_can_reuse_input(mul, activation->src[0]) &&
+        amd_tensor_output_can_reuse_input(mul, other);
+}
+
 static bool amd_launch_ssm_conv(
         amd_backend_context * context,
         const ggml_tensor * conv,
@@ -3384,6 +3425,17 @@ static flagos_lowering_choice amd_query_fusion(
             choice.capture_safe = true;
             choice.implementation_id = 15;
         }
+    } else if (candidate.id == flagos_pattern_id::attention_output_gate &&
+               candidate.node_indices.size() == 2) {
+        const ggml_tensor * activation = cgraph->nodes[candidate.node_indices[0]];
+        const ggml_tensor * mul = cgraph->nodes[candidate.node_indices[1]];
+        if (amd_candidate_outputs_are(candidate, { 1 }) &&
+            amd_fusion_enabled(context->device, "attention_output_gate") &&
+            amd_supports_attention_output_gate(context->device, activation, mul)) {
+            choice.supported = true;
+            choice.capture_safe = true;
+            choice.implementation_id = 16;
+        }
     } else if (candidate.id == flagos_pattern_id::rope_kv_store && candidate.node_indices.size() == 3) {
         const ggml_tensor * rope = cgraph->nodes[candidate.node_indices[0]];
         const ggml_tensor * view = cgraph->nodes[candidate.node_indices[1]];
@@ -3611,6 +3663,40 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_ssm_conv_silu.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(context, activation, "ssm_conv_silu");
+        }
+        return launched;
+    }
+    if (step.candidate.id == flagos_pattern_id::attention_output_gate &&
+        step.candidate.node_indices.size() == 2) {
+        if (step.implementation_id != 16 ||
+            !amd_candidate_outputs_are(step.candidate, { 1 })) {
+            return false;
+        }
+        ggml_tensor * activation = cgraph->nodes[step.candidate.node_indices[0]];
+        ggml_tensor * mul = cgraph->nodes[step.candidate.node_indices[1]];
+        const ggml_tensor * other = amd_attention_output_gate_other(activation, mul);
+        if (!amd_supports_attention_output_gate(context->device, activation, mul) ||
+            other == nullptr) {
+            return false;
+        }
+        const auto * metadata = context->device->aot->find("flagos_silu_mul_f32");
+        int n = static_cast<int>(ggml_nelements(mul));
+        void * input_data = activation->src[0]->data;
+        void * other_data = other->data;
+        void * output_data = mul->data;
+        flagos_amd::kernel_arguments arguments = {
+            &input_data, &other_data, &output_data, &n,
+        };
+        const unsigned int grid_x = static_cast<unsigned int>(
+            (static_cast<uint64_t>(n) + metadata->block_size - 1) /
+            metadata->block_size);
+        const bool launched = context->device->aot->launch(
+            "flagos_silu_mul_f32", context->stream, grid_x, 1, 1, arguments);
+        if (launched) {
+            context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
+            context->stats.fusion_attention_output_gate.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(context, mul, "attention_output_gate");
         }
         return launched;
     }
