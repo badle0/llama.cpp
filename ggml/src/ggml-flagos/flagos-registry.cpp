@@ -18,6 +18,10 @@ const flagos_provider_v1 * flagos_denglin_provider();
 const flagos_provider_v1 * flagos_amd_provider();
 #endif
 
+#ifdef GGML_FLAGOS_HAVE_SPACEMIT
+const flagos_provider_v1 * flagos_spacemit_provider();
+#endif
+
 struct flagos_registered_device {
     const flagos_provider_v1 * provider;
     size_t local_index;
@@ -73,6 +77,9 @@ static std::vector<const flagos_provider_v1 *> flagos_compiled_providers() {
 #endif
 #ifdef GGML_FLAGOS_HAVE_AMD
     providers.push_back(flagos_amd_provider());
+#endif
+#ifdef GGML_FLAGOS_HAVE_SPACEMIT
+    providers.push_back(flagos_spacemit_provider());
 #endif
     return providers;
 }

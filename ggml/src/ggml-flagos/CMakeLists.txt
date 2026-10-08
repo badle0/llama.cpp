@@ -39,7 +39,11 @@ if (GGML_FLAGOS_AMD)
     include(providers/amd/provider.cmake)
 endif()
 
-if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD)
+if (GGML_FLAGOS_SPACEMIT)
+    include(providers/spacemit/provider.cmake)
+endif()
+
+if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD AND NOT GGML_FLAGOS_SPACEMIT)
     message(STATUS "FlagOS: building provider-neutral core with no device provider")
 endif()
 
@@ -147,6 +151,12 @@ if (GGML_FLAGOS_AMD)
             FLAGOS_TRITON_KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels/triton")
         target_link_libraries(flagos-check-amd-jit PRIVATE TritonJIT::triton_jit hip::host)
     endif()
+endif()
+
+if (GGML_FLAGOS_SPACEMIT AND NOT GGML_BACKEND_DL)
+    add_executable(flagos-check-spacemit EXCLUDE_FROM_ALL providers/spacemit/tests/check_spacemit.cpp)
+    target_include_directories(flagos-check-spacemit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(flagos-check-spacemit PRIVATE ggml ggml-flagos)
 endif()
 
 install(FILES
