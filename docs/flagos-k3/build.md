@@ -96,56 +96,64 @@ Note: `test-backend-ops` does not place weights in CPU extra buffer types, so it
 ## 5. Build C — SpacemiT's `ggml-spacemit` (separate clone, K3)
 
 ```bash
-mkdir -p ~/spine-runtime && cd ~/spine-runtime
-wget https://github.com/spacemit-com/spine-runtime/releases/download/0.6.0/spine-runtime.riscv64.0.6.0.tar.gz
-tar xzf spine-runtime.riscv64.0.6.0.tar.gz --strip-components=1        # include/ lib/ must exist
+cd ~
+wget -q https://github.com/spacemit-com/spine-runtime/releases/download/0.6.3/spine-runtime.riscv64.0.6.3.tar.gz
+tar xzf spine-runtime.riscv64.0.6.3.tar.gz && ln -sfn ~/spine-runtime.riscv64.0.6.3 ~/spine-runtime   # include/ lib/
 
-git clone -b agent/ggml-spacemit-backend https://github.com/spacemit-com/llama.cpp ~/llama.cpp-spacemit
+git clone --depth 1 -b agent/ggml-spacemit-backend https://github.com/spacemit-com/llama.cpp ~/llama.cpp-spacemit
 cd ~/llama.cpp-spacemit
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_SPACEMIT=ON -DSPERT_DIR=$HOME/spine-runtime
-cmake --build build --target test-backend-ops llama-bench llama-cli 2>&1 | tee build.log
-LD_LIBRARY_PATH=$HOME/spine-runtime/lib ./build/bin/test-backend-ops -o MUL_MAT 2>&1 | tail -5
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_SPACEMIT=ON -DSPERT_DIR=$HOME/spine-runtime \
+  -DGGML_CPU_REPACK=OFF -DLLAMA_OPENSSL=OFF -DGGML_RVV=ON -DGGML_RV_ZVFH=ON -DGGML_RV_ZFH=ON \
+  -DGGML_RV_ZICBOP=ON -DGGML_RV_ZIHINTPAUSE=ON -DGGML_RV_ZBA=ON > cmake.log 2>&1
+cmake --build build --target llama-bench llama-completion llama-perplexity test-backend-ops > build.log 2>&1
+grep -E 'SpacemiT backend using|IME_SPEC' cmake.log; grep -cE 'error:|FAILED' build.log
 ```
-Status: not yet run. It turns `GGML_CPU_RISCV64_SPACEMIT` off automatically. The backend name reported by its registry is unverified; run without `-b` to list backends.
+Status: built on the K3 2026-10-07 at `4e782bc` (+ the E1 device-type switch below) with spine-runtime 0.6.3: `RISCV64_SPACEMIT_IME_SPEC: IME1;IME2`, 0 errors. The CMake flags are SpacemiT's current ones (their `mtmd-backend` branch, `docs/build-riscv64-spacemit.md`), minus the cross-compile toolchain file. It turns `GGML_CPU_RISCV64_SPACEMIT` off automatically. Registry name `SPACEMIT`, device `SPACEMIT0` (from source, not yet seen on the board). This llama.cpp version uses `llama-completion` for plain prompts; `llama-cli` is the chat tool.
 
-## 6. Adding the SpacemiT provider (plan, not done)
+For experiment E1 (`plan.md` M0.9), apply the device-type switch before building: `git -C ~/llama.cpp-spacemit apply ~/llama.cpp-flagos/docs/flagos-k3/scripts/spacemit-device-type.patch`. Without `GGML_SPACEMIT_DEVICE_TYPE=gpu` the build behaves exactly like stock (ACCEL).
 
-Minimal wiring, mirroring AMD/Denglin:
-- `ggml/src/ggml-flagos/providers/spacemit/{flagos-spacemit-api.h, flagos-spacemit.cpp, provider.cmake}`
-- `ggml/CMakeLists.txt`: `option(GGML_FLAGOS_SPACEMIT ...)` next to the AMD/Denglin options (L201–204)
-- `ggml/src/ggml-flagos/CMakeLists.txt`: `include(providers/spacemit/provider.cmake)` when ON
-- `flagos-registry.cpp` `flagos_compiled_providers()` (L69–78): push the provider under `#ifdef GGML_FLAGOS_HAVE_SPACEMIT`
-- Then configure `build/` with `-DGGML_FLAGOS_SPACEMIT=ON`. M1 done when the registry lists 1 FlagOS device and model output is unchanged.
+## 6. Build D - FlagOS with the SpacemiT provider (`build-flagos/`, K3)
 
-Registry check (lists backends and device counts):
+M1 skeleton (`plan.md` M1). Kept separate from `build/`, which stays the plain-CPU baseline.
 ```bash
-python3 - <<'EOF'
-import ctypes, glob
-g = ctypes.CDLL(glob.glob('build/bin/libggml.*')[0])
-g.ggml_backend_reg_get.restype = ctypes.c_void_p; g.ggml_backend_reg_get.argtypes = [ctypes.c_size_t]
-g.ggml_backend_reg_name.restype = ctypes.c_char_p; g.ggml_backend_reg_name.argtypes = [ctypes.c_void_p]
-g.ggml_backend_reg_dev_count.restype = ctypes.c_size_t; g.ggml_backend_reg_dev_count.argtypes = [ctypes.c_void_p]
-for i in range(g.ggml_backend_reg_count()):
-    r = g.ggml_backend_reg_get(i); print(g.ggml_backend_reg_name(r).decode(), g.ggml_backend_reg_dev_count(r))
-EOF
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/m1_check.py --build
 ```
+The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools, `test-backend-ops` and `llama-completion`, runs every M1 check and prints PASS/FAIL per check; logs go to `build-flagos/m1-logs/`. Without `--build` it only reruns the checks. Options: `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--skip-support`, `--build-dir`.
+
+Mac: same CMake options plus `-DGGML_METAL=OFF -DGGML_BLAS=OFF`; the provider compiles but finds no device (`flagos-check-spacemit` reports "device checks skipped").
 
 ## 7. Models and benchmarks
 
 ```bash
-pip install -U huggingface_hub --break-system-packages
-HF_ENDPOINT=https://hf-mirror.com hf download <repo> --include '*Q4_0*' --local-dir ~/models
+mkdir -p ~/models && cd ~/models
+MS=https://modelscope.cn/models/unsloth          # ModelScope: fast from the board; Qwen's own GGUF repos have no Q4_0
+wget -c -q --show-progress $MS/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q4_0.gguf   # 382156480 bytes
+wget -c -q --show-progress $MS/Qwen3-4B-GGUF/resolve/master/Qwen3-4B-Q4_0.gguf       # 2375773472 bytes
 ```
+List a repo's files: `wget -qO- "https://modelscope.cn/api/v1/models/unsloth/Qwen3-4B-GGUF/repo/files?Revision=master&Recursive=true"`. The 4B file matches SpacemiT's table (2.21 GiB); their 0.6B file was about 6 MiB smaller, so compare 0.6B numbers to their table loosely.
 SpacemiT's doc benchmarks Qwen3-0.6B Q4_0 and qwen35 2B Q4_1 (`docs/build-riscv64-spacemit.md`); A100 IME supports Q2_K–Q6_K, Q4_0/1, Q5_0/1, Q8_0.
 
-```bash
-M=~/models/<file>.gguf
-./build/bin/llama-bench -m $M -t 8 -p 128 -n 64                                   # plain RVV, X100
-SPACEMIT_DISABLE_TCM=1 ./build-ime/bin/llama-bench -m $M -t 8 -p 128 -n 64        # upstream IME2, A100, no TCM
-```
-- Always report `pp` and `tg` separately; repeat and interleave runs (A B A B) and note mean and median.
-- Confirm IME is active: `SPACEMIT_DISABLE_TCM=1 ./build-ime/bin/llama-cli -m $M -p Hi -n 16 -no-cnv 2>&1 | grep -iE 'model buffer|SPACEMIT'` should show a SPACEMIT buffer.
-- Where threads run: `ps -L -o tid,psr,comm -p $(pgrep llama-bench)` (`psr` 8–15 = A100).
+Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interleaved, then perplexity, and saves `summary.txt` (modes and switches described in its header).
+
+**Qwen3-4B Q4_0, 2026-10-08** (5 interleaved runs, `-t 8 -p 128 -n 128 -ub 128 -fa 1 -mmp 0`; perplexity on 8 x 512 tokens of `~/ppl.txt`, `-fa on`):
+
+| Mode | pp128 (t/s) | tg128 (t/s) | Perplexity |
+|---|---|---|---|
+| `cpu`: our fork, X100 cores only | 21.33 | 6.07 | 9.7740 |
+| `ime`: our fork, upstream IME path + TCM | 78.95 | **11.10** | 9.7680 |
+| `spacemit`: ggml-spacemit as shipped | 76.07 | 6.82 | 9.7679 |
+| `spacemit-best`: ggml-spacemit reading CPU buffers, norm pinning off | **81.94** | 10.75 | 9.7480 |
+
+- `ime` reproduces SpacemiT's published numbers for this model (79.74 / 11.29) within 1-2%, and has the fastest generation.
+- Perplexity differs by at most 0.27% across modes, far inside the +/- 0.70 error bar: the upstream IME kernels are accurate on a real model (the first check that actually uses the IME weight layout; `test-backend-ops` does not).
+- ggml-spacemit as shipped generates 39% slower than `ime` (ACCEL with its own buffers only plus norm pinning, `device-type.md` §5). With both fixed it is 3% slower in generation and 4% faster in prefill.
+- Targets for the provider (M2e exit): tg128 >= 11.1 (`ime`) and pp128 >= 82 (`spacemit-best`) on this model.
+- IME confirmed active (separate check, `-lv 4`): `CPU_RISCV64_SPACEMIT model buffer size = 2349.12 MiB` (repacked weights) next to `CPU_Mapped model buffer size = 2246.67 MiB` (the mmap'd GGUF), `graph splits = 1`. The single split (no backend handoffs) is the structural reason the IME path generates fastest. The baseline run itself lacked these lines (library INFO messages need `-lv 4`; fixed in the script).
+
+Manual checks:
+- Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
+- Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
+- Where threads run: `ps -L -o tid,psr,comm -p $(pgrep llama-bench)` (`psr` 8-15 = A100).
 
 ## 8. Troubleshooting
 

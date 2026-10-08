@@ -5,13 +5,15 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 - `docs/flagos-k3/build.md` — step-by-step builds (Mac, K3), verification, benchmarks, troubleshooting
 - `docs/flagos-k3/k3-hardware.md` — board facts, AI cores, TCM investigation and its evidence
 - `docs/flagos-k3/upstream-review.md` — structural concerns in ggml-flagos (fusion + provider shim), with file:line evidence
+- `docs/flagos-k3/plan.md` — build plan for the SpacemiT provider: architecture, decisions D3–D9, milestones M0–M4 with tests and exit criteria, risks
+- `docs/flagos-k3/device-type.md` — GPU vs IGPU vs ACCEL: what the type controls in llama.cpp, what "right behavior" means (R1–R6), predictions and experiments X0–X6
 
 ## 1. Task
 
 - Goal: run llama.cpp inference on the SpacemiT K3 through FlagOS — a **SpacemiT provider inside ggml-flagos**, analogous to how vllm-plugin-FL plugs FlagOS into vLLM.
-- Deliverable shape: in-tree provider at `ggml/src/ggml-flagos/providers/spacemit/` (not yet created). ggml-flagos builds as one ggml backend (`libggml-flagos`); providers are compiled into it.
+- Deliverable shape: in-tree provider at `ggml/src/ggml-flagos/providers/spacemit/` (M1 skeleton drafted). ggml-flagos builds as one ggml backend (`libggml-flagos`); providers are compiled into it.
 - Mentor also asked for a design review of ggml-flagos, focused on **kernel fusion** (providers have different kernel structures) and the **shim between Common and providers** → `upstream-review.md`.
-- Status: FlagOS provider-neutral build and upstream SpacemiT IME baseline both build on the K3; no provider code written yet.
+- Status: FlagOS provider-neutral build and upstream SpacemiT IME baseline both build on the K3; IME + TCM passes on the board (2026-10-07). Build plan written (`plan.md`, 2026-10-07). M1 skeleton drafted 2026-10-08 (`providers/spacemit/`, uncommitted; Mac-tested, board test pending).
 
 ## 2. Decisions (proposed = still to confirm with mentor)
 
@@ -19,9 +21,15 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 |---|---|---|
 | D1 | Standalone backend design (ggml device/buffer/backend), not a ggml-cpu extra buffer type | adopted via ggml-flagos |
 | D2 | Work in the mentor's fork, in-tree; the earlier standalone `ggml-plugin-FL` repo is retired | adopted |
-| D3 | ggml device type `ACCEL`, FlagOS `flagos_provider_kind::cpu_accelerator` | proposed; SpacemiT's own backend is also ACCEL |
+| D3 | ggml device type `ACCEL` | **adopted** (mentor, 2026-10-08). Consequences: the provider must read CPU buffers directly (the KV cache stays on the CPU) and ship correct non-flash attention (`-fa auto` turns flash attention off when it runs attention). Evidence: `device-type.md` §5, `plan.md` §2.8 |
+| D4 | Weights in an IME-repacked buffer, stored once (`is_host = false`); the provider reads CPU buffers for all other operands | proposed, re-evaluated for ACCEL (`plan.md` §2.3) |
+| D5 | spine-runtime executor, one launch per split, barrier per node | proposed, decided after M0 (`plan.md` §2.4) |
+| D6 | Reuse in-tree IME/repack kernels in place; port ggml-spacemit tiling and RVV ops, fixing them (the mentor allows changing that AI-generated code, 2026-10-08) | proposed (`plan.md` §2.5) |
+| D7 | First target Qwen3-0.6B / 4B Q4_0, then Qwen3.5-4B Q4_K_M | proposed |
+| D8 | `flagos_provider_kind::cpu_accelerator` (engine `cpu`); `ai_accelerator` would classify the K3 as an NPU. Independent of D3; affects no execution | proposed, open |
+| D9 | FlagTree AOT package (M3) only if in scope | proposed |
 
-Caveat on D3: ggml's scheduler runs splits sequentially (`ggml_backend_sched_compute_splits`); do not assume the X100 CPU backend and A100 provider run concurrently.
+Caveat: ggml's scheduler runs splits sequentially (`ggml_backend_sched_compute_splits`); do not assume the X100 CPU backend and A100 provider run concurrently.
 
 ## 3. Code and references
 
@@ -29,11 +37,11 @@ Caveat on D3: ggml's scheduler runs splits sequentially (`ggml_backend_sched_com
 |---|---|---|
 | This repo | fork of `kevinzs2048/llama.cpp`, branch `feature/flagos-spacemit` | = mentor's `feature/flagos-amd-890-opt` @ `5794e12` + macOS link fix `eaa25ff` |
 | Mentor baseline | `kevinzs2048/llama.cpp` `feature/flagos-amd-890-opt` @ `5794e12` | exactly the design PDF's baseline; upstream base `ba360ef` (2026-08-11) |
-| Mentor design history | same repo, branch `feature/flagos-multi-provider-backend` | 4 `FLAGOS_BACKEND_*.md` design/review docs not on the AMD branch |
+| Mentor design history | same repo, branch `feature/flagos-multi-provider-backend` | 4 `FLAGOS_BACKEND_*.md` design/review docs not on the AMD branch; §14 is the K3 provider design (co-built in `providers/spacemit`, no parallel ggml-spacemit; it chose K3 = GPU, which the mentor now considers open) |
 | FlagOS Common | `ggml/src/ggml-flagos/flagos-{provider,registry,target,graph-plan}.*` | registry, profiles, fixed-fusion side-plan |
 | Provider templates | `providers/denglin/flagos-denglin.cpp` (read first, 3.2k lines), `providers/amd/` (strict AOT loader, many fusions) | both report GPU/IGPU device types |
 | Upstream SpacemiT CPU path | `ggml/src/ggml-cpu/spacemit/` (`ime.cpp`, `ime_env.cpp`, `spine_mem_pool.cpp`, vendored `spine_tcm.h`) | extra-buffer-type design; A100 binding, TCM, IME2 kernels |
-| SpacemiT standalone backend | `spacemit-com/llama.cpp` branch `agent/ggml-spacemit-backend` @ `4e782bc`, `ggml/src/ggml-spacemit/` | ACCEL backend on spine-runtime; own repacking buffer type; ~35 ops. Primary K3-side reference and the performance baseline to beat |
+| SpacemiT standalone backend | `spacemit-com/llama.cpp` branch `agent/ggml-spacemit-backend` @ `4e782bc`, `ggml/src/ggml-spacemit/` | ACCEL backend on spine-runtime; own repacking buffer type; ~35 ops. Primary K3-side reference. Measured 2026-10-08 (`build.md` §7): the upstream IME path, not ggml-spacemit, is the fastest generation baseline (Qwen3-4B Q4_0 tg128 11.10 vs 6.82 t/s) |
 | spine-runtime | `spacemit-com/spine-runtime` release 0.6.0 (`libspert.so`, `spert.hpp`) | `spert::Stream::launch(Grid, fn)`, `Context::program_id/grid_dim/sync/shared_buffer`, `backend_info()`; does the `/proc/set_ai_thread` opt-in itself |
 | FlagTree SpacemiT backend | `flagos-ai/FlagTree` `third_party/spacemit/` | Triton → linalg → spine-mlir → riscv64 `.so`; `AICPUTarget(...)`; launcher ABI in `backend/driver.py` |
 | Design doc | `ggml-flagos-provider-design.pdf` V2.0 (AI-written summary of the AMD work) | treat claims as needing code verification |
@@ -42,16 +50,16 @@ Caveat on D3: ggml's scheduler runs splits sequentially (`ggml_backend_sched_com
 
 - Bianbu 4.0, kernel 6.18.3, riscv64; GCC 15.2 (assembles IME1+IME2), CMake 4.2, Ninja; 31 GiB RAM, no swap.
 - CPUs 0–7: X100 @ 2.4 GHz (default affinity). CPUs 8–15: A100 AI cores @ 2.0 GHz, usable only after a thread writes `/proc/set_ai_thread`.
-- RVV VLEN 256 on both core types; identical ISA strings. A100 extras: IME matrix extension, per-core TCM (8 × 384 KiB via `/dev/tcm`).
-- Known issue: upstream IME path aborts in TCM acquisition (`ime.cpp:1728`); runs with `SPACEMIT_DISABLE_TCM=1`. Root cause open.
+- RVV VLEN: X100 256 bits, A100 1024 bits (measured 2026-10-07; a thread's `vlenb` changes when it migrates); identical ISA strings. A100 extras: IME matrix extension, TCM (8 × 384 KiB via `/dev/tcm`, assigned per core pair). spine-runtime's `shared_buffer()` is real TCM on this board (`k3-hardware.md` §4).
+- TCM works (resolved 2026-10-07, `k3-hardware.md` §4): upstream IME path passes 1198/1198 `MUL_MAT` with TCM on. That test uses the CPU backend's plain buffers, so it checks thread pinning and TCM handling, not the IME kernels. Two rules: run `~/tcmtest/tcmrelease --apply` before IME runs (a crashed/interrupted run leaves blocks stuck in `/dev/shm/tcm_sync_standalone`), and use ≤ 8 threads (`OMP_THREAD_LIMIT=8` for test-backend-ops, `-t 8` for llama-bench/cli), else `ime.cpp:1705` aborts.
 
 ## 5. Everyday commands (on the K3, repo root)
 
 ```bash
 tmux attach -t build || tmux new -s build                  # long jobs always inside tmux
-cmake --build build --target ggml-flagos flagos-check-provider flagos-check-target flagos-check-graph-plan test-backend-ops llama-bench llama-cli
-for t in provider target graph-plan; do ./build/bin/flagos-check-$t; done
-SPACEMIT_DISABLE_TCM=1 ./build-ime/bin/test-backend-ops -o MUL_MAT -b CPU 2>&1 | tail -3
+cmake --build build --target ggml-flagos flagos-check-provider flagos-check-target flagos-check-graph-plan flagos-check-registry test-backend-ops llama-bench llama-cli
+for t in provider target graph-plan registry; do ./build/bin/flagos-check-$t; done
+~/tcmtest/tcmrelease --apply && OMP_THREAD_LIMIT=8 ./build-ime/bin/test-backend-ops -o MUL_MAT -b CPU 2>&1 | tail -3
 grep -nE 'error:|FAILED' build.log | head                  # after: cmake --build ... 2>&1 | tee build.log
 ```
 
@@ -74,22 +82,34 @@ After any code change, always report:
 3. **Ways to play with it**: which parameters/env vars/shapes to change and what result to expect.
 
 Git (from AGENTS.md, applies to anything that may go upstream):
-- Do not commit or push without explicit approval each time. If asked to commit, add `Assisted-by: Claude Code`; never `Co-authored-by:`.
+- Do not commit or push without explicit approval each time. Commit messages for this fork carry no AI attribution line (no `Assisted-by:`, no `Co-authored-by:`; user decision 2026-10-08).
 - Push only to `origin` (the user's fork). Never push to the mentor's repo.
 - Never write the board's SSH hostname or credentials into the repo (the fork is public).
 
 ## 7. Open questions for the mentor
 
-1. Scope: reuse `ggml-spacemit`'s runtime/buffer layer (spine-runtime launch, repacked buffers) and contribute FlagTree kernels + FlagOS integration, or write an independent provider?
-2. Confirm D3 (ACCEL + `cpu_accelerator`) vs GPU/IGPU-style like AMD.
-3. TCM on Bianbu 4.0: no `/dev/tcm_sync_mem`; `spine_tcm_mem_try_wait` fails in llama.cpp's IME path. Known? Newer image/driver?
-4. AOT path for FlagTree SpacemiT kernels (riscv64 `.so` + stable C signature) usable from C++ without Python?
-5. P0 target model and quant (AMD work used Qwen3.5-4B-Q4_K_M).
-6. Is zero-copy between same-memory-domain devices (`memory_domain_id`) in scope for FlagOS Common?
+Same numbering as `plan.md` §7, which gives the context for each.
+
+1. ~~Device type~~ decided: ACCEL (2026-10-08). Still open: FlagOS `caps.kind`, `cpu_accelerator` (proposed) or `ai_accelerator`?
+2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, provider reading CPU buffers for everything else (`plan.md` §2.3, A2)? The alternative doubles quantized-weight memory.
+3. Is closed `libspert` (spine-runtime) acceptable as a hard dependency?
+4. Reuse the in-tree `ggml-cpu/spacemit` kernel sources in place, or copy them into `providers/spacemit/`?
+5. Phase 0 target: Qwen3-4B Q4_0 or Qwen3.5-4B Q4_K_M?
+6. FlagTree AOT (M3) in scope? Cross-compile on x86 or build on the K3? (FlagTree's SpacemiT backend has no AOT tool; we would write generator, manifest, loader, launcher.)
+7. Is co-building in `providers/spacemit` agreed with SpacemiT, who ship ggml-spacemit as an `ACCEL` backend?
+8. TCM: report to SpacemiT (no dead-owner recovery; `try_wait` timeout unit ~12 µs) and install spacemit-tcm 3.0.1 on the board?
+9. ACCEL gaps in llama.cpp (C5, `plan.md` §6): fix the automatic flash-attention check and norm pinning in our fork, or raise an upstream issue? Without them ACCEL needs `-fa on` and generates 30-39% slower (Qwen3-4B / 0.6B).
+
+Zero-copy between same-memory devices (former question 6) is handled at the ggml level by host-visible buffers (`plan.md` §2.3); `memory_domain_id` stays unused.
 
 ## 8. Next steps (in order)
 
-1. TCM isolation: `diff -w` of `spine_tcm.h` headers, then the standalone `libspine_tcm` test (`k3-hardware.md` §4).
-2. Build and run `ggml-spacemit` with spine-runtime 0.6.0 (`build.md` §5) — does its TCM path work here?
-3. Put a model on the board; first `llama-bench` numbers: plain CPU vs upstream IME vs ggml-spacemit (`build.md` §7).
-4. Settle scope with the mentor (questions 1–2), then create `providers/spacemit/` (M1: device registers, claims nothing).
+Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone M0 (no provider code):
+
+1. ~~TCM isolation~~ done 2026-10-07: TCM works with the IME path (`k3-hardware.md` §4).
+2. M0.1–M0.2: build and run `ggml-spacemit` with spine-runtime (`build.md` §5), with `scripts/spacemit-device-type.patch` applied; `scripts/spert-info.cpp` shows whether `shared_buffer()` is real TCM.
+3. M0.9 (E1): `scripts/e1-device-type.sh`. Done on Qwen3-0.6B (`device-type.md` §5); D3 decided (ACCEL). X3/X3b done 2026-10-08: ACCEL with CPU-buffer reads, `-fa on` and llama.cpp's norm pinning off matches GPU type within 1-2% (Qwen3-0.6B and Qwen3-4B, `device-type.md` §5); the two llama.cpp heuristics are change C5 (`plan.md` §6), a question for the mentor.
+4. ~~M0.3–M0.6~~ done 2026-10-08 on Qwen3-4B Q4_0 (`build.md` §7): provider targets tg128 >= 11.1 (upstream IME) and pp128 >= 82 (ggml-spacemit fixed); all modes within 0.3% perplexity.
+5. ~~M0.4: re-measure A100 VLEN~~ done 2026-10-07: 1024 on A100, 256 on X100 (`k3-hardware.md` §2). ~~M0.2 TCM check~~ done: spine-runtime gets real TCM.
+6. ~~M0.7~~ done 2026-10-08: op matrix of Qwen3-4B Q4_0 in `plan.md` (9 op kinds with flash attention; output head is Q6_K, 4 `ffn_down` are Q4_1).
+7. M0.8: settle D4–D9 with the mentor (questions above; D3 settled), then M1: `providers/spacemit/` skeleton (ACCEL device) that registers and claims nothing.

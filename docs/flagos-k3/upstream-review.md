@@ -46,6 +46,8 @@ B4. **Thin Common; each provider is a full backend.** Providers implement device
 
 B5. **Fail-closed ⇒ failed requests (deliberate tradeoff).** Any post-placement provider error fails `llama_decode`; robustness depends on exact `supports_op`.
 
+B6. **The registry forwards no provider functions.** `ggml_backend_flagos_reg_proc_address` (`flagos-registry.cpp` L105–126) returns only FlagOS's own entry points. A provider cannot expose `ggml_backend_set_n_threads` (llama.cpp looks it up, `src/llama-context.cpp` ~L360), an abort callback, or extra buffer types (`ggml_backend_dev_get_extra_bufts`). For the K3 this means the A100 thread count cannot follow `-t`, and repacked weights cannot live in a second buffer type (`plan.md` §2.3, option A3).
+
 ## C. Code-level findings
 
 - `GGML_FLAGOS_DENGLIN` defaults to ON (`ggml/CMakeLists.txt` L202) and hard-fails without the Denglin SDK; not mentioned in the Design.
