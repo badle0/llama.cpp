@@ -22,9 +22,9 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 | D1 | Standalone backend design (ggml device/buffer/backend), not a ggml-cpu extra buffer type | adopted via ggml-flagos |
 | D2 | Work in the mentor's fork, in-tree; the earlier standalone `ggml-plugin-FL` repo is retired | adopted |
 | D3 | ggml device type `ACCEL` | **adopted** (mentor, 2026-10-08). Consequences: the provider must read CPU buffers directly (the KV cache stays on the CPU) and ship correct non-flash attention (`-fa auto` turns flash attention off when it runs attention). Evidence: `device-type.md` §5, `plan.md` §2.8 |
-| D4 | Weights in an IME-repacked buffer, stored once (`is_host = false`); the provider reads CPU buffers for all other operands | proposed, re-evaluated for ACCEL (`plan.md` §2.3) |
-| D5 | spine-runtime executor, one launch per split, barrier per node | proposed, decided after M0 (`plan.md` §2.4) |
-| D6 | Reuse in-tree IME/repack kernels in place; port ggml-spacemit tiling and RVV ops, fixing them (the mentor allows changing that AI-generated code, 2026-10-08) | proposed (`plan.md` §2.5) |
+| D4 | Weights in an IME-repacked buffer, stored once (`is_host = false`); the provider reads CPU buffers for all other operands | **building on it from M2b** (user, 2026-10-09); mentor confirmation pending (`plan.md` §2.3) |
+| D5 | spine-runtime executor, one launch per split, barrier per step (an op may take several steps) | proposed; implemented in M2a, persistent stream chosen by measurement (`plan.md` §2.4) |
+| D6 | Copy into the provider, per milestone, only the IME kernel, quantizer and repack functions it uses from in-tree `ggml-cpu/spacemit` (bodies unchanged, origin noted); port ggml-spacemit tiling and RVV ops, fixing them (the mentor allows changing that AI-generated code, 2026-10-08) | **decided** (user, 2026-10-09); was "compile in place" (`plan.md` §2.5) |
 | D7 | First target Qwen3-0.6B / 4B Q4_0, then Qwen3.5-4B Q4_K_M | proposed |
 | D8 | `flagos_provider_kind::cpu_accelerator` (engine `cpu`); `ai_accelerator` would classify the K3 as an NPU. Independent of D3; affects no execution | proposed, open |
 | D9 | FlagTree AOT package (M3) only if in scope | proposed |
@@ -41,7 +41,7 @@ Caveat: ggml's scheduler runs splits sequentially (`ggml_backend_sched_compute_s
 | FlagOS Common | `ggml/src/ggml-flagos/flagos-{provider,registry,target,graph-plan}.*` | registry, profiles, fixed-fusion side-plan |
 | Provider templates | `providers/denglin/flagos-denglin.cpp` (read first, 3.2k lines), `providers/amd/` (strict AOT loader, many fusions) | both report GPU/IGPU device types |
 | Upstream SpacemiT CPU path | `ggml/src/ggml-cpu/spacemit/` (`ime.cpp`, `ime_env.cpp`, `spine_mem_pool.cpp`, vendored `spine_tcm.h`) | extra-buffer-type design; A100 binding, TCM, IME2 kernels |
-| SpacemiT standalone backend | `spacemit-com/llama.cpp` branch `agent/ggml-spacemit-backend` @ `4e782bc`, `ggml/src/ggml-spacemit/` | ACCEL backend on spine-runtime; own repacking buffer type; ~35 ops. Primary K3-side reference. Measured 2026-10-08 (`build.md` §7): the upstream IME path, not ggml-spacemit, is the fastest generation baseline (Qwen3-4B Q4_0 tg128 11.10 vs 6.82 t/s) |
+| SpacemiT standalone backend | `spacemit-com/llama.cpp` branch `agent/ggml-spacemit-backend` @ `4e782bc`, `ggml/src/ggml-spacemit/` | ACCEL backend on spine-runtime; own repacking buffer type; ~35 ops. Primary K3-side reference. Copies the in-tree kernel/repack files unchanged; branch `mtmd-backend` @ `64316cd` (2026-09-24) has the same kernel, IME and repack code (checked 2026-10-09). Measured 2026-10-08 (`build.md` §7): the upstream IME path, not ggml-spacemit, is the fastest generation baseline (Qwen3-4B Q4_0 tg128 11.10 vs 6.82 t/s) |
 | spine-runtime | `spacemit-com/spine-runtime` release 0.6.0 (`libspert.so`, `spert.hpp`) | `spert::Stream::launch(Grid, fn)`, `Context::program_id/grid_dim/sync/shared_buffer`, `backend_info()`; does the `/proc/set_ai_thread` opt-in itself |
 | FlagTree SpacemiT backend | `flagos-ai/FlagTree` `third_party/spacemit/` | Triton → linalg → spine-mlir → riscv64 `.so`; `AICPUTarget(...)`; launcher ABI in `backend/driver.py` |
 | Design doc | `ggml-flagos-provider-design.pdf` V2.0 (AI-written summary of the AMD work) | treat claims as needing code verification |
@@ -91,9 +91,9 @@ Git (from AGENTS.md, applies to anything that may go upstream):
 Same numbering as `plan.md` §7, which gives the context for each.
 
 1. ~~Device type~~ decided: ACCEL (2026-10-08). Still open: FlagOS `caps.kind`, `cpu_accelerator` (proposed) or `ai_accelerator`?
-2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, provider reading CPU buffers for everything else (`plan.md` §2.3, A2)? The alternative doubles quantized-weight memory.
+2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, provider reading CPU buffers for everything else (`plan.md` §2.3, A2)? We are building M2b on A2 (2026-10-09); the alternative doubles quantized-weight memory and would change only the buffer part.
 3. Is closed `libspert` (spine-runtime) acceptable as a hard dependency?
-4. Reuse the in-tree `ggml-cpu/spacemit` kernel sources in place, or copy them into `providers/spacemit/`?
+4. Kernel reuse: decided 2026-10-09 to copy, per milestone, only the functions used (`plan.md` §2.5: mentor design §14.1 "reference, not boundary"; ggml-spacemit did the same). Objections?
 5. Phase 0 target: Qwen3-4B Q4_0 or Qwen3.5-4B Q4_K_M?
 6. FlagTree AOT (M3) in scope? Cross-compile on x86 or build on the K3? (FlagTree's SpacemiT backend has no AOT tool; we would write generator, manifest, loader, launcher.)
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, who ship ggml-spacemit as an `ACCEL` backend?
@@ -114,4 +114,4 @@ Full milestone list with tests and exit criteria: `plan.md` §4. Current milesto
 6. ~~M0.7~~ done 2026-10-08: op matrix of Qwen3-4B Q4_0 in `plan.md` (9 op kinds with flash attention; output head is Q6_K, 4 `ffn_down` are Q4_1).
 7. M0.8: settle D4–D9 and C5 with the mentor (questions above; D3 settled).
 8. ~~M1~~ done 2026-10-08: `providers/spacemit/` skeleton, 14/14 checks on the K3 (`plan.md` M1).
-9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement. Next: M2b (Q4_0 `MUL_MAT` on IME), which needs D4 (question 2) from the mentor.
+9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement. Next: M2b (Q4_0 `MUL_MAT` on IME), designed 2026-10-09 (`plan.md` "M2b design"): A2 buffer, copied kernels (D6), GEMV + path A + path C, path B deferred.

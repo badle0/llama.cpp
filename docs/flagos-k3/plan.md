@@ -1,6 +1,6 @@
 # SpacemiT K3 provider: build plan
 
-Written 2026-10-07. Nothing in this plan is built yet.
+Written 2026-10-07; updated as milestones land (M1 done 2026-10-08, M2a done 2026-10-09, M2b designed 2026-10-09).
 
 - "Design" = `ggml-flagos-provider-design.pdf` V2.0 (review baseline, 2026-09-22). Section numbers like "Design §13.3" refer to it.
 - "Mentor design" = `FLAGOS_BACKEND_MULTIPLATFORM_DESIGN.md` and `FLAGOS_BACKEND_MULTIPLATFORM_DESIGN_REVIEW_RESOLUTION.md` on `kevin/feature/flagos-multi-provider-backend` (v0.3, 2026-08-22). Read with `git show kevin/feature/flagos-multi-provider-backend:<file>`.
@@ -10,9 +10,9 @@ Written 2026-10-07. Nothing in this plan is built yet.
 
 1. Build a **direct-op provider** (Design §4.1) at `ggml/src/ggml-flagos/providers/spacemit/`, compiled into `libggml-flagos`, that runs ggml ops on the 8 A100 AI cores (CPUs 8-15).
 2. **Device type: ggml `ACCEL`** (mentor decision, 2026-10-08). llama.cpp then keeps model layers and the KV cache on the CPU side, tries the provider's buffer type first for each weight whose op the provider supports, and always creates the provider's backend ahead of the CPU backend (§2.8). Whole layers reach the AI cores only if the provider also reads CPU buffers directly: in E1, a backend that did not needed 280 backend switches per generated token.
-3. **Memory**: the provider's buffer type holds weights in IME-repacked layout (`is_host = false`), stored once. The KV cache and other inputs stay in CPU buffers, which the provider reads directly (§2.3, D4).
-4. Execution: **one spine-runtime launch per split**. Each of the 8 tiles walks the split's nodes, with a barrier after each node and the core's TCM as scratch. This is ggml-spacemit's model.
-5. Kernels: reuse the in-tree IME GEMM and repack code (byte-identical to ggml-spacemit's) and port ggml-spacemit's tiling and RVV ops, each behind its own op tests. The mentor allows changing ggml-spacemit's code freely (it is AI-generated); its X0 failures must be fixed, not copied. Neither source is validated yet: the upstream 1198/1198 `MUL_MAT` run never used the IME weight layout (`test-backend-ops` allocates in the CPU backend's plain buffer), and ggml-spacemit fails part of the op tests on this board (`device-type.md` X0). FlagTree AOT kernels come later and only if the mentor wants them.
+3. **Memory**: the provider's buffer type holds weights in IME-repacked layout (`is_host = false`), stored once. The KV cache and other inputs stay in CPU buffers, which the provider reads directly (§2.3, D4: building on this from M2b, 2026-10-09; mentor confirmation pending).
+4. Execution: **one spine-runtime launch per split**. Each of the 8 tiles walks the split's steps (one or more per node), with a barrier after each step and the core's TCM as scratch. This is ggml-spacemit's model, except that its kernels also wait inside a node.
+5. Kernels: copy into the provider, milestone by milestone, only the IME GEMM, quantizer and repack functions it uses from the in-tree `ggml-cpu/spacemit` sources (byte-identical to ggml-spacemit's), and port ggml-spacemit's tiling and RVV ops, each behind its own op tests (D6, decided 2026-10-09, §2.5). The mentor allows changing ggml-spacemit's code freely (it is AI-generated); its X0 failures must be fixed, not copied. Neither source is validated yet: the upstream 1198/1198 `MUL_MAT` run never used the IME weight layout (`test-backend-ops` allocates in the CPU backend's plain buffer), `test-backend-ops` has no Q4_0 case that fits the IME 32x256 layout at all (§1), and ggml-spacemit fails part of the op tests on this board (`device-type.md` X0). FlagTree AOT kernels come later and only if the mentor wants them.
 6. **Attention without flash attention must work.** Under ACCEL, llama.cpp's default `-fa auto` switches flash attention off whenever the provider runs attention, because each layer's device is the CPU (confirmed in E1). The default path is therefore `MUL_MAT` on the KV cache plus masked `SOFT_MAX`; flash attention is used with `-fa on` (§2.4).
 7. Order follows Design §13.3: **M0** targets and baselines (no provider code) -> **M1** skeleton -> **M2** direct ops, quantized `MUL_MAT` first -> **M3** AOT package (conditional) -> **M4** fixed fusion (conditional). Design phases P5 (split compiler) and P6 (pre-placement partition) are not needed.
 
@@ -31,7 +31,10 @@ Written 2026-10-07. Nothing in this plan is built yet.
 | In-tree IME GEMM kernels and activation quantizers take plain pointers; the orchestration around them is tied to ggml-cpu's thread pool | `ggml/src/ggml-cpu/spacemit/ime_kernels.h:72-111`; `ime.cpp:69-70, 393, 707` |
 | Upstream IME claims `MUL_MAT` (2-D) and `MUL_MAT_ID` (3-D) for Q2_K-Q6_K, Q4_0/1, Q5_0/1, Q8_0 with F32 activations | `ggml/src/ggml-cpu/spacemit/ime.cpp:1580-1612` |
 | TCM works on this board when stale blocks are released and at most 8 compute threads are used | `k3-hardware.md` §4 |
-| ggml-spacemit: `ACCEL`, one spert launch per `graph_compute`, a grid barrier after every node, whole per-core TCM per tile, IME only for `MUL_MAT`/`MUL_MAT_ID` on repacked weights; its IME and repack sources are byte-identical to ours | `spacemit-com/llama.cpp` @ `4e782bc`: `ggml/src/ggml-spacemit/ggml-spacemit.cpp:423-515, 590-593` |
+| ggml-spacemit: `ACCEL`, one spert launch per `graph_compute`, a grid barrier after every node, whole per-core TCM per tile, IME only for `MUL_MAT`/`MUL_MAT_ID` on repacked weights; its IME and repack sources are byte-identical to ours. It copied the in-tree files into its own directory: `ime1/ime2_kernels.cpp`, `ime_kernels.h`, `repack.{h,cpp}`, `spine_barrier.h` unchanged; `ime.cpp` (+586/-396) and `rvv_kernels.cpp` (+1222/-119) rewritten. Its build still includes ggml-cpu headers and calls ggml-cpu functions (`ggml_get_type_traits_cpu`, `ggml_vec_*`) without linking ggml-cpu, and forces `GGML_CPU_RISCV64_SPACEMIT` off. Branch `mtmd-backend` @ `64316cd` (2026-09-24, used by SpacemiT's CI) has the same kernel, IME, RVV and repack files; it only adds core pinning (`SPACEMIT_PERFER_CORE_ID`) | `spacemit-com/llama.cpp` @ `4e782bc`: `ggml/src/ggml-spacemit/ggml-spacemit.cpp:423-515, 590-593`, `CMakeLists.txt`; compared 2026-10-09 |
+| `test-backend-ops` has no Q4_0 `MUL_MAT` case that fits the IME 32x256 layout (row length % 256, rows % 32): the Q4_0 cases have 16 rows, or 2880 x 2880 (2880 % 256 != 0); the fused cases need ops the provider does not claim | `tests/test-backend-ops.cpp:8875, 8897-8968, 6082-6200` |
+| llama.cpp places a weight once, at load, by asking `supports_op` about a 512-row `MUL_MAT` on it; it writes each weight whole (`ggml_backend_tensor_set(cur, data, 0, n_size)`) unless the device has async, host-buffer and event support | `src/llama-model-loader.cpp:907-947, 1447-1475, 1569, 1640` |
+| If no backend accepts an op on a weight in a buffer, the scheduler copies the weight to another backend (through the buffer's `get_tensor`) | `ggml/src/ggml-backend.cpp:877-895` |
 | FlagTree SpacemiT: Triton -> riscv64 `.so`, launched through spine-runtime; no AOT export tool; 4 commits, no tests, CI only under QEMU | FlagTree `third_party/spacemit/backend/compiler.py:342-353`, `driver.py:82-107` |
 | Reference numbers, upstream IME on A100, 8 threads: Qwen3-0.6B Q4_0 pp128 565.83 / tg128 55.77; Qwen3-4B Q4_0 pp128 79.74 / tg128 11.29 t/s | `docs/build-riscv64-spacemit.md:101-110` |
 
@@ -67,7 +70,7 @@ llama.cpp   ACCEL device: backend created automatically, no -ngl
 | ggml props | async false, events false, host_buffer false, buffer_from_host_ptr false | a synchronous ACCEL backend disables pipeline parallelism across several GPUs (mentor design line 723); irrelevant on a K3-only board |
 | `get_memory` | `/proc/meminfo` MemAvailable / MemTotal | same RAM as the CPU |
 
-### 2.3 Memory model under ACCEL (D4, *proposed*)
+### 2.3 Memory model under ACCEL (D4: A2, building from M2b, 2026-10-09; mentor confirmation pending)
 
 Under ACCEL, llama.cpp puts a weight into the provider's buffer type only when the provider supports the op that uses it (`src/llama-model.cpp:903-917`), and the KV cache always goes to CPU buffers (`src/llama-kv-cache.cpp:211-217`). The scheduler also allocates the provider's compute tensors from its default buffer type.
 
@@ -80,18 +83,19 @@ Under ACCEL, llama.cpp puts a weight into the provider's buffer type only when t
 A2 rules:
 - Buffer type `FlagOS:SpacemiT`: 64-byte alignment, size-0 allocations allowed (llama.cpp probes with one).
 - `supports_buft`: own buffer type, or any host buffer type.
-- `supports_op` judges a tensor by `t->view_src ? t->view_src->buffer : t->buffer`. ggml-spacemit checks only `t->buffer`; views have none before allocation, so it claimed attention on CPU-resident KV views, which started the E1 failure chain (`device-type.md` §5). Weight operands (buffer usage `WEIGHTS`) must be in the provider's buffer; every other operand may be in the provider's buffer or any host buffer.
+- `supports_op` judges a tensor by `t->view_src ? t->view_src->buffer : t->buffer`. ggml-spacemit checks only `t->buffer`; views have none before allocation, so it claimed attention on CPU-resident KV views, which started the E1 failure chain (`device-type.md` §5). A weight operand that the kernel reads in repacked layout must be in the provider's buffer (or not yet allocated, at placement time), never in a host buffer; every other operand may be in the provider's buffer or any host buffer.
 - Claims for weight ops must not depend on batch size: llama.cpp picks each weight's buffer once, at load time. If a later graph's op were refused, the scheduler would copy the repacked weight for the CPU.
-- `set_tensor` repacks quantized weights (whole-tensor writes); `get_tensor` returns the original layout. Lossy repacks (Q4_1, Q4_K, Q6_K) cannot be inverted: keep their original bytes as well, or do not claim them (R4).
-- `init_tensor` attaches repack data only to tensors in weight buffers; ggml-spacemit also attaches it to compute tensors.
+- Whether a tensor is stored repacked is a pure function of its type and shape (one layout function, used by `supports_op`, `set_tensor`, `get_tensor` and the kernel), not of the buffer's usage flag: `test-backend-ops` allocates weights in an ordinary buffer (it sets `WEIGHTS` usage only for its separate weight context, `tests/test-backend-ops.cpp:1384-1393`). No `init_tensor` state is needed. (Corrected 2026-10-09; the earlier rule "repack only in weight buffers" would have left test weights unrepacked.)
+- `set_tensor` repacks whole-tensor writes; a partial write to a repacked tensor aborts (llama.cpp writes weights whole on this device, §1). `get_tensor` returns the original layout; this is needed for correctness, not only for the memory check in M2f: if the provider ever refuses an op on a weight it holds, the scheduler copies the weight out through `get_tensor` (§1). The in-tree buffer has no `get_tensor` (`ggml-cpu/spacemit/ime.cpp:1468`). `cpy_tensor` returns false for repacked tensors, so ggml falls back to `set_tensor` instead of copying raw bytes.
+- Lossy repacks (Q4_1, Q4_K, Q6_K) cannot be inverted: keep their original bytes as well, or do not claim them (R4). The Q4_0 repack is a byte permutation (same size, lossless).
 
-### 2.4 Execution model (D5, *proposed*)
+### 2.4 Execution model (D5, *proposed*; implemented in M2a)
 
 - `graph_compute(split)`:
   1. Re-check every node before any write: the same predicate as `supports_op`, data pointers non-null, alignment, workspace size (Design §7.3). Any failure returns `GGML_STATUS_FAILED` with nothing written.
-  2. One launch of 8 tiles. Each tile walks the nodes; a barrier follows each node.
+  2. One launch of 8 tiles. Each tile walks the steps; a barrier follows each step. An op takes one or more steps (`ADD`: one; `MUL_MAT`: quantize activations, then GEMM). Kernels never wait inside a step: barriers exist only between steps, which keeps the failure protocol below valid and lets the serial stand-in (no spine-runtime) run the same step list.
   3. A tile that fails sets a shared flag; tiles stop at the next barrier; the result is `GGML_STATUS_FAILED`. No exception crosses the runtime (spert has no try/catch around tiles). No fallback after a write (Design §3.3, §12.3).
-- Executor interface (`flagos-spacemit-exec.h`): launch N tiles, barrier, per-tile `{ith, nth, tcm, tcm_size, workspace}`.
+- Executor interface (`flagos-spacemit-exec.h`): launch N tiles, barrier, per-tile `{ith, nth, tcm, tcm_size, workspace}` (M2a built it without `workspace`; M2b adds it). Workspace: one shared scratch buffer per backend, grown before launch to the largest step of the split; an allocation failure returns `GGML_STATUS_FAILED` with nothing written. TCM: from M2b the tiles agree on one TCM size at the start of each launch, so they all choose the same kernel path (mixed paths would leave outputs uncomputed).
   - Implementation 1: spine-runtime (`spert::Stream`, `Grid`, `Context::sync`, `shared_buffer`). It also does the AI-thread opt-in and cross-process core arbitration, and FlagTree kernels (M3) need it anyway.
   - Implementation 2, only if M0 shows spert problems: own pinned thread pool + libspine_tcm, the upstream IME approach that now works on this board.
 - Stream lifetime: **decided 2026-10-09 from the M2a benchmark: persistent (one stream per backend) is the default.** Measured on the K3 (`flagos-check-spacemit --bench`): launch 9.9 us persistent vs 24.3 us per call; per-node barrier 0.79 vs 0.83 us; idle AI-core load 0% in both (a held stream does not spin). Cost: the backend keeps the 8-core grant while it exists, so another spine-runtime process waits until it is freed; `FLAGOS_SPACEMIT_STREAM=per-call` remains as an experiment switch. Bandwidth for reference: 16M-float `ADD` 21.3 GB/s on the 8 AI cores vs 9.6 GB/s on 8 X100 threads.
@@ -100,17 +104,22 @@ A2 rules:
 - Never enable `GGML_CPU_RISCV64_SPACEMIT` in the same build: two TCM users in one process.
 - Attention under ACCEL: with `-fa auto` (llama.cpp's default) flash attention is switched off whenever the provider runs attention, because each layer's device is the CPU (`src/llama-context.cpp:506-560`; confirmed in E1). The default path is therefore non-flash attention (`MUL_MAT` on F16/F32 KV, masked `SOFT_MAX`, `CONT`); it must be correct and fast (M2e). `-fa on` keeps flash attention. llama.cpp's own TODO at that check says the rule is wrong for other cases too; a fix that accepts an ACCEL backend running a CPU layer's attention is an upstream candidate (issue first).
 
-### 2.5 Kernel sources (D6, *proposed*)
+### 2.5 Kernel sources (D6: copy per milestone, decided 2026-10-09)
 
 | Ops | Source | Milestone |
 |---|---|---|
-| quantized `MUL_MAT` | in-tree `ime1_kernels.cpp`, `ime2_kernels.cpp`, `repack.cpp`, RVV activation quantizers, compiled into the provider from their current location (no copy); tiling and TCM staging ported from ggml-spacemit `ime.cpp` (prefill path A, decode path B, no-TCM path C, direct GEMV for Q4_0) | M2b, M2c |
+| quantized `MUL_MAT` | IME2 GEMM kernels, activation quantizers, `memcpy1d` and repack functions copied from in-tree `ggml-cpu/spacemit` (`ime2_kernels.cpp`, `rvv_kernels.cpp`, `repack.cpp` @ `ba360ef`), only the functions each milestone uses, bodies unchanged, origin noted; tiling and TCM staging ported from ggml-spacemit `ime.cpp` @ `4e782bc`: direct GEMV (1 row, Q4_0), path A (about 113 rows and up, activations staged in TCM), path C (no TCM). Path B (weight slabs in TCM, core-pair barrier) deferred (M2b design). `ime1_kernels.cpp` is not needed: IME1 serves X100/A60 cores, the A100 cores use IME2 (`ime_env.cpp:259-262`) | M2b, M2c |
 | `MUL_MAT_ID` | same, MoE kernels | M2c, only for an MoE target |
-| `ADD`, `MUL`, `SCALE`, `RMS_NORM`, `ROPE`, `SOFT_MAX`, `GLU`, `UNARY`, `GET_ROWS`, `SET_ROWS`, `CPY`/`CONT` | port from ggml-spacemit `rvv_kernels.cpp` (kernels take a small context struct) | M2a, M2d |
+| `ADD`, `MUL`, `SCALE`, `RMS_NORM`, `ROPE`, `SOFT_MAX`, `GLU`, `UNARY`, `GET_ROWS`, `SET_ROWS`, `CPY`/`CONT` | port from ggml-spacemit `rvv_kernels.cpp` (kernels take a small context struct). For `CPY`/`CONT` take upstream fix `f266648fa` (2026-09-16): permuted 2-byte (F16/BF16) copies called the 32-bit transpose; ggml-spacemit and our tree still have the bug, which likely explains X0's `CONT` failures (F16/BF16 only) | M2a, M2d |
 | attention: non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`) and `FLASH_ATTN_EXT` | RVV, ported from ggml-spacemit with its X0 failures fixed (both paths fail there); the fast flash-attention variant needs VLEN 1024, which the A100 cores have (M0.4) | M2e |
 | ops from FlagOS's shared Triton kernels | FlagTree SpacemiT backend, AOT package | M3 |
 
-`repack.cpp` includes `ggml-cpu.h`; check what it calls before M2b.
+Why copy (D6, decided 2026-10-09; options and evidence compared in the M2b review):
+- The mentor design (§14.1) treats `ggml-cpu/spacemit` as a reference for kernels, repack, affinity and TCM, "not a formal architecture boundary". Compiling it in place would make the provider depend on ggml-cpu's internal headers (`rvv_kernels.h` includes `ggml-cpu-impl.h`, and `ime2_kernels.cpp` includes `rvv_kernels.h`).
+- SpacemiT made the same choice for ggml-spacemit and never needed to change the kernel or repack files.
+- Copies in the provider's own namespace cannot clash with ggml-cpu's symbols, and the scalar reference functions they include (`*_ref`, plain C++, disabled with `#if 0` upstream and so untested) can run the whole path on the Mac.
+- Size: about 1,000 lines for Q4_0 (M2b) instead of compiling about 10,700.
+- Cost: upstream fixes are taken by hand. At each upstream merge, check `git log` of `ggml/src/ggml-cpu/spacemit/`. Status 2026-10-09: the functions M2b copies are identical in our tree, ggml-spacemit (`4e782bc`, `mtmd-backend` `64316cd`) and upstream master (2026-10-08); upstream changed this directory 3 times since our base (IME1 Q8_0 for X60, `alloc_buffer_n`, the transpose fix above), none in M2b's code. The copied code calls only ggml core functions.
 
 ### 2.6 `supports_op` rules for the K3
 
@@ -131,7 +140,8 @@ New, in `ggml/src/ggml-flagos/providers/spacemit/` (layout from Design §13.2):
 | `provider.cmake` | sources, `GGML_FLAGOS_HAVE_SPACEMIT`, kernel sources and IME flags only on riscv64, spine-runtime only where found | M1 |
 | `flagos-spacemit-exec.{h,cpp}` | executor | M2a **done 2026-10-09** (commits `f78022f`, `187239e`): `flagos-spacemit-exec` (spine-runtime executor, one launch per split, barrier per node, failure flag read after each barrier; serial stand-in without spine-runtime), `flagos-spacemit-ops` (op table shared by `supports_op` and `graph_compute`), `flagos-spacemit-kernels` (RVV `ADD`); stream policy switch `FLAGOS_SPACEMIT_STREAM=per-call`, test-only `FLAGOS_SPACEMIT_TEST_FAIL_NODE=n`; run `spacemit_check.py --milestone m2a --build`. First K3 run 2026-10-09: 14/15; the failure was the provider not claiming `NONE`/view tensors, so `test-backend-ops` test mode (which asks about every tensor) ran 0 `ADD` cases; fixed by claiming them as design §7.4 allows (`187239e`); on the rerun `test-backend-ops -o ADD` passes on the K3. Also found: in a real model `ADD` stays on the CPU (1 split, no provider buffer), because under ACCEL ops without weights only move to the provider next to ops it already holds; claimed weights (M2b) are what seed placement |
 | `flagos-spacemit-ops.{h,cpp}` | predicates and dispatch | M2a |
-| `flagos-spacemit-weights.{h,cpp}` | repack at `set_tensor`, inverse at `get_tensor` | M2b |
+| `flagos-spacemit-weights.{h,cpp}` | layout function; repack at `set_tensor`, inverse at `get_tensor` | M2b |
+| `flagos-spacemit-ime.{h,cpp}`, `flagos-spacemit-ime-kernels.cpp` | Q4_0 matmul steps and paths (ported orchestration); copied IME2 kernel, quantizers, `memcpy1d`, repack (own namespace; IME code on riscv64 only, scalar references everywhere) | M2b |
 | `tests/check_spacemit.cpp` | `flagos-check-spacemit` | M1 |
 | `tools/spacemit_check.py` | acceptance run on the K3 per milestone (`--milestone m1` or `m2a`; was `m1_check.py`) | M1 |
 | `flagos-spacemit-exec.{h,cpp}`, `flagos-spacemit-ops.{h,cpp}`, `flagos-spacemit-kernels.{h,cpp}` | executor, op table, RVV kernels | M2a |
@@ -139,7 +149,7 @@ New, in `ggml/src/ggml-flagos/providers/spacemit/` (layout from Design §13.2):
 
 Common files touched (C1, required, about 10 lines): `ggml/CMakeLists.txt` (option `GGML_FLAGOS_SPACEMIT`, default OFF, next to L201-204); `ggml/src/ggml-flagos/CMakeLists.txt` (include `provider.cmake`, update the "no provider" message, add the check target); `flagos-registry.cpp` (forward declaration and `push_back` under `#ifdef GGML_FLAGOS_HAVE_SPACEMIT`, L13-19 and L69-78).
 
-The skeleton compiles on the Mac (probe returns false there). Kernels compile only on riscv64 with GCC 15.
+The skeleton compiles on the Mac (probe returns false there). IME and RVV kernels compile only on riscv64 with GCC 15; from M2b the scalar reference kernels compile everywhere.
 
 ### 2.8 Device type (D3: ACCEL, decided 2026-10-08)
 
@@ -172,9 +182,9 @@ A new ggml device type is possible (upstream added `IGPU` in PR #15797 and `META
 | D1 | Full ggml device/buffer/backend via FlagOS, not a ggml-cpu extra buffer type | adopted | - |
 | D2 | In-tree provider in the mentor's fork | adopted | - |
 | D3 | ggml device type `ACCEL` | **adopted** (mentor, 2026-10-08) | - |
-| D4 | Weights in an IME-repacked buffer, stored once (A2); the provider reads CPU buffers for all other operands (§2.3) | *proposed*, re-evaluated for ACCEL | A1: host buffer plus a private repacked copy (twice the quantized-weight memory) |
-| D5 | spine-runtime executor, one launch per split, barrier per node; decided after M0 | *proposed* | own pinned pool + libspine_tcm behind the same executor interface |
-| D6 | Reuse in-tree IME/repack kernels in place; port ggml-spacemit tiling and RVV ops, fixing them as needed (the mentor allows changing that AI-generated code, 2026-10-08) | *proposed* | copy the files into `providers/spacemit/` (duplication) |
+| D4 | Weights in an IME-repacked buffer, stored once (A2); the provider reads CPU buffers for all other operands (§2.3) | *proposed*; building on it from M2b (user, 2026-10-09), mentor confirmation pending | A1: host buffer plus a private repacked copy (twice the quantized-weight memory) |
+| D5 | spine-runtime executor, one launch per split, barrier per step (an op may take several steps) | *proposed*; implemented in M2a | own pinned pool + libspine_tcm behind the same executor interface |
+| D6 | Copy, per milestone, only the IME kernel, quantizer and repack functions used from in-tree `ggml-cpu/spacemit` (bodies unchanged, origin noted); port ggml-spacemit tiling and RVV ops, fixing them as needed (the mentor allows changing that AI-generated code, 2026-10-08) | **decided** (user, 2026-10-09; §2.5) | compile the in-tree sources in place (depends on ggml-cpu internal headers; clashes with `GGML_CPU_RISCV64_SPACEMIT`) |
 | D7 | First target Qwen3-0.6B / Qwen3-4B Q4_0, then the AMD target Qwen3.5-4B Q4_K_M | *proposed* | start with Qwen3.5: needs Q4_K/Q6_K (lossy repack) and `GATED_DELTA_NET`/`SSM_CONV` early |
 | D8 | FlagOS `caps.kind = cpu_accelerator` (engine `cpu`): the A100 cores execute RISC-V code with RVV/IME. Independent of D3 (a provider can report ggml `GPU` and FlagOS `cpu_accelerator`) | *proposed*, open for the mentor | `ai_accelerator` makes FlagOS classify the K3 as an NPU (engine `npu`), matching the v0.3 "AI chip provider" wording. The kind changes no execution: only validation, the default profile labels and engine-filtered kernel variants (`flagos-target.cpp:87-89`), so there is nothing to benchmark |
 | D9 | FlagTree AOT (M3) only if the mentor puts it in scope | *proposed* | hand-written kernels only |
@@ -270,11 +280,43 @@ Design's order is simple ops first, then quantized matmul (§13.3). The K3 start
 | Step | Build | Test | Exit |
 |---|---|---|---|
 | M2a | executor (spert), predicates/dispatch framework, error flag, TCM check at probe; first op `ADD` (F32, same shape) | `test-backend-ops -o ADD -b FlagOS:SpacemiT:0`; a forced kernel failure returns `GGML_STATUS_FAILED`; after the run `tcmtest info` shows 0 blocks held | `ADD` matches CPU; empty-launch cost and per-node barrier cost measured; stream-lifetime choice made |
-| M2b | quantized `MUL_MAT` for Q4_0: repacking weight buffer, decode and prefill paths, TCM staging, direct GEMV | `test-backend-ops -o MUL_MAT`; perplexity vs M0.6; `llama-bench -m <model> -t 8 ...`; `graph splits` in the load log (`-lv 4`) | correct; perplexity within the M0.6 range; tg and pp recorded (expect below IME baseline: every other op still runs on X100, with a split switch around each matmul) |
+| M2b | quantized `MUL_MAT` for Q4_0 in the IME 32x256 layout: repacking weight buffer, two-step execution, shared workspace, direct GEMV, path A, path C (design below) | `flagos-check-spacemit` against the CPU backend at the model's shapes; perplexity vs M0.6; `llama-bench -m <model> -t 8 ...`; `graph splits` in the load log (`-lv 4`); `spacemit_check.py --milestone m2b`. Not `test-backend-ops -o MUL_MAT`: no case fits the layout (§1) | correct; perplexity within the M0.6 range; tg and pp recorded (expect below IME baseline: every other op still runs on X100, with a split switch around each matmul) |
 | M2c | the target's other weight types: for Qwen3-4B Q4_0 these are Q6_K (output head) and Q4_1 (`ffn_down` in 4 layers), see the op matrix; Q8_0/Q4_K for later targets; `MUL_MAT_ID` for an MoE target | per type: `test-backend-ops`, perplexity | each claimed type within accuracy budget; lossy types decided with evidence |
 | M2d | the remaining ops of a layer; for Qwen3-4B (op matrix): `RMS_NORM`, `MUL`, `ADD`, `ROPE`, `SET_ROWS` (KV write into the CPU-resident cache), `SWIGLU`, `GET_ROWS` F32, view ops; others (`SCALE`, `UNARY`, `CPY`) as later targets need them | per op `test-backend-ops`; split count | a decode graph has at most a few splits; tg at least the upstream IME baseline |
 | M2e | attention, reading the CPU-resident KV cache directly: the non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`, `CONT`) that the default `-fa auto` uses, and `FLASH_ATTN_EXT` for `-fa on` | `test-backend-ops -o MUL_MAT`, `-o SOFT_MAX`, `-o FLASH_ATTN_EXT`; perplexity with `-fa auto` and `-fa on`; long-context run | default flags give correct output; whole layers on the K3 (a few splits per token); **tg at least the upstream IME path's and pp at least ggml-spacemit's best** (Qwen3-4B Q4_0: tg128 11.10, pp128 81.94, `build.md` §7; Qwen3-0.6B: 57.3 / 594 t/s) |
 | M2f | memory and weight round trip: THP for compute buffers | VmRSS about model + KV + compute (weights stored once); `get_tensor` returns the original bytes for every claimed type | no double storage |
+
+### M2b design (2026-10-09)
+
+Scope: Q4_0 `MUL_MAT` in the IME 32x256 layout only, the layout the IME baseline used. Weight 2-D, rows % 32 == 0, row length % 256 == 0; activations F32; output F32. This covers every Q4_0 matmul of Qwen3-0.6B (1024, 2048, 3072) and Qwen3-4B (1024, 2560, 4096, 9728). Q6_K and Q4_1 stay on the CPU until M2c.
+
+Weights (`flagos-spacemit-weights`, §2.3):
+- `spacemit_weight_layout(t)` returns none or `q4_0_32x256` from type and shape; it is the only place that decides.
+- `set_tensor` repacks whole writes, `get_tensor` undoes the repack, `cpy_tensor` refuses repacked tensors; partial reads or writes of a repacked tensor abort. No `get_alloc_size` (same size).
+
+Op check for `MUL_MAT`: weight layout `q4_0_32x256`, 2-D, not a view, in the provider's buffer or unallocated (never host); activations F32 and contiguous; output F32 and contiguous. It must not depend on the row count: llama.cpp asks once, at load, with 512 rows (§1).
+
+Execution:
+- The op table returns, per op, its steps and workspace size (`ADD`: one step; `MUL_MAT`: quantize activations, then GEMM); `graph_compute` expands nodes into steps; the executor's barrier between steps is the only barrier (§2.4).
+- Workspace: rows x (row length / 256) x 290 bytes for the quantized activations (5.6 MB at 512 rows x 9728).
+- Paths, chosen per matmul from the row count and the agreed TCM size:
+
+| Rows | Path | Used by |
+|---|---|---|
+| 1 | direct GEMV: activations in TCM, weights read from DRAM in 128-column tiles (ggml-spacemit `ime.cpp:421`) | generation (tg128) |
+| about 113 and up | path A: 4-row activation blocks staged in TCM, weights from DRAM | pp128, perplexity (512) |
+| otherwise, or no TCM | path C: DRAM only | short prompts, the last part of a prompt, `-np`, speculative drafts |
+
+  Largest TCM need for Qwen3-4B: about 186 KB of the 384 KiB per core.
+- Path B is deferred (decided 2026-10-09). It stages 32-column weight slabs in TCM and staggers the two cores of each pair with a pair barrier, so one copies while the other computes. Reasons: no M2b measurement uses it; the in-tree version deadlocks when a pair's slab counts differ (rows not a multiple of 256 with 8 cores, or an odd core count), which ggml-spacemit rewrote (`has_pair`, shared slab list); it needs a barrier inside a kernel, which our executor avoids; its gain over path C is unmeasured (ggml-spacemit found reading Q4_0 straight from DRAM faster than staging for 1 row). The M2b benchmark times path C at 4, 16 and 64 rows; if those are clearly slow, path B follows as its own step, ported from ggml-spacemit's loop, with deadlock tests (odd core count, rows not a multiple of 256).
+
+Kernel code (D6): copied from in-tree @ `ba360ef`: `gemm_kernel_i8i4_hp` with `_m1`, `_m4` and the scalar `_mrow_ref`; `quantize_a_row_i8_hp`, `quantize_a_4row_i8_hp` and the scalar `quantize_a_nrow_i8_hp_ref`; `memcpy1d`; `repack_q4_0_to_q4_0_256_32_bl_ref` with `make_block_q4_0x32`. About 1,000 lines in the provider's own namespace. Orchestration ported from ggml-spacemit `ime.cpp` @ `4e782bc`. Build: IME code on riscv64 with `-march=rv64gcv_zfh_zvfh_zba_zicbop_xsmtvdotii` (GCC >= 15) after the compiler checks of `FindSMTIME.cmake`; scalar references everywhere, so the Mac's serial stand-in runs the whole path; configuring with `GGML_CPU_RISCV64_SPACEMIT` also on stops with an error (two TCM users in one process).
+
+Tests:
+- `flagos-check-spacemit`: provider against the CPU backend for the model's matmul shapes at 1, 4, 16, 64, 113, 128 and 512 rows (all three paths), NMSE within `test-backend-ops`' `MUL_MAT` bound (5e-4); on the K3 also IME kernel against the scalar reference; refusals (row length % 256 != 0, rows % 32 != 0, 3-D weight, view, weight in a host buffer, non-contiguous or F16 activations); repack round trip (`set_tensor` then `get_tensor` returns the original bytes); a `MUL_MAT` then `ADD` graph; forced failure still returns `FAILED`; benchmark per path against the CPU.
+- `spacemit_check.py --milestone m2b`: the checks above, model output, provider buffer size in the load log, graph splits, perplexity vs M0.6, pp128/tg128.
+
+Expected: matmuls (and the residual `ADD`s next to them) on the AI cores, everything else on the CPU: about 10 splits per layer, roughly 360 per token on Qwen3-4B (estimate), each costing about 10 us of launch plus a small copy. Generation below the IME baseline's 11.1 t/s until M2d moves the rest of the layer.
 
 ### M3 - AOT package (Design Phase 3, only if D9 is accepted)
 
@@ -303,7 +345,7 @@ Design's order is simple ops first, then quantized matmul (§13.3). The K3 start
 |---|---|---|
 | Registry, lifecycle | `flagos-check-*`, `flagos-check-spacemit`; repeated model load/free | M1 |
 | `supports_op` negative matrix | `test-backend-ops support`: every unclaimed shape/type reported unsupported, never wrong | M2 |
-| Numerics | `test-backend-ops test -b FlagOS:SpacemiT:0 -o <op>`; perplexity vs M0.6, with the default `-fa auto` and with `-fa on` | M2 |
+| Numerics | `test-backend-ops test -b FlagOS:SpacemiT:0 -o <op>`; where no `test-backend-ops` case fits the claim (Q4_0 IME layout), `flagos-check-spacemit` compares with the CPU backend; perplexity vs M0.6, with the default `-fa auto` and with `-fa on` | M2 |
 | Memory | VmRSS; weights stored once; `get_tensor` round trip | M2f |
 | State and alias | KV write (`SET_ROWS`) and in-place ops with views; context shift | M2d-M2e |
 | Fail closed | forced kernel failure returns `GGML_STATUS_FAILED`; no partial writes before launch checks | M2a |
@@ -327,6 +369,8 @@ Design §15.6 gates, as they apply to the K3: no `supports_op` false positives (
 | R7 | ggml-spacemit is AI-generated and over-claims (X0: wrong F16 matmul, masked softmax, CPY; aborts in RMS_NORM, ROPE) | port piece by piece with fixes and tests; the mentor allows changing it |
 | R8 | FlagTree SpacemiT is immature (no AOT tool, no tests, QEMU-only CI with VLEN 1024) | M3 is conditional and starts with one op |
 | R9 | Common gaps: no `get_proc_address` forwarding (thread count, abort callback), no RVV/IME feature bits, no `LOCAL_SCRATCH` cap for TCM (mentor design §8.1, not in code) | work around in the provider; propose C2-C4 only when needed |
+| R10 | The IME Q4_0 32x256 kernel has never been checked op by op: no `test-backend-ops` case fits the layout, the 1198/1198 run used plain buffers, and X0 ran only the cases ggml-spacemit claimed (its Q8_0 and Q6_K IME matmuls failed there) | M2b compares with the CPU backend at the model's shapes, and the IME kernel with its scalar reference |
+| R11 | Copied kernel code (D6) misses later upstream fixes | at each upstream merge, check `git log` of `ggml/src/ggml-cpu/spacemit/`; copied functions keep their bodies unchanged and note their origin |
 
 Optional Common changes, each needing separate approval: C2 RVV/IME/TCM feature bits in `flagos-target.h` (append-only); C3 forward provider functions through `get_proc_address`; C4 `LOCAL_SCRATCH` memory cap.
 
@@ -335,9 +379,9 @@ Outside FlagOS, needing the mentor's decision (fork patch or upstream llama.cpp 
 ## 7. Questions for the mentor
 
 1. ~~Device type~~ decided: ACCEL (2026-10-08). Still open: FlagOS `caps.kind`, `cpu_accelerator` (proposed) or `ai_accelerator`?
-2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, with the provider reading CPU buffers for everything else (A2, §2.3). Agreed? The alternative (A1) doubles quantized-weight memory.
+2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, with the provider reading CPU buffers for everything else (A2, §2.3). We are building M2b on A2 (2026-10-09); please confirm. The alternative (A1) doubles quantized-weight memory and would change only the buffer part.
 3. Is spine-runtime (closed `libspert`) acceptable as a hard dependency of the provider?
-4. Kernel reuse: compile the in-tree `ggml-cpu/spacemit` kernel sources into the provider in place, or copy them into `providers/spacemit/`?
+4. Kernel reuse: decided 2026-10-09 to copy, per milestone, only the functions used into `providers/spacemit/` (§2.5), following the mentor design's "reference, not boundary" (§14.1) and SpacemiT's own ggml-spacemit. Objections? The alternative is compiling the in-tree sources in place.
 5. Target for Phase 0: Qwen3-4B Q4_0 (SpacemiT has reference numbers) or Qwen3.5-4B Q4_K_M (comparable with AMD, but needs lossy Q4_K/Q6_K repacks and gated-delta-net ops early)?
 6. Is FlagTree AOT (M3) in scope, and should it be cross-compiled on x86 or built on the K3?
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, given they ship ggml-spacemit as an `ACCEL` backend?
