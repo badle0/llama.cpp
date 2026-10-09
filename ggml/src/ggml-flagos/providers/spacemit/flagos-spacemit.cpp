@@ -23,6 +23,9 @@
 #if defined(__linux__)
 #    include <unistd.h>
 #endif
+#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE) && defined(__APPLE__)
+#    include <sys/sysctl.h>
+#endif
 
 namespace {
 
@@ -186,7 +189,9 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     size_t workspace_size = 0;
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
         ggml_tensor * node = ggml_graph_node(cgraph, i);
-        if (ggml_op_is_empty(node->op)) {
+        // as ggml-cpu: nothing to do for empty tensors, and nodes without the compute flag are branches the graph
+        // left unselected (ggml_build_forward_select), whose inputs may never have been set
+        if (ggml_op_is_empty(node->op) || ggml_is_empty(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
         const spacemit_op * op = spacemit_find_op(node, &dev->buffer_type);
@@ -275,6 +280,14 @@ void spacemit_device_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
             *free = value_kib * 1024;
         }
     }
+#elif defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE) && defined(__APPLE__)
+    // simulated device on a Mac: the host's memory size; free memory is not tracked
+    uint64_t bytes = 0;
+    size_t   len   = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, nullptr, 0) == 0) {
+        *free  = bytes;
+        *total = bytes;
+    }
 #endif
 }
 
@@ -353,7 +366,9 @@ const ggml_backend_device_i g_device_iface = {
 //
 
 uint32_t spacemit_count_ai_cores() {
-#if defined(__linux__) && defined(__riscv)
+#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
+    return 8;  // simulated device (tests only, non-riscv64 builds): the K3's 8 AI cores
+#elif defined(__linux__) && defined(__riscv)
     constexpr uint64_t a100_marchid = 0x8000000041000002ULL;
     std::ifstream      cpuinfo("/proc/cpuinfo");
     std::string   line;
@@ -374,7 +389,9 @@ uint32_t spacemit_count_ai_cores() {
 }
 
 bool spacemit_ai_gate_available() {
-#if defined(__linux__)
+#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
+    return true;
+#elif defined(__linux__)
     return access("/proc/set_ai_thread", W_OK) == 0;
 #else
     return false;
@@ -405,7 +422,11 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
     }
 
     g_device.name                 = "FlagOS:SpacemiT:0";
+#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
+    g_device.description          = "simulated SpacemiT K3 device for tests (" + std::to_string(n_ai_cores) + " tiles, serial)";
+#else
     g_device.description          = "SpacemiT K3 A100 AI cores (" + std::to_string(n_ai_cores) + ")";
+#endif
     g_device.n_ai_cores           = n_ai_cores;
     g_device.device.iface         = g_device_iface;
     g_device.device.reg           = owner_reg;

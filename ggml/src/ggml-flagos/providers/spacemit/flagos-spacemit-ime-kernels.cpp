@@ -1295,7 +1295,9 @@ size_t gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, s
     return 1;
 }
 
-void copy(void * dst, const void * src, size_t size) {
+// never inlined: memcpy1d's inline asm does not declare the vector registers it overwrites, so it must stay behind a
+// call, where the vector ABI makes every vector register caller-saved
+__attribute__((noinline)) void copy(void * dst, const void * src, size_t size) {
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
     memcpy1d(dst, src, (int64_t) size);
 #else

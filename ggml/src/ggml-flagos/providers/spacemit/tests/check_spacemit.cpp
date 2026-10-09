@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -135,11 +136,23 @@ static int check_buffer(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// reproducible values in [-scale, scale)
+static std::vector<float> random_values(int64_t n, uint32_t seed, float scale) {
+    std::vector<float> v(n);
+    uint32_t           s = seed * 2654435761u + 1;
+    for (float & x : v) {
+        s = s * 1664525u + 1013904223u;
+        x = scale * ((float) (s >> 8) / 8388608.0f - 1.0f);
+    }
+    return v;
+}
+
 // checks that ADD is claimed exactly, computes correctly, and that failures are reported without hanging
 static int check_ops(ggml_backend_dev_t dev) {
     ggml_backend_buffer_type_t buft   = ggml_backend_dev_buffer_type(dev);
     const int64_t              n      = 1000;
-    const int64_t              n_big  = 4000037;  // not a multiple of 8 tiles x 16 floats
+    const int64_t              n_big  = 4000037;  // one row: the RVV kernel splits its elements (the reference, rows)
+    const int64_t              n_rows = 4001;     // rows not a multiple of 8 tiles
     ggml_init_params           params = { ggml_tensor_overhead() * 32 + ggml_graph_overhead() * 8, nullptr, true };
     ggml_context *             ctx    = ggml_init(params);
     REQUIRE(ctx != nullptr);
@@ -150,7 +163,7 @@ static int check_ops(ggml_backend_dev_t dev) {
     ggml_tensor * sum2  = ggml_add(ctx, sum, b);
     ggml_tensor * sum3  = ggml_add(ctx, sum2, b);
     ggml_tensor * view  = ggml_reshape_2d(ctx, a, 100, 10);
-    ggml_tensor * prod  = ggml_mul(ctx, a, b);
+    ggml_tensor * diff  = ggml_sub(ctx, a, b);
     ggml_tensor * row   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 100);
     ggml_tensor * bcast = ggml_add(ctx, view, row);
     ggml_tensor * tview = ggml_transpose(ctx, view);
@@ -160,17 +173,20 @@ static int check_ops(ggml_backend_dev_t dev) {
     ggml_tensor * big_a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_big);
     ggml_tensor * big_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_big);
     ggml_tensor * big   = ggml_add(ctx, big_a, big_b);
+    ggml_tensor * mat_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_rows);
+    ggml_tensor * mat_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_rows);
+    ggml_tensor * mat   = ggml_add(ctx, mat_a, mat_b);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     REQUIRE(buf != nullptr);
 
-    // claimed exactly: inputs and views (no kernel), and same-shape contiguous F32 ADD
+    // claimed exactly: inputs and views (no kernel), F32 ADD with broadcast (M2d); not SUB, strided elements or F16
     CHECK(ggml_backend_dev_supports_op(dev, a));
     CHECK(ggml_backend_dev_supports_op(dev, view));
     CHECK(ggml_backend_dev_supports_op(dev, tview));
     CHECK(ggml_backend_dev_supports_op(dev, sum));
-    CHECK(!ggml_backend_dev_supports_op(dev, prod));
-    CHECK(!ggml_backend_dev_supports_op(dev, bcast));
+    CHECK(ggml_backend_dev_supports_op(dev, bcast));
+    CHECK(!ggml_backend_dev_supports_op(dev, diff));
     CHECK(!ggml_backend_dev_supports_op(dev, strided));
     CHECK(!ggml_backend_dev_supports_op(dev, half));
 
@@ -200,7 +216,7 @@ static int check_ops(ggml_backend_dev_t dev) {
     }
     CHECK(wrong == 0);
 
-    // large ADD split across all tiles, with a tail
+    // large one-row ADD (the RVV kernel splits its elements over the tiles, with a tail)
     std::vector<float> ba = ramp(n_big, 0.5f, 0.0f), bb = ramp(n_big, -2.0f, 3.0f), bout(n_big);
     ggml_backend_tensor_set(big_a, ba.data(), 0, ggml_nbytes(big_a));
     ggml_backend_tensor_set(big_b, bb.data(), 0, ggml_nbytes(big_b));
@@ -214,43 +230,57 @@ static int check_ops(ggml_backend_dev_t dev) {
     }
     CHECK(wrong_big == 0);
 
+    // ADD over rows that do not divide evenly among the tiles
+    std::vector<float> ma = random_values(n * n_rows, 21, 4.0f), mb = random_values(n * n_rows, 22, 4.0f), mout(n * n_rows);
+    ggml_backend_tensor_set(mat_a, ma.data(), 0, ggml_nbytes(mat_a));
+    ggml_backend_tensor_set(mat_b, mb.data(), 0, ggml_nbytes(mat_b));
+    ggml_cgraph * mat_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(mat_graph, mat);
+    CHECK(ggml_backend_graph_compute(backend, mat_graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(mat, mout.data(), 0, ggml_nbytes(mat));
+    int64_t wrong_mat = 0;
+    for (int64_t i = 0; i < n * n_rows; i++) {
+        wrong_mat += mout[i] != ma[i] + mb[i];
+    }
+    CHECK(wrong_mat == 0);
+
     // an unclaimed op is rejected before anything runs
     std::fprintf(stderr, "(the next error line is expected)\n");
-    ggml_cgraph * mul_graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(mul_graph, prod);
-    CHECK(ggml_backend_graph_compute(backend, mul_graph) == GGML_STATUS_FAILED);
+    ggml_cgraph * sub_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(sub_graph, diff);
+    CHECK(ggml_backend_graph_compute(backend, sub_graph) == GGML_STATUS_FAILED);
     ggml_backend_free(backend);
 
-    // a kernel failure inside the launch stops every tile and is reported (test-only switch)
-    set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", "1");
-    ggml_backend_t failing = ggml_backend_dev_init(dev, nullptr);
-    set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", nullptr);
-    REQUIRE(failing != nullptr);
-    CHECK(ggml_backend_graph_compute(failing, chain) == GGML_STATUS_FAILED);
-    ggml_backend_free(failing);
+    // a kernel failure inside the launch stops every tile and is reported (test-only switch). Repeated, in the
+    // first step and in a later one: on the AI cores a failure seen at the wrong barrier would hang a launch
+    constexpr int k_fail_runs = 100;
+    int           fail_ok     = 0;
+    for (const char * fail_node : { "0", "1" }) {
+        set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", fail_node);
+        ggml_backend_t failing = ggml_backend_dev_init(dev, nullptr);
+        set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", nullptr);
+        REQUIRE(failing != nullptr);
+        for (int r = 0; r < k_fail_runs; r++) {
+            fail_ok += ggml_backend_graph_compute(failing, chain) == GGML_STATUS_FAILED;
+        }
+        ggml_backend_free(failing);
+    }
+    CHECK(fail_ok == 2 * k_fail_runs);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
-    std::printf("ops      ADD claimed exactly (not MUL, broadcast, strided or F16); 3-node chain and %lld-element ADD exact: checked\n",
-                (long long) n_big);
-    std::printf("backend  empty and view-only graphs succeed; unclaimed op and forced kernel failure return FAILED: checked\n");
+    std::printf("ops      ADD claimed exactly (with broadcast; not SUB, strided or F16); 3-node chain, %lld-element row and "
+                "%lldx%lld ADD exact: checked\n",
+                (long long) n_big, (long long) n_rows, (long long) n);
+    std::printf("backend  empty and view-only graphs succeed; unclaimed op returns FAILED; forced kernel failure in step 0 "
+                "and 1 returns FAILED %d/%d times: checked\n",
+                fail_ok, 2 * k_fail_runs);
     return 0;
 }
 
 //
 // Q4_0 MUL_MAT (M2b): weights in the IME layout, compared with the CPU backend
 //
-
-// reproducible values in [-scale, scale)
-static std::vector<float> random_values(int64_t n, uint32_t seed, float scale) {
-    std::vector<float> v(n);
-    uint32_t           s = seed * 2654435761u + 1;
-    for (float & x : v) {
-        s = s * 1664525u + 1013904223u;
-        x = scale * ((float) (s >> 8) / 8388608.0f - 1.0f);
-    }
-    return v;
-}
 
 static std::vector<uint8_t> quantize_q4_0(int64_t k, int64_t n, uint32_t seed) {
     const std::vector<float> w = random_values(k * n, seed, 1.0f);
@@ -259,11 +289,15 @@ static std::vector<uint8_t> quantize_q4_0(int64_t k, int64_t n, uint32_t seed) {
     return q;
 }
 
+// any NaN or Inf gives +inf, which fails every bound (a NaN would pass `e > bound`) and survives std::max
 static double nmse(const float * out, const float * ref, int64_t n) {
     double err = 0.0, norm = 0.0;
     for (int64_t i = 0; i < n; i++) {
         err += ((double) out[i] - ref[i]) * ((double) out[i] - ref[i]);
         norm += (double) ref[i] * ref[i];
+    }
+    if (!std::isfinite(err) || !std::isfinite(norm)) {
+        return HUGE_VAL;
     }
     return norm > 0.0 ? err / norm : err;
 }
@@ -524,6 +558,430 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     return 0;
 }
 
+//
+// M2d: the ops of a layer together in one launch, against the CPU backend
+//
+
+struct layer_weights {
+    ggml_tensor *attn_norm, *q_norm, *k_norm, *ffn_norm, *wq, *wk, *wv, *wo, *wg, *wu, *wd;
+};
+
+// a Qwen3-like layer (all dimensions small): d hidden, nh query and nkv key/value heads of hd, ff in the FFN
+constexpr int64_t k_d = 256, k_hd = 128, k_nh = 2, k_nkv = 1, k_ff = 512, k_slots = 16;
+
+static layer_weights new_layer_weights(ggml_context * ctx) {
+    layer_weights w;
+    w.attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_d);
+    w.q_norm    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_hd);
+    w.k_norm    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_hd);
+    w.ffn_norm  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_d);
+    w.wq        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_nh * k_hd);
+    w.wk        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_nkv * k_hd);
+    w.wv        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_nkv * k_hd);
+    w.wo        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_nh * k_hd, k_d);
+    w.wg        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
+    w.wu        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
+    w.wd        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_ff, k_d);
+    return w;
+}
+
+static void set_layer_weights(const layer_weights & w) {
+    uint32_t seed = 100;
+    for (ggml_tensor * t : { w.attn_norm, w.q_norm, w.k_norm, w.ffn_norm }) {
+        std::vector<float> v = random_values(t->ne[0], seed++, 0.2f);
+        for (float & x : v) {
+            x += 1.0f;
+        }
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    }
+    for (ggml_tensor * t : { w.wq, w.wk, w.wv, w.wo, w.wg, w.wu, w.wd }) {
+        const std::vector<uint8_t> q = quantize_q4_0(t->ne[0], t->ne[1], seed++);
+        ggml_backend_tensor_set(t, q.data(), 0, q.size());
+    }
+}
+
+struct layer_out {
+    ggml_tensor *full, *out, *set_k, *set_v;  // full: the layer output of every token; out: the last token's row
+};
+
+// norm, Q/K/V, Q and K norms, RoPE (NEOX), KV writes, output projection, residual, FFN norm, SwiGLU FFN, residual,
+// and the last token's row: every op of a Qwen3 layer except attention, whose output q stands in for here
+static layer_out build_layer(ggml_context * ctx, const layer_weights & w, ggml_tensor * x, ggml_tensor * pos,
+                             ggml_tensor * kv_idx, ggml_tensor * out_ids, ggml_tensor * k_cache, ggml_tensor * v_cache,
+                             int64_t n_tokens) {
+    const float   eps = 1e-6f;
+    ggml_tensor * h   = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w.attn_norm);
+    ggml_tensor * q   = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w.wq, h), k_hd, k_nh, n_tokens);
+    q                 = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), w.q_norm);
+    q = ggml_rope_ext(ctx, q, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_tensor * k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w.wk, h), k_hd, k_nkv, n_tokens);
+    k               = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), w.k_norm);
+    k = ggml_rope_ext(ctx, k, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_tensor * v = ggml_mul_mat(ctx, w.wv, h);
+
+    layer_out o;
+    o.set_k = ggml_set_rows(ctx, k_cache, ggml_reshape_2d(ctx, k, k_hd * k_nkv, n_tokens), kv_idx);
+    o.set_v = ggml_set_rows(ctx, v_cache, v, kv_idx);
+
+    ggml_tensor * f   = ggml_add(ctx, ggml_mul_mat(ctx, w.wo, ggml_reshape_2d(ctx, q, k_hd * k_nh, n_tokens)), x);
+    ggml_tensor * g   = ggml_mul(ctx, ggml_rms_norm(ctx, f, eps), w.ffn_norm);
+    ggml_tensor * s   = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w.wg, g), ggml_mul_mat(ctx, w.wu, g));
+    o.full            = ggml_add(ctx, ggml_mul_mat(ctx, w.wd, s), f);
+    o.out             = ggml_get_rows(ctx, o.full, out_ids);
+    return o;
+}
+
+static std::vector<float> f16_to_f32(const std::vector<uint8_t> & bytes) {
+    std::vector<float> out(bytes.size() / sizeof(ggml_fp16_t));
+    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(bytes.data()), out.data(), (int64_t) out.size());
+    return out;
+}
+
+// a layer chains three Q4_0 matmuls, each quantizing its activations to 8 bits; on the Mac the whole output's NMSE
+// against the CPU is about 4.0e-4 at 7 tokens, above a single matmul's bound
+constexpr double k_layer_max_nmse = 1e-3;
+
+// every contiguous F32 node of a computed graph is finite. In a layer a NaN from a norm, RoPE or SwiGLU would
+// otherwise reach the output as finite values: the next matmul's activation quantization ignores it in its scale
+static bool graph_finite(ggml_cgraph * g) {
+    for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
+        ggml_tensor * t = ggml_graph_node(g, i);
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            continue;
+        }
+        std::vector<float> v(ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+        if (!std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); })) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the layer on the provider, with the KV cache in a CPU buffer and the norm and Q4_0 weights in the provider's buffer
+// (where llama.cpp puts them), against the same layer on the CPU backend; returns the larger NMSE of the whole output
+// and the caches, or -1 when refused, failed, or the last-token row is not an exact copy of the provider's output
+static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int64_t n_tokens) {
+    ggml_init_params params = { ggml_tensor_overhead() * 128 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);  // inputs and caches: CPU buffer
+    ggml_context *   ctx_wd = ggml_init(params);  // weights for the provider: its buffer
+    ggml_context *   ctx_wc = ggml_init(params);  // weights for the CPU: CPU buffer
+    ggml_context *   ctx_gd = ggml_init(params);  // the provider's graph
+    ggml_context *   ctx_gc = ggml_init(params);  // the CPU's graph
+
+    ggml_tensor * x       = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, k_d, n_tokens);
+    ggml_tensor * pos     = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * kv_idx  = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * out_ids = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 1);
+    ggml_tensor * kc_d    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    ggml_tensor * vc_d    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    ggml_tensor * kc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    ggml_tensor * vc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    const layer_weights wd = new_layer_weights(ctx_wd);
+    const layer_weights wc = new_layer_weights(ctx_wc);
+
+    ggml_backend_buffer_t bh  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bwd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wd, ggml_backend_dev_buffer_type(dev));
+    ggml_backend_buffer_t bwc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wc, ggml_backend_cpu_buffer_type());
+    if (bh == nullptr || bwd == nullptr || bwc == nullptr) {
+        return -1.0;
+    }
+    ggml_backend_buffer_clear(bh, 0);
+    set_layer_weights(wd);
+    set_layer_weights(wc);
+
+    const std::vector<float> xv = random_values(k_d * n_tokens, 5, 1.0f);
+    std::vector<int32_t>     pv(n_tokens);
+    std::vector<int64_t>     iv(n_tokens);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        pv[t] = (int32_t) (40 + t);
+        iv[t] = (3 + 5 * t) % k_slots;  // distinct slots
+    }
+    const int32_t last = (int32_t) (n_tokens - 1);
+    ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(pos, pv.data(), 0, ggml_nbytes(pos));
+    ggml_backend_tensor_set(kv_idx, iv.data(), 0, ggml_nbytes(kv_idx));
+    ggml_backend_tensor_set(out_ids, &last, 0, sizeof(last));
+
+    const layer_out od = build_layer(ctx_gd, wd, x, pos, kv_idx, out_ids, kc_d, vc_d, n_tokens);
+    const layer_out oc = build_layer(ctx_gc, wc, x, pos, kv_idx, out_ids, kc_c, vc_c, n_tokens);
+    ggml_backend_buffer_t bgd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gd, ggml_backend_dev_buffer_type(dev));
+    ggml_backend_buffer_t bgc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gc, ggml_backend_cpu_buffer_type());
+    ggml_cgraph *         gd  = ggml_new_graph(ctx_gd);
+    ggml_cgraph *         gc  = ggml_new_graph(ctx_gc);
+    for (ggml_tensor * t : { od.out, od.set_k, od.set_v }) {
+        ggml_build_forward_expand(gd, t);
+    }
+    for (ggml_tensor * t : { oc.out, oc.set_k, oc.set_v }) {
+        ggml_build_forward_expand(gc, t);
+    }
+
+    double worst = -1.0;
+    if (bgd != nullptr && bgc != nullptr && ggml_backend_graph_compute(backend, gd) == GGML_STATUS_SUCCESS &&
+        ggml_backend_graph_compute(cpu, gc) == GGML_STATUS_SUCCESS) {
+        std::vector<float> full(ggml_nelements(od.full)), out(ggml_nelements(od.out));
+        ggml_backend_tensor_get(od.full, full.data(), 0, ggml_nbytes(od.full));
+        ggml_backend_tensor_get(od.out, out.data(), 0, ggml_nbytes(od.out));
+        worst = nmse(full.data(), static_cast<const float *>(oc.full->data), (int64_t) full.size());
+        if (std::memcmp(out.data(), full.data() + (n_tokens - 1) * k_d, k_d * sizeof(float)) != 0 || !graph_finite(gd)) {
+            worst = -1.0;  // GET_ROWS is a copy; a non-finite intermediate is a failure
+        }
+        for (const auto & caches : { std::pair<ggml_tensor *, ggml_tensor *>{ kc_d, kc_c }, { vc_d, vc_c } }) {
+            std::vector<uint8_t> a(ggml_nbytes(caches.first)), b(a.size());
+            ggml_backend_tensor_get(caches.first, a.data(), 0, a.size());
+            ggml_backend_tensor_get(caches.second, b.data(), 0, b.size());
+            const std::vector<float> fa = f16_to_f32(a), fb = f16_to_f32(b);
+            worst = worst < 0.0 ? worst : std::max(worst, nmse(fa.data(), fb.data(), (int64_t) fa.size()));
+        }
+    }
+
+    for (ggml_backend_buffer_t b : { bh, bwd, bwc, bgd, bgc }) {
+        ggml_backend_buffer_free(b);
+    }
+    for (ggml_context * c : { ctx_h, ctx_wd, ctx_wc, ctx_gd, ctx_gc }) {
+        ggml_free(c);
+    }
+    return worst;
+}
+
+// ROPE NEOX with a head size above 128, the shape that takes ggml-spacemit's RVV rotation (smaller NEOX heads use its
+// scalar loop): -o ROPE has none (test-backend-ops reaches it only in RMS_NORM_MUL_ROPE, rows of 768 and 8192, whole
+// rows rotated), here at Qwen3-like base and positions, whole and half rotated
+static double rope_wide_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int n_dims) {
+    ggml_init_params params = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);
+    ggml_context *   ctx_d  = ggml_init(params);
+    ggml_tensor *    x      = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, 256, 4, 3);
+    ggml_tensor *    pos    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 3);
+    ggml_tensor * y_ref = ggml_rope_ext(ctx_h, x, pos, nullptr, n_dims, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_tensor * y     = ggml_rope_ext(ctx_d, x, pos, nullptr, n_dims, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+    double                e  = -1.0;
+    if (bh != nullptr && bd != nullptr) {
+        const std::vector<float> xv = random_values(ggml_nelements(x), 9, 1.0f);
+        const int32_t            pv[3] = { 0, 17, 4095 };
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(pos, pv, 0, sizeof(pv));
+        ggml_cgraph * gd = ggml_new_graph(ctx_d);
+        ggml_cgraph * gc = ggml_new_graph(ctx_h);
+        ggml_build_forward_expand(gd, y);
+        ggml_build_forward_expand(gc, y_ref);
+        if (ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(backend, gd) == GGML_STATUS_SUCCESS &&
+            ggml_backend_graph_compute(cpu, gc) == GGML_STATUS_SUCCESS) {
+            std::vector<float> out(ggml_nelements(y));
+            ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
+            e = nmse(out.data(), static_cast<const float *>(y_ref->data), (int64_t) out.size());
+        }
+    }
+    ggml_backend_buffer_free(bh);
+    ggml_backend_buffer_free(bd);
+    ggml_free(ctx_h);
+    ggml_free(ctx_d);
+    return e;
+}
+
+// GET_ROWS with one index: the tiles split the columns, and with few columns some tiles get none (the ported kernel
+// overran there before its flagos guard). llama.cpp's last-token rows (one row of 2560) and MoE router weights (one
+// column) are such cases. Inputs in CPU buffers, output in ours.
+static double get_rows_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int64_t nc) {
+    ggml_init_params params = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);
+    ggml_context *   ctx_d  = ggml_init(params);
+    ggml_tensor *    src    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, nc, 8);
+    ggml_tensor *    idx    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 1);
+    ggml_tensor *    y_ref  = ggml_get_rows(ctx_h, src, idx);
+    ggml_tensor *    y      = ggml_get_rows(ctx_d, src, idx);
+    ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+    double                e  = -1.0;
+    if (bh != nullptr && bd != nullptr) {
+        const std::vector<float> sv = random_values(ggml_nelements(src), 11, 1.0f);
+        const int32_t            row = 5;
+        ggml_backend_tensor_set(src, sv.data(), 0, ggml_nbytes(src));
+        ggml_backend_tensor_set(idx, &row, 0, sizeof(row));
+        ggml_cgraph * gd = ggml_new_graph(ctx_d);
+        ggml_cgraph * gc = ggml_new_graph(ctx_h);
+        ggml_build_forward_expand(gd, y);
+        ggml_build_forward_expand(gc, y_ref);
+        if (ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(backend, gd) == GGML_STATUS_SUCCESS &&
+            ggml_backend_graph_compute(cpu, gc) == GGML_STATUS_SUCCESS) {
+            std::vector<float> out(ggml_nelements(y));
+            ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
+            e = nmse(out.data(), static_cast<const float *>(y_ref->data), (int64_t) out.size());
+        }
+    }
+    ggml_backend_buffer_free(bh);
+    ggml_backend_buffer_free(bd);
+    ggml_free(ctx_h);
+    ggml_free(ctx_d);
+    return e;
+}
+
+// SET_ROWS of nr F32 rows into an F16 cache in a CPU buffer, as llama.cpp's KV writes; nc 1 is the transposed V
+// cache written when flash attention is off. Returns the NMSE of the provider's cache against the CPU backend's.
+static double set_rows_nmse(ggml_backend_t backend, ggml_backend_t cpu, int64_t nc, int64_t nr) {
+    const int64_t    slots  = 2 * nr + 3;
+    ggml_init_params params = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_context *   ctx    = ggml_init(params);
+    ggml_tensor *    src    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, nr);
+    ggml_tensor *    idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nr);
+    ggml_tensor *    c_d    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nc, slots);
+    ggml_tensor *    c_c    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nc, slots);
+    ggml_tensor *    y_d    = ggml_set_rows(ctx, c_d, src, idx);  // views of the caches: no buffer of ours involved
+    ggml_tensor *    y_c    = ggml_set_rows(ctx, c_c, src, idx);
+    ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    double                e = -1.0;
+    if (b != nullptr) {
+        ggml_backend_buffer_clear(b, 0);
+        const std::vector<float> sv = random_values(ggml_nelements(src), 13, 1.0f);
+        std::vector<int64_t>     iv(nr);
+        for (int64_t r = 0; r < nr; r++) {
+            iv[r] = (2 * r + 1) % slots;
+        }
+        ggml_backend_tensor_set(src, sv.data(), 0, ggml_nbytes(src));
+        ggml_backend_tensor_set(idx, iv.data(), 0, ggml_nbytes(idx));
+        ggml_cgraph * gd = ggml_new_graph(ctx);
+        ggml_cgraph * gc = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gd, y_d);
+        ggml_build_forward_expand(gc, y_c);
+        if (ggml_backend_supports_op(backend, y_d) && ggml_backend_graph_compute(backend, gd) == GGML_STATUS_SUCCESS &&
+            ggml_backend_graph_compute(cpu, gc) == GGML_STATUS_SUCCESS) {
+            std::vector<uint8_t> a(ggml_nbytes(c_d)), r(ggml_nbytes(c_c));
+            ggml_backend_tensor_get(c_d, a.data(), 0, a.size());
+            ggml_backend_tensor_get(c_c, r.data(), 0, r.size());
+            const std::vector<float> fa = f16_to_f32(a), fr = f16_to_f32(r);
+            e = nmse(fa.data(), fr.data(), (int64_t) fa.size());
+        }
+    }
+    ggml_backend_buffer_free(b);
+    ggml_free(ctx);
+    return e;
+}
+
+// a GET_ROWS with an index out of range fails the launch (the CPU would abort), as the first step and after an ADD,
+// repeatedly (see check_ops); an unselected node (no compute flag, as ggml_build_forward_select leaves) is skipped
+// as on the CPU, so its never-set indices do no harm. Returns the number of launches that behaved, of k_bad_runs * 2 + 1.
+constexpr int k_bad_runs = 100;
+
+static int bad_index_runs(ggml_backend_dev_t dev, ggml_backend_t backend) {
+    ggml_init_params params = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 4, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);
+    ggml_context *   ctx_d  = ggml_init(params);
+    ggml_tensor *    src    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, 64, 8);
+    ggml_tensor *    idx    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 3);
+    ggml_tensor *    first  = ggml_get_rows(ctx_d, src, idx);
+    ggml_tensor *    later  = ggml_get_rows(ctx_d, ggml_add(ctx_d, src, src), idx);
+    ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+    int                   ok = 0;
+    if (bh != nullptr && bd != nullptr) {
+        const std::vector<float> sv       = random_values(ggml_nelements(src), 17, 1.0f);
+        const int32_t            good[3]  = { 1, 7, 2 };
+        const int32_t            bad[3]   = { 1, 9, 2 };  // 9 >= 8 rows; with 3 rows split over the tiles, tile 1 fails
+        ggml_backend_tensor_set(src, sv.data(), 0, ggml_nbytes(src));
+        ggml_backend_tensor_set(idx, good, 0, sizeof(good));
+        ggml_cgraph * g_first = ggml_new_graph(ctx_d);
+        ggml_cgraph * g_later = ggml_new_graph(ctx_d);
+        ggml_build_forward_expand(g_first, first);
+        ggml_build_forward_expand(g_later, later);
+        // with valid indices both graphs run, so the failures below come from the kernel, not a refusal
+        if (ggml_backend_graph_compute(backend, g_first) != GGML_STATUS_SUCCESS ||
+            ggml_backend_graph_compute(backend, g_later) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "FAIL: GET_ROWS graphs with valid indices did not run\n");
+            g_failures++;
+            ok = -1;
+        }
+        ggml_backend_tensor_set(idx, bad, 0, sizeof(bad));
+        for (int r = 0; r < k_bad_runs && ok >= 0; r++) {
+            ok += ggml_backend_graph_compute(backend, g_first) == GGML_STATUS_FAILED;
+            ok += ggml_backend_graph_compute(backend, g_later) == GGML_STATUS_FAILED;
+        }
+        first->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+        ok += ggml_backend_graph_compute(backend, g_first) == GGML_STATUS_SUCCESS;
+    }
+    ggml_backend_buffer_free(bh);
+    ggml_backend_buffer_free(bd);
+    ggml_free(ctx_h);
+    ggml_free(ctx_d);
+    return ok;
+}
+
+static int check_rows(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+
+    double worst_get = 0.0, worst_set = 0.0;
+    for (int64_t nc : { 1, 10, 17, 41, 2560 }) {
+        const double e = get_rows_nmse(dev, backend, cpu, nc);
+        if (e < 0.0 || e > 0.0) {
+            std::fprintf(stderr, "FAIL: GET_ROWS one row of %lld: %s %.3e\n", (long long) nc,
+                         e < 0.0 ? "refused or failed" : "NMSE", e);
+            g_failures++;
+        }
+        worst_get = std::max(worst_get, e);
+    }
+    for (const auto & [nc, nr] : { std::pair<int64_t, int64_t>{ 1024, 1 }, { 1024, 7 }, { 1024, 512 }, { 1, 512 } }) {
+        const double e = set_rows_nmse(backend, cpu, nc, nr);
+        if (e < 0.0 || e > 1e-7) {
+            std::fprintf(stderr, "FAIL: SET_ROWS %lld rows of %lld into a CPU-buffer F16 cache: %s %.3e\n",
+                         (long long) nr, (long long) nc, e < 0.0 ? "refused or failed" : "NMSE", e);
+            g_failures++;
+        }
+        worst_set = std::max(worst_set, e);
+    }
+
+    const int bad_ok = bad_index_runs(dev, backend);
+    if (bad_ok != 2 * k_bad_runs + 1) {
+        std::fprintf(stderr, "FAIL: index out of range / unselected node: %d of %d launches as expected\n", bad_ok,
+                     2 * k_bad_runs + 1);
+        g_failures++;
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    std::printf("rows     GET_ROWS one row of 1-2560 columns vs CPU: max NMSE %.2e (bound 0); SET_ROWS into a CPU-buffer "
+                "F16 cache (1-512 rows of 1024, 512 rows of 1): max NMSE %.2e; index out of range fails the launch and "
+                "an unselected node is skipped: %d/%d\n",
+                worst_get, worst_set, bad_ok, 2 * k_bad_runs + 1);
+    return 0;
+}
+
+static int check_layer(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 8);
+
+    double worst = 0.0;
+    for (int64_t n_tokens : { 1, 7 }) {
+        const double e = layer_nmse(dev, backend, cpu, n_tokens);
+        if (e < 0.0 || e > k_layer_max_nmse) {
+            std::fprintf(stderr, "FAIL: layer with %lld tokens: %s %.3e\n", (long long) n_tokens,
+                         e < 0.0 ? "refused or failed" : "NMSE", e);
+            g_failures++;
+        }
+        worst = std::max(worst, e);
+    }
+    // the whole head rotated, and half of it (the rest copied)
+    const double e_rope_full = rope_wide_nmse(dev, backend, cpu, 256);
+    const double e_rope_half = rope_wide_nmse(dev, backend, cpu, 128);
+    const double e_rope      = e_rope_full < 0.0 || e_rope_half < 0.0 ? -1.0 : std::max(e_rope_full, e_rope_half);
+    if (e_rope < 0.0 || e_rope > 1e-7) {
+        std::fprintf(stderr, "FAIL: ROPE NEOX head 256 (n_dims 256, 128): %s %.3e\n", e_rope < 0.0 ? "refused or failed" : "NMSE",
+                     e_rope);
+        g_failures++;
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    std::printf("layer    Qwen3-like layer in one launch vs CPU (1 and 7 tokens, all rows; KV cache in a CPU buffer, "
+                "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e%s\n",
+                worst, k_layer_max_nmse, e_rope, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+    return 0;
+}
+
 static double time_us(const std::function<void()> & fn, int iterations) {
     for (int i = 0; i < iterations / 10 + 1; i++) {
         fn();
@@ -703,7 +1161,7 @@ int main(int argc, char ** argv) {
     CHECK(n_spacemit == 1);
 
     if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
-        check_mul_mat(dev, full) != 0) {
+        check_mul_mat(dev, full) != 0 || check_rows(dev) != 0 || check_layer(dev) != 0) {
         return 1;
     }
     if (run_bench && bench(dev) != 0) {

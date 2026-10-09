@@ -18,8 +18,6 @@ int64_t spacemit_test_fail_step() {
     return value != nullptr ? std::atoll(value) : -1;
 }
 
-constexpr uint32_t SPACEMIT_MAX_TILES = 64;
-
 struct spacemit_launch {
     const spacemit_step * steps          = nullptr;
     size_t                n_steps        = 0;
@@ -37,8 +35,9 @@ bool spacemit_run_step(const spacemit_launch & launch, size_t i, const spacemit_
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 
-// every tile reaches every barrier and reads the failure flag right after it, so all tiles stop together:
-// a tile that left early would leave the others waiting at the next barrier forever
+// every tile reaches every barrier, also after a failure, when it only skips the remaining kernels: a tile that left
+// early would leave the others waiting at the next barrier forever. (Leaving when the flag is set after a barrier is
+// not enough: a faster tile may already have failed in the next step, so tiles would disagree.)
 void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept {
     const uint32_t                ith = ctx->program_id(0);
     const uint32_t                nth = ctx->grid_dim(0);
@@ -47,9 +46,7 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     // agree on one TCM size, the smallest any tile has, so every tile takes the same kernel path
     launch->tcm_sizes[ith] = tcm.data != nullptr ? tcm.size : 0;
     if (ctx->sync() != spert::Status::Ok) {
-        launch->failed.store(true);
-    }
-    if (launch->failed.load()) {
+        launch->failed.store(true);  // spine-runtime's barrier itself failed: nothing can keep the tiles together
         return;
     }
     size_t tcm_size = launch->tcm_sizes[0];
@@ -60,14 +57,12 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
                                  launch->workspace_size };
 
     for (size_t i = 0; i < launch->n_steps; i++) {
-        if (!spacemit_run_step(*launch, i, tile)) {
+        if (!launch->failed.load() && !spacemit_run_step(*launch, i, tile)) {
             launch->failed.store(true);
         }
         if (ctx->sync() != spert::Status::Ok) {
             launch->failed.store(true);
-        }
-        if (launch->failed.load()) {
-            break;
+            return;
         }
     }
 }

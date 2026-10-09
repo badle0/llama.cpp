@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 
+// most tiles one launch can have (the K3 has 8 AI cores); per-tile workspace slices are sized for this many
+constexpr uint32_t SPACEMIT_MAX_TILES = 64;
+
 // one AI-core tile of a launch: tile ith of nth, with that core's TCM and the workspace all tiles share.
 // All tiles of a launch see the same tcm_size (0 and tcm == nullptr when any tile lacks TCM), so they take the
 // same kernel path.

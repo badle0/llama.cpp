@@ -1,6 +1,7 @@
 #include "flagos-spacemit-ime.h"
 
 #include "flagos-spacemit-ime-kernels.h"
+#include "flagos-spacemit-kernels.h"
 
 #include "../../../ggml-impl.h"
 
@@ -40,14 +41,10 @@ int64_t div_up(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
-// test-only: FLAGOS_SPACEMIT_TEST_REFERENCE=1 runs the scalar reference kernels on the AI cores, to tell a kernel
-// error from an orchestration error; without the IME kernels the references are always used
+// test-only FLAGOS_SPACEMIT_TEST_REFERENCE (flagos-spacemit-kernels.h); without the IME kernels the scalar references
+// are always used
 bool use_reference() {
-    static const bool reference = [] {
-        const char * value = std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE");
-        return !spacemit_ime::have_ime() || (value != nullptr && std::strcmp(value, "0") != 0);
-    }();
-    return reference;
+    return spacemit_use_reference() || !spacemit_ime::have_ime();
 }
 
 // rows [0, rows) of a block: 4 rows per kernel call while 4 remain, then 1

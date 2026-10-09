@@ -1,6 +1,7 @@
 # SpacemiT K3 provider. On riscv64 it needs spine-runtime (libspert) to run ops on the A100 AI cores and a compiler
-# with the SpacemiT IME2 instructions (GCC >= 15); elsewhere it builds without them, finds no device, and its executor
-# falls back to a serial stand-in and the kernels to scalar references, used by tests.
+# with the SpacemiT IME2 instructions (GCC >= 15); elsewhere it builds without them, finds no device (unless
+# FLAGOS_SPACEMIT_HOST_TEST_DEVICE is ON), and its executor falls back to a serial stand-in and the kernels to the
+# references, used by tests.
 
 set(FLAGOS_SPACEMIT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
@@ -13,6 +14,8 @@ list(APPEND FLAGOS_SOURCES
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ops.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.h"
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-weights.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-weights.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime.h"
@@ -54,14 +57,23 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
         message(FATAL_ERROR "FlagOS SpacemiT: the compiler lacks the SpacemiT IME2 instructions (needs GCC >= 15); "
                             "see CMakeFiles/CMakeConfigureLog.yaml for the failed checks")
     endif()
-    list(APPEND FLAGOS_PRIVATE_DEFINITIONS GGML_FLAGOS_SPACEMIT_IME2)
+    list(APPEND FLAGOS_PRIVATE_DEFINITIONS GGML_FLAGOS_SPACEMIT_IME2 GGML_FLAGOS_SPACEMIT_RVV)
 
     # only the kernels need the vector ISA; they run on the A100 cores (RVV 1024)
-    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.cpp" PROPERTIES
+    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.cpp" PROPERTIES
         COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba;-mabi=lp64d")
     set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.cpp" PROPERTIES
         COMPILE_OPTIONS "${FLAGOS_SPACEMIT_IME_MARCH};-mabi=lp64d")
     message(STATUS "FlagOS: enabling SpacemiT K3 provider with spine-runtime at ${FLAGOS_SPACEMIT_SPERT_DIR} and IME2 kernels")
 else()
-    message(STATUS "FlagOS: enabling SpacemiT K3 provider without spine-runtime (not riscv64: no device, serial test executor, reference kernels)")
+    # test only: a simulated device on this host (8 tiles run one after another by the serial executor, reference
+    # kernels), so test-backend-ops and flagos-check-spacemit can run the provider's code before it reaches the K3
+    option(FLAGOS_SPACEMIT_HOST_TEST_DEVICE "FlagOS SpacemiT: expose a simulated device on non-riscv64 hosts (tests only)" OFF)
+    if (FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
+        list(APPEND FLAGOS_PRIVATE_DEFINITIONS GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
+        message(STATUS "FlagOS: enabling SpacemiT K3 provider with a simulated test device (not riscv64: serial executor, reference kernels)")
+    else()
+        message(STATUS "FlagOS: enabling SpacemiT K3 provider without spine-runtime (not riscv64: no device, serial test executor, reference kernels)")
+    endif()
 endif()
