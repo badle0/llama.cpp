@@ -205,14 +205,17 @@ def perplexity(bdir, logs, model, text):
     # as M0.6 (build.md §7): 8 x 512 tokens, flash attention on
     cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-t", "8",
            "-fa", "on", "-lv", "4"]
-    ppl = []
+    ppl, problems = [], []
     for name, extra, drop in [("enabled", {}, ("FLAGOS_SPACEMIT_DISABLE",)), ("disabled", {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]:
         rc, out, err = run(cmd, logs / f"ppl-{name}", env_extra=extra, env_drop=drop, timeout=3600)
         m = re.search(r"Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)", out + err)
         ppl.append(float(m.group(1)) if rc == 0 and m else None)
+        if ppl[-1] is None:
+            # a negative rc is the signal that ended the run (-9: killed, e.g. out of memory; -11: segfault)
+            problems.append(f"{name} run gave no result: rc={rc}, last log line: {last_line(err or out)[:100]}")
     ok = None not in ppl and abs(ppl[0] / ppl[1] - 1.0) <= 0.01
     detail = f"provider {ppl[0]}, CPU {ppl[1]}" + (f" ({100.0 * (ppl[0] / ppl[1] - 1.0):+.2f}%)" if None not in ppl else "")
-    report("perplexity within 1% of the CPU", ok, detail)
+    report("perplexity within 1% of the CPU", ok, "; ".join([detail, *problems]))
 
 
 def llama_bench(bdir, logs, model, ime_build, tcm_dir):

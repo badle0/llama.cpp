@@ -471,7 +471,7 @@ static int check_mul_mat_add(ggml_backend_dev_t dev, ggml_backend_t backend, ggm
 }
 
 // the provider against the CPU backend for shapes and row counts that take every path: 1 row (GEMV), 113 and more
-// rows (path A), the rest (path C); 4-row blocks with partial tails
+// rows with n <= 64 rows (path A), the rest (path C); 4-row blocks with partial tails
 static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     if (check_mul_mat_claims(dev) != 0 || check_weight_round_trip(dev) != 0) {
         return 1;
