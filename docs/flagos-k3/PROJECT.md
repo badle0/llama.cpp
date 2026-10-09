@@ -13,7 +13,7 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 - Goal: run llama.cpp inference on the SpacemiT K3 through FlagOS — a **SpacemiT provider inside ggml-flagos**, analogous to how vllm-plugin-FL plugs FlagOS into vLLM.
 - Deliverable shape: in-tree provider at `ggml/src/ggml-flagos/providers/spacemit/` (M1 skeleton done). ggml-flagos builds as one ggml backend (`libggml-flagos`); providers are compiled into it.
 - Mentor also asked for a design review of ggml-flagos, focused on **kernel fusion** (providers have different kernel structures) and the **shim between Common and providers** → `upstream-review.md`.
-- Status: FlagOS provider-neutral build and upstream SpacemiT IME baseline both build on the K3; IME + TCM passes on the board (2026-10-07). Build plan written (`plan.md`, 2026-10-07). M1 skeleton done 2026-10-08 (`providers/spacemit/`, commit `4389005`; 14/14 checks on the K3). M2a done 2026-10-09 (spine-runtime executor + `ADD`, commits `f78022f`, `187239e`; `test-backend-ops -o ADD` passes on the K3). M2b done 2026-10-09 (Q4_0 `MUL_MAT` on the IME, commit `6671c59`): accurate (perplexity -0.13% vs CPU on Qwen3-4B), pp128 2.4x the X100 cores, tg128 about equal to them because of 355 CPU/AI-core handoffs per token (`build.md` §7). M2d (the rest of a layer except attention) implemented 2026-10-09, K3 run pending.
+- Status: FlagOS provider-neutral build and upstream SpacemiT IME baseline both build on the K3; IME + TCM passes on the board (2026-10-07). Build plan written (`plan.md`, 2026-10-07). M1 skeleton done 2026-10-08 (`providers/spacemit/`, commit `4389005`; 14/14 checks on the K3). M2a done 2026-10-09 (spine-runtime executor + `ADD`, commits `f78022f`, `187239e`; `test-backend-ops -o ADD` passes on the K3). M2b done 2026-10-09 (Q4_0 `MUL_MAT` on the IME, commit `6671c59`): accurate (perplexity -0.13% vs CPU on Qwen3-4B), pp128 2.4x the X100 cores, tg128 about equal to them because of 355 CPU/AI-core handoffs per token (`build.md` §7). M2d done 2026-10-10 (the rest of a layer except attention, commits `f1cf809`, `7a2b897`, `e5f69ff`): tg128 7.16, pp128 53.0, as accurate as the IME path (`build.md` §7); the Q4_1 `ffn_down` matmuls and attention on the X100 cores are what remains.
 
 ## 2. Decisions (proposed = still to confirm with mentor)
 
@@ -98,13 +98,14 @@ Same numbering as `plan.md` §7, which gives the context for each.
 6. FlagTree AOT (M3) in scope? Cross-compile on x86 or build on the K3? (FlagTree's SpacemiT backend has no AOT tool; we would write generator, manifest, loader, launcher.)
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, who ship ggml-spacemit as an `ACCEL` backend?
 8. TCM: report to SpacemiT (no dead-owner recovery; `try_wait` timeout unit ~12 µs) and install spacemit-tcm 3.0.1 on the board? Also one CPU-backend crash in 8 runs whose register state the program cannot produce (`build.md` §7; not reproduced by targeted tests).
-9. ACCEL gaps in llama.cpp (C5, `plan.md` §6): fix the automatic flash-attention check and norm pinning in our fork, or raise an upstream issue? Norm pinning is now patched in the fork as a separate commit (2026-10-09, needed for M2d); keep it? Without them ACCEL needs `-fa on` and generates 30-39% slower (Qwen3-4B / 0.6B).
+9. ACCEL gaps in llama.cpp (C5, `plan.md` §6): fix the automatic flash-attention check and norm pinning in our fork, or raise an upstream issue? Norm pinning is now patched in the fork as a separate commit (`f1cf809`, 2026-10-09, needed for M2d); keep it? Without them ACCEL needs `-fa on` and generates 30-39% slower (Qwen3-4B / 0.6B).
+10. Order after M2d: M2c, then M2e? Moving the Q4_1 matmuls alone takes pp128 from 53 to 83 t/s; attention on the X100 cores costs +445 ms per token at a context of 4096 (`plan.md` §7).
 
 Zero-copy between same-memory devices (former question 6) is handled at the ggml level by host-visible buffers (`plan.md` §2.3); `memory_domain_id` stays unused.
 
 ## 8. Next steps (in order)
 
-Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone: M2d, K3 run pending.
+Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone: M2c (proposed next, question 10; M2d done 2026-10-10).
 
 1. ~~TCM isolation~~ done 2026-10-07: TCM works with the IME path (`k3-hardware.md` §4).
 2. M0.1–M0.2: build and run `ggml-spacemit` with spine-runtime (`build.md` §5), with `scripts/spacemit-device-type.patch` applied; `scripts/spert-info.cpp` shows whether `shared_buffer()` is real TCM.
@@ -115,4 +116,5 @@ Full milestone list with tests and exit criteria: `plan.md` §4. Current milesto
 7. M0.8: settle D4–D9 and C5 with the mentor (questions above; D3 settled).
 8. ~~M1~~ done 2026-10-08: `providers/spacemit/` skeleton, 14/14 checks on the K3 (`plan.md` M1).
 9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement.
-10. ~~M2b~~ done 2026-10-09: Q4_0 `MUL_MAT` on the IME (A2 buffer, copied kernels, GEMV + path A + path C); results in `plan.md` "M2b design" and `build.md` §7. Next: M2d before M2c (decided 2026-10-09; removing the handoffs is worth more for generation than moving the output head). M2d implemented 2026-10-09 (`plan.md` "M2d design"): the rest of a layer except attention, with ggml-spacemit's RVV kernels ported and ggml-cpu-style references; the norm-pinning patch C5b (approved by the user; mentor to confirm, question 9); a CMake host test device for the Mac. All claimed cases pass on the Mac's simulated device; K3 run pending (`spacemit_check.py --milestone m2d`).
+10. ~~M2b~~ done 2026-10-09: Q4_0 `MUL_MAT` on the IME (A2 buffer, copied kernels, GEMV + path A + path C); results in `plan.md` "M2b design" and `build.md` §7. Next: M2d before M2c (decided 2026-10-09; removing the handoffs is worth more for generation than moving the output head). M2d implemented 2026-10-09 (`plan.md` "M2d design"): the rest of a layer except attention, with ggml-spacemit's RVV kernels ported and ggml-cpu-style references; the norm-pinning patch C5b (approved by the user; mentor to confirm, question 9); a CMake host test device for the Mac. All claimed cases pass on the Mac's simulated device.
+11. ~~M2d~~ done 2026-10-10 on the K3 (`build.md` §7). Next, pending the mentor (question 10): M2c, the Q4_1 matmuls first (pp128 53 -> about 83, measured with a requantized model), then the Q6_K output head; then M2e (attention; decisive beyond about 1k tokens of context).
