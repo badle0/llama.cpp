@@ -393,5 +393,5 @@ Outside FlagOS, needing the mentor's decision (fork patch or upstream llama.cpp 
 5. Target for Phase 0: Qwen3-4B Q4_0 (SpacemiT has reference numbers) or Qwen3.5-4B Q4_K_M (comparable with AMD, but needs lossy Q4_K/Q6_K repacks and gated-delta-net ops early)?
 6. Is FlagTree AOT (M3) in scope, and should it be cross-compiled on x86 or built on the K3?
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, given they ship ggml-spacemit as an `ACCEL` backend?
-8. Should we report the TCM issues to SpacemiT (no dead-owner recovery; `try_wait` timeout unit about 12 µs, not 1 µs)?
+8. Should we report the TCM issues to SpacemiT (no dead-owner recovery; `try_wait` timeout unit about 12 µs, not 1 µs)? Also one CPU-backend crash in 8 runs whose register state the program cannot produce (`build.md` §7; targeted tests with about 80 million page faults did not reproduce it).
 9. ACCEL gaps in llama.cpp (C5, §6): patch the automatic flash-attention check and norm pinning in our fork, or raise an upstream llama.cpp issue? Without them ACCEL needs `-fa on` and generates 30-39% slower (`device-type.md` §5, X3b).

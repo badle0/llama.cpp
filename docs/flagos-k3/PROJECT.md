@@ -97,7 +97,7 @@ Same numbering as `plan.md` §7, which gives the context for each.
 5. Phase 0 target: Qwen3-4B Q4_0 or Qwen3.5-4B Q4_K_M?
 6. FlagTree AOT (M3) in scope? Cross-compile on x86 or build on the K3? (FlagTree's SpacemiT backend has no AOT tool; we would write generator, manifest, loader, launcher.)
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, who ship ggml-spacemit as an `ACCEL` backend?
-8. TCM: report to SpacemiT (no dead-owner recovery; `try_wait` timeout unit ~12 µs) and install spacemit-tcm 3.0.1 on the board?
+8. TCM: report to SpacemiT (no dead-owner recovery; `try_wait` timeout unit ~12 µs) and install spacemit-tcm 3.0.1 on the board? Also one CPU-backend crash in 8 runs whose register state the program cannot produce (`build.md` §7; not reproduced by targeted tests).
 9. ACCEL gaps in llama.cpp (C5, `plan.md` §6): fix the automatic flash-attention check and norm pinning in our fork, or raise an upstream issue? Without them ACCEL needs `-fa on` and generates 30-39% slower (Qwen3-4B / 0.6B).
 
 Zero-copy between same-memory devices (former question 6) is handled at the ggml level by host-visible buffers (`plan.md` §2.3); `memory_domain_id` stays unused.
