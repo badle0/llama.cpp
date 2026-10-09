@@ -81,7 +81,7 @@ Decision rule:
 | SOFT_MAX | 24/212, FAIL | SET_ROWS | 86/86 |
 | SCALE | 1/4, FAIL | MUL | 67/67 |
 | CPY | 60/73, FAIL | ADD | 75/75 |
-| CONT | 18/26, FAIL | GLU | 0/0 (no case claimed) |
+| CONT | 18/26, FAIL | GLU | 0/0, most likely the filter: GLU cases are named by their GLU op (`-o SWIGLU`), so `-o GLU` matches none (2026-10-09; the exact command was not recorded). `test-backend-ops` did not cover SwiGLU; the GPU-type model runs did execute it |
 | RMS_NORM, ROPE, FLASH_ATTN_EXT | no summary line; the run probably died (cause pending) | | |
 
 Consequence: E1's ACCEL-vs-GPU differences mix device-type effects with backend bugs. ACCEL mode's garbage text is more likely a bug exposed by the ops that ACCEL placement puts on the backend than a property of ACCEL itself. Perplexity per mode (X1) and the buffer-policy swap (X3) are needed before drawing conclusions about the type. Failure details (which types and shapes) are pending.
@@ -116,7 +116,7 @@ Reading:
 | CONT | 9 | F16/BF16 only | unlikely |
 | SCALE | 4 | ignores `bias` | no (`bias=0`) |
 | RMS_NORM | aborts | `rvv_kernels.cpp:1656: GGML_ASSERT(epsilon > 0.0f)` on eps = 0 cases | no (eps 1e-6) |
-| ROPE | aborts | `rvv_kernels.cpp:3998: GGML_ASSERT(ctx.workspace_size >= ...)`: workspace not sized for ROPE | would abort, not corrupt |
+| ROPE | aborts | `rvv_kernels.cpp:3998: GGML_ASSERT(ctx.workspace_size >= ...)`: workspace not sized for ROPE (in a `-o ROPE` run; other ops' graphs can grow the workspace first) | no: Qwen3's F32 NEOX heads of 128 take the scalar path with a stack cache (`rvv_kernels.cpp:3992-3996`), which skips the assert (clarified 2026-10-09) |
 | FLASH_ATTN_EXT | segfault + 4 | head size 40 with ALiBi crashes; ALiBi cases NMSE ~0.006 | no (head size 128, no ALiBi) |
 
 Its `supports_op` claims many cases its kernels get wrong. None of these is yet tied to ACCEL mode's output (perplexity exactly the vocabulary size = identical logits, which looks like an unwritten result rather than an inaccurate kernel). The tensor diff (`scripts/tensor-diff.py`) decides that.

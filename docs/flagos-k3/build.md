@@ -114,13 +114,25 @@ For experiment E1 (`plan.md` M0.9), apply the device-type switch before building
 
 ## 6. Build D - FlagOS with the SpacemiT provider (`build-flagos/`, K3)
 
-M1 skeleton (`plan.md` M1). Kept separate from `build/`, which stays the plain-CPU baseline.
+The SpacemiT provider (`plan.md` M1-M2d). Kept separate from `build/`, which stays the plain-CPU baseline.
 ```bash
-python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2a --build
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2d --build
 ```
-The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools, `test-backend-ops` and `llama-completion`, runs the milestone's checks and prints PASS/FAIL per check (INFO lines for measurements); logs go to `build-flagos/<milestone>-logs/`. From M2a the provider links spine-runtime from `~/spine-runtime` (override with `--spert-dir`). Without `--build` it only reruns the checks. Options: `--milestone m1|m2a`, `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--skip-support`, `--build-dir`, `--spert-dir`, `--tcm-dir` (default `~/tcmtest`, for the TCM checks).
+The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools (with `flagos-check-spacemit`), `test-backend-ops`, `llama-completion`, `llama-bench` and `llama-perplexity`, runs the milestone's checks and prints PASS/FAIL per check (INFO lines for measurements); logs go to `build-flagos/<milestone>-logs/`. From M2a the provider links spine-runtime from `~/spine-runtime` (override with `--spert-dir`). Without `--build` it only reruns the checks. Options: `--milestone m1|m2a|m2b|m2d` (default m2d; each milestone's expectations hold only for the code of that milestone, e.g. m2a expects `ADD` as the only claimed op), `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--ppl-text`, `--ime-build`, `--skip-support`, `--build-dir`, `--spert-dir`, `--tcm-dir` (default `~/tcmtest`, for the TCM checks), `--segv <segv.so>` (preloads the crash reporter `scripts/segv.c` into the model, perplexity and llama-bench runs).
 
 Mac: same CMake options plus `-DGGML_METAL=OFF -DGGML_BLAS=OFF`; the provider compiles but finds no device (`flagos-check-spacemit` reports "device checks skipped").
+
+Mac host-test device (from M2d): in a separate build directory, `-DFLAGOS_SPACEMIT_HOST_TEST_DEVICE=ON` exposes a simulated device (8 tiles run one after another by the serial executor, reference kernels), so the provider's claims, tiling, executor and reference kernels run every claimed `test-backend-ops` case before the K3. The RVV and IME kernels compile only on the K3, so the K3 run is still needed. The option exists only off riscv64, and is for tests: llama.cpp would also use the simulated device in model runs.
+```bash
+cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF \
+  -DGGML_FLAGOS_SPACEMIT=ON -DFLAGOS_SPACEMIT_HOST_TEST_DEVICE=ON -DGGML_METAL=OFF -DGGML_BLAS=OFF
+cmake --build build-host -j "$(sysctl -n hw.ncpu)" --target flagos-check-spacemit test-backend-ops
+./build-host/bin/flagos-check-spacemit --expect-device | tail -1        # "all checks passed"
+for o in ADD MUL RMS_NORM ROPE SET_ROWS GET_ROWS SWIGLU RMS_NORM_MUL_ADD ADD_RMS_NORM RMS_NORM_MUL_ROPE ROPE_SET_ROWS; do
+  printf '%s: ' $o; ./build-host/bin/test-backend-ops test -o $o -b FlagOS:SpacemiT:0 2>&1 | grep 'tests passed'
+done
+```
+The riscv64-only code (RVV and IME kernels) can be parsed on the Mac without a RISC-V toolchain: `docs/flagos-k3/scripts/rvv-syntax-check.sh` runs Apple clang for riscv64 with RVV (a stand-in `riscv_vector.h` in `scripts/rvv-syntax/`), checking types, intrinsic signatures and template instantiations. Nothing is assembled or linked, so the K3 build remains the real test. Expected: 0 errors; 2 unused-variable warnings in the copied IME kernel (body unchanged, D6).
 
 ## 7. Models and benchmarks
 
