@@ -137,7 +137,8 @@ def tcm_hygiene(tcm_dir, logs):
 
 
 def tokens_per_second(log):
-    m = re.search(r"\beval time =.*?([0-9.]+) tokens per second", log)
+    # the generation line, not "prompt eval time"
+    m = re.search(r"(?<!prompt )eval time =.*?([0-9.]+) tokens per second", log)
     return float(m.group(1)) if m else None
 
 

@@ -162,7 +162,10 @@ static int check_ops(ggml_backend_dev_t dev) {
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     REQUIRE(buf != nullptr);
 
-    // claimed exactly: same-shape contiguous F32 ADD only
+    // claimed exactly: inputs and views (no kernel), and same-shape contiguous F32 ADD
+    CHECK(ggml_backend_dev_supports_op(dev, a));
+    CHECK(ggml_backend_dev_supports_op(dev, view));
+    CHECK(ggml_backend_dev_supports_op(dev, tview));
     CHECK(ggml_backend_dev_supports_op(dev, sum));
     CHECK(!ggml_backend_dev_supports_op(dev, prod));
     CHECK(!ggml_backend_dev_supports_op(dev, bcast));

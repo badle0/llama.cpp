@@ -288,8 +288,9 @@ ggml_backend_buffer_type_t spacemit_device_buffer_type(ggml_backend_dev_t dev) {
     return &spacemit_device_from_dev(dev)->buffer_type;
 }
 
+// inputs (NONE) and views need no kernel; claiming them lets graphs that contain them run here (design §7.4)
 bool spacemit_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    return spacemit_find_kernel(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
+    return ggml_op_is_empty(op->op) || spacemit_find_kernel(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
 }
 
 // operands may also live in CPU buffers: under ACCEL the KV cache and activations stay there
