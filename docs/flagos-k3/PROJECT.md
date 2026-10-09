@@ -114,4 +114,4 @@ Full milestone list with tests and exit criteria: `plan.md` §4. Current milesto
 6. ~~M0.7~~ done 2026-10-08: op matrix of Qwen3-4B Q4_0 in `plan.md` (9 op kinds with flash attention; output head is Q6_K, 4 `ffn_down` are Q4_1).
 7. M0.8: settle D4–D9 and C5 with the mentor (questions above; D3 settled).
 8. ~~M1~~ done 2026-10-08: `providers/spacemit/` skeleton, 14/14 checks on the K3 (`plan.md` M1).
-9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement. Next: M2b (Q4_0 `MUL_MAT` on IME), designed 2026-10-09 (`plan.md` "M2b design"): A2 buffer, copied kernels (D6), GEMV + path A + path C, path B deferred.
+9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement. Next: M2b (Q4_0 `MUL_MAT` on IME), designed and implemented 2026-10-09 (`plan.md` "M2b design"): A2 buffer, copied kernels (D6), GEMV + path A + path C, path B deferred; Mac-tested with the reference kernels, K3 run pending.

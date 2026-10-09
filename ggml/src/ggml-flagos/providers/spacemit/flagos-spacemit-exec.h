@@ -22,8 +22,9 @@ class spacemit_executor {
   public:
     virtual ~spacemit_executor() = default;
 
-    // runs the steps in order on every tile, with a barrier after each step; false if any step or the runtime failed
-    virtual bool run(const std::vector<spacemit_step> & steps) = 0;
+    // runs the steps in order on every tile, with a barrier after each step, all tiles sharing the workspace;
+    // false if any step or the runtime failed
+    virtual bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) = 0;
 
     virtual const char * name() const = 0;
 };

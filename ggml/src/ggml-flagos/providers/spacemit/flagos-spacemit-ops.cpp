@@ -1,6 +1,8 @@
 #include "flagos-spacemit-ops.h"
 
+#include "flagos-spacemit-ime.h"
 #include "flagos-spacemit-kernels.h"
+#include "flagos-spacemit-weights.h"
 
 // an operand is usable when it is not allocated yet (placement time), or lives in our buffer or in host memory
 static bool spacemit_buffer_usable(const ggml_tensor * t, ggml_backend_buffer_type_t own_buft) {
@@ -20,16 +22,40 @@ static bool spacemit_add_f32_supported(const ggml_tensor * op) {
            ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op);
 }
 
-spacemit_kernel_fn spacemit_find_kernel(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
-    spacemit_kernel_fn kernel = nullptr;
+// Q4_0 weight in the IME layout, read in that layout: so it must sit in our buffer (or be unallocated at placement
+// time), never in a host buffer. The answer must not depend on the row count: llama.cpp asks once per weight, at
+// load, with 512 rows (plan.md M2b design).
+static bool spacemit_mul_mat_q4_0_supported(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    if (spacemit_weight_layout(w) != spacemit_layout::q4_0_32x256) {
+        return false;
+    }
+    if (w->buffer != nullptr && ggml_backend_buffer_get_type(w->buffer) != own_buft) {
+        return false;
+    }
+    return x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(op);
+}
+
+static const spacemit_kernel_fn k_add_f32_steps[] = { spacemit_kernel_add_f32 };
+static const spacemit_op        k_add_f32         = { k_add_f32_steps, 1, nullptr };
+
+static const spacemit_kernel_fn k_mul_mat_q4_0_steps[] = { spacemit_mul_mat_q4_0_quantize, spacemit_mul_mat_q4_0_gemm };
+static const spacemit_op        k_mul_mat_q4_0         = { k_mul_mat_q4_0_steps, 2, spacemit_mul_mat_q4_0_workspace };
+
+const spacemit_op * spacemit_find_op(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
+    const spacemit_op * impl = nullptr;
     switch (op->op) {
         case GGML_OP_ADD:
-            kernel = spacemit_add_f32_supported(op) ? spacemit_kernel_add_f32 : nullptr;
+            impl = spacemit_add_f32_supported(op) ? &k_add_f32 : nullptr;
+            break;
+        case GGML_OP_MUL_MAT:
+            impl = spacemit_mul_mat_q4_0_supported(op, own_buft) ? &k_mul_mat_q4_0 : nullptr;
             break;
         default:
             break;
     }
-    if (kernel == nullptr || !spacemit_buffer_usable(op, own_buft)) {
+    if (impl == nullptr || !spacemit_buffer_usable(op, own_buft)) {
         return nullptr;
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -37,5 +63,5 @@ spacemit_kernel_fn spacemit_find_kernel(const ggml_tensor * op, ggml_backend_buf
             return nullptr;
         }
     }
-    return kernel;
+    return impl;
 }

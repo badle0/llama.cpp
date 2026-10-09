@@ -2,6 +2,7 @@
 
 #include "../../../ggml-impl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 
@@ -17,11 +18,16 @@ int64_t spacemit_test_fail_step() {
     return value != nullptr ? std::atoll(value) : -1;
 }
 
+constexpr uint32_t SPACEMIT_MAX_TILES = 64;
+
 struct spacemit_launch {
-    const spacemit_step * steps   = nullptr;
-    size_t                n_steps = 0;
-    int64_t               fail_step = -1;
+    const spacemit_step * steps          = nullptr;
+    size_t                n_steps        = 0;
+    void *                workspace      = nullptr;
+    size_t                workspace_size = 0;
+    int64_t               fail_step      = -1;
     std::atomic<bool>     failed{ false };
+    size_t                tcm_sizes[SPACEMIT_MAX_TILES] = {};  // each tile's TCM, so all can agree on one size
 };
 
 bool spacemit_run_step(const spacemit_launch & launch, size_t i, const spacemit_tile & tile) {
@@ -34,8 +40,25 @@ bool spacemit_run_step(const spacemit_launch & launch, size_t i, const spacemit_
 // every tile reaches every barrier and reads the failure flag right after it, so all tiles stop together:
 // a tile that left early would leave the others waiting at the next barrier forever
 void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept {
-    const spert::SharedBufferView tcm  = ctx->shared_buffer();
-    const spacemit_tile           tile = { ctx->program_id(0), ctx->grid_dim(0), tcm.data, tcm.size };
+    const uint32_t                ith = ctx->program_id(0);
+    const uint32_t                nth = ctx->grid_dim(0);
+    const spert::SharedBufferView tcm = ctx->shared_buffer();
+
+    // agree on one TCM size, the smallest any tile has, so every tile takes the same kernel path
+    launch->tcm_sizes[ith] = tcm.data != nullptr ? tcm.size : 0;
+    if (ctx->sync() != spert::Status::Ok) {
+        launch->failed.store(true);
+    }
+    if (launch->failed.load()) {
+        return;
+    }
+    size_t tcm_size = launch->tcm_sizes[0];
+    for (uint32_t i = 1; i < nth; i++) {
+        tcm_size = std::min(tcm_size, launch->tcm_sizes[i]);
+    }
+    const spacemit_tile tile = { ith, nth, tcm_size != 0 ? tcm.data : nullptr, tcm_size, launch->workspace,
+                                 launch->workspace_size };
+
     for (size_t i = 0; i < launch->n_steps; i++) {
         if (!spacemit_run_step(*launch, i, tile)) {
             launch->failed.store(true);
@@ -54,7 +77,7 @@ class spert_executor final : public spacemit_executor {
     spert_executor(spacemit_stream_policy policy, uint32_t n_cores, int64_t fail_step) :
         policy(policy), n_cores(n_cores), fail_step(fail_step) {}
 
-    bool run(const std::vector<spacemit_step> & steps) override {
+    bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
         std::unique_ptr<spert::Stream> per_call_stream;
         spert::Stream *                stream = nullptr;
         if (policy == spacemit_stream_policy::per_call) {
@@ -69,11 +92,18 @@ class spert_executor final : public spacemit_executor {
         if (stream == nullptr) {
             return false;
         }
+        if (static_cast<uint32_t>(stream->core_count()) > SPACEMIT_MAX_TILES) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: %u AI cores, at most %u supported\n",
+                           static_cast<uint32_t>(stream->core_count()), SPACEMIT_MAX_TILES);
+            return false;
+        }
 
         spacemit_launch launch;
-        launch.steps     = steps.data();
-        launch.n_steps   = steps.size();
-        launch.fail_step = fail_step;
+        launch.steps          = steps.data();
+        launch.n_steps        = steps.size();
+        launch.workspace      = workspace;
+        launch.workspace_size = workspace_size;
+        launch.fail_step      = fail_step;
         const spert::Future future = stream->launch(spert::Grid{ stream->core_count() }, spacemit_tile_main, &launch);
         const spert::Status status = future.sync();
         if (status != spert::Status::Ok) {
@@ -110,14 +140,14 @@ class serial_executor final : public spacemit_executor {
   public:
     serial_executor(uint32_t n_tiles, int64_t fail_step) : n_tiles(n_tiles), fail_step(fail_step) {}
 
-    bool run(const std::vector<spacemit_step> & steps) override {
+    bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
         spacemit_launch launch;
         launch.steps     = steps.data();
         launch.n_steps   = steps.size();
         launch.fail_step = fail_step;
         for (size_t i = 0; i < steps.size() && !launch.failed.load(); i++) {
             for (uint32_t ith = 0; ith < n_tiles; ith++) {
-                if (!spacemit_run_step(launch, i, { ith, n_tiles, nullptr, 0 })) {
+                if (!spacemit_run_step(launch, i, { ith, n_tiles, nullptr, 0, workspace, workspace_size })) {
                     launch.failed.store(true);
                 }
             }

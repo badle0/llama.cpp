@@ -288,6 +288,8 @@ Design's order is simple ops first, then quantized matmul (§13.3). The K3 start
 
 ### M2b design (2026-10-09)
 
+**Implemented 2026-10-09** (uncommitted; K3 run pending): `flagos-spacemit-weights`, `-ime`, `-ime-kernels` (copies verified byte-identical to the in-tree ranges, except the two marked zero guards in the reference quantizer), op table with steps and workspace, executor TCM agreement, `flagos-check-spacemit --full`, `spacemit_check.py --milestone m2b`. Mac, reference kernels on a simulated device: 40 matmul cases up to 512 rows at Qwen3-4B shapes, max NMSE 2.6e-5 (bound 5e-4); claims, round trip and `MUL_MAT`->`ADD` checked; 0 build warnings. The IME code compiles only on the K3.
+
 Scope: Q4_0 `MUL_MAT` in the IME 32x256 layout only, the layout the IME baseline used. Weight 2-D, rows % 32 == 0, row length % 256 == 0; activations F32; output F32. This covers every Q4_0 matmul of Qwen3-0.6B (1024, 2048, 3072) and Qwen3-4B (1024, 2560, 4096, 9728). Q6_K and Q4_1 stay on the CPU until M2c.
 
 Weights (`flagos-spacemit-weights`, §2.3):

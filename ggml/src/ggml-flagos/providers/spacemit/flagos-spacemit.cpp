@@ -1,13 +1,16 @@
 // FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15).
-// One ACCEL device with a buffer type and a backend; ops run on the AI cores through spine-runtime (M2a: ADD).
+// One ACCEL device with a buffer type and a backend; ops run on the AI cores through spine-runtime
+// (M2a: ADD; M2b: Q4_0 MUL_MAT on the IME, weights repacked in the buffer).
 
 #include "flagos-spacemit-api.h"
 #include "flagos-spacemit-exec.h"
 #include "flagos-spacemit-ops.h"
+#include "flagos-spacemit-weights.h"
 
 #include "../../../ggml-backend-impl.h"
 #include "../../../ggml-impl.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +50,14 @@ struct spacemit_buffer_context {
 struct spacemit_backend_context {
     std::unique_ptr<spacemit_executor> executor;
     std::vector<spacemit_step>         steps;
+    void *                             workspace      = nullptr;  // shared by the tiles; grows to the largest split
+    size_t                             workspace_size = 0;
+
+    ~spacemit_backend_context() {
+        if (workspace != nullptr) {
+            ggml_aligned_free(workspace, workspace_size);
+        }
+    }
 };
 
 std::mutex              g_mutex;
@@ -57,7 +68,7 @@ spacemit_device_context g_device;
 ggml_guid g_backend_guid = { 0x46, 0x6c, 0x61, 0x67, 0x4f, 0x53, 0x2d, 0x53, 0x50, 0x4d, 0x54, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 //
-// buffer: plain 64-byte aligned host memory; M2b adds the IME weight layout
+// buffer: 64-byte aligned host memory; Q4_0 matmul weights are stored in the IME layout (flagos-spacemit-weights.h)
 //
 
 void spacemit_buffer_free(ggml_backend_buffer_t buffer) {
@@ -71,19 +82,21 @@ void * spacemit_buffer_base(ggml_backend_buffer_t buffer) {
 }
 
 void spacemit_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    std::memset(static_cast<char *>(tensor->data) + offset, value, size);
+    spacemit_tensor_fill(tensor, value, offset, size);
 }
 
+// repacks; reads undo the repack, so the scheduler can still copy a weight out if the provider refuses an op on it
 void spacemit_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    std::memcpy(static_cast<char *>(tensor->data) + offset, data, size);
+    spacemit_tensor_write(tensor, data, offset, size);
 }
 
 void spacemit_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    std::memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
+    spacemit_tensor_read(tensor, data, offset, size);
 }
 
+// a raw copy would skip the repack; returning false makes ggml use set_tensor instead
 bool spacemit_buffer_cpy_tensor(ggml_backend_buffer_t, const ggml_tensor * src, ggml_tensor * dst) {
-    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer)) {
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) || spacemit_tensor_is_repacked(dst)) {
         return false;
     }
     std::memcpy(dst->data, src->data, ggml_nbytes(src));
@@ -134,7 +147,7 @@ const ggml_backend_buffer_type_i g_buffer_type_iface = {
     /* .get_alignment  = */ spacemit_buffer_type_alignment,
     /* .get_max_size   = */ nullptr,
     /* .get_alloc_size = */ nullptr,
-    // the weight layout will be IME-specific from M2b, so the CPU backend must not read it directly
+    // repacked weights are not in ggml's layout, so the CPU backend must not read this buffer directly
     /* .is_host        = */ [](ggml_backend_buffer_type_t) { return false; },
 };
 
@@ -163,19 +176,21 @@ bool spacemit_data_ready(const ggml_tensor * node) {
     return true;
 }
 
-// every node is checked before the launch, so a graph either runs completely or fails with nothing written
+// every node and the workspace are checked before the launch, so a graph either runs completely or fails with
+// nothing written
 ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * ctx = static_cast<spacemit_backend_context *>(backend->context);
     auto * dev = static_cast<spacemit_device_context *>(backend->device->context);
 
     ctx->steps.clear();
+    size_t workspace_size = 0;
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
         ggml_tensor * node = ggml_graph_node(cgraph, i);
         if (ggml_op_is_empty(node->op)) {
             continue;
         }
-        const spacemit_kernel_fn kernel = spacemit_find_kernel(node, &dev->buffer_type);
-        if (kernel == nullptr) {
+        const spacemit_op * op = spacemit_find_op(node, &dev->buffer_type);
+        if (op == nullptr) {
             GGML_LOG_ERROR("FlagOS SpacemiT: no kernel for %s (%s)\n", ggml_op_desc(node), node->name);
             return GGML_STATUS_FAILED;
         }
@@ -183,14 +198,31 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             GGML_LOG_ERROR("FlagOS SpacemiT: %s (%s) has an unallocated operand\n", ggml_op_desc(node), node->name);
             return GGML_STATUS_FAILED;
         }
-        ctx->steps.push_back({ kernel, node });
+        for (uint32_t s = 0; s < op->n_steps; s++) {
+            ctx->steps.push_back({ op->steps[s], node });
+        }
+        if (op->workspace_size != nullptr) {
+            workspace_size = std::max(workspace_size, op->workspace_size(node));
+        }
     }
     if (ctx->steps.empty()) {
         return GGML_STATUS_SUCCESS;
     }
+    if (workspace_size > ctx->workspace_size) {
+        if (ctx->workspace != nullptr) {
+            ggml_aligned_free(ctx->workspace, ctx->workspace_size);
+        }
+        ctx->workspace      = ggml_aligned_malloc(workspace_size);
+        ctx->workspace_size = ctx->workspace != nullptr ? workspace_size : 0;
+        if (ctx->workspace == nullptr) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: failed to allocate a %zu-byte workspace\n", workspace_size);
+            return GGML_STATUS_FAILED;
+        }
+    }
 
     std::lock_guard<std::mutex> lock(dev->run_mutex);
-    return ctx->executor->run(ctx->steps) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+    return ctx->executor->run(ctx->steps, ctx->workspace, ctx->workspace_size) ? GGML_STATUS_SUCCESS
+                                                                                  : GGML_STATUS_FAILED;
 }
 
 const ggml_backend_i g_backend_iface = {
@@ -290,7 +322,7 @@ ggml_backend_buffer_type_t spacemit_device_buffer_type(ggml_backend_dev_t dev) {
 
 // inputs (NONE) and views need no kernel; claiming them lets graphs that contain them run here (design §7.4)
 bool spacemit_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    return ggml_op_is_empty(op->op) || spacemit_find_kernel(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
+    return ggml_op_is_empty(op->op) || spacemit_find_op(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
 }
 
 // operands may also live in CPU buffers: under ACCEL the KV cache and activations stay there
