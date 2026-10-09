@@ -13,7 +13,7 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 - Goal: run llama.cpp inference on the SpacemiT K3 through FlagOS — a **SpacemiT provider inside ggml-flagos**, analogous to how vllm-plugin-FL plugs FlagOS into vLLM.
 - Deliverable shape: in-tree provider at `ggml/src/ggml-flagos/providers/spacemit/` (M1 skeleton done). ggml-flagos builds as one ggml backend (`libggml-flagos`); providers are compiled into it.
 - Mentor also asked for a design review of ggml-flagos, focused on **kernel fusion** (providers have different kernel structures) and the **shim between Common and providers** → `upstream-review.md`.
-- Status: FlagOS provider-neutral build and upstream SpacemiT IME baseline both build on the K3; IME + TCM passes on the board (2026-10-07). Build plan written (`plan.md`, 2026-10-07). M1 skeleton done 2026-10-08 (`providers/spacemit/`, commit `4389005`; 14/14 checks on the K3).
+- Status: FlagOS provider-neutral build and upstream SpacemiT IME baseline both build on the K3; IME + TCM passes on the board (2026-10-07). Build plan written (`plan.md`, 2026-10-07). M1 skeleton done 2026-10-08 (`providers/spacemit/`, commit `4389005`; 14/14 checks on the K3). M2a done 2026-10-09 (spine-runtime executor + `ADD`, commits `f78022f`, `187239e`; `test-backend-ops -o ADD` passes on the K3).
 
 ## 2. Decisions (proposed = still to confirm with mentor)
 
@@ -113,4 +113,5 @@ Full milestone list with tests and exit criteria: `plan.md` §4. Current milesto
 5. ~~M0.4: re-measure A100 VLEN~~ done 2026-10-07: 1024 on A100, 256 on X100 (`k3-hardware.md` §2). ~~M0.2 TCM check~~ done: spine-runtime gets real TCM.
 6. ~~M0.7~~ done 2026-10-08: op matrix of Qwen3-4B Q4_0 in `plan.md` (9 op kinds with flash attention; output head is Q6_K, 4 `ffn_down` are Q4_1).
 7. M0.8: settle D4–D9 and C5 with the mentor (questions above; D3 settled).
-8. ~~M1~~ done 2026-10-08: `providers/spacemit/` skeleton, 14/14 checks on the K3 (`plan.md` M1). Next: M2a (executor on spine-runtime + first op `ADD`); D4 is needed before M2b.
+8. ~~M1~~ done 2026-10-08: `providers/spacemit/` skeleton, 14/14 checks on the K3 (`plan.md` M1).
+9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement. Next: M2b (Q4_0 `MUL_MAT` on IME), which needs D4 (question 2) from the mentor.
