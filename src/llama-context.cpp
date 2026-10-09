@@ -2511,6 +2511,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
+                // under default device selection ACCEL devices hold no layers, so every layer's device is the CPU, and
+                // pinning there would split each norm off from the ops an ACCEL backend runs around it: for layers on the
+                // CPU, leave the norm to the scheduler when an ACCEL backend supports it
+                if (ggml_backend_dev_type(dev_layer) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    for (const auto & backend : backends) {
+                        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
+                            ggml_backend_supports_op(backend.get(), cur)) {
+                            return;
+                        }
+                    }
+                }
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
