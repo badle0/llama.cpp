@@ -1,7 +1,9 @@
 // FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15).
-// M1 skeleton: one ACCEL device, a weight buffer type and a backend; no ops are claimed yet.
+// One ACCEL device with a buffer type and a backend; ops run on the AI cores through spine-runtime (M2a: ADD).
 
 #include "flagos-spacemit-api.h"
+#include "flagos-spacemit-exec.h"
+#include "flagos-spacemit-ops.h"
 
 #include "../../../ggml-backend-impl.h"
 #include "../../../ggml-impl.h"
@@ -10,8 +12,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #if defined(__linux__)
 #    include <unistd.h>
@@ -32,11 +36,17 @@ struct spacemit_device_context {
     uint32_t                   n_ai_cores = 0;
     ggml_backend_device        device     = {};
     ggml_backend_buffer_type   buffer_type = {};
+    std::mutex                 run_mutex;  // backends of this device share the same AI cores
 };
 
 struct spacemit_buffer_context {
     void * data = nullptr;
     size_t size = 0;
+};
+
+struct spacemit_backend_context {
+    std::unique_ptr<spacemit_executor> executor;
+    std::vector<spacemit_step>         steps;
 };
 
 std::mutex              g_mutex;
@@ -137,19 +147,50 @@ const char * spacemit_backend_name(ggml_backend_t backend) {
 }
 
 void spacemit_backend_free(ggml_backend_t backend) {
+    delete static_cast<spacemit_backend_context *>(backend->context);
     delete backend;
 }
 
-// nothing is claimed in M1, so the scheduler only ever passes graphs without compute nodes
-ggml_status spacemit_backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
+bool spacemit_data_ready(const ggml_tensor * node) {
+    if (node->data == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i] != nullptr && node->src[i]->data == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// every node is checked before the launch, so a graph either runs completely or fails with nothing written
+ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    auto * ctx = static_cast<spacemit_backend_context *>(backend->context);
+    auto * dev = static_cast<spacemit_device_context *>(backend->device->context);
+
+    ctx->steps.clear();
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
-        const ggml_tensor * node = ggml_graph_node(cgraph, i);
-        if (!ggml_op_is_empty(node->op)) {
+        ggml_tensor * node = ggml_graph_node(cgraph, i);
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        const spacemit_kernel_fn kernel = spacemit_find_kernel(node, &dev->buffer_type);
+        if (kernel == nullptr) {
             GGML_LOG_ERROR("FlagOS SpacemiT: no kernel for %s (%s)\n", ggml_op_desc(node), node->name);
             return GGML_STATUS_FAILED;
         }
+        if (!spacemit_data_ready(node)) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: %s (%s) has an unallocated operand\n", ggml_op_desc(node), node->name);
+            return GGML_STATUS_FAILED;
+        }
+        ctx->steps.push_back({ kernel, node });
     }
-    return GGML_STATUS_SUCCESS;
+    if (ctx->steps.empty()) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    std::lock_guard<std::mutex> lock(dev->run_mutex);
+    return ctx->executor->run(ctx->steps) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 const ggml_backend_i g_backend_iface = {
@@ -224,12 +265,22 @@ void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
     };
 }
 
+// experiment switch: FLAGOS_SPACEMIT_STREAM=per-call releases the AI cores after every graph (M2a measures both)
+spacemit_stream_policy spacemit_stream_policy_from_env() {
+    const char * value = std::getenv("FLAGOS_SPACEMIT_STREAM");
+    return value != nullptr && std::strcmp(value, "per-call") == 0 ? spacemit_stream_policy::per_call
+                                                                    : spacemit_stream_policy::persistent;
+}
+
 ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
+    auto * ctx     = new spacemit_backend_context;
+    ctx->executor  = spacemit_executor_create(spacemit_stream_policy_from_env(), spacemit_device_from_dev(dev)->n_ai_cores);
+    GGML_LOG_DEBUG("FlagOS SpacemiT: backend uses %s\n", ctx->executor->name());
     return new ggml_backend{
         /* .guid    = */ &g_backend_guid,
         /* .iface   = */ g_backend_iface,
         /* .device  = */ dev,
-        /* .context = */ nullptr,
+        /* .context = */ ctx,
     };
 }
 
@@ -237,9 +288,8 @@ ggml_backend_buffer_type_t spacemit_device_buffer_type(ggml_backend_dev_t dev) {
     return &spacemit_device_from_dev(dev)->buffer_type;
 }
 
-// M1 claims no ops: the CPU backend runs everything
-bool spacemit_device_supports_op(ggml_backend_dev_t, const ggml_tensor *) {
-    return false;
+bool spacemit_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    return spacemit_find_kernel(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
 }
 
 // operands may also live in CPU buffers: under ACCEL the KV cache and activations stay there
@@ -399,7 +449,11 @@ bool spacemit_device_profile(size_t index, flagos_device_profile * profile) {
     profile->architecture      = "a100";
     profile->microarchitecture = "rvv1024-ime2";
     profile->target            = "riscv64-a100-ime2";
+#if defined(GGML_FLAGOS_SPACEMIT_SPERT)
+    profile->runtime           = "spine-runtime";
+#else
     profile->runtime           = "none";
+#endif
     profile->aot_format        = nullptr;
     return flagos_device_profile_is_valid(profile);
 }

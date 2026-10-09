@@ -129,11 +129,12 @@ New, in `ggml/src/ggml-flagos/providers/spacemit/` (layout from Design §13.2):
 | `flagos-spacemit-api.h` | `const flagos_provider_v1 * flagos_spacemit_provider();` | M1 |
 | `flagos-spacemit.cpp` | descriptor, probe, device, buffer type, backend, `graph_compute` | M1 |
 | `provider.cmake` | sources, `GGML_FLAGOS_HAVE_SPACEMIT`, kernel sources and IME flags only on riscv64, spine-runtime only where found | M1 |
-| `flagos-spacemit-exec.{h,cpp}` | executor | M2a |
+| `flagos-spacemit-exec.{h,cpp}` | executor | M2a **Implemented 2026-10-09** (uncommitted; Mac-tested incl. a simulated K3, board run pending): `flagos-spacemit-exec` (spine-runtime executor, one launch per split, barrier per node, failure flag read after each barrier; serial stand-in without spine-runtime), `flagos-spacemit-ops` (op table shared by `supports_op` and `graph_compute`), `flagos-spacemit-kernels` (RVV `ADD`); stream policy switch `FLAGOS_SPACEMIT_STREAM=per-call`, test-only `FLAGOS_SPACEMIT_TEST_FAIL_NODE=n`; run `spacemit_check.py --milestone m2a --build` |
 | `flagos-spacemit-ops.{h,cpp}` | predicates and dispatch | M2a |
 | `flagos-spacemit-weights.{h,cpp}` | repack at `set_tensor`, inverse at `get_tensor` | M2b |
 | `tests/check_spacemit.cpp` | `flagos-check-spacemit` | M1 |
-| `tools/m1_check.py` | M1 acceptance run on the K3 | M1 |
+| `tools/spacemit_check.py` | acceptance run on the K3 per milestone (`--milestone m1` or `m2a`; was `m1_check.py`) | M1 |
+| `flagos-spacemit-exec.{h,cpp}`, `flagos-spacemit-ops.{h,cpp}`, `flagos-spacemit-kernels.{h,cpp}` | executor, op table, RVV kernels | M2a |
 | `flagos-spacemit-aot.{h,cpp}`, `tools/` | package loader and generator | M3 |
 
 Common files touched (C1, required, about 10 lines): `ggml/CMakeLists.txt` (option `GGML_FLAGOS_SPACEMIT`, default OFF, next to L201-204); `ggml/src/ggml-flagos/CMakeLists.txt` (include `provider.cmake`, update the "no provider" message, add the check target); `flagos-registry.cpp` (forward declaration and `push_back` under `#ifdef GGML_FLAGOS_HAVE_SPACEMIT`, L13-19 and L69-78).
@@ -240,7 +241,7 @@ Consequences:
 
 ### M1 - Skeleton (Design Phase 1)
 
-**Drafted 2026-10-08** (uncommitted; builds and passes its checks on the Mac, including a simulated K3; not yet run on the board).
+**Done 2026-10-08** (commit `4389005`): `m1_check.py --build` (now `spacemit_check.py --milestone m1`) on the K3 passes 14/14. Device found (8 A100 cores, ACCEL, VLEN 1024, 31.3 GiB shared RAM), absent with `FLAGOS_SPACEMIT_DISABLE=1`; 0 of 19577 `test-backend-ops` cases claimed; Qwen3-0.6B output identical with the provider enabled and disabled, no provider buffer in use, 1 graph split in both. FlagOS's own check tools still pass.
 
 Build: C1 wiring; descriptor, probe (with a test-only switch `FLAGOS_SPACEMIT_DISABLE=1` that makes it return false), ACCEL device, buffer type, backend whose `supports_op` claims nothing and whose `graph_compute` returns `GGML_STATUS_FAILED` for any compute node; profile; `flagos-check-spacemit`. Files:
 
@@ -250,13 +251,13 @@ Build: C1 wiring; descriptor, probe (with a test-only switch `FLAGOS_SPACEMIT_DI
 | `.../providers/spacemit/flagos-spacemit.cpp` | the provider: probe, device, buffer type, backend, FlagOS descriptor |
 | `.../providers/spacemit/provider.cmake` | adds the sources and `GGML_FLAGOS_HAVE_SPACEMIT` |
 | `.../providers/spacemit/tests/check_spacemit.cpp` | `flagos-check-spacemit`: registry, buffer and backend checks through the built library |
-| `.../providers/spacemit/tools/m1_check.py` | the M1 acceptance run on the K3 (build, checks, device list, op support, model comparison) |
+| `.../providers/spacemit/tools/spacemit_check.py` | the acceptance run on the K3 (build, checks, device list, op support, model comparison); `--milestone m1` |
 | `ggml/CMakeLists.txt`, `ggml/src/ggml-flagos/CMakeLists.txt`, `flagos-registry.cpp` | C1 wiring: option `GGML_FLAGOS_SPACEMIT` (default OFF), include, check target, registry entry |
 
 Test (K3), in a separate build directory so `build/` stays the plain-CPU baseline:
 ```bash
-python3 ggml/src/ggml-flagos/providers/spacemit/tools/m1_check.py --build      # builds build-flagos/, then all checks
-python3 ggml/src/ggml-flagos/providers/spacemit/tools/m1_check.py              # checks only, after a rebuild
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m1 --build   # builds build-flagos/, then all checks
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m1           # checks only, after a rebuild
 ```
 Exit: registry lists exactly one FlagOS device on the K3 and none on the Mac; all check tools pass; nothing is claimed, so nothing lands in the provider's buffers and the output equals the run with the provider disabled. With the option OFF, nothing changes.
 

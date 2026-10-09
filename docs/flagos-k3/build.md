@@ -116,9 +116,9 @@ For experiment E1 (`plan.md` M0.9), apply the device-type switch before building
 
 M1 skeleton (`plan.md` M1). Kept separate from `build/`, which stays the plain-CPU baseline.
 ```bash
-python3 ggml/src/ggml-flagos/providers/spacemit/tools/m1_check.py --build
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2a --build
 ```
-The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools, `test-backend-ops` and `llama-completion`, runs every M1 check and prints PASS/FAIL per check; logs go to `build-flagos/m1-logs/`. Without `--build` it only reruns the checks. Options: `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--skip-support`, `--build-dir`.
+The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools, `test-backend-ops` and `llama-completion`, runs the milestone's checks and prints PASS/FAIL per check (INFO lines for measurements); logs go to `build-flagos/<milestone>-logs/`. From M2a the provider links spine-runtime from `~/spine-runtime` (override with `--spert-dir`). Without `--build` it only reruns the checks. Options: `--milestone m1|m2a`, `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--skip-support`, `--build-dir`, `--spert-dir`, `--tcm-dir` (default `~/tcmtest`, for the TCM checks).
 
 Mac: same CMake options plus `-DGGML_METAL=OFF -DGGML_BLAS=OFF`; the provider compiles but finds no device (`flagos-check-spacemit` reports "device checks skipped").
 
