@@ -105,7 +105,7 @@ Zero-copy between same-memory devices (former question 6) is handled at the ggml
 
 ## 8. Next steps (in order)
 
-Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone: M2c.2, the Q6_K output head (M2c.1 done 2026-10-10).
+Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone: M2c.2, the Q6_K output head (M2c.1 done 2026-10-10; M2c.2 designed 2026-10-10, `plan.md` "M2c.2 design").
 
 1. ~~TCM isolation~~ done 2026-10-07: TCM works with the IME path (`k3-hardware.md` §4).
 2. M0.1–M0.2: build and run `ggml-spacemit` with spine-runtime (`build.md` §5), with `scripts/spacemit-device-type.patch` applied; `scripts/spert-info.cpp` shows whether `shared_buffer()` is real TCM.
@@ -118,4 +118,5 @@ Full milestone list with tests and exit criteria: `plan.md` §4. Current milesto
 9. ~~M2a~~ done 2026-10-09: spine-runtime executor + `ADD` (`plan.md` M2a); persistent stream chosen by measurement.
 10. ~~M2b~~ done 2026-10-09: Q4_0 `MUL_MAT` on the IME (A2 buffer, copied kernels, GEMV + path A + path C); results in `plan.md` "M2b design" and `build.md` §7. Next: M2d before M2c (decided 2026-10-09; removing the handoffs is worth more for generation than moving the output head). M2d implemented 2026-10-09 (`plan.md` "M2d design"): the rest of a layer except attention, with ggml-spacemit's RVV kernels ported and ggml-cpu-style references; the norm-pinning patch C5b (approved by the user; mentor to confirm, question 9); a CMake host test device for the Mac. All claimed cases pass on the Mac's simulated device.
 11. ~~M2d~~ done 2026-10-10 on the K3 (`build.md` §7). Next (user decision 2026-10-10, question 10): M2c, the Q4_1 matmuls first (pp128 53 -> about 83, measured with a requantized model), then the Q6_K output head; then M2e (attention; decisive beyond about 1k tokens of context).
-12. ~~M2c.1~~ done 2026-10-10 on the K3 (`build.md` §7): Q4_1 matmuls on the IME, 75 splits, pp128 83.5, tg128 7.22, mean KLD 0.0032 / 0.0020. Next: M2c.2 (the Q6_K output head; design to write; accuracy judged by its KLD increase over M2c.1), then M2e.
+12. ~~M2c.1~~ done 2026-10-10 on the K3 (`build.md` §7): Q4_1 matmuls on the IME, 75 splits, pp128 83.5, tg128 7.22, mean KLD 0.0032 / 0.0020. Next: M2c.2 (the Q6_K output head; accuracy judged by its KLD increase over M2c.1), then M2e.
+13. M2c.2 designed 2026-10-10 (`plan.md` "M2c.2 design"): the in-tree route (Q6_K requantized to Q8_0 at load, `gemm_kernel_i8i8`), Q8_0 weights too, reads of the head return the nearest Q6_K. Expected tg128 +6% on 4B, +10% on 0.6B. Found while designing: the IME path's 1-row matmuls run at 27 GB/s or more against our 24, worth about 20 ms per token; measure path B for 1 row after M2c.2.
