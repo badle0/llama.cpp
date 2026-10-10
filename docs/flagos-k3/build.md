@@ -213,6 +213,41 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 - Microbenchmarks (`--bench`): launch 11.2 us, barrier 0.89 us per node (M2a 9.9 / 0.79); 16M-float ADD 22.7 GB/s with the ported RVV kernel (M2a's hand-written one: 21.3); matmul timings unchanged from M2b.
 - Qwen3-0.6B: 65 splits per token (1 + 28 x 2 + 2 + 3 x 2: 28 layers, 3 with Q4_1 `ffn_down`), M2b 277. tg128 26.75 -> 29.03 (+8.5%), much less than on 4B: the output head (tied to the token embedding; about 128 MB per token if Q6_K like 4B's, type not checked) stays on the X100 cores and is roughly a third of the 34 ms per token (estimate), so M2c matters more here. The `cpu` row varies between days (tg128 28.17 at M2b, 26.03 now), so compare within a run. Perplexity +0.61%, within 1%; the smaller model is more sensitive to the IME's 8-bit activations.
 
+
+**Provider M2c.1 (Q4_1 matmuls on the AI cores), 2026-10-10** (commit `6577170`; `spacemit_check.py --milestone m2c`: 28/28 on Qwen3-4B; llama-bench 3 runs, same flags, back to back):
+
+| Model | Mode | pp128 (t/s) | tg128 (t/s) | Perplexity |
+|---|---|---|---|---|
+| Qwen3-4B Q4_0 | `provider` | 83.49 | 7.22 | 9.7647 (-0.10% vs `cpu`) |
+| | `cpu` | 21.14 | 5.58 | 9.7740 |
+| | `ime` | 79.29 | 11.05 | - |
+
+- Correctness on the A100 cores (`flagos-check-spacemit --full`, IME kernels): Q4_1 against the CPU on the converted weights, 20 cases up to 512 rows and up to 9728 x 2560 (the 4B `ffn_down`), max NMSE 9.7e-7 (bound 5e-4; the Mac's reference 1.1e-6). The zero-point probe (zero point 15 against 32 equal activations) gives 3.0e-7 for 1 row and for 4, so the 1-row kernel's exact branch, which the provider enables, computes like the 4-row kernel (upstream's 16-bit branch would give about 4.6, shown by emulation on the Mac). Q4_0 unchanged: 40 cases, 2.8e-5. With the reference kernels the layer NMSE is 3.84e-4, as in M2d. Every `test-backend-ops` set still passes with both kernel sets; no `MUL_MAT` case fits the IME layouts. The conversion alone changes a matmul on random weights by NMSE 5.86e-3, a CPU computation that gives the same value on the Mac: both machines produce the same zero points.
+- Placement: 75 splits per token, as predicted (M2d 83): the 4 layers with a Q4_1 `ffn_down` no longer go back to the X100 cores for it. Provider buffers: model 1955.75 MiB, compute 72 MiB.
+- Prefill: pp128 53.00 -> 83.49 (+58%), above `ime` (79.29) and the prefill target of 82 (`spacemit-best`, M0.5 above), so the pp half of the M2e exit is met. The same as with the requantized model (83.01), although the Q4_1 kernel is 1.1-1.5x slower than Q4_0's at 4-128 rows: the 4 matmuls are 3% of the FLOPs, so their extra 14 ms per 128-token batch is under 1% of prefill.
+- Generation: tg128 7.16 -> 7.22, within the variation between days (the `cpu` row went 5.95 -> 5.58); provider over `cpu` 1.20 -> 1.29; `llama-completion` 7.46 t/s against 5.97 with the provider disabled. The same-day comparison with the requantized model (+4.5%, M2d above) is the better estimate. What remains to `ime`'s 11.05 is the Q6_K output head on the X100 cores (about 25 ms per token, M2c.2) and attention (M2e).
+- Accuracy against the CPU's logits (`llama-perplexity --kl-divergence`, 8 x 512 tokens, 2,040 scored; commands in §6):
+
+| Run | Mean KLD | 99% KLD | Max KLD | Same top token |
+|---|---|---|---|---|
+| M2c.1, 512-token batches (prefill path) | 0.00316 ± 0.00022 | 0.0244 | 0.241 | 96.86 ± 0.39% |
+| M2c.1, `-ub 1` (generation path) | 0.00203 ± 0.00020 | 0.0175 | 0.287 | 97.30 ± 0.36% |
+| M2d, 512-token batches | 0.00238 | 0.0215 | 0.127 | 97.0% |
+| `ime`, 512-token batches | 0.00339 | 0.0266 | 0.350 | 96.9% |
+
+  The prefill path rose 0.0008 over M2d (about 3 standard errors): the cost of the zero-point conversion and the 8-bit activations in the 4 Q4_1 matmuls. It equals `ime` within one standard error. The generation path, measured here for the first time in any milestone, is the more accurate one: in prefill the 4-row Q4_0 quantizer (`quantize_a_4row_i8_hp`) gives 4 consecutive tokens one shared activation scale per 32 values; in generation each token has its own (the Q4_1 kernels keep per-row scales in both). This is also the first model-level check of M2b's 1-row Q4_0 kernel (fp16 accumulation).
+- Microbenchmarks (`--bench`, the 4B `ffn_down` shape 9728 x 2560, in us; Q4_0 at the same shape; the CPU column is what llama.cpp runs for Q4_1, since ggml-cpu does not repack it):
+
+| Rows | Q4_1 provider | Q4_0 provider | Q4_1 `cpu` |
+|---|---|---|---|
+| 1 | 579 | 593 | 1804 |
+| 4 | 740 | 669 | 9016 |
+| 16 | 2180 | 1554 | 28192 |
+| 64 | 6955 | 4806 | 117211 |
+| 128 | 10129 | 6676 | 228752 |
+
+  1 row is memory-bound: 25.5 GB/s of Q4_1 weights against 23.6 for Q4_0, so the exact 1-row branch costs nothing. At 128 rows (path A for both) 629 against 955 GFLOP/s: the 32x32 kernel's work per 32-value block. Launch 11.0 us, per node 0.90 us, 16M-float `ADD` 22.4 GB/s (as M2d). Qwen3-0.6B not run (expected 59 splits).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
