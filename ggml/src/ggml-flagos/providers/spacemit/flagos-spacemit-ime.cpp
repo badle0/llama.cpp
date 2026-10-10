@@ -2,6 +2,7 @@
 
 #include "flagos-spacemit-ime-kernels.h"
 #include "flagos-spacemit-kernels.h"
+#include "flagos-spacemit-weights.h"
 
 #include "../../../ggml-impl.h"
 
@@ -11,29 +12,48 @@
 
 namespace {
 
-constexpr int64_t k_block   = spacemit_ime::q4_0_k_block;   // K values per IME block
-constexpr int64_t nb_cols   = spacemit_ime::q4_0_row_tile;  // weight rows per IME tile
-constexpr int64_t row_align = 4;                            // rows of the 4-row kernel
+constexpr int64_t nb_cols   = spacemit_ime::row_tile;  // weight rows per IME tile
+constexpr int64_t row_align = 4;                       // rows of the 4-row kernel
+
+// one IME weight layout: its K block, its row sizes and its kernels (flagos-spacemit-ime-kernels.h)
+struct mm_format {
+    int64_t k_block;  // K values per block, in the activations and in the weights
+    size_t (*act_row_bytes)(size_t k);
+    size_t (*weight_row_bytes)(size_t k);
+    void (*quantize_row)(const float * a, size_t count_k, uint8_t * qa, bool reference);
+    void (*quantize_4rows)(const float * a, size_t count_k, uint8_t * qa, bool reference);
+    size_t (*gemm)(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n, size_t k_blocks,
+                   size_t ldc, bool reference);
+};
+
+const mm_format k_q4_0_32x256 = { (int64_t) spacemit_ime::q4_0_k_block, spacemit_ime::q4_0_act_row_bytes,
+                                  spacemit_ime::q4_0_weight_row_bytes,  spacemit_ime::q4_0_quantize_row,
+                                  spacemit_ime::q4_0_quantize_4rows,    spacemit_ime::q4_0_gemm };
+const mm_format k_q4_1_32x32  = { (int64_t) spacemit_ime::q4_1_k_block, spacemit_ime::q4_1_act_row_bytes,
+                                  spacemit_ime::q4_1_weight_row_bytes,  spacemit_ime::q4_1_quantize_row,
+                                  spacemit_ime::q4_1_quantize_4rows,    spacemit_ime::q4_1_gemm };
 
 struct mm_dims {
-    int64_t m;            // activation rows (all batch dimensions flattened; the weight is 2-D)
-    int64_t k;            // row length
-    int64_t n;            // weight rows = output columns
-    int64_t k_blocks;
-    int64_t a_row_bytes;  // quantized activation row
-    int64_t b_row_bytes;  // weight row (the repacked layout keeps Q4_0's size)
+    const mm_format * f;  // the weight's layout (spacemit_find_op admits only the two IME layouts)
+    int64_t           m;  // activation rows (all batch dimensions flattened; the weight is 2-D)
+    int64_t           k;  // row length
+    int64_t           n;  // weight rows = output columns
+    int64_t           k_blocks;
+    int64_t           a_row_bytes;  // quantized activation row
+    int64_t           b_row_bytes;  // repacked weight row
 };
 
 mm_dims mm_dims_of(const ggml_tensor * node) {
     const ggml_tensor * w = node->src[0];
     const ggml_tensor * x = node->src[1];
     mm_dims             d;
+    d.f           = spacemit_weight_layout(w) == spacemit_layout::q4_1_32x32 ? &k_q4_1_32x32 : &k_q4_0_32x256;
     d.m           = x->ne[1] * x->ne[2] * x->ne[3];
     d.k           = x->ne[0];
     d.n           = w->ne[1];
-    d.k_blocks    = d.k / k_block;
-    d.a_row_bytes = (int64_t) spacemit_ime::act_row_bytes(d.k);
-    d.b_row_bytes = (int64_t) ggml_row_size(GGML_TYPE_Q4_0, d.k);
+    d.k_blocks    = d.k / d.f->k_block;
+    d.a_row_bytes = (int64_t) d.f->act_row_bytes(d.k);
+    d.b_row_bytes = (int64_t) d.f->weight_row_bytes(d.k);
     return d;
 }
 
@@ -51,7 +71,7 @@ bool use_reference() {
 void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, int64_t cols, const mm_dims & d,
                bool reference) {
     while (rows > 0) {
-        const auto done = (int64_t) spacemit_ime::gemm(qa, wb, c, rows, cols, d.k_blocks, d.n, reference);
+        const auto done = (int64_t) d.f->gemm(qa, wb, c, rows, cols, d.k_blocks, d.n, reference);
         qa += done * d.a_row_bytes;
         c += done * d.n;
         rows -= done;
@@ -60,26 +80,26 @@ void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, 
 
 }  // namespace
 
-size_t spacemit_mul_mat_q4_0_workspace(const ggml_tensor * node) {
+size_t spacemit_mul_mat_workspace(const ggml_tensor * node) {
     const mm_dims d = mm_dims_of(node);
     return GGML_PAD((size_t) (d.m * d.a_row_bytes), 64);
 }
 
 // step 1: quantize the activations into the workspace. One row: the tiles split its K blocks. Several rows: the tiles
 // split blocks of 4 rows; full blocks are stored interleaved for the 4-row kernel, the last partial block row by row.
-bool spacemit_mul_mat_q4_0_quantize(const spacemit_tile & tile, ggml_tensor * node) {
+bool spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node) {
     const mm_dims d         = mm_dims_of(node);
     const bool    reference = use_reference();
     const float * x         = static_cast<const float *>(node->src[1]->data);
     uint8_t *     qa        = static_cast<uint8_t *>(tile.workspace);
 
     if (d.m == 1) {
-        const int64_t blk_bytes = (int64_t) spacemit_ime::q8_hp_blk_size(k_block, true, true);
+        const int64_t blk_bytes = (int64_t) d.f->act_row_bytes(d.f->k_block);
         const int64_t per_tile  = div_up(d.k_blocks, tile.nth);
         const int64_t b0        = tile.ith * per_tile;
         const int64_t b1        = std::min(b0 + per_tile, d.k_blocks);
         if (b0 < b1) {
-            spacemit_ime::quantize_row(x + b0 * k_block, (b1 - b0) * k_block, qa + b0 * blk_bytes, reference);
+            d.f->quantize_row(x + b0 * d.f->k_block, (b1 - b0) * d.f->k_block, qa + b0 * blk_bytes, reference);
         }
         return true;
     }
@@ -91,10 +111,10 @@ bool spacemit_mul_mat_q4_0_quantize(const spacemit_tile & tile, ggml_tensor * no
         const int64_t r0   = rb * row_align;
         const int64_t rows = std::min(row_align, d.m - r0);
         if (rows == row_align) {
-            spacemit_ime::quantize_4rows(x + r0 * d.k, d.k, qa + r0 * d.a_row_bytes, reference);
+            d.f->quantize_4rows(x + r0 * d.k, d.k, qa + r0 * d.a_row_bytes, reference);
         } else {
             for (int64_t r = r0; r < r0 + rows; r++) {
-                spacemit_ime::quantize_row(x + r * d.k, d.k, qa + r * d.a_row_bytes, reference);
+                d.f->quantize_row(x + r * d.k, d.k, qa + r * d.a_row_bytes, reference);
             }
         }
     }
@@ -102,7 +122,7 @@ bool spacemit_mul_mat_q4_0_quantize(const spacemit_tile & tile, ggml_tensor * no
 }
 
 // step 2: multiply. The path depends only on the shape and the TCM size, which all tiles agree on.
-bool spacemit_mul_mat_q4_0_gemm(const spacemit_tile & tile, ggml_tensor * node) {
+bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     const mm_dims   d         = mm_dims_of(node);
     const bool      reference = use_reference();
     const uint8_t * qa        = static_cast<const uint8_t *>(tile.workspace);
@@ -113,13 +133,14 @@ bool spacemit_mul_mat_q4_0_gemm(const spacemit_tile & tile, ggml_tensor * node) 
     const int64_t   nth       = tile.nth;
 
     // one row (generation): the quantized row in TCM, weights read straight from DRAM, 128 columns per call
-    // (ggml-spacemit ime.cpp:421, which found this faster than staging Q4_0 weights in TCM)
+    // (ggml-spacemit ime.cpp:421, which found this faster than staging Q4_0 weights in TCM; it stages Q4_1 weights in
+    // TCM, its path B, which we do not have: plan.md, M2c design)
     if (d.m == 1 && tcm != nullptr && (size_t) d.a_row_bytes <= tile.tcm_size) {
         spacemit_ime::copy(tcm, qa, d.a_row_bytes);
         constexpr int64_t tile_cols = 4 * nb_cols;
         for (int64_t n0 = ith * tile_cols; n0 < d.n; n0 += tile_cols * nth) {
-            spacemit_ime::gemm(tcm, w + n0 * d.b_row_bytes, out + n0, 1, std::min(d.n - n0, tile_cols), d.k_blocks,
-                               d.n, reference);
+            d.f->gemm(tcm, w + n0 * d.b_row_bytes, out + n0, 1, std::min(d.n - n0, tile_cols), d.k_blocks, d.n,
+                      reference);
         }
         return true;
     }

@@ -8,9 +8,15 @@
 #include <vector>
 
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
-    if (t->view_src == nullptr && t->type == GGML_TYPE_Q4_0 && t->ne[0] % spacemit_ime::q4_0_k_block == 0 &&
-        t->ne[1] % spacemit_ime::q4_0_row_tile == 0 && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t)) {
+    if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[2] != 1 || t->ne[3] != 1 ||
+        !ggml_is_contiguous(t)) {
+        return spacemit_layout::plain;
+    }
+    if (t->type == GGML_TYPE_Q4_0 && t->ne[0] % spacemit_ime::q4_0_k_block == 0) {
         return spacemit_layout::q4_0_32x256;
+    }
+    if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q4_1_k_block == 0) {
+        return spacemit_layout::q4_1_32x32;
     }
     return spacemit_layout::plain;
 }
@@ -26,8 +32,27 @@ static ggml_tensor * spacemit_storage(const ggml_tensor * t, size_t & offset) {
 }
 
 static void spacemit_pack(ggml_tensor * t, const void * data) {
-    const int rc = spacemit_ime::repack_q4_0(t, data, ggml_nbytes(t));
-    GGML_ASSERT(rc == 0 && "tensor does not fit the q4_0 32x256 layout");
+    const int rc = spacemit_weight_layout(t) == spacemit_layout::q4_1_32x32 ?
+                       spacemit_ime::repack_q4_1(t, data, ggml_nbytes(t)) :
+                       spacemit_ime::repack_q4_0(t, data, ggml_nbytes(t));
+    GGML_ASSERT(rc == 0 && "tensor does not fit its IME layout");
+}
+
+static void spacemit_unpack(const ggml_tensor * t, void * data) {
+    if (spacemit_weight_layout(t) == spacemit_layout::q4_1_32x32) {
+        spacemit_ime::unpack_q4_1(t, data);
+    } else {
+        spacemit_ime::unpack_q4_0(t, data);
+    }
+}
+
+// a partial write into a lossy layout re-converts the blocks it touches from what the layout kept, so a write that
+// ends inside a block would change a value the next write completes (a block's minimum split over two writes gets a
+// different zero point than one whole write); it must cover whole blocks. llama.cpp writes weights whole on this device.
+static void spacemit_check_partial(const ggml_tensor * base, size_t offset, size_t size) {
+    const size_t blk = ggml_type_size(base->type);
+    GGML_ASSERT((spacemit_weight_layout(base) != spacemit_layout::q4_1_32x32 || (offset % blk == 0 && size % blk == 0)) &&
+                "a partial write to a Q4_1 weight must cover whole blocks");
 }
 
 bool spacemit_tensor_is_repacked(const ggml_tensor * t) {
@@ -48,8 +73,9 @@ void spacemit_tensor_write(ggml_tensor * t, const void * data, size_t offset, si
         spacemit_pack(base, data);
         return;
     }
+    spacemit_check_partial(base, offset, size);
     std::vector<uint8_t> whole(nbytes);
-    spacemit_ime::unpack_q4_0(base, whole.data());
+    spacemit_unpack(base, whole.data());
     std::memcpy(whole.data() + offset, data, size);
     spacemit_pack(base, whole.data());
 }
@@ -64,11 +90,11 @@ void spacemit_tensor_read(const ggml_tensor * t, void * data, size_t offset, siz
     offset += base_offset;
     const size_t nbytes = ggml_nbytes(base);
     if (offset == 0 && size == nbytes) {
-        spacemit_ime::unpack_q4_0(base, data);
+        spacemit_unpack(base, data);
         return;
     }
     std::vector<uint8_t> whole(nbytes);
-    spacemit_ime::unpack_q4_0(base, whole.data());
+    spacemit_unpack(base, whole.data());
     std::memcpy(data, whole.data() + offset, size);
 }
 
@@ -79,8 +105,9 @@ void spacemit_tensor_fill(ggml_tensor * t, uint8_t value, size_t offset, size_t 
         std::memset(static_cast<char *>(t->data) + offset, value, size);
         return;
     }
+    spacemit_check_partial(base, base_offset + offset, size);
     std::vector<uint8_t> whole(ggml_nbytes(base));
-    spacemit_ime::unpack_q4_0(base, whole.data());
+    spacemit_unpack(base, whole.data());
     std::memset(whole.data() + base_offset + offset, value, size);
     spacemit_pack(base, whole.data());
 }

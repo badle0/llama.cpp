@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Acceptance run for the SpacemiT provider milestones (plan.md M1, M2a, M2b, M2d). Run on the K3; standard library only.
+# Acceptance run for the SpacemiT provider milestones (plan.md M1, M2a, M2b, M2d, M2c). Run on the K3; standard library
+# only.
 #   all:  (--build) configure and build build-flagos/; FlagOS Common checks; flagos-check-spacemit with the
 #         device present and with FLAGOS_SPACEMIT_DISABLE=1; llama.cpp lists the device; op claims; a model
 #         gives identical output with the provider enabled and disabled
@@ -12,7 +13,10 @@
 #   m2d:  as m2b, with the layer ops: it claims exactly ADD, MUL, RMS_NORM, ROPE, SET_ROWS, GET_ROWS, SWIGLU and
 #         MUL_MAT; test-backend-ops passes for each and for the multi-op graphs built from them, with the RVV and
 #         with the reference kernels; flagos-check-spacemit adds a Qwen3-like layer against the CPU
-# Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d] [--build] [--build-dir DIR] [--model GGUF] [--ppl-text FILE]
+#   m2c:  as m2d, with Q4_1 matmuls (the IME layout q4_1 32x32, lossy): flagos-check-spacemit adds Q4_1 against the
+#         CPU on the converted weights, the conversion's own effect and the 1-row kernel's zero-point probe (both
+#         informational), and the layer with a Q4_1 down projection; the benchmark adds Q4_1 at Qwen3-4B's ffn_down
+# Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c] [--build] [--build-dir DIR] [--model GGUF] [--ppl-text FILE]
 #                          [--ime-build DIR] [--skip-support] [--segv SO]
 import argparse
 import csv
@@ -94,16 +98,20 @@ def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
     # a hang here means tiles did not stop together after a failure
     rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device", *args], logs / log,
                        env_extra=env_extra, timeout=timeout)
-    detail = "; ".join(ln for ln in out.splitlines() if ln.startswith(("device", "flagos ", "ops ", "matmul   Q4_0", "rows ", "layer")))
+    detail = "; ".join(ln for ln in out.splitlines()
+                       if ln.startswith(("device", "flagos ", "ops ", "matmul   Q4_0", "matmul   Q4_1", "rows ", "layer")))
     fails = [ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln]
     report(name, rc == 0, detail if rc == 0 else "; ".join(fails[:3]) or last_line(err))
+    for ln in out.splitlines():
+        if ln.startswith("info "):
+            info(name, ln[len("info "):].strip())
 
 
 def check_tools(bdir, logs, milestone):
     for tool in ["provider", "target", "graph-plan", "registry"]:
         rc, out, err = run([str(bdir / "bin" / f"flagos-check-{tool}")], logs / f"check-{tool}")
         report(f"flagos-check-{tool}", rc == 0, last_line(out) if rc == 0 else f"{last_line(err or out)} (rc={rc})")
-    if milestone in ("m2b", "m2d"):
+    if milestone in ("m2b", "m2d", "m2c"):
         check_spacemit(bdir, logs, "flagos-check-spacemit (device present, Qwen3-4B shapes)", "check-spacemit", ["--full"],
                        timeout=900)
         # the same with the reference kernels on the AI cores: tells a kernel error from a tiling error
@@ -132,7 +140,8 @@ def support(bdir, logs, milestone):
         ok = rc == 0 and not claimed and n_no > 0
     elif milestone == "m2a":
         ok = rc == 0 and ops == ["ADD"]
-    elif milestone == "m2d":
+    elif milestone in ("m2d", "m2c"):
+        # no MUL_MAT case of test-backend-ops fits the IME layouts (16-row Q4_0/Q4_1 weights), so MUL_MAT may show 0
         ok = rc == 0 and set(M2D_OPS) <= set(ops) <= set(M2D_OPS) | {"MUL_MAT"}
     else:
         # no MUL_MAT case of test-backend-ops fits the IME layout (plan.md §1), so MUL_MAT may show 0 claims
@@ -152,7 +161,7 @@ def op_test(bdir, logs, op, env_extra=None, tag=""):
 
 
 def op_correctness(bdir, logs, milestone):
-    if milestone != "m2d":
+    if milestone not in ("m2d", "m2c"):
         report("test-backend-ops ADD", *op_test(bdir, logs, "ADD"))
         return
     for op in M2D_OPS + M2D_GRAPHS:
@@ -198,7 +207,7 @@ def model_run(bdir, logs, model, milestone):
     rc_on, text_on, log_on = run(cmd, logs / "model-enabled", env_extra=preload, env_drop=("FLAGOS_SPACEMIT_DISABLE",))
     rc_off, text_off, log_off = run(cmd, logs / "model-disabled", env_extra={"FLAGOS_SPACEMIT_DISABLE": "1", **preload})
     report("model runs", rc_on == 0 and rc_off == 0, f"rc enabled={rc_on}, disabled={rc_off}")
-    if milestone in ("m2b", "m2d"):
+    if milestone in ("m2b", "m2d", "m2c"):
         # the IME kernels quantize activations differently from the CPU, so greedy text may drift; perplexity decides
         same = next((i for i, (a, b) in enumerate(zip(text_on, text_off)) if a != b), min(len(text_on), len(text_off)))
         info("model output", "identical to the CPU" if text_on == text_off else f"differs from the CPU after {same} characters")
@@ -214,7 +223,7 @@ def model_run(bdir, logs, model, milestone):
     if milestone == "m1":
         report("nothing placed on the provider", not placed, "no provider buffers in use" if not placed else ", ".join(placed))
         report("graph splits unchanged", splits[0] == splits[1] and bool(splits[0]), f"enabled {splits[0]}, disabled {splits[1]}")
-    elif milestone in ("m2b", "m2d"):
+    elif milestone in ("m2b", "m2d", "m2c"):
         report("weights placed on the provider", any(p.startswith("model") for p in placed), ", ".join(placed) or "none in use")
         info("graph splits", f"enabled {splits[0]}, disabled {splits[1]}")
     else:
@@ -267,7 +276,8 @@ def llama_bench(bdir, logs, model, ime_build, tcm_dir):
 
 def main():
     ap = argparse.ArgumentParser(description="acceptance run for the FlagOS SpacemiT provider (run on the K3)")
-    ap.add_argument("--milestone", choices=["m1", "m2a", "m2b", "m2d"], default="m2d", help="expectations to check (default: %(default)s)")
+    ap.add_argument("--milestone", choices=["m1", "m2a", "m2b", "m2d", "m2c"], default="m2c",
+                    help="expectations to check (default: %(default)s)")
     ap.add_argument("--build", action="store_true", help="configure and build before checking")
     ap.add_argument("--build-dir", default=str(REPO / "build-flagos"), help="FlagOS build directory (default: %(default)s)")
     ap.add_argument("--spert-dir", default="", help="spine-runtime release directory (default: ~/spine-runtime)")
@@ -298,14 +308,14 @@ def main():
     list_devices(bdir, logs)
     if not args.skip_support:
         support(bdir, logs, args.milestone)
-    if args.milestone in ("m2a", "m2b", "m2d"):
+    if args.milestone in ("m2a", "m2b", "m2d", "m2c"):
         op_correctness(bdir, logs, args.milestone)
         bench(bdir, logs)
     model_run(bdir, logs, args.model, args.milestone)
-    if args.milestone in ("m2b", "m2d"):
+    if args.milestone in ("m2b", "m2d", "m2c"):
         perplexity(bdir, logs, args.model, args.ppl_text)
         llama_bench(bdir, logs, args.model, args.ime_build, args.tcm_dir)
-    if args.milestone in ("m2a", "m2b", "m2d"):
+    if args.milestone in ("m2a", "m2b", "m2d", "m2c"):
         tcm_hygiene(args.tcm_dir, logs)
 
     n_fail = results.count(False)

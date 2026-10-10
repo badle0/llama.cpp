@@ -1,6 +1,7 @@
 // FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15).
 // One ACCEL device with a buffer type and a backend; ops run on the AI cores through spine-runtime
-// (M2a: ADD; M2b: Q4_0 MUL_MAT on the IME, weights repacked in the buffer).
+// (M2a: ADD; M2b, M2c: Q4_0 and Q4_1 MUL_MAT on the IME, weights repacked in the buffer; M2d: the other ops of a
+// layer except attention).
 
 #include "flagos-spacemit-api.h"
 #include "flagos-spacemit-exec.h"
@@ -71,7 +72,7 @@ spacemit_device_context g_device;
 ggml_guid g_backend_guid = { 0x46, 0x6c, 0x61, 0x67, 0x4f, 0x53, 0x2d, 0x53, 0x50, 0x4d, 0x54, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 //
-// buffer: 64-byte aligned host memory; Q4_0 matmul weights are stored in the IME layout (flagos-spacemit-weights.h)
+// buffer: 64-byte aligned host memory; Q4_0 and Q4_1 matmul weights are stored in IME layouts (flagos-spacemit-weights.h)
 //
 
 void spacemit_buffer_free(ggml_backend_buffer_t buffer) {
@@ -88,7 +89,8 @@ void spacemit_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, 
     spacemit_tensor_fill(tensor, value, offset, size);
 }
 
-// repacks; reads undo the repack, so the scheduler can still copy a weight out if the provider refuses an op on it
+// repacks; reads undo the repack (Q4_1: the converted weights), so the scheduler can still copy a weight out if the
+// provider refuses an op on it
 void spacemit_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     spacemit_tensor_write(tensor, data, offset, size);
 }

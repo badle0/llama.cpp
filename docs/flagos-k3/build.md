@@ -114,11 +114,25 @@ For experiment E1 (`plan.md` M0.9), apply the device-type switch before building
 
 ## 6. Build D - FlagOS with the SpacemiT provider (`build-flagos/`, K3)
 
-The SpacemiT provider (`plan.md` M1-M2d). Kept separate from `build/`, which stays the plain-CPU baseline.
+The SpacemiT provider (`plan.md` M1-M2d, M2c). Kept separate from `build/`, which stays the plain-CPU baseline.
 ```bash
-python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2d --build
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2c --build
 ```
-The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools (with `flagos-check-spacemit`), `test-backend-ops`, `llama-completion`, `llama-bench` and `llama-perplexity`, runs the milestone's checks and prints PASS/FAIL per check (INFO lines for measurements); logs go to `build-flagos/<milestone>-logs/`. From M2a the provider links spine-runtime from `~/spine-runtime` (override with `--spert-dir`). Without `--build` it only reruns the checks. Options: `--milestone m1|m2a|m2b|m2d` (default m2d; each milestone's expectations hold only for the code of that milestone, e.g. m2a expects `ADD` as the only claimed op), `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--ppl-text`, `--ime-build`, `--skip-support`, `--build-dir`, `--spert-dir`, `--tcm-dir` (default `~/tcmtest`, for the TCM checks), `--segv <segv.so>` (preloads the crash reporter `scripts/segv.c` into the model, perplexity and llama-bench runs).
+The script configures `build-flagos/` with `-DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON`, builds the provider, the FlagOS check tools (with `flagos-check-spacemit`), `test-backend-ops`, `llama-completion`, `llama-bench` and `llama-perplexity`, runs the milestone's checks and prints PASS/FAIL per check (INFO lines for measurements); logs go to `build-flagos/<milestone>-logs/`. From M2a the provider links spine-runtime from `~/spine-runtime` (override with `--spert-dir`). Without `--build` it only reruns the checks. Options: `--milestone m1|m2a|m2b|m2d|m2c` (default m2c; each milestone's expectations hold only for the code of that milestone, e.g. m2a expects `ADD` as the only claimed op), `--model` (default `~/models/Qwen3-0.6B-Q4_0.gguf`), `--ppl-text`, `--ime-build`, `--skip-support`, `--build-dir`, `--spert-dir`, `--tcm-dir` (default `~/tcmtest`, for the TCM checks), `--segv <segv.so>` (preloads the crash reporter `scripts/segv.c` into the model, perplexity and llama-bench runs).
+
+Accuracy against the CPU's logits (M2c's exit; M2d's numbers in §7 were measured the same way, with 512-row batches only). The base logits come from a CPU-only run; reuse the file from the M2d measurement if it is still there (set `KB` to its path):
+```bash
+B=build-flagos/bin; M=~/models/Qwen3-4B-Q4_0.gguf; KB=~/kld/qwen3-4b-cpu.bin; mkdir -p ~/kld
+[ -f "$KB" ] || FLAGOS_SPACEMIT_DISABLE=1 $B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on \
+  --kl-divergence-base "$KB" > ~/kld/base.log 2>&1
+~/tcmtest/tcmrelease --apply
+$B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on --kl-divergence-base "$KB" --kl-divergence \
+  > ~/kld/m2c.log 2>&1; grep -E 'Mean +KLD|99.0% +KLD|Maximum KLD|Same top p' ~/kld/m2c.log
+# the same through the generation path: 1-token ubatches use the 1-row kernels and the GEMV path (about 10 minutes)
+~/tcmtest/tcmrelease --apply
+$B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on -ub 1 --kl-divergence-base "$KB" --kl-divergence \
+  > ~/kld/m2c-ub1.log 2>&1; grep -E 'Mean +KLD|99.0% +KLD|Maximum KLD|Same top p' ~/kld/m2c-ub1.log
+```
 
 Mac: same CMake options plus `-DGGML_METAL=OFF -DGGML_BLAS=OFF`; the provider compiles but finds no device (`flagos-check-spacemit` reports "device checks skipped").
 

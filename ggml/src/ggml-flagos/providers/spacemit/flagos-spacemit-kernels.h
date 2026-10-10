@@ -6,7 +6,7 @@
 // from ggml-spacemit (flagos-spacemit-rvv-kernels.cpp) when that version handles the tensor's layout correctly, and
 // otherwise a portable reference that follows ggml-cpu's implementation; other hosts always use the reference.
 
-// test-only: FLAGOS_SPACEMIT_TEST_REFERENCE=1 runs the portable references (and M2b's scalar IME references) on the AI
+// test-only: FLAGOS_SPACEMIT_TEST_REFERENCE=1 runs the portable references (and the scalar IME references) on the AI
 // cores, to tell a ported-kernel error from an orchestration error; hosts without the K3 kernels always use them
 bool spacemit_use_reference();
 

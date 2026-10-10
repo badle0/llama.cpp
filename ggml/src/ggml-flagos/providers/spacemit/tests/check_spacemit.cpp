@@ -2,8 +2,9 @@
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
-//   --full           also check Q4_0 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560; slow without the IME)
-//   --bench          also measure launch cost, per-node cost, bandwidth, and Q4_0 matmul time against the CPU
+//   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560; slow without
+//                    the IME)
+//   --bench          also measure launch cost, per-node cost, bandwidth, and Q4_0 and Q4_1 matmul time against the CPU
 // Without a flag, a host without the device skips the device checks.
 
 #include "ggml-alloc.h"
@@ -279,13 +280,13 @@ static int check_ops(ggml_backend_dev_t dev) {
 }
 
 //
-// Q4_0 MUL_MAT (M2b): weights in the IME layout, compared with the CPU backend
+// Q4_0 and Q4_1 MUL_MAT (M2b, M2c): weights in IME layouts, compared with the CPU backend
 //
 
-static std::vector<uint8_t> quantize_q4_0(int64_t k, int64_t n, uint32_t seed) {
+static std::vector<uint8_t> quantize_weights(ggml_type type, int64_t k, int64_t n, uint32_t seed) {
     const std::vector<float> w = random_values(k * n, seed, 1.0f);
-    std::vector<uint8_t>     q(ggml_row_size(GGML_TYPE_Q4_0, k) * n);
-    ggml_quantize_chunk(GGML_TYPE_Q4_0, w.data(), q.data(), 0, n, k, nullptr);
+    std::vector<uint8_t>     q(ggml_row_size(type, k) * n);
+    ggml_quantize_chunk(type, w.data(), q.data(), 0, n, k, nullptr);
     return q;
 }
 
@@ -302,28 +303,34 @@ static double nmse(const float * out, const float * ref, int64_t n) {
     return norm > 0.0 ? err / norm : err;
 }
 
-// one Q4_0 weight [k x n], held twice: in the provider's buffer (repacked) and in a CPU buffer (the reference)
+// one quantized weight [k x n], held twice: in the provider's buffer (repacked) and in a CPU buffer (the reference).
+// The reference gets the provider's read-back: the GGUF bytes for Q4_0, the converted weights for Q4_1, so a comparison
+// measures the kernels and the tiling; check_weight_round_trip checks the conversion.
 struct mm_weight {
     int64_t               k = 0, n = 0;
     ggml_context *        ctx_dev = nullptr, * ctx_cpu = nullptr;
     ggml_backend_buffer_t buf_dev = nullptr, buf_cpu = nullptr;
     ggml_tensor *         w_dev = nullptr, * w_cpu = nullptr;
 
-    bool init(ggml_backend_dev_t dev, int64_t k_, int64_t n_, uint32_t seed) {
+    bool init(ggml_backend_dev_t dev, int64_t k_, int64_t n_, uint32_t seed, ggml_type type = GGML_TYPE_Q4_0) {
+        return init_with(dev, type, k_, n_, quantize_weights(type, k_, n_, seed));
+    }
+
+    bool init_with(ggml_backend_dev_t dev, ggml_type type, int64_t k_, int64_t n_, std::vector<uint8_t> q) {
         k                       = k_;
         n                       = n_;
         ggml_init_params params = { ggml_tensor_overhead() * 2, nullptr, true };
         ctx_dev                 = ggml_init(params);
         ctx_cpu                 = ggml_init(params);
-        w_dev                   = ggml_new_tensor_2d(ctx_dev, GGML_TYPE_Q4_0, k, n);
-        w_cpu                   = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_Q4_0, k, n);
+        w_dev                   = ggml_new_tensor_2d(ctx_dev, type, k, n);
+        w_cpu                   = ggml_new_tensor_2d(ctx_cpu, type, k, n);
         buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, ggml_backend_dev_buffer_type(dev));
         buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu, ggml_backend_cpu_buffer_type());
         if (buf_dev == nullptr || buf_cpu == nullptr) {
             return false;
         }
-        const std::vector<uint8_t> q = quantize_q4_0(k, n, seed);
         ggml_backend_tensor_set(w_dev, q.data(), 0, q.size());
+        ggml_backend_tensor_get(w_dev, q.data(), 0, q.size());
         ggml_backend_tensor_set(w_cpu, q.data(), 0, q.size());
         return true;
     }
@@ -388,10 +395,10 @@ struct mm_run {
 
 constexpr double k_mul_mat_max_nmse = 5e-4;  // test-backend-ops' bound for MUL_MAT
 
-// which tensors the provider claims for MUL_MAT: exactly Q4_0 weights in the IME layout, in its buffer
+// which tensors the provider claims for MUL_MAT: exactly Q4_0 and Q4_1 weights in their IME layouts, in its buffer
 static int check_mul_mat_claims(ggml_backend_dev_t dev) {
     ggml_backend_buffer_type_t buft   = ggml_backend_dev_buffer_type(dev);
-    ggml_init_params           params = { ggml_tensor_overhead() * 48, nullptr, true };
+    ggml_init_params           params = { ggml_tensor_overhead() * 80, nullptr, true };
     ggml_context *             ctx    = ggml_init(params);
     ggml_context *             ctx_cpu = ggml_init(params);
     REQUIRE(ctx != nullptr && ctx_cpu != nullptr);
@@ -410,12 +417,21 @@ static int check_mul_mat_claims(ggml_backend_dev_t dev) {
     ggml_tensor * w_q8 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256, 64);
     ggml_tensor * w_v  = ggml_view_2d(ctx, w, 256, 32, w->nb[1], 0);
     ggml_tensor * w_c  = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_Q4_0, 256, 64);
+    ggml_tensor * v1   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 256, 64);
+    ggml_tensor * v1_k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 2880, 64);
+    ggml_tensor * v1_n = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 256, 16);
+    ggml_tensor * v1_3 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 32, 2);
+    ggml_tensor * v1_v = ggml_view_2d(ctx, v1, 256, 32, v1->nb[1], 0);
+    ggml_tensor * v1_c = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_Q4_1, 256, 64);
 
     // claimed for any row count, before allocation (test-backend-ops) and with a zero-size buffer of our type
     // standing in for the weight's (what llama.cpp does at load, src/llama-model-loader.cpp:907-947)
     CHECK(ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w, x1)));
     CHECK(ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w, x512)));
     CHECK(ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w, x4d)));
+    CHECK(ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1, x1)));      // Q4_1: any row length % 32 (blocks of 32)
+    CHECK(ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1, x512)));
+    CHECK(ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1_k, x_k)));
     ggml_tensor * probe = ggml_mul_mat(ctx, w, x512);
     w->buffer           = ggml_backend_buft_alloc_buffer(buft, 0);
     CHECK(ggml_backend_dev_supports_op(dev, probe));
@@ -426,13 +442,18 @@ static int check_mul_mat_claims(ggml_backend_dev_t dev) {
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_k, x_k)));   // row length not a multiple of 256
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_n, x1)));    // rows not a multiple of 32
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_3d, x_3d))); // 3-D weight
-    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_q8, x1)));   // Q8_0 (M2c)
+    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_q8, x1)));   // Q8_0
+    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1_n, x1)));   // Q4_1, rows not a multiple of 32
+    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1_3, x_3d))); // Q4_1, 3-D weight
+    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1_v, x1)));   // Q4_1, view of a weight
+    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1, x16)));    // Q4_1, F16 activations
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_v, x1)));    // view of a weight
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w, x16)));     // F16 activations
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w, xt)));      // non-contiguous activations
     ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu, ggml_backend_cpu_buffer_type());
     REQUIRE(buf_cpu != nullptr);
     CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w_c, x1)));    // plain Q4_0 in a CPU buffer
+    CHECK(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, v1_c, x1)));   // plain Q4_1 in a CPU buffer
 
     ggml_backend_buffer_free(buf_cpu);
     ggml_free(ctx);
@@ -440,16 +461,50 @@ static int check_mul_mat_claims(ggml_backend_dev_t dev) {
     return 0;
 }
 
-// set_tensor repacks, get_tensor restores the GGUF bytes, partial access works
+// a Q4_1 block as GGUF stores it: a weight is d * q + m
+struct q4_1_block {
+    ggml_fp16_t d, m;
+    uint8_t     qs[16];
+};
+static_assert(sizeof(q4_1_block) == 20, "Q4_1 block size");
+
+// the conversion of the q4_1 32x32 layout (plan.md, M2c design; make_block_q4_1x32 in the provider): the zero point
+// zp = clamp(round(-m / d), 0, 15) replaces the minimum, so a read gives back m = -zp * d; d and the quants are kept
+static std::vector<uint8_t> q4_1_converted(std::vector<uint8_t> bytes) {
+    auto * b = reinterpret_cast<q4_1_block *>(bytes.data());
+    for (size_t i = 0; i < bytes.size() / sizeof(q4_1_block); i++) {
+        const float d  = ggml_fp16_to_fp32(b[i].d);
+        const float zp = std::min(15.0f, std::max(0.0f, -std::nearbyintf(ggml_fp16_to_fp32(b[i].m) / d)));
+        const float m  = -zp * d;
+        b[i].m         = ggml_fp32_to_fp16(m == 0.0f ? 0.0f : m);
+    }
+    return bytes;
+}
+
+// the largest change of the minimum, in steps d: every weight of a block moves by that much
+static double q4_1_max_shift(const std::vector<uint8_t> & from, const std::vector<uint8_t> & to) {
+    const auto * a = reinterpret_cast<const q4_1_block *>(from.data());
+    const auto * b = reinterpret_cast<const q4_1_block *>(to.data());
+    double       worst = 0.0;
+    for (size_t i = 0; i < from.size() / sizeof(q4_1_block); i++) {
+        const double d = ggml_fp16_to_fp32(a[i].d);
+        worst = std::max(worst, std::fabs((double) ggml_fp16_to_fp32(b[i].m) - ggml_fp16_to_fp32(a[i].m)) / d);
+    }
+    return worst;
+}
+
+// set_tensor repacks; get_tensor restores the GGUF bytes (Q4_0) or returns the converted weights (Q4_1); partial
+// access works
 static int check_weight_round_trip(ggml_backend_dev_t dev) {
     ggml_init_params params = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
     REQUIRE(ctx != nullptr);
     ggml_tensor *         w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 512, 64);
+    ggml_tensor *         w1  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 512, 64);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
     REQUIRE(buf != nullptr);
 
-    std::vector<uint8_t>       q = quantize_q4_0(512, 64, 7), out(q.size());
+    std::vector<uint8_t>       q = quantize_weights(GGML_TYPE_Q4_0, 512, 64, 7), out(q.size());
     ggml_backend_tensor_set(w, q.data(), 0, q.size());
     CHECK(std::memcmp(w->data, q.data(), q.size()) != 0);  // stored repacked (the buffer is host memory underneath)
     ggml_backend_tensor_get(w, out.data(), 0, out.size());
@@ -464,6 +519,25 @@ static int check_weight_round_trip(ggml_backend_dev_t dev) {
     std::fill(q.begin() + 36, q.begin() + 54, (uint8_t) 0x11);
     ggml_backend_tensor_get(w, out.data(), 0, out.size());
     CHECK(out == q);
+
+    // Q4_1: reads return the converted weights, every weight within half a step of the GGUF one (random blocks hold
+    // values of both signs, so no zero point is clamped); a second round trip, and partial access, convert nothing again
+    const std::vector<uint8_t> q1 = quantize_weights(GGML_TYPE_Q4_1, 512, 64, 9);
+    std::vector<uint8_t>       c1(q1.size()), again(q1.size());
+    ggml_backend_tensor_set(w1, q1.data(), 0, q1.size());
+    ggml_backend_tensor_get(w1, c1.data(), 0, c1.size());
+    CHECK(c1 == q4_1_converted(q1));
+    CHECK(c1 != q1);
+    CHECK(q4_1_max_shift(q1, c1) <= 0.5 + 1e-2);  // plus the fp16 rounding of m
+    ggml_backend_tensor_set(w1, c1.data(), 0, c1.size());
+    ggml_backend_tensor_get(w1, again.data(), 0, again.size());
+    CHECK(again == c1);
+    ggml_backend_tensor_get(w1, again.data(), 1000, 300);
+    CHECK(std::memcmp(again.data(), c1.data() + 1000, 300) == 0);
+    ggml_backend_tensor_set(w1, patch.data(), 500, patch.size());  // inside blocks 25-29: their d, m and quants
+    std::copy(patch.begin(), patch.end(), c1.begin() + 500);
+    ggml_backend_tensor_get(w1, again.data(), 0, again.size());
+    CHECK(again == q4_1_converted(c1));
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -504,8 +578,72 @@ static int check_mul_mat_add(ggml_backend_dev_t dev, ggml_backend_t backend, ggm
     return 0;
 }
 
+// how much the zero-point conversion alone changes a matmul: the CPU backend with the GGUF Q4_1 weights against the
+// CPU backend with the converted ones, random weights at Qwen3-0.6B's ffn_down shape, 16 rows (informational: the
+// accuracy budget is decided by perplexity and KLD on the model, plan.md M2c design)
+static double q4_1_conversion_nmse(ggml_backend_dev_t dev, ggml_backend_t cpu) {
+    const int64_t k = 3072, n = 1024, m = 16;
+    mm_weight     w;
+    if (!w.init(dev, k, n, 21, GGML_TYPE_Q4_1)) {
+        return -1.0;
+    }
+    ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
+    ggml_context *   ctx    = ggml_init(params);
+    ggml_tensor *    w_gguf = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, k, n);
+    ggml_tensor *    x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+    ggml_tensor *    y_conv = ggml_mul_mat(ctx, w.w_cpu, x);
+    ggml_tensor *    y_gguf = ggml_mul_mat(ctx, w_gguf, x);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    double                e   = -1.0;
+    if (buf != nullptr) {
+        const std::vector<uint8_t> q  = quantize_weights(GGML_TYPE_Q4_1, k, n, 21);
+        const std::vector<float>   xv = random_values(k * m, 22, 2.0f);
+        ggml_backend_tensor_set(w_gguf, q.data(), 0, q.size());
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_cgraph * g = ggml_new_graph(ctx);
+        ggml_build_forward_expand(g, y_conv);
+        ggml_build_forward_expand(g, y_gguf);
+        if (ggml_backend_graph_compute(cpu, g) == GGML_STATUS_SUCCESS) {
+            e = nmse(static_cast<const float *>(y_conv->data), static_cast<const float *>(y_gguf->data), n * m);
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return e;
+}
+
+// zero point times activation sum beyond 16 bits: blocks with zero point 15 (values 0 down to -1) against 32 equal
+// activations need 15 x 32 x 127 = 60960. Upstream's active branch of the 1-row kernel (gemm_kernel_i8i4_m1) multiplies
+// in 16 bits and would wrap; the provider runs its exact branch, as the 4-row kernel is (plan.md R12). Returns the NMSE
+// against the CPU of 1 row and of 4 rows
+static std::pair<double, double> q4_1_zero_point_probe(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu) {
+    const int64_t      k = 256, n = 32;
+    std::vector<float> wv(k * n);
+    for (int64_t i = 0; i < k * n; i++) {
+        wv[i] = -(float) (i % 16) / 15.0f;  // per block of 32: d = 1/15, m = -1, so zero point 15
+    }
+    std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q4_1, k) * n);
+    ggml_quantize_chunk(GGML_TYPE_Q4_1, wv.data(), q.data(), 0, n, k, nullptr);
+    mm_weight w;
+    if (!w.init_with(dev, GGML_TYPE_Q4_1, k, n, q)) {
+        return { -1.0, -1.0 };
+    }
+    double e[2] = { -1.0, -1.0 };
+    for (int i = 0; i < 2; i++) {
+        const int64_t m = i == 0 ? 1 : 4;
+        mm_run        run;
+        if (run.init(dev, w, m, 1)) {
+            const std::vector<float> ones(k * m, 1.0f);
+            ggml_backend_tensor_set(run.x, ones.data(), 0, ggml_nbytes(run.x));
+            e[i] = run.compare(dev, backend, cpu);
+        }
+    }
+    return { e[0], e[1] };
+}
+
 // the provider against the CPU backend for shapes and row counts that take every path: 1 row (GEMV), 113 and more
-// rows with n <= 64 rows (path A), the rest (path C); 4-row blocks with partial tails
+// rows with n <= 64 rows (path A), the rest (path C); 4-row blocks with partial tails. Q4_1 is compared with its
+// converted weights (mm_weight)
 static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     if (check_mul_mat_claims(dev) != 0 || check_weight_round_trip(dev) != 0) {
         return 1;
@@ -515,46 +653,66 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     REQUIRE(backend != nullptr && cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 8);
 
-    struct shape { int64_t k, n; std::vector<int64_t> rows; };
+    struct shape { ggml_type type; int64_t k, n; std::vector<int64_t> rows; };
     std::vector<shape> shapes = {
-        { 256, 32, { 1, 2, 4, 5, 16, 64, 113, 128 } },
-        { 512, 96, { 1, 2, 4, 5, 16, 64, 113, 128 } },
-        { 1024, 2048, { 1, 4, 7, 64, 128 } },  // Qwen3-0.6B q projection
-        { 2560, 1024, { 1, 5, 128 } },         // Qwen3-4B k/v projection
+        { GGML_TYPE_Q4_0, 256, 32, { 1, 2, 4, 5, 16, 64, 113, 128 } },
+        { GGML_TYPE_Q4_0, 512, 96, { 1, 2, 4, 5, 16, 64, 113, 128 } },
+        { GGML_TYPE_Q4_0, 1024, 2048, { 1, 4, 7, 64, 128 } },  // Qwen3-0.6B q projection
+        { GGML_TYPE_Q4_0, 2560, 1024, { 1, 5, 128 } },         // Qwen3-4B k/v projection
+        { GGML_TYPE_Q4_1, 256, 32, { 1, 2, 4, 5, 16, 64, 113, 128 } },
+        { GGML_TYPE_Q4_1, 2880, 64, { 1, 5, 113 } },           // 90 K blocks, not a multiple of 16
+        { GGML_TYPE_Q4_1, 3072, 1024, { 1, 4, 7, 64, 128 } },  // Qwen3-0.6B ffn down
     };
-    if (full) {  // Qwen3-4B q, attention output, ffn gate/up, ffn down
+    if (full) {  // Qwen3-4B q, attention output, ffn gate/up, ffn down, and its Q4_1 ffn down
         for (const auto & s : { std::pair<int64_t, int64_t>{ 2560, 4096 }, { 4096, 2560 }, { 2560, 9728 }, { 9728, 2560 } }) {
-            shapes.push_back({ s.first, s.second, { 1, 7, 128, 512 } });
+            shapes.push_back({ GGML_TYPE_Q4_0, s.first, s.second, { 1, 7, 128, 512 } });
         }
+        shapes.push_back({ GGML_TYPE_Q4_1, 9728, 2560, { 1, 7, 128, 512 } });
     }
 
-    int    n_cases  = 0;
-    double max_nmse = 0.0;
+    int    n_cases[2]  = { 0, 0 };  // Q4_0, Q4_1
+    double max_nmse[2] = { 0.0, 0.0 };
     for (const shape & s : shapes) {
+        const int t = s.type == GGML_TYPE_Q4_1 ? 1 : 0;
         mm_weight w;
-        REQUIRE(w.init(dev, s.k, s.n, (uint32_t) (s.k + s.n)));
+        REQUIRE(w.init(dev, s.k, s.n, (uint32_t) (s.k + s.n), s.type));
         for (int64_t m : s.rows) {
             mm_run run;
             REQUIRE(run.init(dev, w, m, (uint32_t) m));
             const double e = run.compare(dev, backend, cpu);
             if (e < 0.0 || e > k_mul_mat_max_nmse) {
-                std::fprintf(stderr, "FAIL: Q4_0 matmul k=%lld n=%lld rows=%lld: %s %.3e\n", (long long) s.k,
-                             (long long) s.n, (long long) m, e < 0.0 ? "refused or failed" : "NMSE", e);
+                std::fprintf(stderr, "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s %.3e\n", ggml_type_name(s.type),
+                             (long long) s.k, (long long) s.n, (long long) m, e < 0.0 ? "refused or failed" : "NMSE", e);
                 g_failures++;
             }
-            max_nmse = std::max(max_nmse, e);
-            n_cases++;
+            max_nmse[t] = std::max(max_nmse[t], e);
+            n_cases[t]++;
         }
     }
     check_mul_mat_add(dev, backend, cpu);
+    const double conversion = q4_1_conversion_nmse(dev, cpu);
+    const auto   probe      = q4_1_zero_point_probe(dev, backend, cpu);
+    CHECK(conversion >= 0.0);  // ran; the value is informational
+    if (probe.first < 0.0 || probe.first > k_mul_mat_max_nmse || probe.second < 0.0 || probe.second > k_mul_mat_max_nmse) {
+        std::fprintf(stderr, "FAIL: Q4_1 matmul, zero point 15 against 32 equal activations: NMSE 1 row %.3e, 4 rows %.3e\n",
+                     probe.first, probe.second);
+        g_failures++;
+    }
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
+    const char * kernels = std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "";
     std::printf("matmul   Q4_0 (IME layout 32x256) vs CPU: %d cases, rows 1-%d, max NMSE %.2e (bound %.0e)%s\n",
-                n_cases, full ? 512 : 128, max_nmse, k_mul_mat_max_nmse,
-                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                n_cases[0], full ? 512 : 128, max_nmse[0], k_mul_mat_max_nmse, kernels);
+    std::printf("matmul   Q4_1 (IME layout 32x32) vs CPU on the converted weights: %d cases, rows 1-%d, max NMSE %.2e "
+                "(bound %.0e); zero point 15 against 32 equal activations: NMSE 1 row %.2e, 4 rows %.2e%s\n",
+                n_cases[1], full ? 512 : 128, max_nmse[1], k_mul_mat_max_nmse, probe.first, probe.second, kernels);
     std::printf("matmul   claims exact (any row count; not other layouts, types, views, F16 or strided activations, "
-                "CPU-buffer weights); repack round trip; MUL_MAT->ADD graph: checked\n");
+                "CPU-buffer weights); repack round trip (Q4_1 converted, within half a step); MUL_MAT->ADD graph: "
+                "checked\n");
+    std::printf("info     Q4_1 conversion alone (CPU, GGUF against converted weights), random weights 3072x1024, 16 rows: "
+                "NMSE %.2e\n",
+                conversion);
     return 0;
 }
 
@@ -569,7 +727,8 @@ struct layer_weights {
 // a Qwen3-like layer (all dimensions small): d hidden, nh query and nkv key/value heads of hd, ff in the FFN
 constexpr int64_t k_d = 256, k_hd = 128, k_nh = 2, k_nkv = 1, k_ff = 512, k_slots = 16;
 
-static layer_weights new_layer_weights(ggml_context * ctx) {
+// down: the FFN down projection's type (Qwen3-4B Q4_0 has Q4_1 there in its first 4 layers)
+static layer_weights new_layer_weights(ggml_context * ctx, ggml_type down) {
     layer_weights w;
     w.attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_d);
     w.q_norm    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_hd);
@@ -581,8 +740,12 @@ static layer_weights new_layer_weights(ggml_context * ctx) {
     w.wo        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_nh * k_hd, k_d);
     w.wg        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
     w.wu        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
-    w.wd        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_ff, k_d);
+    w.wd        = ggml_new_tensor_2d(ctx, down, k_ff, k_d);
     return w;
+}
+
+static std::vector<ggml_tensor *> layer_tensors(const layer_weights & w) {
+    return { w.attn_norm, w.q_norm, w.k_norm, w.ffn_norm, w.wq, w.wk, w.wv, w.wo, w.wg, w.wu, w.wd };
 }
 
 static void set_layer_weights(const layer_weights & w) {
@@ -595,8 +758,18 @@ static void set_layer_weights(const layer_weights & w) {
         ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
     }
     for (ggml_tensor * t : { w.wq, w.wk, w.wv, w.wo, w.wg, w.wu, w.wd }) {
-        const std::vector<uint8_t> q = quantize_q4_0(t->ne[0], t->ne[1], seed++);
+        const std::vector<uint8_t> q = quantize_weights(t->type, t->ne[0], t->ne[1], seed++);
         ggml_backend_tensor_set(t, q.data(), 0, q.size());
+    }
+}
+
+// the CPU computes with the weights the provider holds: the same bytes, a Q4_1 weight after its conversion (mm_weight)
+static void copy_layer_weights(const layer_weights & from, const layer_weights & to) {
+    const std::vector<ggml_tensor *> a = layer_tensors(from), b = layer_tensors(to);
+    for (size_t i = 0; i < a.size(); i++) {
+        std::vector<uint8_t> bytes(ggml_nbytes(a[i]));
+        ggml_backend_tensor_get(a[i], bytes.data(), 0, bytes.size());
+        ggml_backend_tensor_set(b[i], bytes.data(), 0, bytes.size());
     }
 }
 
@@ -637,7 +810,7 @@ static std::vector<float> f16_to_f32(const std::vector<uint8_t> & bytes) {
     return out;
 }
 
-// a layer chains three Q4_0 matmuls, each quantizing its activations to 8 bits; on the Mac the whole output's NMSE
+// a layer chains three quantized matmuls, each quantizing its activations to 8 bits; on the Mac the whole output's NMSE
 // against the CPU is about 4.0e-4 at 7 tokens, above a single matmul's bound
 constexpr double k_layer_max_nmse = 1e-3;
 
@@ -658,10 +831,11 @@ static bool graph_finite(ggml_cgraph * g) {
     return true;
 }
 
-// the layer on the provider, with the KV cache in a CPU buffer and the norm and Q4_0 weights in the provider's buffer
-// (where llama.cpp puts them), against the same layer on the CPU backend; returns the larger NMSE of the whole output
-// and the caches, or -1 when refused, failed, or the last-token row is not an exact copy of the provider's output
-static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int64_t n_tokens) {
+// the layer on the provider, with the KV cache in a CPU buffer and the norm and quantized weights in the provider's
+// buffer (where llama.cpp puts them), against the same layer on the CPU backend; returns the larger NMSE of the whole
+// output and the caches, or -1 when refused, failed, or the last-token row is not an exact copy of the provider's output
+static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int64_t n_tokens,
+                         ggml_type down) {
     ggml_init_params params = { ggml_tensor_overhead() * 128 + ggml_graph_overhead() * 2, nullptr, true };
     ggml_context *   ctx_h  = ggml_init(params);  // inputs and caches: CPU buffer
     ggml_context *   ctx_wd = ggml_init(params);  // weights for the provider: its buffer
@@ -677,8 +851,8 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
     ggml_tensor * vc_d    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * kc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * vc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
-    const layer_weights wd = new_layer_weights(ctx_wd);
-    const layer_weights wc = new_layer_weights(ctx_wc);
+    const layer_weights wd = new_layer_weights(ctx_wd, down);
+    const layer_weights wc = new_layer_weights(ctx_wc, down);
 
     ggml_backend_buffer_t bh  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
     ggml_backend_buffer_t bwd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wd, ggml_backend_dev_buffer_type(dev));
@@ -688,7 +862,7 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
     }
     ggml_backend_buffer_clear(bh, 0);
     set_layer_weights(wd);
-    set_layer_weights(wc);
+    copy_layer_weights(wd, wc);
 
     const std::vector<float> xv = random_values(k_d * n_tokens, 5, 1.0f);
     std::vector<int32_t>     pv(n_tokens);
@@ -955,14 +1129,16 @@ static int check_layer(ggml_backend_dev_t dev) {
     ggml_backend_cpu_set_n_threads(cpu, 8);
 
     double worst = 0.0;
-    for (int64_t n_tokens : { 1, 7 }) {
-        const double e = layer_nmse(dev, backend, cpu, n_tokens);
-        if (e < 0.0 || e > k_layer_max_nmse) {
-            std::fprintf(stderr, "FAIL: layer with %lld tokens: %s %.3e\n", (long long) n_tokens,
-                         e < 0.0 ? "refused or failed" : "NMSE", e);
-            g_failures++;
+    for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
+        for (int64_t n_tokens : { 1, 7 }) {
+            const double e = layer_nmse(dev, backend, cpu, n_tokens, down);
+            if (e < 0.0 || e > k_layer_max_nmse) {
+                std::fprintf(stderr, "FAIL: layer with %lld tokens, down projection %s: %s %.3e\n", (long long) n_tokens,
+                             ggml_type_name(down), e < 0.0 ? "refused or failed" : "NMSE", e);
+                g_failures++;
+            }
+            worst = std::max(worst, e);
         }
-        worst = std::max(worst, e);
     }
     // the whole head rotated, and half of it (the rest copied)
     const double e_rope_full = rope_wide_nmse(dev, backend, cpu, 256);
@@ -976,8 +1152,8 @@ static int check_layer(ggml_backend_dev_t dev) {
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
-    std::printf("layer    Qwen3-like layer in one launch vs CPU (1 and 7 tokens, all rows; KV cache in a CPU buffer, "
-                "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e%s\n",
+    std::printf("layer    Qwen3-like layer in one launch vs CPU (1 and 7 tokens, down projection Q4_0 and Q4_1, all rows; "
+                "KV cache in a CPU buffer, weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e%s\n",
                 worst, k_layer_max_nmse, e_rope, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
@@ -1084,14 +1260,17 @@ static int bench(ggml_backend_dev_t dev) {
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
 
-    // Q4_0 matmul at Qwen3-4B's FFN shapes: 1 row (GEMV), small batches (path C), 128 rows (path A)
+    // Q4_0 matmul at Qwen3-4B's FFN shapes, and Q4_1 at its ffn_down shape (its first 4 layers): 1 row (GEMV), small
+    // batches (path C), 128 rows (path A)
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu8    = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu8 != nullptr);
     ggml_backend_cpu_set_n_threads(cpu8, 8);
-    for (const auto & s : { std::pair<int64_t, int64_t>{ 2560, 9728 }, { 9728, 2560 } }) {
+    struct bench_shape { ggml_type type; int64_t k, n; };
+    for (const bench_shape & s : { bench_shape{ GGML_TYPE_Q4_0, 2560, 9728 }, bench_shape{ GGML_TYPE_Q4_0, 9728, 2560 },
+                                   bench_shape{ GGML_TYPE_Q4_1, 9728, 2560 } }) {
         mm_weight w;
-        REQUIRE(w.init(dev, s.first, s.second, 1));
+        REQUIRE(w.init(dev, s.k, s.n, 1, s.type));
         for (int64_t m : { 1, 4, 16, 64, 128 }) {
             mm_run run;
             REQUIRE(run.init(dev, w, m, 1));
@@ -1100,10 +1279,10 @@ static int bench(ggml_backend_dev_t dev) {
             const double t_dev = time_us([&] { ok &= ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS; }, iters);
             const double t_cpu = time_us([&] { ggml_backend_graph_compute(cpu8, run.g_cpu); }, iters);
             CHECK(ok);
-            const double flop = 2.0 * s.first * s.second * m;
-            std::printf("bench    q4_0 matmul %lldx%lld rows %3lld: provider %8.0f us (%6.1f GFLOP/s), cpu %8.0f us (%6.1f GFLOP/s)\n",
-                        (long long) s.first, (long long) s.second, (long long) m, t_dev, flop / t_dev / 1e3, t_cpu,
-                        flop / t_cpu / 1e3);
+            const double flop = 2.0 * s.k * s.n * m;
+            std::printf("bench    %s matmul %lldx%lld rows %3lld: provider %8.0f us (%6.1f GFLOP/s), cpu %8.0f us (%6.1f GFLOP/s)\n",
+                        ggml_type_name(s.type), (long long) s.k, (long long) s.n, (long long) m, t_dev,
+                        flop / t_dev / 1e3, t_cpu, flop / t_cpu / 1e3);
         }
     }
     ggml_backend_free(backend);

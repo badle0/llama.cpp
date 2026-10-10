@@ -83,13 +83,13 @@ static bool spacemit_swiglu_f32_supported(const ggml_tensor * op) {
             (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1) && ggml_are_same_shape(src0, src1)));
 }
 
-// Q4_0 weight in the IME layout, read in that layout: so it must sit in our buffer (or be unallocated at placement
-// time), never in a host buffer. The answer must not depend on the row count: llama.cpp asks once per weight, at
-// load, with 512 rows (plan.md M2b design).
-static bool spacemit_mul_mat_q4_0_supported(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
+// a weight in an IME layout (Q4_0 32x256, Q4_1 32x32), read in that layout: so it must sit in our buffer (or be
+// unallocated at placement time), never in a host buffer. The answer must not depend on the row count: llama.cpp asks
+// once per weight, at load, with 512 rows (plan.md M2b design).
+static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
-    if (spacemit_weight_layout(w) != spacemit_layout::q4_0_32x256) {
+    if (spacemit_weight_layout(w) == spacemit_layout::plain) {
         return false;
     }
     if (w->buffer != nullptr && ggml_backend_buffer_get_type(w->buffer) != own_buft) {
@@ -110,8 +110,8 @@ SPACEMIT_ONE_STEP_OP(k_set_rows, spacemit_kernel_set_rows, nullptr);
 SPACEMIT_ONE_STEP_OP(k_get_rows_f32, spacemit_kernel_get_rows_f32, nullptr);
 SPACEMIT_ONE_STEP_OP(k_swiglu_f32, spacemit_kernel_swiglu_f32, nullptr);
 
-static const spacemit_kernel_fn k_mul_mat_q4_0_steps[] = { spacemit_mul_mat_q4_0_quantize, spacemit_mul_mat_q4_0_gemm };
-static const spacemit_op        k_mul_mat_q4_0         = { k_mul_mat_q4_0_steps, 2, spacemit_mul_mat_q4_0_workspace };
+static const spacemit_kernel_fn k_mul_mat_ime_steps[] = { spacemit_mul_mat_quantize, spacemit_mul_mat_gemm };
+static const spacemit_op        k_mul_mat_ime         = { k_mul_mat_ime_steps, 2, spacemit_mul_mat_workspace };
 
 const spacemit_op * spacemit_find_op(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
     const spacemit_op * impl = nullptr;
@@ -138,7 +138,7 @@ const spacemit_op * spacemit_find_op(const ggml_tensor * op, ggml_backend_buffer
             impl = spacemit_swiglu_f32_supported(op) ? &k_swiglu_f32 : nullptr;
             break;
         case GGML_OP_MUL_MAT:
-            impl = spacemit_mul_mat_q4_0_supported(op, own_buft) ? &k_mul_mat_q4_0 : nullptr;
+            impl = spacemit_mul_mat_ime_supported(op, own_buft) ? &k_mul_mat_ime : nullptr;
             break;
         default:
             break;
