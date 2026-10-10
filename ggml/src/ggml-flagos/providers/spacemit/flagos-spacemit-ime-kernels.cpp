@@ -1,24 +1,29 @@
 // IME2 matrix multiplication pieces for the SpacemiT provider (plan.md §2.5, D6: copy per milestone): Q4_0 in the
-// layout q4_0 32x256 (M2b) and Q4_1 in the layout q4_1 32x32 (M2c).
+// layout q4_0 32x256 (M2b), Q4_1 in the layout q4_1 32x32 (M2c.1), Q8_0 and Q6_K in the layout q8_0 32x32 (M2c.2).
 //
 // Copied from ggml/src/ggml-cpu/spacemit @ ba360ef; identical in ggml-spacemit (spacemit-com/llama.cpp 4e782bc and
-// mtmd-backend 64316cd) and in upstream llama.cpp master (Q4_0: 2026-10-08; Q4_1: 2026-10-10):
+// mtmd-backend 64316cd) and in upstream llama.cpp master (Q4_0: 2026-10-08; Q4_1, Q8_0 and Q6_K: 2026-10-10):
 //   ime2_kernels.cpp  Q4_0: gemm_kernel_i8i4_hp_mrow_ref (324-436), gemm_kernel_i8i4_hp_m1 (2883-3005),
 //                     gemm_kernel_i8i4_hp_m4 (3360-3741)
 //                     Q4_1: gemm_kernel_i8i4_mrow_ref (217-322), gemm_kernel_i8i4_m1 (2430-2881),
 //                     gemm_kernel_i8i4_m4 (3007-3358)
+//                     Q8_0, Q6_K: gemm_kernel_i8i8_mrow_ref (679-735), gemm_kernel_i8i8_m1 (4773-4892),
+//                     gemm_kernel_i8i8_m4 (4894-5004)
 //   rvv_kernels.cpp   memcpy1d (1013-1113)
 //                     Q4_0: quantize_a_nrow_i8_hp_ref (1739-1795), quantize_a_row_i8_hp (1989-2098),
 //                     quantize_a_4row_i8_hp (2100-2303)
-//                     Q4_1: quantize_a_nrow_i8_ref (1708-1737), quantize_a_row_i8 (1848-1914),
+//                     Q4_1, Q8_0, Q6_K: quantize_a_nrow_i8_ref (1708-1737), quantize_a_row_i8 (1848-1914),
 //                     quantize_a_4row_i8 (1916-1987)
 //   repack.cpp        QK_0, block (40-53), block_q4_0x32, block_q4_0x32x256 (76-82), make_block_q4_0x32 (292-320),
 //                     repack_q4_0_to_q4_0_256_32_bl_ref (592-628)
 //                     block_with_zp (55-59), block_q4_1x32 (77), make_block_q4_1x32 (322-355),
 //                     repack_q4_1_to_q4_1_32_bl_ref (779-812)
-// Bodies are unchanged except, marked "flagos": two zero guards in quantize_a_nrow_i8_hp_ref and one in
-// quantize_a_nrow_i8_ref; the last K blocks in gemm_kernel_i8i4_mrow_ref (dropped unless their count was a multiple of
-// 16, which it asserted); unaligned fp32 scales read and written with memcpy in those two references; and in
+//                     block_q8_0x32 (78), make_block_q8_0x32 (357-371), repack_q8_0_to_q8_0_32_bl_ref (1271-1309),
+//                     repack_q6_k_to_q8_0_32_bl_ref (985-1084)
+// Bodies are unchanged except, marked "flagos": two zero guards in quantize_a_nrow_i8_hp_ref, one in
+// quantize_a_nrow_i8_ref and one in repack_q6_k_to_q8_0_32_bl_ref; the last K blocks in gemm_kernel_i8i4_mrow_ref
+// (dropped unless their count was a multiple of 16, which it asserted); unaligned fp32 scales read and written with
+// memcpy in the references gemm_kernel_i8i4_mrow_ref, quantize_a_nrow_i8_ref and gemm_kernel_i8i8_mrow_ref; and in
 // gemm_kernel_i8i4_m1 the exact zero-point branch upstream disables with #if 0, instead of its 16-bit one. Everything
 // below the copies (dispatch, unpack) is new. When upstream changes these functions, take the fix by hand (plan.md R11).
 //
@@ -34,6 +39,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
 #    include <riscv_vector.h>
@@ -67,6 +73,7 @@ template <int K, int N> struct block {
 };
 
 using block_q4_0x32 = block<4, 32>;
+using block_q8_0x32 = block<8, 32>;
 
 struct block_q4_0x32x256 {
     block_q4_0x32 blocks[8];  // [f16 * 32 | i4 * 32 * 32] * 8
@@ -210,6 +217,165 @@ static int repack_q4_1_to_q4_1_32_bl_ref(ggml_tensor *              t,
                 dst_tmp[i] = src[x + i * nblocks];
             }
             *dst++ = make_block_q4_1x32(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
+static block_q8_0x32 make_block_q8_0x32(block_q8_0 * in, unsigned int blck_size_interleave) {
+    block_q8_0x32 out;
+    GGML_ASSERT(QK8_0 / blck_size_interleave == 1);
+    GGML_UNUSED(blck_size_interleave);
+
+    for (int i = 0; i < 32; i++) {
+        out.d[i] = in[i].d;
+    }
+
+    for (int i = 0; i < 32; i++) {
+        memcpy(out.qs + i * QK8_0, in[i].qs, QK8_0);
+    }
+
+    return out;
+}
+
+static int repack_q8_0_to_q8_0_32_bl_ref(ggml_tensor *              t,
+                                         int                        interleave_block,
+                                         const void * GGML_RESTRICT data,
+                                         size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(interleave_block == 32);  // unused
+
+    constexpr int nrows_interleaved = 32;
+
+    block_q8_0x32 *    dst = (block_q8_0x32 *) t->data;
+    const block_q8_0 * src = (const block_q8_0 *) data;
+    block_q8_0         dst_tmp[32];
+    int                nrow    = ggml_nrows(t);
+    int                nblocks = t->ne[0] / QK8_0;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q8_0));
+
+    if (t->ne[0] % QK8_0 != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        int64_t nrows_real = std::min((int64_t) nrow - b, (int64_t) nrows_interleaved);
+        for (int64_t x = 0; x < nblocks; x++) {
+            int i = 0;
+            for (; i < nrows_real; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            for (; i < nrows_interleaved; i++) {
+                memset(&dst_tmp[i], 0, sizeof(block_q8_0));
+            }
+            *dst++ = make_block_q8_0x32(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
+static int repack_q6_k_to_q8_0_32_bl_ref(ggml_tensor *              t,
+                                         int                        interleave_block,
+                                         const void * GGML_RESTRICT data,
+                                         size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(interleave_block == 32);
+    GGML_ASSERT(QK_K / QK4_1 == 8);
+
+    constexpr int nrows_interleaved = 32;
+
+    block_q8_0x32 *    dst = (block_q8_0x32 *) t->data;
+    const block_q6_K * src = (const block_q6_K *) data;
+    block_q8_0         dst_tmp[32];
+    int8_t             aux8[QK4_1];
+    int                nrow    = ggml_nrows(t);
+    int                nblocks = t->ne[0] / QK_K;
+
+    if (t->ne[0] % QK_K != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        int64_t nrow_real = std::min((int64_t) nrow - b, (int64_t) nrows_interleaved);
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int bi = 0; bi < 8; bi++) {
+                int i = 0;
+                for (; i < nrow_real; i++) {
+                    const uint8_t * q4     = src[x + i * nblocks].ql;
+                    const uint8_t * qh     = src[x + i * nblocks].qh;
+                    const int8_t *  scales = src[x + i * nblocks].scales;
+                    float           d      = GGML_FP16_TO_FP32(src[x + i * nblocks].d);
+
+                    q4 += 64 * (bi / 4);
+                    qh += 32 * (bi / 4);
+                    int8_t * GGML_RESTRICT a = aux8;
+
+                    int8_t bi_idx = bi % 4;
+
+                    if (bi_idx == 0) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        }
+                    } else if (bi_idx == 1) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        }
+                    } else if (bi_idx == 2) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        }
+                    } else if (bi_idx == 3) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        }
+                    }
+                    a = aux8;
+
+                    float a_max_abs = 0.0f;
+                    float scale_0   = scales[bi * 2 + 0] * d;
+                    float scale_1   = scales[bi * 2 + 1] * d;
+                    for (int l = 0; l < 16; ++l) {
+                        a_max_abs = std::max(a_max_abs, std::abs(a[l] * scale_0));
+                    }
+
+                    for (int l = 16; l < 32; ++l) {
+                        a_max_abs = std::max(a_max_abs, std::abs(a[l] * scale_1));
+                    }
+
+                    float reflect_scale   = a_max_abs / ((1 << 7) - 1);
+                    // flagos: zero guard; a block of zeros (e.g. unused vocabulary rows) divided by 0, and its NaN
+                    // quants were cast to int8 (UB)
+                    float reflect_scale_0 = reflect_scale ? scale_0 / reflect_scale : 0.0f;
+                    float reflect_scale_1 = reflect_scale ? scale_1 / reflect_scale : 0.0f;
+
+                    for (int l = 0; l < 16; ++l) {
+                        float a_temp = std::clamp(std::nearbyintf(a[l] * reflect_scale_0), -128.0f, 127.0f);
+                        a[l]         = (int8_t) (a_temp);
+                    }
+
+                    for (int l = 16; l < 32; ++l) {
+                        float a_temp = std::clamp(std::nearbyintf(a[l] * reflect_scale_1), -128.0f, 127.0f);
+                        a[l]         = (int8_t) (a_temp);
+                    }
+
+                    dst_tmp[i].d = GGML_FP32_TO_FP16(reflect_scale);
+
+                    memcpy(dst_tmp[i].qs, a, 32 * sizeof(int8_t));
+                }
+
+                for (; i < nrows_interleaved; i++) {
+                    memset(&dst_tmp[i], 0, sizeof(block_q8_0));
+                }
+
+                *dst++ = make_block_q8_0x32(dst_tmp, interleave_block);
+            }
         }
         src += nrows_interleaved * nblocks;
     }
@@ -531,6 +697,65 @@ void quantize_a_nrow_i8_ref(size_t blk_len, const float * a_ptr, size_t count_k,
                 a_sum += quantized;
             }
             a_sum_ptr[row] = -a_sum;
+        }
+    }
+}
+
+template <size_t MB_ROWS, size_t NB_COLS>
+void gemm_kernel_i8i8_mrow_ref(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc) {
+    int64_t b_blk_stride        = (sizeof(ggml_fp16_t) + blk_len);
+    int64_t b_stride            = k_blks * b_blk_stride;
+    int64_t a_blk_stride        = q8_blk_size(blk_len, true);
+    int64_t a_nrow_block_stride = a_blk_stride * MB_ROWS;
+    int64_t b_ncol_block_stride = b_blk_stride * NB_COLS;
+
+    float output[MB_ROWS * NB_COLS] = { 0 };
+
+    for (size_t ni = 0; ni < count_n; ni += NB_COLS, c_ptr += NB_COLS) {
+        size_t   nb_real = std::min<size_t>(NB_COLS, count_n - ni);
+        int8_t * b_data  = (int8_t *) quant_b_data + ni * b_stride + NB_COLS * sizeof(ggml_fp16_t);
+
+        int8_t * a_data = (int8_t *) quant_a_ptr + sizeof(float) * MB_ROWS + sizeof(int16_t) * MB_ROWS;
+
+        for (size_t mi = 0; mi < MB_ROWS; mi++) {
+            for (size_t ci = 0; ci < NB_COLS; ci++) {
+                output[ci + mi * NB_COLS] = 0;
+            }
+        }
+
+        for (size_t ki = 0; ki < k_blks; ki++, a_data += a_nrow_block_stride, b_data += b_ncol_block_stride) {
+            ggml_fp16_t * b_scale_fp16 = (ggml_fp16_t *) (b_data - NB_COLS * sizeof(ggml_fp16_t));
+
+            float * a_scale_row = (float *) (a_data - sizeof(float) * MB_ROWS - sizeof(int16_t) * MB_ROWS);
+
+            for (size_t mi = 0; mi < MB_ROWS; mi++) {
+                float a_scale;  // flagos: memcpy, as 1-row blocks (38 bytes) are unaligned
+                std::memcpy(&a_scale, a_scale_row + mi, sizeof(float));
+                for (size_t ci = 0; ci < NB_COLS; ci++) {
+                    float   b_scale = ggml_fp16_to_fp32(b_scale_fp16[ci]);
+                    int32_t acc     = 0;
+                    for (size_t bi = 0; bi < blk_len; bi++) {
+                        int8_t a0 = a_data[mi * blk_len + bi];
+                        int8_t b0 = b_data[ci * blk_len + bi];
+                        acc += static_cast<int32_t>(a0) * static_cast<int32_t>(b0);
+                    }
+                    output[ci + mi * NB_COLS] += static_cast<float>(acc) * a_scale * b_scale;
+                }
+            }
+        }
+
+        for (size_t mi = 0; mi < MB_ROWS; mi++) {
+            for (size_t ci = 0; ci < nb_real; ci++) {
+                c_ptr[mi * ldc + ci] = output[mi * NB_COLS + ci];
+            }
         }
     }
 }
@@ -2276,6 +2501,239 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
     }
 }
 
+void gemm_kernel_i8i8_m1(size_t          blk_len,
+                         const uint8_t * quant_a_ptr,
+                         const uint8_t * quant_b_data,
+                         const uint8_t * quant_b_zp,
+                         float *         c_ptr,
+                         size_t          count_m,
+                         size_t          count_n,
+                         size_t          k_blks,
+                         size_t          ldc) {
+    for (size_t n = 0; n < count_n; n += 32) {
+        size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
+        uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data +      //
+                                  n * k_blks * blk_len +          // b data
+                                  n * k_blks * sizeof(_Float16);  // scale
+        float * CPtr = c_ptr + n;
+        size_t  cnt  = k_blks;
+
+        // A format Version_1 (FP32 SCALE FOR Normal VMADOTins of IME2)
+        // A M1K32 int8    256bit
+        // Ascale fp32 * 1  32bit
+        // || scl*1(fp32) | Asum(int16) | blk0 || scl*1(fp32) | Asum(int16) | blk0 || ...
+        // || Element                          || Element                          || ...
+        // B format
+        // B N8K32 int4    2048bit
+        //   4VRF, N32K32, 8192bit
+        // Bscale fp16 * N32 512bit;
+        // || scl*32..(fp16) | blk0 blk1 ... blk31 || scl*32..(fp16) | blk0 blk1 ... blk31 || ...
+        // || Element                              || Element                              || ...
+
+        //bias always be nullptr
+        __asm__ volatile(
+
+            // t3 = k/32
+            "mv           t3, %[BCK]              \n\t"
+            "mv           t4, %[NBLKS]            \n\t"
+            "mv           s2, %[pA]               \n\t"  // s2 = pASCL
+            "addi         s3, %[pA], 4+2          \n\t"  // s3 = pAData, (pA+AScl+ASum)
+            "mv           s4, %[pB]               \n\t"  // s4 = pBSCL
+            "addi         s5, %[pB], 32*2         \n\t"  // s5 = pBdata;
+            "mv           s6, %[pC]               \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vxor.vv      v2, v0, v0              \n\t"  // clear acc
+
+            // ordinary vmadot: vle*6 flw*1 vecIns*64 vmadot*8
+            ".align 4                             \n\t"
+            "_K_LPST%=:                           \n\t"
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vl4r.v       v4, (s5)                \n\t"  // B Data 4VRF * 8Row * 32
+            "addi         s5, s5, 128*4           \n\t"
+            "vl4r.v       v8, (s5)                \n\t"  // B Data 4VRF * 8Row * 32
+            "addi         s5, s5, 128*4+64        \n\t"
+
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v0, (s4)                \n\t"  // B Scale 4VRF*8Row*FP16 = 512bit
+            "addi         s4, s4, 64+128*8        \n\t"
+
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vle8.v       v3, (s3)                \n\t"  // A Data M1*K32*int8 = 256bit
+            "addi         s3, s3, 32+6            \n\t"
+
+            "flw          f0, (s2)                \n\t"  // A Scale fp32
+            "addi         s2, s2, 6+32            \n\t"  // AScale + Asum(FP32+i16)
+
+            "vsetvli      t0, zero, e32, m1       \n\t"
+            "vupack.vv    v24, v4, v5, 1          \n\t"
+            "vupack.vv    v26, v6, v7, 1          \n\t"
+            "vupack.vv    v28, v8, v9, 1          \n\t"
+            "vupack.vv    v30, v10, v11, 1        \n\t"
+
+            "vslidedown.vi  v4, v3, 4             \n\t"
+
+            "vxor.vv      v16, v16, v16           \n\t"
+            "vxor.vv      v18, v16, v16           \n\t"
+            "vxor.vv      v20, v16, v16           \n\t"
+            "vxor.vv      v22, v16, v16           \n\t"
+
+            "vmadot       v16, v3, v24, i8         \n\t"  // M0 N0 - N7 INT32(256bit)
+            "vmadot       v18, v3, v26, i8         \n\t"  // M0 N8 - N15
+            "vmadot       v20, v3, v28, i8         \n\t"  // M0 N16 - N23
+            "vmadot       v22, v3, v30, i8         \n\t"  // M0 N24 - N31
+
+            "vmadot       v16, v4, v25, i8         \n\t"
+            "vmadot       v18, v4, v27, i8         \n\t"
+            "vmadot       v20, v4, v29, i8         \n\t"
+            "vmadot       v22, v4, v31, i8         \n\t"
+
+            "vpack.vv     v24, v16, v18, 2        \n\t"
+            "vpack.vv     v26, v20, v22, 2        \n\t"
+            "vpack.vv     v16, v24, v26, 3        \n\t"
+
+            // b_scale fp16 -> fp32
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            "vfwcvt.f.f.v v24, v0                 \n\t"
+            // mac result i32 -> fp32
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vfcvt.f.x.v  v26, v16                \n\t"
+            // a_scale * b_scale;
+            "vfmul.vf     v1, v24, f0             \n\t"
+            // static_cast<float>(qsum) * a_scale * b_scale;
+            "vfmacc.vv    v2, v1, v26             \n\t"
+
+            "addi         t3, t3, -1              \n\t"
+            "bgtz         t3, _K_LPST%=           \n\t"
+            "_K_LPND%=:                           \n\t"
+
+            //-----------------------------------------
+            // STORE Equal 32N-------------------------
+            "_ST32%=:                             \n\t"
+            "vsetvli      t0, t4, e32, m1         \n\t"
+            "vse32.v      v2, (s6)                \n\t"  // M0 [N0 : N32]; FP32(1024bit)
+
+            "_FUNC_END%=:                         \n\t"
+
+            :
+            : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
+            : "cc", "t0", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+    }
+}
+
+void gemm_kernel_i8i8_m4(size_t          blk_len,
+                         const uint8_t * quant_a_ptr,
+                         const uint8_t * quant_b_data,
+                         const uint8_t * quant_b_zp,
+                         float *         c_ptr,
+                         size_t          count_m,
+                         size_t          count_n,
+                         size_t          k_blks,
+                         size_t          ldc) {
+    int64_t b_data_stride = k_blks * sizeof(ggml_fp16_t) + k_blks * blk_len;
+    for (size_t ni = 0; ni < count_n; ni += 32) {
+        uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
+        int8_t *  a_data = (int8_t *) quant_a_ptr;
+        float *   dst_c  = c_ptr + ni;
+
+        asm volatile(
+            "vsetvli        t0, x0, e32, m1       \n\t"
+            "vxor.vv        v28, v28, v28         \n\t"
+            "vxor.vv        v29, v29, v29         \n\t"
+            "vxor.vv        v30, v30, v30         \n\t"
+            "vxor.vv        v31, v31, v31         \n\t"
+
+            ".align 4                             \n\t"
+            "BLK_LOOP%=:                          \n\t"
+            // load scale A
+            "flw            fa0, (%[A])           \n\t"
+            "flw            fa1, 4(%[A])          \n\t"
+            "flw            fa2, 8(%[A])          \n\t"
+            "flw            fa3, 12(%[A])         \n\t"
+            "addi           %[A], %[A], 16+8      \n\t"  // Ascl+Asum; FP32*4+i16*4
+
+            // load scale B
+            "vsetvli        t0, x0, e16, mf2      \n\t"
+            "vle16.v        v12, (%[B])           \n\t"
+            "addi           %[B], %[B], 64        \n\t"
+            "vfwcvt.f.f.v   v14, v12              \n\t"
+
+            "vsetvli        t0, x0, e8, m1        \n\t"
+            "vl1r.v         v0, (%[A])            \n\t"
+            "addi           %[A], %[A], 128       \n\t"  // 4*32@i8
+            "vl4r.v         v4, (%[B])            \n\t"  // 32*32@i8
+            "addi           %[B], %[B], 512       \n\t"
+            "vl4r.v         v8, (%[B])            \n\t"  // 32*32@i8
+            "addi           %[B], %[B], 512       \n\t"
+
+            "vsetvli        t0, zero, e32, m1     \n\t"
+            "vupack.vv      v2, v0, v0, 1         \n\t"
+
+            "vupack.vv      v24, v4, v5, 1        \n\t"
+            "vupack.vv      v26, v6, v7, 1        \n\t"
+            "vupack.vv      v4, v8, v9, 1         \n\t"
+            "vupack.vv      v6, v10, v11, 1       \n\t"
+
+            // init the accumu to asum * zp
+            "vsetvli        t0, x0, e32, m1       \n\t"
+            "vxor.vv        v16, v16, v16         \n\t"
+            "vxor.vv        v18, v16, v16         \n\t"
+            "vxor.vv        v20, v16, v16         \n\t"
+            "vxor.vv        v22, v16, v16         \n\t"
+
+            // i4 * i4 vmadot
+            "vsetvli        t0, x0, e32, m1       \n\t"
+            "vmadot         v16, v2, v24, i8      \n\t"
+            "vmadot         v18, v2, v26, i8      \n\t"
+            "vmadot         v20, v2, v4, i8       \n\t"
+            "vmadot         v22, v2, v6, i8       \n\t"
+            "vmadot         v16, v3, v25, i8      \n\t"
+            "vmadot         v18, v3, v27, i8      \n\t"
+            "vmadot         v20, v3, v5, i8       \n\t"
+            "vmadot         v22, v3, v7, i8       \n\t"
+
+            "vpack.vv       v0, v16, v18, 2       \n\t"
+            "vpack.vv       v2, v20, v22, 2       \n\t"
+            "vpack.vv       v16, v0, v2, 3        \n\t"
+            "vpack.vv       v18, v1, v3, 3        \n\t"
+
+            "vfcvt.f.x.v    v16, v16              \n\t"
+            "vfcvt.f.x.v    v17, v17              \n\t"
+            "vfcvt.f.x.v    v18, v18              \n\t"
+            "vfcvt.f.x.v    v19, v19              \n\t"
+
+            // mul scale
+            "vfmul.vv       v16, v16, v14         \n\t"
+            "vfmul.vv       v17, v17, v14         \n\t"
+            "vfmul.vv       v18, v18, v14         \n\t"
+            "vfmul.vv       v19, v19, v14         \n\t"
+
+            "addi           %[BK], %[BK], -1      \n\t"
+            "vfmacc.vf      v28, fa0, v16         \n\t"
+            "vfmacc.vf      v29, fa1, v17         \n\t"
+            "vfmacc.vf      v30, fa2, v18         \n\t"
+            "vfmacc.vf      v31, fa3, v19         \n\t"
+
+            "bgtz           %[BK], BLK_LOOP%=     \n\t"
+
+            // save
+            "vsetvli        t0, x0, e32, m1       \n\t"
+            "add            t2, %[LDC], %[DST]    \n\t"
+            "vse32.v        v28, (%[DST])         \n\t"
+            "add            t3, %[LDC], t2        \n\t"
+            "vse32.v        v29, (t2)             \n\t"
+            "add            t2, %[LDC], t3        \n\t"
+            "vse32.v        v30, (t3)             \n\t"
+            "vse32.v        v31, (t2)             \n\t"
+            : [A] "+r"(a_data), [B] "+r"(b_data)
+            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks)
+            : "t0", "t1", "t2", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+              "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
+              "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3");
+    }
+}
+
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 32);
     int64_t a_blk_stride = q8_blk_size(blk_len, true);
@@ -2474,24 +2932,24 @@ size_t q4_0_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
     return 1;
 }
 
-void q4_1_quantize_row(const float * a, size_t count_k, uint8_t * qa, bool reference) {
+void i8_quantize_row(const float * a, size_t count_k, uint8_t * qa, bool reference) {
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
     if (!reference) {
-        quantize_a_row_i8(q4_1_k_block, a, count_k, qa);
+        quantize_a_row_i8(i8_k_block, a, count_k, qa);
         return;
     }
 #endif
-    quantize_a_nrow_i8_ref<1>(q4_1_k_block, a, count_k, qa);
+    quantize_a_nrow_i8_ref<1>(i8_k_block, a, count_k, qa);
 }
 
-void q4_1_quantize_4rows(const float * a, size_t count_k, uint8_t * qa, bool reference) {
+void i8_quantize_4rows(const float * a, size_t count_k, uint8_t * qa, bool reference) {
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
     if (!reference) {
-        quantize_a_4row_i8(q4_1_k_block, a, count_k, qa);
+        quantize_a_4row_i8(i8_k_block, a, count_k, qa);
         return;
     }
 #endif
-    quantize_a_nrow_i8_ref<4>(q4_1_k_block, a, count_k, qa);
+    quantize_a_nrow_i8_ref<4>(i8_k_block, a, count_k, qa);
 }
 
 // same contract as gemm_kernel_i8i4 (ime2_kernels.cpp:5583). The kernels read the zero points from the weight blocks
@@ -2515,6 +2973,36 @@ size_t q4_1_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
         return 4;
     }
     gemm_kernel_i8i4_mrow_ref<1, row_tile>(q4_1_k_block, qa, qb, qb, c, count_m, count_n, k_blocks, ldc);
+    return 1;
+}
+
+// same contract as gemm_kernel_i8i8 (ime2_kernels.cpp:5652); the weight blocks have no zero points.
+// gemm_kernel_i8i8_m4 decrements its input-only asm operand %[BK] inside its loop over 32-column groups, so in a call
+// with more than 32 columns later groups would depend on the register allocation (plan.md R13). Calling it per 32
+// columns from a loop here would not avoid that: inlined (it has one caller) or with interprocedural register
+// allocation, k_blocks can stay in that register from one call to the next. Every 4-row call gets at most 32 columns
+// instead, as upstream's do (flagos-spacemit-ime.cpp: path A, and path C with more than one row, pass at most 32),
+// and the assert keeps it so. gemm_kernel_i8i8_m1 copies its counter into t3 and may take all columns, but its asm
+// does not declare the vector registers it uses: call it only from functions like this one, which hold no vector
+// values (as copy() does for memcpy1d)
+size_t q8_0_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n, size_t k_blocks,
+                 size_t ldc, bool reference) {
+#if defined(GGML_FLAGOS_SPACEMIT_IME2)
+    if (!reference) {
+        if (count_m >= 4) {
+            GGML_ASSERT(count_n <= row_tile);
+            gemm_kernel_i8i8_m4(q8_0_k_block, qa, qb, nullptr, c, count_m, count_n, k_blocks, ldc);
+            return 4;
+        }
+        gemm_kernel_i8i8_m1(q8_0_k_block, qa, qb, nullptr, c, count_m, count_n, k_blocks, ldc);
+        return 1;
+    }
+#endif
+    if (count_m >= 4) {
+        gemm_kernel_i8i8_mrow_ref<4, row_tile>(q8_0_k_block, qa, qb, nullptr, c, count_m, count_n, k_blocks, ldc);
+        return 4;
+    }
+    gemm_kernel_i8i8_mrow_ref<1, row_tile>(q8_0_k_block, qa, qb, nullptr, c, count_m, count_n, k_blocks, ldc);
     return 1;
 }
 
@@ -2586,6 +3074,57 @@ void unpack_q4_1(const ggml_tensor * t, void * data) {
                 }
             }
         }
+    }
+}
+
+int repack_q8_0(ggml_tensor * t, const void * data, size_t size) {
+    return repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, size);
+}
+
+// inverse of repack_q8_0_to_q8_0_32_bl_ref and make_block_q8_0x32: restores the GGUF Q8_0 bytes
+void unpack_q8_0(const ggml_tensor * t, void * data) {
+    const block_q8_0x32 * src     = static_cast<const block_q8_0x32 *>(t->data);
+    block_q8_0 *          dst     = static_cast<block_q8_0 *>(data);
+    const int64_t         nrow    = ggml_nrows(t);
+    const int64_t         nblocks = t->ne[0] / QK8_0;
+
+    for (int64_t b = 0; b < nrow; b += 32, dst += 32 * nblocks) {
+        for (int64_t x = 0; x < nblocks; x++, src++) {
+            for (int64_t i = 0; i < 32; i++) {
+                block_q8_0 & out = dst[x + i * nblocks];
+                out.d            = src->d[i];
+                std::memcpy(out.qs, src->qs + i * QK8_0, QK8_0);
+            }
+        }
+    }
+}
+
+int repack_q6_k(ggml_tensor * t, const void * data, size_t size) {
+    return repack_q6_k_to_q8_0_32_bl_ref(t, 32, data, size);
+}
+
+// the requantization in repack_q6_k_to_q8_0_32_bl_ref cannot be undone: Q6_K cannot express the stored Q8_0 values, so
+// this returns the nearest Q6_K, the stored values quantized again with ggml's Q6_K quantizer. The read-back is
+// approximate: it differs from the weights the kernels compute with by about one Q6_K rounding (plan.md, M2c.2 design).
+// One 32-row group at a time, so the temporary stays at 32 rows of floats (the Qwen3-4B head has 389M weights).
+void unpack_q6_k(const ggml_tensor * t, void * data) {
+    const block_q8_0x32 * src      = static_cast<const block_q8_0x32 *>(t->data);
+    const int64_t         nrow     = ggml_nrows(t);
+    const int64_t         k        = t->ne[0];
+    const int64_t         nblocks  = k / QK8_0;
+    const size_t          row_size = ggml_row_size(GGML_TYPE_Q6_K, k);
+    std::vector<float>    rows((size_t) (32 * k));
+
+    for (int64_t b = 0; b < nrow; b += 32) {
+        for (int64_t x = 0; x < nblocks; x++, src++) {
+            for (int64_t i = 0; i < 32; i++) {
+                const float d = GGML_FP16_TO_FP32(src->d[i]);
+                for (int64_t j = 0; j < QK8_0; j++) {
+                    rows[i * k + x * QK8_0 + j] = d * (float) (int8_t) src->qs[i * QK8_0 + j];
+                }
+            }
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q6_K, rows.data(), static_cast<char *>(data) + b * row_size, 0, 32, k, nullptr);
     }
 }
 

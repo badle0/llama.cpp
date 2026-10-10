@@ -29,12 +29,32 @@ struct mm_format {
 const mm_format k_q4_0_32x256 = { (int64_t) spacemit_ime::q4_0_k_block, spacemit_ime::q4_0_act_row_bytes,
                                   spacemit_ime::q4_0_weight_row_bytes,  spacemit_ime::q4_0_quantize_row,
                                   spacemit_ime::q4_0_quantize_4rows,    spacemit_ime::q4_0_gemm };
-const mm_format k_q4_1_32x32  = { (int64_t) spacemit_ime::q4_1_k_block, spacemit_ime::q4_1_act_row_bytes,
-                                  spacemit_ime::q4_1_weight_row_bytes,  spacemit_ime::q4_1_quantize_row,
-                                  spacemit_ime::q4_1_quantize_4rows,    spacemit_ime::q4_1_gemm };
+const mm_format k_q4_1_32x32  = { (int64_t) spacemit_ime::q4_1_k_block, spacemit_ime::i8_act_row_bytes,
+                                  spacemit_ime::q4_1_weight_row_bytes,  spacemit_ime::i8_quantize_row,
+                                  spacemit_ime::i8_quantize_4rows,      spacemit_ime::q4_1_gemm };
+// Q8_0 weights, and Q6_K weights requantized to Q8_0 at load: the same layout and kernels
+const mm_format k_q8_0_32x32  = { (int64_t) spacemit_ime::q8_0_k_block, spacemit_ime::i8_act_row_bytes,
+                                  spacemit_ime::q8_0_weight_row_bytes,  spacemit_ime::i8_quantize_row,
+                                  spacemit_ime::i8_quantize_4rows,      spacemit_ime::q8_0_gemm };
+
+// spacemit_find_op admits only weights with an IME layout
+const mm_format & mm_format_of(const ggml_tensor * w) {
+    switch (spacemit_weight_layout(w)) {
+        case spacemit_layout::q4_0_32x256:
+            return k_q4_0_32x256;
+        case spacemit_layout::q4_1_32x32:
+            return k_q4_1_32x32;
+        case spacemit_layout::q8_0_32x32:
+        case spacemit_layout::q6_k_q8_0_32x32:
+            return k_q8_0_32x32;
+        case spacemit_layout::plain:
+            break;
+    }
+    GGML_ABORT("MUL_MAT weight without an IME layout");
+}
 
 struct mm_dims {
-    const mm_format * f;  // the weight's layout (spacemit_find_op admits only the two IME layouts)
+    const mm_format * f;  // the weight's layout
     int64_t           m;  // activation rows (all batch dimensions flattened; the weight is 2-D)
     int64_t           k;  // row length
     int64_t           n;  // weight rows = output columns
@@ -47,7 +67,7 @@ mm_dims mm_dims_of(const ggml_tensor * node) {
     const ggml_tensor * w = node->src[0];
     const ggml_tensor * x = node->src[1];
     mm_dims             d;
-    d.f           = spacemit_weight_layout(w) == spacemit_layout::q4_1_32x32 ? &k_q4_1_32x32 : &k_q4_0_32x256;
+    d.f           = &mm_format_of(w);
     d.m           = x->ne[1] * x->ne[2] * x->ne[3];
     d.k           = x->ne[0];
     d.n           = w->ne[1];
@@ -133,8 +153,8 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     const int64_t   nth       = tile.nth;
 
     // one row (generation): the quantized row in TCM, weights read straight from DRAM, 128 columns per call
-    // (ggml-spacemit ime.cpp:421, which found this faster than staging Q4_0 weights in TCM; it stages Q4_1 weights in
-    // TCM, its path B, which we do not have: plan.md, M2c design)
+    // (ggml-spacemit ime.cpp:421, which found this faster than staging Q4_0 weights in TCM; it stages the weights of
+    // the other types in TCM, its path B, which we do not have: plan.md, M2c and M2c.2 designs)
     if (d.m == 1 && tcm != nullptr && (size_t) d.a_row_bytes <= tile.tcm_size) {
         spacemit_ime::copy(tcm, qa, d.a_row_bytes);
         constexpr int64_t tile_cols = 4 * nb_cols;

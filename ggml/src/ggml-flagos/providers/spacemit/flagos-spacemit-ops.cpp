@@ -83,9 +83,9 @@ static bool spacemit_swiglu_f32_supported(const ggml_tensor * op) {
             (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1) && ggml_are_same_shape(src0, src1)));
 }
 
-// a weight in an IME layout (Q4_0 32x256, Q4_1 32x32), read in that layout: so it must sit in our buffer (or be
-// unallocated at placement time), never in a host buffer. The answer must not depend on the row count: llama.cpp asks
-// once per weight, at load, with 512 rows (plan.md M2b design).
+// a weight in an IME layout (Q4_0 32x256, Q4_1 32x32, Q8_0 and Q6_K in q8_0 32x32), read in that layout: so it must
+// sit in our buffer (or be unallocated at placement time), never in a host buffer. The answer must not depend on the
+// row count: llama.cpp asks once per weight, at load, with 512 rows (plan.md M2b design).
 static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];

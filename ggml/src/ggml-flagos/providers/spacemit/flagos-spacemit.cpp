@@ -1,7 +1,7 @@
 // FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15).
 // One ACCEL device with a buffer type and a backend; ops run on the AI cores through spine-runtime
-// (M2a: ADD; M2b, M2c: Q4_0 and Q4_1 MUL_MAT on the IME, weights repacked in the buffer; M2d: the other ops of a
-// layer except attention).
+// (M2a: ADD; M2b, M2c: Q4_0, Q4_1, Q8_0 and Q6_K MUL_MAT on the IME, weights repacked in the buffer, Q6_K requantized
+// to Q8_0; M2d: the other ops of a layer except attention).
 
 #include "flagos-spacemit-api.h"
 #include "flagos-spacemit-exec.h"
@@ -72,7 +72,10 @@ spacemit_device_context g_device;
 ggml_guid g_backend_guid = { 0x46, 0x6c, 0x61, 0x67, 0x4f, 0x53, 0x2d, 0x53, 0x50, 0x4d, 0x54, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 //
-// buffer: 64-byte aligned host memory; Q4_0 and Q4_1 matmul weights are stored in IME layouts (flagos-spacemit-weights.h)
+// buffer: 64-byte aligned host memory; Q4_0, Q4_1, Q8_0 and Q6_K matmul weights are stored in IME layouts
+// (flagos-spacemit-weights.h), a Q6_K weight in more than ggml_nbytes (get_alloc_size). set, get, memset and cpy work
+// in ggml's layout within ggml_nbytes; only the repack and its inverse touch the stored bytes beyond it, and clear
+// covers the whole buffer.
 //
 
 void spacemit_buffer_free(ggml_backend_buffer_t buffer) {
@@ -89,8 +92,8 @@ void spacemit_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, 
     spacemit_tensor_fill(tensor, value, offset, size);
 }
 
-// repacks; reads undo the repack (Q4_1: the converted weights), so the scheduler can still copy a weight out if the
-// provider refuses an op on it
+// repacks; reads undo the repack (Q4_1: the converted weights; Q6_K: the nearest Q6_K), so the scheduler can still copy
+// a weight out if the provider refuses an op on it
 void spacemit_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     spacemit_tensor_write(tensor, data, offset, size);
 }
@@ -146,12 +149,17 @@ size_t spacemit_buffer_type_alignment(ggml_backend_buffer_type_t) {
     return SPACEMIT_BUFFER_ALIGNMENT;
 }
 
+// a Q6_K weight is stored requantized to Q8_0: 34 bytes per 32 weights instead of 26.25
+size_t spacemit_buffer_type_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
+    return spacemit_weight_alloc_size(tensor);
+}
+
 const ggml_backend_buffer_type_i g_buffer_type_iface = {
     /* .get_name       = */ spacemit_buffer_type_name,
     /* .alloc_buffer   = */ spacemit_buffer_type_alloc,
     /* .get_alignment  = */ spacemit_buffer_type_alignment,
     /* .get_max_size   = */ nullptr,
-    /* .get_alloc_size = */ nullptr,
+    /* .get_alloc_size = */ spacemit_buffer_type_alloc_size,
     // repacked weights are not in ggml's layout, so the CPU backend must not read this buffer directly
     /* .is_host        = */ [](ggml_backend_buffer_type_t) { return false; },
 };

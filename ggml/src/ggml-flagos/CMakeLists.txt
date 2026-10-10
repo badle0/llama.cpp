@@ -156,7 +156,7 @@ endif()
 if (GGML_FLAGOS_SPACEMIT AND NOT GGML_BACKEND_DL)
     add_executable(flagos-check-spacemit EXCLUDE_FROM_ALL providers/spacemit/tests/check_spacemit.cpp)
     target_include_directories(flagos-check-spacemit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(flagos-check-spacemit PRIVATE ggml ggml-flagos)
+    target_link_libraries(flagos-check-spacemit PRIVATE ggml ggml-flagos Threads::Threads)
 endif()
 
 install(FILES

@@ -18,7 +18,20 @@ spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q4_1_k_block == 0) {
         return spacemit_layout::q4_1_32x32;
     }
+    if (t->type == GGML_TYPE_Q8_0 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {
+        return spacemit_layout::q8_0_32x32;
+    }
+    if (t->type == GGML_TYPE_Q6_K && t->ne[0] % ggml_blck_size(GGML_TYPE_Q6_K) == 0) {  // always true for Q6_K
+        return spacemit_layout::q6_k_q8_0_32x32;
+    }
     return spacemit_layout::plain;
+}
+
+size_t spacemit_weight_alloc_size(const ggml_tensor * t) {
+    if (spacemit_weight_layout(t) == spacemit_layout::q6_k_q8_0_32x32) {
+        return (size_t) ggml_nrows(t) * spacemit_ime::q8_0_weight_row_bytes((size_t) t->ne[0]);
+    }
+    return ggml_nbytes(t);
 }
 
 // the tensor that owns t's bytes, and t's byte offset inside it
@@ -32,27 +45,59 @@ static ggml_tensor * spacemit_storage(const ggml_tensor * t, size_t & offset) {
 }
 
 static void spacemit_pack(ggml_tensor * t, const void * data) {
-    const int rc = spacemit_weight_layout(t) == spacemit_layout::q4_1_32x32 ?
-                       spacemit_ime::repack_q4_1(t, data, ggml_nbytes(t)) :
-                       spacemit_ime::repack_q4_0(t, data, ggml_nbytes(t));
+    const size_t size = ggml_nbytes(t);
+    int          rc   = -1;
+    switch (spacemit_weight_layout(t)) {
+        case spacemit_layout::q4_0_32x256:
+            rc = spacemit_ime::repack_q4_0(t, data, size);
+            break;
+        case spacemit_layout::q4_1_32x32:
+            rc = spacemit_ime::repack_q4_1(t, data, size);
+            break;
+        case spacemit_layout::q8_0_32x32:
+            rc = spacemit_ime::repack_q8_0(t, data, size);
+            break;
+        case spacemit_layout::q6_k_q8_0_32x32:
+            rc = spacemit_ime::repack_q6_k(t, data, size);
+            break;
+        case spacemit_layout::plain:
+            break;
+    }
     GGML_ASSERT(rc == 0 && "tensor does not fit its IME layout");
 }
 
 static void spacemit_unpack(const ggml_tensor * t, void * data) {
-    if (spacemit_weight_layout(t) == spacemit_layout::q4_1_32x32) {
-        spacemit_ime::unpack_q4_1(t, data);
-    } else {
-        spacemit_ime::unpack_q4_0(t, data);
+    switch (spacemit_weight_layout(t)) {
+        case spacemit_layout::q4_0_32x256:
+            spacemit_ime::unpack_q4_0(t, data);
+            return;
+        case spacemit_layout::q4_1_32x32:
+            spacemit_ime::unpack_q4_1(t, data);
+            return;
+        case spacemit_layout::q8_0_32x32:
+            spacemit_ime::unpack_q8_0(t, data);
+            return;
+        case spacemit_layout::q6_k_q8_0_32x32:
+            spacemit_ime::unpack_q6_k(t, data);
+            return;
+        case spacemit_layout::plain:
+            break;
     }
+    GGML_ABORT("tensor has no IME layout");
 }
 
-// a partial write into a lossy layout re-converts the blocks it touches from what the layout kept, so a write that
-// ends inside a block would change a value the next write completes (a block's minimum split over two writes gets a
-// different zero point than one whole write); it must cover whole blocks. llama.cpp writes weights whole on this device.
+// a partial write into a lossy layout goes through the read-back of the whole tensor. Q4_1: it re-converts the blocks
+// it touches from what the layout kept, so a write that ends inside a block would change a value the next write
+// completes (a block's minimum split over two writes gets a different zero point than one whole write); it must cover
+// whole blocks. Q6_K: the read-back is approximate, so writing it back would requantize every block the write leaves
+// alone; only a write of the whole tensor is allowed. llama.cpp writes weights whole on this device.
 static void spacemit_check_partial(const ggml_tensor * base, size_t offset, size_t size) {
-    const size_t blk = ggml_type_size(base->type);
-    GGML_ASSERT((spacemit_weight_layout(base) != spacemit_layout::q4_1_32x32 || (offset % blk == 0 && size % blk == 0)) &&
+    const spacemit_layout layout = spacemit_weight_layout(base);
+    const size_t          blk    = ggml_type_size(base->type);
+    GGML_ASSERT((layout != spacemit_layout::q4_1_32x32 || (offset % blk == 0 && size % blk == 0)) &&
                 "a partial write to a Q4_1 weight must cover whole blocks");
+    GGML_ASSERT((layout != spacemit_layout::q6_k_q8_0_32x32 || (offset == 0 && size == ggml_nbytes(base))) &&
+                "a partial write to a Q6_K weight must cover the whole tensor");
 }
 
 bool spacemit_tensor_is_repacked(const ggml_tensor * t) {
