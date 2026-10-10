@@ -248,6 +248,32 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 
   1 row is memory-bound: 25.5 GB/s of Q4_1 weights against 23.6 for Q4_0, so the exact 1-row branch costs nothing. At 128 rows (path A for both) 629 against 955 GFLOP/s: the 32x32 kernel's work per 32-value block. Launch 11.0 us, per node 0.90 us, 16M-float `ADD` 22.4 GB/s (as M2d). Qwen3-0.6B not run (expected 59 splits).
 
+
+**Provider M2c.2 (the Q6_K output head and Q8_0 matmuls on the AI cores), 2026-10-10** (commit `72e0666`; `spacemit_check.py --milestone m2c2`: 29/29 on Qwen3-4B; llama-bench 3 runs, same flags, back to back):
+
+| Model | Mode | pp128 (t/s) | tg128 (t/s) | Perplexity |
+|---|---|---|---|---|
+| Qwen3-4B Q4_0 | `provider` | 84.50 | 7.84 | 9.7581 (-0.16% vs `cpu`) |
+| | `cpu` | 21.14 | 5.68 | 9.7740 |
+| | `ime` | 79.30 | 11.03 | - |
+
+- Correctness on the A100 cores (IME kernels, `--full`): Q8_0 against the CPU 14 cases, max NMSE 4.45e-8; Q6_K against the CPU's Q6_K 14 cases (both heads, 151936 rows, at 1, 7 and 128 rows), 5.93e-5 (bound 5e-4); Q6_K against the CPU's Q8_0 of the same values (the requantization alone) 5.07e-7 (bound 5e-6). All identical to the Mac's reference kernels to three digits: both 8-bit IME kernels are exact per 32-value block, and both machines store the same head bytes. `test-backend-ops -o MUL_MAT` passes its 3 claimed cases (Q8_0 2880 x 2880, Q6_K 2048 x 6144, Q6_K 151936 x 2048) with the IME and with the reference kernels: the first `test-backend-ops` cases for an IME matmul. Q4_0 and Q4_1 unchanged (2.81e-5, 9.68e-7, probe 3.02e-7).
+- Placement: 74 splits per token, as predicted (M2c.1 75). Provider buffers: model 2349.87 MiB (+394.1 MiB, the head as Q8_0; `ime`'s repacked buffer is 2349.12 MiB), compute 301.75 MiB (from 72: the logits and the head's activations now live in the provider's compute buffer instead of the CPU's).
+- The head (`--bench`, 2560 x 151936): 1 row 16.6 ms on the AI cores against 26.0 ms on the X100 cores, i.e. 413 MB at 24.9 GB/s, the same bandwidth as the Q4_0/Q4_1 1-row matmuls: the direct path does not lose for Q8_0 here (ggml-spacemit took path B for it). 4 rows 17.0 ms (memory-bound), 16 rows 27.7 ms (CPU 279 ms).
+- Generation: tg128 7.22 -> 7.84 (+8.6%; 138.5 -> 127.6 ms per token; the `cpu` row is 1.8% higher than at M2c.1, so about +7% net of the day). The head saves 9.4 ms and one split about 0.1 ms. `llama-completion` 7.80 t/s against 5.85 with the provider disabled. Prefill unchanged (84.50, noise): a prompt batch computes the head for its last token only.
+- Accuracy against the CPU's logits (same base file and commands as M2c.1):
+
+| Run | Mean KLD | 99% KLD | Max KLD | Same top token |
+|---|---|---|---|---|
+| M2c.2, 512-token batches | 0.00326 ± 0.00021 | 0.0242 | 0.223 | 96.72 ± 0.40% |
+| M2c.2, `-ub 1` | 0.00220 ± 0.00021 | 0.0161 | 0.287 | 97.16 ± 0.37% |
+| M2c.1, 512-token batches | 0.00316 | 0.0244 | 0.241 | 96.86% |
+| M2c.1, `-ub 1` | 0.00203 | 0.0175 | 0.287 | 97.30% |
+| `ime`, 512-token batches | 0.00339 | 0.0266 | 0.350 | 96.9% |
+
+  The head's requantization adds 0.00010 (512-token batches) and 0.00017 (`-ub 1`) to the mean KLD, under the exit limit of 0.0005 and about the 0.0002 estimated from the logit noise; the tails (99%, maximum) and the same-top-token rate do not move beyond noise. With the same conversions as `ime` (Q4_1 zero points, Q6_K -> Q8_0), the provider is slightly closer to the CPU than `ime` is.
+- Remaining generation time (estimates): about 99 ms streaming 2.46 GB of weights at about 25 GB/s, about 9 ms for 74 handoffs, about 20 ms for attention on the X100 cores, the embedding lookup and the other ops; `ime` takes 90.7 ms, so its 1-row matmuls run at 27 GB/s or more. Qwen3-0.6B not run (expected 58 splits).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
