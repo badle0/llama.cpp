@@ -371,10 +371,67 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 - The IME reference with its weights rotated: 89.2 ms per token (82.4 unrotated: the old benchmark also served mid-sized shapes partly from caches). `paired` on huge pages is 4.7% faster per token and faster or equal at every shape except the Q4_1 down projection (+5%).
 - Reading in `plan.md` ("1-row matmul bandwidth", round 2 results).
 
+**Round 2 adopted, confirmation run, 2026-10-11** (commit `b8187d2`: `paired` the default, buffers from 2 MiB on huge pages; `spacemit_check.py --milestone m2c2`: 29/29 on Qwen3-4B; llama-bench 3 runs, same flags as above):
+
+| Model | Mode | pp128 (t/s) | tg128 (t/s) | Perplexity |
+|---|---|---|---|---|
+| Qwen3-4B Q4_0 | `provider` | 83.09 | 8.68 | 9.7581 (-0.16% vs `cpu`) |
+| | `cpu` | 21.17 | 5.56 | 9.7740 |
+| | `ime` | 79.34 | 11.02 | - |
+
+| 1-row benchmark, huge pages | q | k, v | attn out | gate, up | down | down Q4_1 | head | per token |
+|---|---|---|---|---|---|---|---|---|
+| **`paired` (the default)** | 206 | 86 | 217 | 460 | 494 | 586 | 13942 | **86.6 ms** |
+| `staged` | 222 | 82 | 246 | 482 | 568 | 643 | 14247 | 92.5 |
+| `direct` | 230 | 83 | 239 | 529 | 562 | 604 | 14809 | 96.1 |
+
+- Every check passes with `paired` as the default (the strategy check 78/78 on the AI cores); huge pages 64 of 64 MiB; 74 splits; perplexity M2c.2's to the last digit (the matmuls return the same bytes).
+- Generation against round 1's run of the same runner (`staged`, 4 KiB pages): tg128 8.31 -> 8.68 (+4.5%), `llama-completion` 8.64 -> 8.91 t/s (+3.1%; 32 tokens, the noisiest of the three), with the `cpu` and `ime` rows as then (5.54 and 11.01), so the board ran as then. The runner's llama-bench reads about 5% below the stand-alone `-p 0 -n 128` command in both rounds (`staged` on 4 KiB pages 8.31 against 8.68; `paired` on huge pages 8.68 against 9.18); compare runner with runner and stand-alone with stand-alone.
+- Prefill 83.1, 1.5% below the last two runs while `cpu` and `ime` held within 0.3%: small, possibly noise. Prefill uses path A, untouched, and the 1-row path only for the head of each batch's last token.
+- The benchmark's `staged` row is now valid on huge pages: `paired` is 6.4% below it (round 2 estimated about 92), and 2.9% below the in-tree path's 89.2 (round 2).
+
+**Experiments with the switches, 2026-10-11** (stand-alone `llama-bench -t 8 -p 0 -n 128 -fa 1 -mmp 0 -r 3`; tg128 in t/s, ± the spread of the 3 runs; huge pages unless noted; in the order run):
+
+| Experiment | Results (t/s) |
+|---|---|
+| 1-row strategy, two rounds interleaved | `paired` 9.00 ± 0.18, 9.18 ± 0.10; `staged` 8.78, 8.79; `direct` 8.65, 8.72 |
+| `paired`: columns per slab, tiles | 32 (the default) 9.22; 64: 8.93; 128: 8.72; 6 tiles 9.06; 4 tiles 8.33 |
+| pages, two rounds interleaved | huge 9.27, 9.27; 4 KiB 9.16, 9.15 |
+
+- The pairs' turns: `paired` +3.5% over `staged` (110.0 against 113.8 ms per token; +4.4% in the second round, whose `paired` run was steadier; round 2: +5.0%). Staging over direct reads: only +1.2% on huge pages, against 3.7% in the benchmark on huge pages and 6.4% on 4 KiB pages (round 2), likely because direct reads gain more from huge pages. The benchmark overstates differences in generation about 1.5-3 fold.
+- The defaults are the best of these variants: slabs of 64 and 128 columns lose 3% and 5%, 6 tiles 2%, 4 tiles 10%. Huge pages: +1.3% (107.9 against 109.2 ms per token; round 2: +1.2%).
+- The same configuration (`paired`, huge pages) read 9.00 to 9.27 over the session, rising, so only interleaved comparisons count.
+
+Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,4096 -r 1`, tg32 in t/s):
+
+| Depth | `provider` | `cpu` | `ime` |
+|---|---|---|---|
+| 0 | 9.70 | 5.87 | 11.05 |
+| 1024 | 6.74 | 4.56 | 9.34 |
+| 4096 | 1.80 | 1.52 | 6.41 |
+
+- From depth 0 to 4096 a token takes 452 ms more on the provider, 488 on `cpu` and 66 on `ime` (M2d: 445 and 68): attention on the X100 cores costs about 7 times what it costs on the A100 cores. The faster matmuls lifted the provider at depth 0 by 32% since M2d (7.36), at 4096 by 5% (1.72), where it barely beats `cpu`. Beyond about 1k tokens M2e decides generation speed.
+- The runner's flags stand-alone (`llama-bench -p 128 -n 128 -ub 128 -r 3`): pp128 83.09 ± 1.13, tg128 8.66 ± 0.03, so the runner's lower tg128 comes from its flags, not from running after the perplexity runs. llama-bench creates a new context (and so a new provider backend and spine-runtime stream) for every test; with `-p 128` the tg128 test runs in the process's second context, after a prompt test. Its 8.66 matches the `direct` strategy (8.65, 8.72), as if the 1-row path ran without TCM there; `ime` loses nothing the same way (11.02 against 11.05). Cause open (`plan.md`, "1-row matmul bandwidth").
+- Prefill with and without huge pages (`-p 128 -n 0 -ub 128`, two rounds interleaved): 83.07 and 83.59 against 84.34 and 83.72 on 4 KiB pages, so huge pages cost prefill about 0.8% if anything (within the spread of single runs), while generation gains 1.3%.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
 - Where threads run: `ps -L -o tid,psr,comm -p $(pgrep llama-bench)` (`psr` 8-15 = A100).
+- Compare speeds only within one session, interleaved and repeated: between sessions or harnesses tg128 moves by about 4-5%.
+
+Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
+
+| Variable | Applies to | Effect |
+|---|---|---|
+| `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
+| `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
+| `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |
+| `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
+| `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
+| `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and path A run; `flagos-check-spacemit` sets 393216 for its 1-row checks |
+| `FLAGOS_SPACEMIT_TEST_THREADS=1` | host executor (Mac) | the tiles of each launch on threads, so pair waits wait (with the TCM stand-in: everything as on the AI cores) |
+| `FLAGOS_SPACEMIT_TEST_FAIL_NODE=<n>` | tests | tile 0 reports a failure at step n |
 
 ## 8. Troubleshooting
 
