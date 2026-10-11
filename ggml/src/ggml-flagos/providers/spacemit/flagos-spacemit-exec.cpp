@@ -4,11 +4,49 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 #    include <spert.hpp>
 #endif
+
+// the pair waits of one launch (spacemit_pair_wait). The counts only grow during the launch, so the waits of all its
+// steps continue one count
+struct spacemit_pairs {
+    struct alignas(64) counter {  // one cache line each: the two tiles of a pair spin on theirs
+        std::atomic<uint32_t> calls{ 0 };
+    };
+    counter                   by_pair[SPACEMIT_MAX_TILES / 2];  // the calls of both tiles of the pair
+    uint32_t                  by_tile[SPACEMIT_MAX_TILES] = {};  // each tile's own calls, written only by that tile
+    const std::atomic<bool> * failed     = nullptr;             // the launch's failure flag
+    bool                      concurrent = true;                // false: the tiles run one after another; only count
+};
+
+bool spacemit_pair_wait(const spacemit_tile & tile) {
+    GGML_ASSERT(tile.pairs != nullptr);
+    spacemit_pairs & p = *tile.pairs;
+    const uint32_t   n = ++p.by_tile[tile.ith];
+    if (!p.concurrent) {
+        return true;
+    }
+    std::atomic<uint32_t> & both = p.by_pair[tile.ith / 2].calls;
+    both.fetch_add(1, std::memory_order_acq_rel);
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t spin = 1; both.load(std::memory_order_acquire) < 2 * n; spin++) {
+        if (p.failed->load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (spin % 65536 == 0 && std::chrono::steady_clock::now() - start > std::chrono::seconds(10)) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: tile %u waited 10 s for tile %u at pair wait %u\n", tile.ith, tile.ith ^ 1u, n);
+            return false;
+        }
+#if defined(__riscv_zihintpause)
+        __asm__ __volatile__("pause");
+#endif
+    }
+    return true;
+}
 
 namespace {
 
@@ -26,6 +64,9 @@ struct spacemit_launch {
     int64_t               fail_step      = -1;
     std::atomic<bool>     failed{ false };
     size_t                tcm_sizes[SPACEMIT_MAX_TILES] = {};  // each tile's TCM, so all can agree on one size
+    spacemit_pairs        pairs;
+
+    spacemit_launch() { pairs.failed = &failed; }
 };
 
 bool spacemit_run_step(const spacemit_launch & launch, size_t i, const spacemit_tile & tile) {
@@ -54,7 +95,7 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
         tcm_size = std::min(tcm_size, launch->tcm_sizes[i]);
     }
     const spacemit_tile tile = { ith, nth, tcm_size != 0 ? tcm.data : nullptr, tcm_size, launch->workspace,
-                                 launch->workspace_size };
+                                 launch->workspace_size, &launch->pairs };
 
     for (size_t i = 0; i < launch->n_steps; i++) {
         if (!launch->failed.load() && !spacemit_run_step(*launch, i, tile)) {
@@ -130,6 +171,19 @@ class spert_executor final : public spacemit_executor {
 
 #else
 
+// the serial executor runs the two tiles of a pair one after another, so their pair waits can only be counted. On the
+// AI cores a pair whose tiles waited unequally often in a step would wait until the launch fails
+bool spacemit_pairs_balanced(const spacemit_pairs & p, uint32_t n_tiles) {
+    for (uint32_t t = 0; t + 1 < n_tiles; t += 2) {
+        if (p.by_tile[t] != p.by_tile[t + 1]) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: tiles %u and %u made %u and %u pair waits\n", t, t + 1, p.by_tile[t],
+                           p.by_tile[t + 1]);
+            return false;
+        }
+    }
+    return true;
+}
+
 // runs the tiles one after another on the calling thread; lets the full path be tested on hosts without the AI cores.
 // test-only: FLAGOS_SPACEMIT_TEST_TCM=<bytes> gives the tiles a stand-in for TCM in heap memory, so that the paths that
 // need TCM (the 1-row path, path A) run there too; one buffer serves all tiles, as they never run at the same time
@@ -150,14 +204,19 @@ class serial_executor final : public spacemit_executor {
 
     bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
         spacemit_launch launch;
-        launch.steps     = steps.data();
-        launch.n_steps   = steps.size();
-        launch.fail_step = fail_step;
+        launch.steps            = steps.data();
+        launch.n_steps          = steps.size();
+        launch.fail_step        = fail_step;
+        launch.pairs.concurrent = false;
         for (size_t i = 0; i < steps.size() && !launch.failed.load(); i++) {
             for (uint32_t ith = 0; ith < n_tiles; ith++) {
-                if (!spacemit_run_step(launch, i, { ith, n_tiles, tcm, tcm_size, workspace, workspace_size })) {
+                if (!spacemit_run_step(launch, i,
+                                       { ith, n_tiles, tcm, tcm_size, workspace, workspace_size, &launch.pairs })) {
                     launch.failed.store(true);
                 }
+            }
+            if (!spacemit_pairs_balanced(launch.pairs, n_tiles)) {
+                launch.failed.store(true);
             }
         }
         return !launch.failed.load();

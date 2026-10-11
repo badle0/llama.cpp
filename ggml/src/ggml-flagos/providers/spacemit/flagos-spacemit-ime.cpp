@@ -101,15 +101,16 @@ void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, 
 // How a single activation row (generation) is multiplied. Default: the weights staged through TCM 32 columns at a time
 // (memcpy1d), each slab multiplied there, slabs dealt round-robin to the tiles. Measured on the K3 (plan.md, "1-row
 // matmul bandwidth"): 10% less time per Qwen3-4B token than reading the weights straight from DRAM. The copies are the
-// limit, not the kernels (they multiply a slab from TCM about three times faster than DRAM delivers it), and while a
-// tile multiplies, fewer tiles stream from DRAM, which then delivers more in total. Without room in TCM for a 32-column
-// slab the weights are read straight from DRAM.
+// limit, not the kernels (they multiply a slab from TCM about three times faster than DRAM delivers it), and memcpy1d
+// reads DRAM faster than the kernels' own loads do. Without room in TCM for a 32-column slab the weights are read
+// straight from DRAM.
 // test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>][@<tiles>], read at every call so a benchmark can switch:
-// staged[:c] (c = 32, the default); direct[:c] (c = 128): straight from DRAM, c columns per kernel call; copy[:c] and
+// staged[:c] (c = 32, the default); paired[:c] (c = 32): staged, the two tiles of each pair taking turns as in the
+// in-tree path B (gemv below); direct[:c] (c = 128): straight from DRAM, c columns per kernel call; copy[:c] and
 // compute[:c]: staging's copies alone, or its multiplications alone (one slab copied once), wrong results, timing only;
 // @t: only the first t tiles take part, the others wait (how the bandwidth depends on the number of streams)
 struct gemv_strategy {
-    enum kind_t { staged, direct, copy_only, compute_only };
+    enum kind_t { staged, paired, direct, copy_only, compute_only };
     kind_t  kind  = staged;
     int64_t cols  = nb_cols;
     int64_t tiles = 0;  // 0: all
@@ -121,8 +122,9 @@ gemv_strategy gemv_strategy_from_env() {
         gemv_strategy::kind_t kind;
         int64_t               cols;
     } names[] = {
-        { "staged", gemv_strategy::staged, nb_cols },        { "direct", gemv_strategy::direct, 4 * nb_cols },
-        { "copy", gemv_strategy::copy_only, nb_cols },       { "compute", gemv_strategy::compute_only, nb_cols },
+        { "staged", gemv_strategy::staged, nb_cols },        { "paired", gemv_strategy::paired, nb_cols },
+        { "direct", gemv_strategy::direct, 4 * nb_cols },    { "copy", gemv_strategy::copy_only, nb_cols },
+        { "compute", gemv_strategy::compute_only, nb_cols },
     };
     gemv_strategy s;
     const char *  v = std::getenv("FLAGOS_SPACEMIT_GEMV");
@@ -147,17 +149,23 @@ gemv_strategy gemv_strategy_from_env() {
     return s;
 }
 
-// one activation row, already quantized into the start of the tile's TCM, times all weight rows (gemv_strategy)
-void gemv(const gemv_strategy & s, uint8_t * tcm, size_t tcm_size, const uint8_t * w, float * out, const mm_dims & d,
-          int64_t ith, int64_t nth, bool reference) {
+// one activation row, already quantized into the start of the tile's TCM, times all weight rows (gemv_strategy); false
+// when a pair wait failed (paired)
+bool gemv(const gemv_strategy & s, const spacemit_tile & tile, const uint8_t * w, float * out, const mm_dims & d,
+          bool reference) {
+    const int64_t ith = tile.ith;
+    int64_t       nth = tile.nth;
     if (s.tiles > 0) {
         nth = std::min(nth, s.tiles);
         if (ith >= nth) {
-            return;
+            return true;
         }
     }
+    uint8_t *     tcm   = static_cast<uint8_t *>(tile.tcm);
     const int64_t a_off = GGML_PAD(d.a_row_bytes, 64);
-    const int64_t fit   = (int64_t) tcm_size > a_off ? ((int64_t) tcm_size - a_off) / d.b_row_bytes / nb_cols * nb_cols : 0;
+    const int64_t fit   = (int64_t) tile.tcm_size > a_off ?
+                              ((int64_t) tile.tcm_size - a_off) / d.b_row_bytes / nb_cols * nb_cols :
+                              0;
     const int64_t slab  = std::min(s.cols, fit);
 
     if (s.kind == gemv_strategy::direct || slab < nb_cols) {
@@ -165,22 +173,71 @@ void gemv(const gemv_strategy & s, uint8_t * tcm, size_t tcm_size, const uint8_t
         for (int64_t n0 = ith * chunk; n0 < d.n; n0 += chunk * nth) {
             d.f->gemm(tcm, w + n0 * d.b_row_bytes, out + n0, 1, std::min(d.n - n0, chunk), d.k_blocks, d.n, reference);
         }
-        return;
+        return true;
     }
 
-    uint8_t * buf = tcm + a_off;
-    if (s.kind == gemv_strategy::compute_only && ith * slab < d.n) {
-        spacemit_ime::copy(buf, w + ith * slab * d.b_row_bytes, std::min(d.n - ith * slab, slab) * d.b_row_bytes);
+    // the slab starting at column n0, if there is one: copied into TCM, or multiplied there
+    uint8_t *  buf      = tcm + a_off;
+    const auto stage    = [&](int64_t n0) {
+        if (n0 < d.n) {
+            spacemit_ime::copy(buf, w + n0 * d.b_row_bytes, std::min(d.n - n0, slab) * d.b_row_bytes);
+        }
+    };
+    const auto multiply = [&](int64_t n0) {
+        if (n0 < d.n) {
+            d.f->gemm(tcm, buf, out + n0, 1, std::min(d.n - n0, slab), d.k_blocks, d.n, reference);
+        }
+    };
+
+    // paired: the in-tree path B (ggml-cpu/spacemit/ime.cpp:435-494). The two tiles of a pair take turns: the even one
+    // copies its first slab while the odd one waits; then in every round one multiplies while the other copies. Both
+    // wait 1 + rounds times, rounds being the even tile's number of slabs (the odd tile may have one slab fewer and
+    // still waits in that last round); a tile without a partner (an odd number of tiles) runs as staged
+    if (s.kind == gemv_strategy::paired) {
+        const int64_t step    = slab * nth;
+        const int64_t first   = (ith & ~int64_t(1)) * slab;  // the even tile's first slab
+        const int64_t rounds  = first < d.n ? div_up(d.n - first, step) : 0;
+        const bool    even    = ith % 2 == 0;
+        const bool    partner = (ith ^ 1) < nth;
+        const auto    wait    = [&] { return !partner || spacemit_pair_wait(tile); };
+        if (rounds == 0) {
+            return true;
+        }
+        int64_t n0 = ith * slab;
+        if (even) {
+            stage(n0);
+        }
+        if (!wait()) {
+            return false;
+        }
+        if (!even) {
+            stage(n0);
+        }
+        for (int64_t r = 0; r < rounds; r++, n0 += step) {
+            if (!even && !wait()) {
+                return false;
+            }
+            multiply(n0);
+            if (even && !wait()) {
+                return false;
+            }
+            stage(n0 + step);
+        }
+        return true;
+    }
+
+    if (s.kind == gemv_strategy::compute_only) {
+        stage(ith * slab);
     }
     for (int64_t n0 = ith * slab; n0 < d.n; n0 += slab * nth) {
-        const int64_t cols = std::min(d.n - n0, slab);
         if (s.kind != gemv_strategy::compute_only) {
-            spacemit_ime::copy(buf, w + n0 * d.b_row_bytes, cols * d.b_row_bytes);
+            stage(n0);
         }
         if (s.kind != gemv_strategy::copy_only) {
-            d.f->gemm(tcm, buf, out + n0, 1, cols, d.k_blocks, d.n, reference);
+            multiply(n0);
         }
     }
+    return true;
 }
 
 }  // namespace
@@ -240,8 +297,7 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     // one row (generation): the quantized row in TCM, the weights staged through TCM (gemv_strategy above)
     if (d.m == 1 && tcm != nullptr && (size_t) d.a_row_bytes <= tile.tcm_size) {
         spacemit_ime::copy(tcm, qa, d.a_row_bytes);
-        gemv(gemv_strategy_from_env(), tcm, tile.tcm_size, w, out, d, ith, nth, reference);
-        return true;
+        return gemv(gemv_strategy_from_env(), tile, w, out, d, reference);
     }
 
     // ime.cpp's split: blocks of rows when there are enough for every tile, otherwise columns

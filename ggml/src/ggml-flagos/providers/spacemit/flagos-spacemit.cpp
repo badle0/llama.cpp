@@ -12,6 +12,7 @@
 #include "../../../ggml-impl.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,9 @@
 
 #if defined(__linux__)
 #    include <unistd.h>
+#endif
+#if !defined(_WIN32)
+#    include <sys/mman.h>
 #endif
 #if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE) && defined(__APPLE__)
 #    include <sys/sysctl.h>
@@ -47,8 +51,9 @@ struct spacemit_device_context {
 };
 
 struct spacemit_buffer_context {
-    void * data = nullptr;
-    size_t size = 0;
+    void * data   = nullptr;
+    size_t size   = 0;
+    size_t mapped = 0;  // > 0: data is a mapping of this many bytes (spacemit_map_huge), else from ggml_aligned_malloc
 };
 
 struct spacemit_backend_context {
@@ -72,15 +77,48 @@ spacemit_device_context g_device;
 ggml_guid g_backend_guid = { 0x46, 0x6c, 0x61, 0x67, 0x4f, 0x53, 0x2d, 0x53, 0x50, 0x4d, 0x54, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 //
-// buffer: 64-byte aligned host memory; Q4_0, Q4_1, Q8_0 and Q6_K matmul weights are stored in IME layouts
-// (flagos-spacemit-weights.h), a Q6_K weight in more than ggml_nbytes (get_alloc_size). set, get, memset and cpy work
-// in ggml's layout within ggml_nbytes; only the repack and its inverse touch the stored bytes beyond it, and clear
-// covers the whole buffer.
+// buffer: host memory on huge pages where the system has them (spacemit_map_huge), else 64-byte aligned; Q4_0, Q4_1,
+// Q8_0 and Q6_K matmul weights are stored in IME layouts (flagos-spacemit-weights.h), a Q6_K weight in more than
+// ggml_nbytes (get_alloc_size). set, get, memset and cpy work in ggml's layout within ggml_nbytes; only the repack and
+// its inverse touch the stored bytes beyond it, and clear covers the whole buffer.
 //
+
+#if defined(MADV_HUGEPAGE)
+// memory on 2 MiB transparent huge pages, as the in-tree path keeps its weights (ggml-cpu/spacemit/spine_mem_pool.cpp,
+// HPAGE): the K3 gives them only on request (madvise), and with 4 KiB pages that path's 1-row matmuls take 2 ms more
+// per Qwen3-4B token (plan.md, "1-row matmul bandwidth"). Whole huge pages from a huge page boundary; nullptr if the
+// mapping fails. If madvise is refused, the memory keeps the default pages.
+void * spacemit_map_huge(size_t size, size_t & mapped) {
+    constexpr size_t huge = size_t(2) << 20;
+    const size_t     len  = GGML_PAD(size, huge);
+    void *           raw  = mmap(nullptr, len + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        return nullptr;
+    }
+    // one huge page more than needed, trimmed at both ends to start on a huge page boundary
+    uint8_t * base = static_cast<uint8_t *>(raw);
+    uint8_t * data = reinterpret_cast<uint8_t *>(GGML_PAD(reinterpret_cast<uintptr_t>(base), huge));
+    if (data > base) {
+        munmap(base, (size_t) (data - base));
+    }
+    munmap(data + len, huge - (size_t) (data - base));
+    if (madvise(data, len, MADV_HUGEPAGE) != 0) {
+        GGML_LOG_DEBUG("FlagOS SpacemiT: madvise(MADV_HUGEPAGE) failed (errno %d); default pages\n", errno);
+    }
+    mapped = len;
+    return data;
+}
+#endif
 
 void spacemit_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<spacemit_buffer_context *>(buffer->context);
-    ggml_aligned_free(ctx->data, ctx->size);
+    if (ctx->mapped > 0) {
+#if defined(MADV_HUGEPAGE)
+        munmap(ctx->data, ctx->mapped);
+#endif
+    } else {
+        ggml_aligned_free(ctx->data, ctx->size);
+    }
     delete ctx;
 }
 
@@ -134,14 +172,25 @@ const char * spacemit_buffer_type_name(ggml_backend_buffer_type_t) {
     return "FlagOS:SpacemiT";
 }
 
-// ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it
+// ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it.
+// test-only: FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1 keeps the default pages, for comparison
 ggml_backend_buffer_t spacemit_buffer_type_alloc(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    void * data   = nullptr;
+    size_t mapped = 0;
+#if defined(MADV_HUGEPAGE)
+    const char * no_huge = std::getenv("FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES");
+    if (no_huge == nullptr || std::strcmp(no_huge, "0") == 0) {
+        data = spacemit_map_huge(size, mapped);
+    }
+#endif
+    if (data == nullptr) {
+        data = ggml_aligned_malloc(size);
+    }
     if (data == nullptr) {
         GGML_LOG_ERROR("FlagOS SpacemiT: failed to allocate a %zu-byte buffer\n", size);
         return nullptr;
     }
-    auto * ctx = new spacemit_buffer_context{ data, size };
+    auto * ctx = new spacemit_buffer_context{ data, size, mapped };
     return ggml_backend_buffer_init(buft, g_buffer_iface, ctx, size);
 }
 

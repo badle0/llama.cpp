@@ -1,5 +1,5 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
-// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench]
+// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench | --bench-gemv]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -7,6 +7,7 @@
 //                    the IME
 //   --bench          also measure launch cost, per-node cost, bandwidth, and Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul
 //                    time against the CPU, and the 1-row strategies of FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
+//   --bench-gemv     of the benchmarks only the 1-row strategies
 // Without a flag, a host without the device skips the device checks.
 
 #include "ggml-alloc.h"
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,6 +97,29 @@ static int check_registry(ggml_backend_dev_t dev, size_t global_index) {
     return 0;
 }
 
+// bytes of [base, base + size) on huge pages, from the kernel's count per mapping (AnonHugePages in /proc/self/smaps);
+// -1 without that file (not Linux)
+static double huge_page_bytes(const void * base, size_t size) {
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps) {
+        return -1.0;
+    }
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base), e = b + size;
+    std::string     line;
+    bool            overlaps = false;
+    double          bytes    = 0.0;
+    while (std::getline(smaps, line)) {
+        unsigned long long lo = 0, hi = 0;
+        char               dash = 0;
+        if (std::sscanf(line.c_str(), "%llx%c%llx", &lo, &dash, &hi) == 3 && dash == '-') {
+            overlaps = lo < e && hi > b;  // a mapping's first line: its address range
+        } else if (overlaps && line.rfind("AnonHugePages:", 0) == 0) {
+            bytes += 1024.0 * std::atof(line.c_str() + std::strlen("AnonHugePages:"));
+        }
+    }
+    return bytes;
+}
+
 static int check_buffer(ggml_backend_dev_t dev) {
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     REQUIRE(buft != nullptr);
@@ -136,6 +161,25 @@ static int check_buffer(ggml_backend_dev_t dev) {
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     std::printf("buffer   alloc/free (incl. size 0), set/get, memset, clear: checked\n");
+
+    // where the system has them, the buffers lie on huge pages (flagos-spacemit.cpp, spacemit_map_huge): what the
+    // kernel counts for a 64 MiB buffer once a clear has touched it
+    const size_t          big_size = size_t(64) << 20;
+    ggml_backend_buffer_t big      = ggml_backend_buft_alloc_buffer(buft, big_size);
+    REQUIRE(big != nullptr);
+    ggml_backend_buffer_clear(big, 1);
+    const double huge = huge_page_bytes(ggml_backend_buffer_get_base(big), big_size);
+    ggml_backend_buffer_free(big);
+    std::string thp;
+    std::getline(std::ifstream("/sys/kernel/mm/transparent_hugepage/enabled"), thp);
+    const char * no_huge = std::getenv("FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES");
+    if (huge < 0.0) {
+        std::printf("info     huge pages: not counted (no /proc/self/smaps)\n");
+    } else {
+        std::printf("info     huge pages: %.0f of 64 MiB of a provider buffer%s (transparent huge pages: %s)\n", huge / 1048576.0,
+                    no_huge != nullptr && std::strcmp(no_huge, "0") != 0 ? ", FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES set" : "",
+                    thp.empty() ? "?" : thp.c_str());
+    }
     return 0;
 }
 
@@ -901,9 +945,11 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
 }
 
 // the 1-row strategies of FLAGOS_SPACEMIT_GEMV (plan.md, "1-row matmul bandwidth"): the default (staged:32, unset), the
-// others, and some on fewer tiles (@t); bench_gemv() times them
-static const char * const k_gemv_strategies[] = { "staged",     "staged:64",  "staged:128", "staged:256", "staged@5",
-                                                  "direct",     "direct:32",  "direct:512", "direct:32@6" };
+// others, and some on fewer tiles (@t); bench_gemv() times them. For paired the shapes below also give a pair whose odd
+// tile has one slab fewer (480 and 1056 columns), pairs without work (paired:256) and a tile without a partner (@5)
+static const char * const k_gemv_strategies[] = { "staged",    "staged:64",  "staged:128", "staged:256",  "staged@5",
+                                                  "paired",    "paired:64",  "paired:256", "paired@5",    "direct",
+                                                  "direct:32", "direct:512", "direct:32@6" };
 
 // every strategy gives the same bytes as reading the weights straight from DRAM: the same kernel on the same data, only
 // the weights' path (DRAM or a copy in TCM) and the tile of each column differ. The output is filled with NaN first, so
@@ -973,8 +1019,8 @@ static int check_gemv_strategies(ggml_backend_dev_t dev) {
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
-    std::printf("gemv     1-row strategies (the default staged:32, staged:64/128/256, staged@5, direct:32/128/512, "
-                "direct:32@6) at 6 shapes "
+    std::printf("gemv     1-row strategies (the default staged:32, staged:64/128/256, staged@5, paired:32/64/256, paired@5, "
+                "direct:32/128/512, direct:32@6) at 6 shapes "
                 "with TCM: %d/%d identical to direct (copy-only control differs); direct vs CPU max NMSE %.2e (bound %.0e)%s\n",
                 n_same, n_runs, worst, k_mul_mat_max_nmse,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
@@ -1475,9 +1521,10 @@ static double ime_row_bytes(ggml_type type, int64_t k) {
 // the 1-row strategies (FLAGOS_SPACEMIT_GEMV; plan.md, "1-row matmul bandwidth") at every 1-row matmul shape of a
 // Qwen3-4B token, and the time each gives a whole token: the shapes weighted by how often a token runs them (q; k and v;
 // attention output; gate and up; down in Q4_0 and in Q4_1; the head). Besides the default (staged:32) and direct reads:
-// staging's two halves alone (copy, compute; wrong results), and runs on fewer tiles (@t), which show how the bandwidth
-// depends on the number of tiles streaming from DRAM at once. Each run is its own launch, so per token these include
-// about 250 launches the model does not pay
+// the two tiles of each pair taking turns (paired), staging's two halves alone (copy, compute; wrong results), and runs
+// on fewer tiles (@t). As in the model, where a token reads each matrix once, every run reads its weights from DRAM: it
+// takes the next of enough copies of the weight (32 MB together) to leave the caches (before 2026-10-11 k and v stayed
+// cached). Each run is its own launch, so per token these include about 250 launches the model does not pay
 static int bench_gemv(ggml_backend_dev_t dev) {
     set_env("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the serial stand-in's TCM (check_gemv_strategies)
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -1489,24 +1536,31 @@ static int bench_gemv(ggml_backend_dev_t dev) {
         { GGML_TYPE_Q4_0, 2560, 9728, 72 }, { GGML_TYPE_Q4_0, 9728, 2560, 32 }, { GGML_TYPE_Q4_1, 9728, 2560, 4 },
         { GGML_TYPE_Q6_K, 2560, 151936, 1 },
     };
-    const std::vector<std::string> strategies = { "staged",      "staged:64",   "direct",      "direct:32",
-                                                  "direct:512",  "copy",        "compute",     "staged@6",
-                                                  "staged@5",    "staged@4",    "direct:32@6", "direct:32@5",
-                                                  "direct:32@4", "copy@6",      "copy@4",      "copy@2" };
+    const std::vector<std::string> strategies = { "staged", "staged@6", "paired", "paired:64",
+                                                  "paired@6", "direct",  "copy",   "compute" };
+    constexpr double    k_rotation_bytes = 32e6;
     std::vector<double> per_token(strategies.size(), 0.0);
     double              token_bytes = 0.0;
     for (const gemv_shape & s : shapes) {
-        mm_weight w;
-        REQUIRE(w.init(dev, s.k, s.n, 1, s.type, s.type == GGML_TYPE_Q6_K));
-        mm_run run;
-        REQUIRE(run.init(dev, w, 1, 1));
-        const double bytes = (double) s.n * ime_row_bytes(s.type, s.k);
+        const double                            bytes  = (double) s.n * ime_row_bytes(s.type, s.k);
+        const size_t                            copies = (size_t) std::min(32.0, std::ceil(k_rotation_bytes / bytes));
+        const std::vector<uint8_t>              q      = quantize_weights(s.type, s.k, s.n, 1);
+        std::vector<std::unique_ptr<mm_weight>> ws;
+        std::vector<std::unique_ptr<mm_run>>    runs;
+        for (size_t c = 0; c < copies; c++) {
+            ws.push_back(std::make_unique<mm_weight>());
+            REQUIRE(ws.back()->init_with(dev, s.type, s.k, s.n, q, s.type == GGML_TYPE_Q6_K));
+            runs.push_back(std::make_unique<mm_run>());
+            REQUIRE(runs.back()->init(dev, *ws.back(), 1, 1));
+        }
         token_bytes += bytes * s.per_token;
         for (size_t i = 0; i < strategies.size(); i++) {
             set_env("FLAGOS_SPACEMIT_GEMV", strategies[i].c_str());
-            bool         ok = true;
-            const double t  = time_us([&] { ok &= ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS; },
-                                      s.n > 100000 ? 5 : 30);
+            bool         ok   = true;
+            size_t       next = 0;
+            const double t    = time_us(
+                [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
+                s.n > 100000 ? 5 : 30);
             CHECK(ok);
             per_token[i] += t * s.per_token;
             std::printf("bench    gemv %-4s %5lldx%-6lld %-15s %8.0f us %6.1f GB/s\n", ggml_type_name(s.type),
@@ -1627,6 +1681,7 @@ int main(int argc, char ** argv) {
     bool expect_none   = false;
     bool full          = false;
     bool run_bench     = false;
+    bool run_gemv      = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -1636,8 +1691,11 @@ int main(int argc, char ** argv) {
             full = true;
         } else if (std::strcmp(argv[i], "--bench") == 0) {
             run_bench = true;
+        } else if (std::strcmp(argv[i], "--bench-gemv") == 0) {
+            run_gemv = true;
         } else {
-            std::fprintf(stderr, "usage: %s [--expect-device | --expect-none] [--full] [--bench]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-gemv]\n",
+                         argv[0]);
             return 2;
         }
     }
@@ -1676,7 +1734,7 @@ int main(int argc, char ** argv) {
         check_layer(dev) != 0) {
         return 1;
     }
-    if (run_bench && bench(dev) != 0) {
+    if (run_bench ? bench(dev) != 0 : run_gemv && bench_gemv(dev) != 0) {
         return 1;
     }
     if (g_failures != 0) {
