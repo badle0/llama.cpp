@@ -464,6 +464,42 @@ Implementation notes: the dispatch calls `_m4` once and asserts at most 32 colum
 
 **What M2c.2 leaves:** the X100 cores then run only attention and the token embedding lookup. Generation would be about 130 ms per token against `ime`'s 90.5. Besides attention (M2e), the 1-row matmuls: `ime` streams 2.46 GB of weights per token (Q4_0, Q4_1, Q8_0 head) in at most 90.5 ms, so its 1-row matmuls run at 27 GB/s or more, while our direct GEMV path measures 23.6-25.5 GB/s (`build.md` §7). Each GB/s is about 4 ms per token; reaching 30 GB/s would save about 20 ms, more than M2c.2. Worth measuring after M2c.2: path B for 1 row (weight slabs staged in TCM), which `ime` uses there.
 
+### 1-row matmul bandwidth (2026-10-10)
+
+**Status:** measurement prepared 2026-10-10 (user decision: before M2e; time box: one K3 run); not yet run.
+
+**Question.** After M2c, Qwen3-4B generates at 127.6 ms per token against `ime`'s 90.7. About 99 ms of ours are 1-row matmuls streaming 2.46 GB of weights (Q4_0, Q4_1, the Q8_0 head), and every one of them measures 23.6-25.5 GB/s, whatever its format (`build.md` §7). `ime` streams the same 2.46 GB in at most 90.7 ms, so its 1-row matmuls run at 27.1 GB/s or more, about 29 if its other work takes about 5 ms (estimate). At 29 GB/s ours would take about 85 ms: about 14 ms less per token, +12% generation.
+
+**Hypothesis.** Our 1-row kernels read the weights straight from DRAM and use each 512-byte vector load right after issuing it, so a core waits for memory about once per block: 3.1 GB/s per core is what one such load in flight gives at about 165 ns of latency (estimate). The in-tree path (path B) first copies 32-column weight slabs into TCM with `memcpy1d`, which keeps two 1 KB loads in flight, then multiplies from TCM, and staggers the two cores of each pair with a barrier so that one copies while the other multiplies. ggml-spacemit kept direct reads for Q4_0 (faster there, by its measurement) and staged the other types.
+
+**Measurement** (test-only switch `FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>]`, read at every call; unset, the provider behaves as before):
+
+| Strategy | What it does |
+|---|---|
+| `direct[:c]` (c = 128) | today's path: weights from DRAM, c columns per kernel call, calls dealt round-robin to the tiles |
+| `range` | each tile one contiguous range of columns (longer sequential streams) |
+| `staged[:c]` (c = 64), `staged-range[:c]` | c columns at a time copied into TCM with `memcpy1d`, then multiplied there (path B without the pair barrier, which our executor does not allow inside a step, §2.4); slabs shrink to fit the 384 KiB TCM |
+| `copy[:c]`, `compute[:c]` | staging's copies alone (the ceiling for staging: DRAM to TCM) or its multiplications alone (the kernels' speed from TCM); wrong results, timing only |
+| `prefetch[:c]` (c = 32), `prefetch-range[:c]` | direct, each call first hinting the tile's next chunk into the caches with Zicbop `prefetch.r` (whether the core honours it, and into which cache, is not documented) |
+
+- Correctness: every strategy returns the same bytes as direct, checked by `flagos-check-spacemit` at 6 shapes (partial chunks, ranges and slabs; slabs that shrink; all four weight types). On the Mac it gives the serial stand-in a TCM (new test-only `FLAGOS_SPACEMIT_TEST_TCM`), which also runs the 1-row path and path A there for the first time. A copy-only control must differ, proving the strategies ran. Mutations confirmed: a staged strategy that skips a slab fails; without the TCM stand-in the control fails.
+- Speed: `flagos-check-spacemit --bench` times every strategy at the 7 shapes of a token's 1-row matmuls and prints per-token totals, weighted by how often a token runs each shape (36 q; 72 k and v; 36 attention outputs; 72 gate and up; 32 Q4_0 and 4 Q4_1 down; the head). Each run is its own launch, so the totals include about 250 launches the model does not pay; the comparison between strategies is what counts.
+- Reference: `docs/flagos-k3/scripts/ime-gemv-bench.cpp` times the upstream IME path (`ime`) at the same shapes through ggml-cpu's `CPU_RISCV64_SPACEMIT` buffer type, each result also compared with ggml-cpu's plain path to show that the IME path ran.
+
+**Decision rule.** Adopt the fastest strategy as the 1-row path if its per-token total is at least 5% below direct (its results are identical, so accuracy cannot change), confirm with tg128 against today's numbers, then remove the switch and the strategies that lost. If none wins: `copy` about as slow as direct means DRAM is the ceiling, `ime`'s advantage lies elsewhere (no handoffs; attention on the AI cores), and M2e is next; `ime-gemv-bench` clearly faster than every strategy points to path B's pair staggering, which needs a wait inside a step: decide then.
+
+**On the K3:**
+```bash
+cd ~/llama.cpp-flagos && git -c safe.directory=$PWD pull
+cmake --build build-flagos --target ggml-flagos flagos-check-spacemit -j 8 2>&1 | tail -1
+~/tcmtest/tcmrelease --apply && ./build-flagos/bin/flagos-check-spacemit --expect-device --bench > ~/gemv-bench.txt 2>&1; tail -1 ~/gemv-bench.txt
+grep -E '^(gemv|bench    gemv)' ~/gemv-bench.txt
+cmake --build build-ime --target ggml ggml-cpu -j 8 2>&1 | tail -1      # the IME build, current tree
+g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench.cpp -Lbuild-ime/bin \
+  -lggml -lggml-base -lggml-cpu -Wl,-rpath,$PWD/build-ime/bin -o ~/ime-gemv-bench
+~/tcmtest/tcmrelease --apply && OMP_THREAD_LIMIT=8 ~/ime-gemv-bench | tee ~/ime-gemv.txt
+```
+
 ### M3 - AOT package (Design Phase 3, only if D9 is accepted)
 
 - Generator `tools/generate_flagos_spacemit_kernels.py`, modelled on the AMD generator: compile FlagOS's shared Triton kernels (`ggml/src/ggml-flagos/kernels/generate_flagos_kernels.py`) with `triton.compile(ASTSource(...), target=AICPUTarget(...))` and take `asm["so"]`. Cross-compile on x86 with SpacemiT's toolchain; FlagTree's documented flow is x86 + Docker.

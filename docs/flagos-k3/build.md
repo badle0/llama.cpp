@@ -136,7 +136,7 @@ $B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on -ub 1 --kl-
 
 Mac: same CMake options plus `-DGGML_METAL=OFF -DGGML_BLAS=OFF`; the provider compiles but finds no device (`flagos-check-spacemit` reports "device checks skipped").
 
-Mac host-test device (from M2d): in a separate build directory, `-DFLAGOS_SPACEMIT_HOST_TEST_DEVICE=ON` exposes a simulated device (8 tiles run one after another by the serial executor, reference kernels), so the provider's claims, tiling, executor and reference kernels run every claimed `test-backend-ops` case before the K3. The RVV and IME kernels compile only on the K3, so the K3 run is still needed. The option exists only off riscv64, and is for tests: llama.cpp would also use the simulated device in model runs.
+Mac host-test device (from M2d): in a separate build directory, `-DFLAGOS_SPACEMIT_HOST_TEST_DEVICE=ON` exposes a simulated device (8 tiles run one after another by the serial executor, reference kernels), so the provider's claims, tiling, executor and reference kernels run every claimed `test-backend-ops` case before the K3. The RVV and IME kernels compile only on the K3, so the K3 run is still needed. The option exists only off riscv64, and is for tests: llama.cpp would also use the simulated device in model runs. The serial stand-in has no TCM unless `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` gives it one (heap memory); `flagos-check-spacemit` sets it to 384 KiB for its 1-row strategy check, so the 1-row path and path A run on the Mac too.
 ```bash
 cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF \
   -DGGML_FLAGOS_SPACEMIT=ON -DFLAGOS_SPACEMIT_HOST_TEST_DEVICE=ON -DGGML_METAL=OFF -DGGML_BLAS=OFF

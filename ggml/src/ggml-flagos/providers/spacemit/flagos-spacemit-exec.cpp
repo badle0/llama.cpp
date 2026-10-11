@@ -130,10 +130,23 @@ class spert_executor final : public spacemit_executor {
 
 #else
 
-// runs the tiles one after another on the calling thread; lets the full path be tested on hosts without the AI cores
+// runs the tiles one after another on the calling thread; lets the full path be tested on hosts without the AI cores.
+// test-only: FLAGOS_SPACEMIT_TEST_TCM=<bytes> gives the tiles a stand-in for TCM in heap memory, so that the paths that
+// need TCM (the 1-row path, path A) run there too; one buffer serves all tiles, as they never run at the same time
 class serial_executor final : public spacemit_executor {
   public:
-    serial_executor(uint32_t n_tiles, int64_t fail_step) : n_tiles(n_tiles), fail_step(fail_step) {}
+    serial_executor(uint32_t n_tiles, int64_t fail_step) : n_tiles(n_tiles), fail_step(fail_step) {
+        const char * value = std::getenv("FLAGOS_SPACEMIT_TEST_TCM");
+        const size_t size  = value != nullptr ? (size_t) std::max(0LL, std::atoll(value)) : 0;
+        tcm                = size > 0 ? ggml_aligned_malloc(size) : nullptr;
+        tcm_size           = tcm != nullptr ? size : 0;
+    }
+
+    ~serial_executor() override {
+        if (tcm != nullptr) {
+            ggml_aligned_free(tcm, tcm_size);
+        }
+    }
 
     bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
         spacemit_launch launch;
@@ -142,7 +155,7 @@ class serial_executor final : public spacemit_executor {
         launch.fail_step = fail_step;
         for (size_t i = 0; i < steps.size() && !launch.failed.load(); i++) {
             for (uint32_t ith = 0; ith < n_tiles; ith++) {
-                if (!spacemit_run_step(launch, i, { ith, n_tiles, nullptr, 0, workspace, workspace_size })) {
+                if (!spacemit_run_step(launch, i, { ith, n_tiles, tcm, tcm_size, workspace, workspace_size })) {
                     launch.failed.store(true);
                 }
             }
@@ -155,6 +168,8 @@ class serial_executor final : public spacemit_executor {
   private:
     uint32_t n_tiles;
     int64_t  fail_step;
+    void *   tcm      = nullptr;
+    size_t   tcm_size = 0;
 };
 
 #endif

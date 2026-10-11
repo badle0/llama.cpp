@@ -98,6 +98,106 @@ void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, 
     }
 }
 
+// test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>] picks how a single activation row (generation) is multiplied,
+// for the 1-row bandwidth measurement (plan.md, "1-row matmul bandwidth"). Read at every call, so a benchmark can switch
+// between runs; unset or unknown means direct.
+// - direct[:c] (c = 128): weights read straight from DRAM, c columns per kernel call, calls dealt round-robin to tiles
+// - range: each tile one contiguous range of columns, 128 per call
+// - staged[:c] (c = 64): c columns at a time copied into TCM (memcpy1d), then multiplied there; slabs dealt round-robin.
+//   A slab shrinks to the largest multiple of 32 columns that fits the TCM after the activation row
+// - staged-range[:c]: the same over contiguous ranges
+// - copy[:c], compute[:c]: staged's copies alone, or its multiplications alone (one slab copied once), to time the two
+//   halves; their results are wrong
+// - prefetch[:c] (c = 32), prefetch-range[:c]: direct or range in calls of c columns, each call first hinting the
+//   tile's next chunk into the caches (Zicbop prefetch.r, spacemit_ime::prefetch)
+struct gemv_strategy {
+    enum kind_t { direct, range, staged, staged_range, copy_only, compute_only, prefetch, prefetch_range };
+    kind_t  kind = direct;
+    int64_t cols = 4 * nb_cols;
+};
+
+gemv_strategy gemv_strategy_from_env() {
+    static const struct {
+        const char *          name;
+        gemv_strategy::kind_t kind;
+        int64_t               cols;
+    } names[] = {
+        { "direct", gemv_strategy::direct, 4 * nb_cols },        { "range", gemv_strategy::range, 4 * nb_cols },
+        { "staged", gemv_strategy::staged, 2 * nb_cols },        { "staged-range", gemv_strategy::staged_range, 2 * nb_cols },
+        { "copy", gemv_strategy::copy_only, 2 * nb_cols },       { "compute", gemv_strategy::compute_only, 2 * nb_cols },
+        { "prefetch", gemv_strategy::prefetch, nb_cols },        { "prefetch-range", gemv_strategy::prefetch_range, nb_cols },
+    };
+    gemv_strategy s;
+    const char *  v = std::getenv("FLAGOS_SPACEMIT_GEMV");
+    if (v == nullptr) {
+        return s;
+    }
+    const size_t len = std::strcspn(v, ":");
+    for (const auto & n : names) {
+        if (std::strlen(n.name) == len && std::strncmp(v, n.name, len) == 0) {
+            s.kind = n.kind;
+            s.cols = n.cols;
+            if (v[len] == ':' && std::atoll(v + len + 1) >= nb_cols) {
+                s.cols = std::atoll(v + len + 1) / nb_cols * nb_cols;
+            }
+        }
+    }
+    return s;
+}
+
+// columns [c0, c1) of tile ith when every tile takes one contiguous range of whole 32-column groups
+void tile_range(int64_t n, int64_t ith, int64_t nth, int64_t & c0, int64_t & c1) {
+    const int64_t per = div_up(div_up(n, nb_cols), nth) * nb_cols;
+    c0                = std::min(ith * per, n);
+    c1                = std::min(c0 + per, n);
+}
+
+// one activation row, already quantized into the start of the tile's TCM, times all weight rows (gemv_strategy)
+void gemv(const gemv_strategy & s, uint8_t * tcm, size_t tcm_size, const uint8_t * w, float * out, const mm_dims & d,
+          int64_t ith, int64_t nth, bool reference) {
+    const int64_t a_off = GGML_PAD(d.a_row_bytes, 64);
+    const int64_t fit   = (int64_t) tcm_size > a_off ? ((int64_t) tcm_size - a_off) / d.b_row_bytes / nb_cols * nb_cols : 0;
+    const int64_t slab  = std::min(s.cols, fit);
+
+    const bool staged = s.kind == gemv_strategy::staged || s.kind == gemv_strategy::staged_range ||
+                        s.kind == gemv_strategy::copy_only || s.kind == gemv_strategy::compute_only;
+    if (!staged || slab < nb_cols) {
+        const bool    hint  = s.kind == gemv_strategy::prefetch || s.kind == gemv_strategy::prefetch_range;
+        const int64_t chunk = staged ? 4 * nb_cols : s.cols;  // a staged strategy without room in TCM: direct
+        int64_t       c0 = ith * chunk, c1 = d.n, step = chunk * nth;
+        if (s.kind == gemv_strategy::range || s.kind == gemv_strategy::prefetch_range) {
+            tile_range(d.n, ith, nth, c0, c1);
+            step = chunk;
+        }
+        for (int64_t n0 = c0; n0 < c1; n0 += step) {
+            if (hint && n0 + step < c1) {
+                spacemit_ime::prefetch(w + (n0 + step) * d.b_row_bytes, std::min(c1 - n0 - step, chunk) * d.b_row_bytes);
+            }
+            d.f->gemm(tcm, w + n0 * d.b_row_bytes, out + n0, 1, std::min(c1 - n0, chunk), d.k_blocks, d.n, reference);
+        }
+        return;
+    }
+
+    uint8_t * buf  = tcm + a_off;
+    int64_t   c0   = ith * slab, c1 = d.n, step = slab * nth;
+    if (s.kind == gemv_strategy::staged_range) {
+        tile_range(d.n, ith, nth, c0, c1);
+        step = slab;
+    }
+    if (s.kind == gemv_strategy::compute_only && c0 < c1) {
+        spacemit_ime::copy(buf, w + c0 * d.b_row_bytes, std::min(c1 - c0, slab) * d.b_row_bytes);
+    }
+    for (int64_t n0 = c0; n0 < c1; n0 += step) {
+        const int64_t cols = std::min(c1 - n0, slab);
+        if (s.kind != gemv_strategy::compute_only) {
+            spacemit_ime::copy(buf, w + n0 * d.b_row_bytes, cols * d.b_row_bytes);
+        }
+        if (s.kind != gemv_strategy::copy_only) {
+            d.f->gemm(tcm, buf, out + n0, 1, cols, d.k_blocks, d.n, reference);
+        }
+    }
+}
+
 }  // namespace
 
 size_t spacemit_mul_mat_workspace(const ggml_tensor * node) {
@@ -152,16 +252,13 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     const int64_t   ith       = tile.ith;
     const int64_t   nth       = tile.nth;
 
-    // one row (generation): the quantized row in TCM, weights read straight from DRAM, 128 columns per call
-    // (ggml-spacemit ime.cpp:421, which found this faster than staging Q4_0 weights in TCM; it stages the weights of
-    // the other types in TCM, its path B, which we do not have: plan.md, M2c and M2c.2 designs)
+    // one row (generation): the quantized row in TCM; by default the weights are read straight from DRAM, 128 columns
+    // per call (ggml-spacemit ime.cpp:421, which found this faster than staging Q4_0 weights in TCM; it stages the weights
+    // of the other types in TCM, its path B). The other strategies of gemv_strategy are for the 1-row bandwidth
+    // measurement
     if (d.m == 1 && tcm != nullptr && (size_t) d.a_row_bytes <= tile.tcm_size) {
         spacemit_ime::copy(tcm, qa, d.a_row_bytes);
-        constexpr int64_t tile_cols = 4 * nb_cols;
-        for (int64_t n0 = ith * tile_cols; n0 < d.n; n0 += tile_cols * nth) {
-            d.f->gemm(tcm, w + n0 * d.b_row_bytes, out + n0, 1, std::min(d.n - n0, tile_cols), d.k_blocks, d.n,
-                      reference);
-        }
+        gemv(gemv_strategy_from_env(), tcm, tile.tcm_size, w, out, d, ith, nth, reference);
         return true;
     }
 

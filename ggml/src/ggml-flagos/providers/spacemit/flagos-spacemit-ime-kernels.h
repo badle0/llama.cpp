@@ -88,6 +88,9 @@ size_t q8_0_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
 // copy into or out of TCM
 void copy(void * dst, const void * src, size_t size);
 
+// a read hint (Zicbop prefetch.r) for every 64 bytes of [p, p + size); a no-op without the IME build
+void prefetch(const void * p, size_t size);
+
 // GGUF bytes <-> IME layout in t->data; repack returns 0 on success. unpack_q4_0 and unpack_q8_0 restore the GGUF
 // bytes; unpack_q4_1 returns the converted tensor (m = -zp * d), the weights the kernels compute with; unpack_q6_k
 // returns the nearest Q6_K to the stored Q8_0 values (approximate). repack_q6_k writes

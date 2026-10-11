@@ -106,7 +106,7 @@ def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
                        env_extra=env_extra, timeout=timeout)
     detail = "; ".join(ln for ln in out.splitlines()
                        if ln.startswith(("device", "flagos ", "ops ", "matmul   Q4_0", "matmul   Q4_1", "matmul   Q8_0",
-                                         "matmul   Q6_K", "rows ", "layer")))
+                                         "matmul   Q6_K", "gemv ", "rows ", "layer")))
     fails = [ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln]
     report(name, rc == 0, detail if rc == 0 else "; ".join(fails[:3]) or last_line(err))
     for ln in out.splitlines():
@@ -186,7 +186,9 @@ def op_correctness(bdir, logs, milestone):
 
 def bench(bdir, logs):
     rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device", "--bench"], logs / "bench", timeout=900)
-    lines = [ln.split("bench", 1)[1].strip() for ln in out.splitlines() if ln.startswith("bench")]
+    # the 1-row strategy table (one line per shape and strategy) stays in the log; its per-token totals are shown
+    lines = [ln.split("bench", 1)[1].strip() for ln in out.splitlines()
+             if ln.startswith("bench") and (not ln.startswith("bench    gemv ") or " per Qwen3-4B token " in ln)]
     report("benchmark ran", rc == 0 and len(lines) >= 3, f"rc={rc}" + ("" if rc == 0 else f": {last_line(err)}"))
     for ln in lines:
         info("benchmark", ln)

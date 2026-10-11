@@ -105,7 +105,7 @@ Zero-copy between same-memory devices (former question 6) is handled at the ggml
 
 ## 8. Next steps (in order)
 
-Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone: to decide (M2c done 2026-10-10): M2e (attention) or first the 1-row matmul bandwidth (path B for 1 row), see next steps.
+Full milestone list with tests and exit criteria: `plan.md` §4. Current milestone: the 1-row matmul bandwidth measurement (user decision 2026-10-10; `plan.md` "1-row matmul bandwidth"), then M2e.
 
 1. ~~TCM isolation~~ done 2026-10-07: TCM works with the IME path (`k3-hardware.md` §4).
 2. M0.1–M0.2: build and run `ggml-spacemit` with spine-runtime (`build.md` §5), with `scripts/spacemit-device-type.patch` applied; `scripts/spert-info.cpp` shows whether `shared_buffer()` is real TCM.
@@ -121,4 +121,4 @@ Full milestone list with tests and exit criteria: `plan.md` §4. Current milesto
 12. ~~M2c.1~~ done 2026-10-10 on the K3 (`build.md` §7): Q4_1 matmuls on the IME, 75 splits, pp128 83.5, tg128 7.22, mean KLD 0.0032 / 0.0020. Next: M2c.2 (the Q6_K output head; accuracy judged by its KLD increase over M2c.1), then M2e.
 13. M2c.2 designed 2026-10-10 (`plan.md` "M2c.2 design"): the in-tree route (Q6_K requantized to Q8_0 at load, `gemm_kernel_i8i8`), Q8_0 weights too, reads of the head return the nearest Q6_K. Expected tg128 +6% on 4B, +10% on 0.6B. Found while designing: the IME path's 1-row matmuls run at 27 GB/s or more against our 24, worth about 20 ms per token; measure path B for 1 row after M2c.2.
 14. ~~M2c.2~~ done 2026-10-10 on the K3 (`build.md` §7): 29/29, 74 splits, the head 16.6 ms per token (X100: 26.0), tg128 7.84, mean KLD +0.0001 / +0.0002 over M2c.1. M2c done for the Qwen3 targets.
-15. Next, to decide: M2e (attention on the AI cores; decisive beyond about 1k tokens of context, +445 ms per token at 4096 on the X100 cores) or first the 1-row matmul bandwidth (`ime` reaches at least 27 GB/s against our 24.9; about 17 ms per token at 30 GB/s; path B for 1 row, `plan.md` "What M2c.2 leaves").
+15. 1-row matmul bandwidth first, then M2e (user decision 2026-10-10). Measurement prepared 2026-10-10 (`plan.md` "1-row matmul bandwidth"): test-only strategies behind `FLAGOS_SPACEMIT_GEMV` (direct, contiguous ranges, staged in TCM, prefetch hints, and staging's two halves alone), each checked identical to direct; their times at a token's shapes (`flagos-check-spacemit --bench`) and the upstream IME path's at the same shapes (`scripts/ime-gemv-bench.cpp`). Adopt a strategy if it is at least 5% faster per token; otherwise go to M2e.
