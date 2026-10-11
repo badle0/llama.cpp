@@ -2,10 +2,10 @@
 // ggml-cpu's CPU_RISCV64_SPACEMIT extra buffer type (the `ime` mode of build.md §7), at every 1-row matmul shape of a
 // Qwen3-4B token, and the per-token total weighted as in `flagos-check-spacemit --bench` (lines "gemv").
 // Also each result against ggml-cpu's plain path on the same weights, to show that the IME path ran and is right.
-// Build on the K3 against the IME build (build-ime, GGML_CPU_RISCV64_SPACEMIT=ON), from the repository root:
-//   g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench.cpp -Lbuild-ime/bin \
-//       -lggml -lggml-base -lggml-cpu -Wl,-rpath,$PWD/build-ime/bin -o ~/ime-gemv-bench
-// Run: ~/tcmtest/tcmrelease --apply && OMP_THREAD_LIMIT=8 ~/ime-gemv-bench
+// Build on the K3 against the IME build (build-ime, GGML_CPU_RISCV64_SPACEMIT=ON), from the repository root, on one line:
+//   g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench.cpp build-ime/bin/libggml.so
+//       build-ime/bin/libggml-base.so build-ime/bin/libggml-cpu.so -Wl,-rpath,$PWD/build-ime/bin -o ~/ime-gemv-bench
+// Run: ~/tcmtest/tcmrelease --apply > /dev/null && OMP_THREAD_LIMIT=8 ~/ime-gemv-bench
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"

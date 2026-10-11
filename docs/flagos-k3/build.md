@@ -274,6 +274,30 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
   The head's requantization adds 0.00010 (512-token batches) and 0.00017 (`-ub 1`) to the mean KLD, under the exit limit of 0.0005 and about the 0.0002 estimated from the logit noise; the tails (99%, maximum) and the same-top-token rate do not move beyond noise. With the same conversions as `ime` (Q4_1 zero points, Q6_K -> Q8_0), the provider is slightly closer to the CPU than `ime` is.
 - Remaining generation time (estimates): about 99 ms streaming 2.46 GB of weights at about 25 GB/s, about 9 ms for 74 handoffs, about 20 ms for attention on the X100 cores, the embedding lookup and the other ops; `ime` takes 90.7 ms, so its 1-row matmuls run at 27 GB/s or more. Qwen3-0.6B not run (expected 58 splits).
 
+
+**1-row matmul strategies, 2026-10-11** (`plan.md` "1-row matmul bandwidth"; commit `a522799`, `flagos-check-spacemit --bench`, test-only `FLAGOS_SPACEMIT_GEMV`; us per 1-row matmul, 30 repetitions, 5 for the head; per-token total = the shapes weighted by how often a Qwen3-4B token runs them: 36 q, 72 k and v, 36 attention outputs, 72 gate and up, 32 + 4 down, 1 head; 2460 MB of weights):
+
+| Strategy | q 2560x4096 | k, v 2560x1024 | attn out 4096x2560 | gate, up 2560x9728 | down 9728x2560 | down Q4_1 | head (Q8_0) 2560x151936 | per token |
+|---|---|---|---|---|---|---|---|---|
+| direct (128 columns per call, the old path) | 259 | 30 | 262 | 606 | 603 | 586 | 16624 | 102.8 ms |
+| direct:32 | 256 | 28 | 253 | 595 | 607 | 571 | 16849 | 101.8 |
+| direct:512 (5 of 8 tiles busy at 2560 columns) | 265 | 130 | 217 | 602 | 533 | 565 | 16660 | 106.0 |
+| range | 265 | 30 | 258 | 613 | 609 | 574 | 16847 | 103.8 |
+| **staged:32 (adopted)** | **232** | 36 | **234** | **518** | 585 | 610 | 14943 | **92.7** |
+| staged:64 | 246 | 35 | 243 | 545 | 628 | 710 | 15896 | 98.1 |
+| staged:128 | 268 | 36 | 271 | 587 | 639 | 707 | 15770 | 103.3 |
+| staged:256 | 285 | 151 | 266 | 633 | 645 | 708 | 15140 | 114.8 |
+| staged-range:64 | 252 | 36 | 243 | 567 | 704 | 744 | 14323 | 101.0 |
+| prefetch:32 | 334 | 122 | 326 | 695 | 1180 | 1121 | 22091 | 146.9 |
+| prefetch:64 | 364 | 94 | 422 | 785 | 1099 | 1107 | 31611 | 162.8 |
+| prefetch-range:32 | 320 | 115 | 324 | 701 | 1122 | 1127 | 22537 | 144.9 |
+| copy:64 (staging's copies alone) | 232 | 22 | 232 | 550 | 580 | 591 | 15719 | 94.5 |
+| compute:64 (its multiplications alone) | 70 | 31 | 73 | 140 | 254 | 309 | 3538 | 30.4 |
+
+- Every strategy gave the same bytes as direct (`flagos-check-spacemit`: 72/72, the copy-only control differs). Each run is its own launch, so the per-token totals include about 250 launches (about 4 ms) the model does not pay.
+- k and v (1.5 MB each) stay in a cache across the repetitions (30 us = 49 GB/s); a token reads them once, from DRAM. With 1024 columns, `direct:512` and `staged:256` leave 6 and 4 tiles without work there.
+- Reading in `plan.md`: staging wins because its copies (`memcpy1d`) and the interleaving of copy and multiply phases keep fewer tiles streaming from DRAM at once, which then delivers more in total (`direct:512` with 5 busy tiles: 27 GB/s on the down projection, against 23 with 8).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

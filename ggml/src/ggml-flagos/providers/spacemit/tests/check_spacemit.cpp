@@ -900,15 +900,15 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     return 0;
 }
 
-// the 1-row strategies of FLAGOS_SPACEMIT_GEMV (the 1-row bandwidth measurement, plan.md); bench() times them
-static const char * const k_gemv_strategies[] = { "direct",     "direct:32",       "direct:512",  "range",
-                                                  "staged:32",  "staged:64",       "staged:128",  "staged:256",
-                                                  "staged-range:64", "prefetch:32", "prefetch:64", "prefetch-range:32" };
+// the 1-row strategies of FLAGOS_SPACEMIT_GEMV (plan.md, "1-row matmul bandwidth"): the default (staged:32, unset), the
+// others, and some on fewer tiles (@t); bench_gemv() times them
+static const char * const k_gemv_strategies[] = { "staged",     "staged:64",  "staged:128", "staged:256", "staged@5",
+                                                  "direct",     "direct:32",  "direct:512", "direct:32@6" };
 
-// every strategy gives the same bytes as the default: the same kernel on the same data, only the weights' path (DRAM or
-// a copy in TCM) and the tile of each column differ. The output is filled with NaN first, so skipped columns show. The
-// strategies need TCM: on a host without the AI cores the serial stand-in gets the K3's 384 KiB (spine-runtime ignores
-// the variable)
+// every strategy gives the same bytes as reading the weights straight from DRAM: the same kernel on the same data, only
+// the weights' path (DRAM or a copy in TCM) and the tile of each column differ. The output is filled with NaN first, so
+// skipped columns show. The strategies need TCM: on a host without the AI cores the serial stand-in gets the K3's
+// 384 KiB (spine-runtime ignores the variable)
 static int check_gemv_strategies(ggml_backend_dev_t dev) {
     set_env("FLAGOS_SPACEMIT_TEST_TCM", "393216");
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -952,7 +952,7 @@ static int check_gemv_strategies(ggml_backend_dev_t dev) {
             return ok && std::memcmp(out.data(), ref.data(), ggml_nbytes(run.y)) == 0;
         };
         for (const char * strategy : k_gemv_strategies) {
-            if (!run_strategy(strategy)) {
+            if (!run_strategy(strategy) || (strategy == k_gemv_strategies[0] && !run_strategy(nullptr))) {
                 std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld: strategy %s differs from direct\n",
                              ggml_type_name(s.type), (long long) s.k, (long long) s.n, strategy);
                 g_failures++;
@@ -963,7 +963,7 @@ static int check_gemv_strategies(ggml_backend_dev_t dev) {
         }
         // control: copy only stages the weights and never multiplies, so its output must differ; if it does not, the
         // strategies were not used (no TCM: path C instead) and the comparisons above prove nothing
-        if (run_strategy("copy:64")) {
+        if (run_strategy("copy")) {
             std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld: the 1-row strategies are not in use (no TCM?)\n",
                          ggml_type_name(s.type), (long long) s.k, (long long) s.n);
             g_failures++;
@@ -973,8 +973,8 @@ static int check_gemv_strategies(ggml_backend_dev_t dev) {
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
-    std::printf("gemv     1-row strategies (direct:32/128/512, range, staged:32/64/128/256, staged-range:64, prefetch:32/64, "
-                "prefetch-range:32) at 6 shapes "
+    std::printf("gemv     1-row strategies (the default staged:32, staged:64/128/256, staged@5, direct:32/128/512, "
+                "direct:32@6) at 6 shapes "
                 "with TCM: %d/%d identical to direct (copy-only control differs); direct vs CPU max NMSE %.2e (bound %.0e)%s\n",
                 n_same, n_runs, worst, k_mul_mat_max_nmse,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
@@ -1473,10 +1473,11 @@ static double ime_row_bytes(ggml_type type, int64_t k) {
 }
 
 // the 1-row strategies (FLAGOS_SPACEMIT_GEMV; plan.md, "1-row matmul bandwidth") at every 1-row matmul shape of a
-// Qwen3-4B token, plus copy:64 and compute:64 (staging's two halves alone, wrong results), and the time each strategy
-// gives a whole token: the shapes weighted by how often a token runs them (q; k and v; attention output; gate and up;
-// down in Q4_0 and in Q4_1; the head). Each run is its own launch, so per token these include about 250 launches the
-// model does not pay
+// Qwen3-4B token, and the time each gives a whole token: the shapes weighted by how often a token runs them (q; k and v;
+// attention output; gate and up; down in Q4_0 and in Q4_1; the head). Besides the default (staged:32) and direct reads:
+// staging's two halves alone (copy, compute; wrong results), and runs on fewer tiles (@t), which show how the bandwidth
+// depends on the number of tiles streaming from DRAM at once. Each run is its own launch, so per token these include
+// about 250 launches the model does not pay
 static int bench_gemv(ggml_backend_dev_t dev) {
     set_env("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the serial stand-in's TCM (check_gemv_strategies)
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -1488,9 +1489,10 @@ static int bench_gemv(ggml_backend_dev_t dev) {
         { GGML_TYPE_Q4_0, 2560, 9728, 72 }, { GGML_TYPE_Q4_0, 9728, 2560, 32 }, { GGML_TYPE_Q4_1, 9728, 2560, 4 },
         { GGML_TYPE_Q6_K, 2560, 151936, 1 },
     };
-    std::vector<std::string> strategies(std::begin(k_gemv_strategies), std::end(k_gemv_strategies));
-    strategies.push_back("copy:64");
-    strategies.push_back("compute:64");
+    const std::vector<std::string> strategies = { "staged",      "staged:64",   "direct",      "direct:32",
+                                                  "direct:512",  "copy",        "compute",     "staged@6",
+                                                  "staged@5",    "staged@4",    "direct:32@6", "direct:32@5",
+                                                  "direct:32@4", "copy@6",      "copy@4",      "copy@2" };
     std::vector<double> per_token(strategies.size(), 0.0);
     double              token_bytes = 0.0;
     for (const gemv_shape & s : shapes) {

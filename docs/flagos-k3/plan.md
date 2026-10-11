@@ -466,7 +466,7 @@ Implementation notes: the dispatch calls `_m4` once and asserts at most 32 colum
 
 ### 1-row matmul bandwidth (2026-10-10)
 
-**Status:** measurement prepared 2026-10-10 (user decision: before M2e; time box: one K3 run); not yet run.
+**Status:** measured on the K3 2026-10-11 (commit `a522799`; table in `build.md` §7). Staging the weights through TCM in 32-column slabs (`staged:32`) is 9.8% faster per token than today's direct reads and is adopted as the 1-row path (not yet committed). Pending, one K3 run: tg128 with it, the tile-count series, and the IME reference (its link failed).
 
 **Question.** After M2c, Qwen3-4B generates at 127.6 ms per token against `ime`'s 90.7. About 99 ms of ours are 1-row matmuls streaming 2.46 GB of weights (Q4_0, Q4_1, the Q8_0 head), and every one of them measures 23.6-25.5 GB/s, whatever its format (`build.md` §7). `ime` streams the same 2.46 GB in at most 90.7 ms, so its 1-row matmuls run at 27.1 GB/s or more, about 29 if its other work takes about 5 ms (estimate). At 29 GB/s ours would take about 85 ms: about 14 ms less per token, +12% generation.
 
@@ -477,10 +477,11 @@ Implementation notes: the dispatch calls `_m4` once and asserts at most 32 colum
 | Strategy | What it does |
 |---|---|
 | `direct[:c]` (c = 128) | today's path: weights from DRAM, c columns per kernel call, calls dealt round-robin to the tiles |
-| `range` | each tile one contiguous range of columns (longer sequential streams) |
-| `staged[:c]` (c = 64), `staged-range[:c]` | c columns at a time copied into TCM with `memcpy1d`, then multiplied there (path B without the pair barrier, which our executor does not allow inside a step, §2.4); slabs shrink to fit the 384 KiB TCM |
+| `range` | each tile one contiguous range of columns (longer sequential streams); removed 2026-10-11, no gain |
+| `staged[:c]` (c = 64; 32 from 2026-10-11, the default), `staged-range[:c]` | c columns at a time copied into TCM with `memcpy1d`, then multiplied there (path B without the pair barrier, which our executor does not allow inside a step, §2.4); slabs shrink to fit the 384 KiB TCM. `staged-range` removed 2026-10-11 |
 | `copy[:c]`, `compute[:c]` | staging's copies alone (the ceiling for staging: DRAM to TCM) or its multiplications alone (the kernels' speed from TCM); wrong results, timing only |
-| `prefetch[:c]` (c = 32), `prefetch-range[:c]` | direct, each call first hinting the tile's next chunk into the caches with Zicbop `prefetch.r` (whether the core honours it, and into which cache, is not documented) |
+| `prefetch[:c]` (c = 32), `prefetch-range[:c]` | direct, each call first hinting the tile's next chunk into the caches with Zicbop `prefetch.r`; removed 2026-10-11 (41-58% slower) |
+| `@t` (added 2026-10-11) | only the first t tiles take part, the others wait: how the bandwidth depends on the number of tiles streaming at once |
 
 - Correctness: every strategy returns the same bytes as direct, checked by `flagos-check-spacemit` at 6 shapes (partial chunks, ranges and slabs; slabs that shrink; all four weight types). On the Mac it gives the serial stand-in a TCM (new test-only `FLAGOS_SPACEMIT_TEST_TCM`), which also runs the 1-row path and path A there for the first time. A copy-only control must differ, proving the strategies ran. Mutations confirmed: a staged strategy that skips a slab fails; without the TCM stand-in the control fails.
 - Speed: `flagos-check-spacemit --bench` times every strategy at the 7 shapes of a token's 1-row matmuls and prints per-token totals, weighted by how often a token runs each shape (36 q; 72 k and v; 36 attention outputs; 72 gate and up; 32 Q4_0 and 4 Q4_1 down; the head). Each run is its own launch, so the totals include about 250 launches the model does not pay; the comparison between strategies is what counts.
@@ -488,16 +489,24 @@ Implementation notes: the dispatch calls `_m4` once and asserts at most 32 colum
 
 **Decision rule.** Adopt the fastest strategy as the 1-row path if its per-token total is at least 5% below direct (its results are identical, so accuracy cannot change), confirm with tg128 against today's numbers, then remove the switch and the strategies that lost. If none wins: `copy` about as slow as direct means DRAM is the ceiling, `ime`'s advantage lies elsewhere (no handoffs; attention on the AI cores), and M2e is next; `ime-gemv-bench` clearly faster than every strategy points to path B's pair staggering, which needs a wait inside a step: decide then.
 
+**Results (K3, 2026-10-11; per-token totals of the 7 shapes, table in `build.md` §7):** direct 102.8 ms (23.9 GB/s); `staged:32` 92.7 ms (26.5 GB/s, -9.8%), the only strategy past the 5% bar; `staged:64` 98.1; `staged:256` 114.8; `range` 103.8; `direct:512` 106.0; prefetch hints 145-163; staging's copies alone 94.5, its multiplications alone 30.4.
+- `staged:32` gains on q (-10%), the attention output (-11%), gate and up (-14.5%; 41% of a token's weight bytes) and the head (-10%), and loses a little on the Q4_1 down projection (+4%). Longer slabs lose: a tile then spends longer in each copy.
+- Staging is bound by its copies: `staged:32` takes about the time of the copies alone, and the kernels multiply a slab from TCM about three times faster than DRAM delivers it (30.4 ms per token), so their work hides while other tiles copy.
+- Fewer tiles streaming at once get more bandwidth in total: `direct:512` leaves only 5 of 8 tiles busy at the 2560-column shapes and still beats balanced 8-tile direct reads (down projection 533 vs 607 us, 27 vs 23 GB/s; attention output 217 vs 253). Staging likely wins the same way: a tile multiplying for about a third of its time leaves about 5-6 tiles streaming. The in-tree path B enforces 4 with its pair barrier. Measured next with `@t`.
+- Zicbop prefetch hints cost 41-58%: dropped.
+- k and v (1.5 MB each) stay in a cache across the benchmark's 30 repetitions (30 us, 49 GB/s); a token reads them once, so that column does not represent the model.
+
+**Decision (2026-10-11, by the rule above):** `staged:32` is the 1-row path. Direct reads remain the fallback where a 32-column slab does not fit the TCM (none of Qwen3's shapes). `range`, `staged-range` and the prefetch strategies are removed; `FLAGOS_SPACEMIT_GEMV` keeps `staged`, `direct`, `copy`, `compute` and `@t` for measurements. Results are identical bytes, so accuracy cannot change; checked at 6 shapes, and on the Mac the whole `flagos-check-spacemit` and `test-backend-ops` also pass with a TCM stand-in, where the new path runs everywhere. Expected: about 10 ms less per token, tg128 7.84 -> about 8.5.
+
 **On the K3:**
 ```bash
 cd ~/llama.cpp-flagos && git -c safe.directory=$PWD pull
 cmake --build build-flagos --target ggml-flagos flagos-check-spacemit -j 8 2>&1 | tail -1
-~/tcmtest/tcmrelease --apply && ./build-flagos/bin/flagos-check-spacemit --expect-device --bench > ~/gemv-bench.txt 2>&1; tail -1 ~/gemv-bench.txt
-grep -E '^(gemv|bench    gemv)' ~/gemv-bench.txt
+~/tcmtest/tcmrelease --apply > /dev/null && ./build-flagos/bin/flagos-check-spacemit --expect-device --bench > ~/gemv-bench.txt 2>&1; tail -1 ~/gemv-bench.txt
+awk '/^bench    gemv q/ { k = $3 ":" $4; if (!(k in seen)) { seen[k] = 1; col[++nc] = k } if (!($5 in sseen)) { sseen[$5] = 1; row[++nr] = $5 } t[$5, k] = $6 } /^bench    gemv per/ { tot[$10] = $11 } END { printf "%-17s", "us"; for (i = 1; i <= nc; i++) printf " %15s", col[i]; printf " %9s\n", "token ms"; for (j = 1; j <= nr; j++) { printf "%-17s", row[j]; for (i = 1; i <= nc; i++) printf " %15s", t[row[j], col[i]]; printf " %9s\n", tot[row[j]] } }' ~/gemv-bench.txt; grep '^gemv' ~/gemv-bench.txt
 cmake --build build-ime --target ggml ggml-cpu -j 8 2>&1 | tail -1      # the IME build, current tree
-g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench.cpp -Lbuild-ime/bin \
-  -lggml -lggml-base -lggml-cpu -Wl,-rpath,$PWD/build-ime/bin -o ~/ime-gemv-bench
-~/tcmtest/tcmrelease --apply && OMP_THREAD_LIMIT=8 ~/ime-gemv-bench | tee ~/ime-gemv.txt
+g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench.cpp build-ime/bin/libggml.so build-ime/bin/libggml-base.so build-ime/bin/libggml-cpu.so -Wl,-rpath,$PWD/build-ime/bin -o ~/ime-gemv-bench
+~/tcmtest/tcmrelease --apply > /dev/null && OMP_THREAD_LIMIT=8 ~/ime-gemv-bench | tee ~/ime-gemv.txt
 ```
 
 ### M3 - AOT package (Design Phase 3, only if D9 is accepted)

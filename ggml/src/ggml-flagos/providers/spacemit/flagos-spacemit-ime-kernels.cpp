@@ -3006,20 +3006,6 @@ size_t q8_0_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
     return 1;
 }
 
-// for the 1-row bandwidth measurement (flagos-spacemit-ime.cpp, gemv_strategy): Zicbop's prefetch.r hint for every 64
-// bytes of [p, p + size); this file is the one built with zicbop in its -march. A no-op without the IME build
-void prefetch(const void * p, size_t size) {
-#if defined(GGML_FLAGOS_SPACEMIT_IME2)
-    const char * c = static_cast<const char *>(p);
-    for (size_t i = 0; i < size; i += 64) {
-        __asm__ volatile("prefetch.r 0(%0)" : : "r"(c + i));
-    }
-#else
-    GGML_UNUSED(p);
-    GGML_UNUSED(size);
-#endif
-}
-
 // never inlined: memcpy1d's inline asm does not declare the vector registers it overwrites, so it must stay behind a
 // call, where the vector ABI makes every vector register caller-saved
 __attribute__((noinline)) void copy(void * dst, const void * src, size_t size) {
