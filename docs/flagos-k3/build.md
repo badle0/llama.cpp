@@ -296,7 +296,44 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 
 - Every strategy gave the same bytes as direct (`flagos-check-spacemit`: 72/72, the copy-only control differs). Each run is its own launch, so the per-token totals include about 250 launches (about 4 ms) the model does not pay.
 - k and v (1.5 MB each) stay in a cache across the repetitions (30 us = 49 GB/s); a token reads them once, from DRAM. With 1024 columns, `direct:512` and `staged:256` leave 6 and 4 tiles without work there.
-- Reading in `plan.md`: staging wins because its copies (`memcpy1d`) and the interleaving of copy and multiply phases keep fewer tiles streaming from DRAM at once, which then delivers more in total (`direct:512` with 5 busy tiles: 27 GB/s on the down projection, against 23 with 8).
+- Reading in `plan.md` (first version, revised with the tile counts below): staging wins because its copies (`memcpy1d`) and the interleaving of copy and multiply phases keep fewer tiles streaming from DRAM at once, which then delivers more in total (`direct:512` with 5 busy tiles: 27 GB/s on the down projection, against 23 with 8).
+
+**Provider with 1-row staging, 2026-10-11** (commit `507cb52`, `staged:32` the 1-row path; `spacemit_check.py --milestone m2c2`: 29/29 on Qwen3-4B; llama-bench 3 runs, same flags):
+
+| Model | Mode | pp128 (t/s) | tg128 (t/s) | Perplexity |
+|---|---|---|---|---|
+| Qwen3-4B Q4_0 | `provider` | 84.40 | 8.31 | 9.7581 (-0.16% vs `cpu`) |
+| | `cpu` | 21.11 | 5.54 | 9.7740 |
+| | `ime` | 79.37 | 11.01 | - |
+
+- Generation: tg128 7.84 -> 8.31 (+6.0%; 127.6 -> 120.3 ms per token); `llama-completion` 7.80 -> 8.64 t/s against 5.48 with the provider disabled. The benchmark predicted 10.4 ms less per token (8.54 t/s). Part of the difference: k and v come from a cache in the benchmark but from DRAM in the model, where 4 slabs per tile leave staging little to overlap (estimate 1-1.5 ms, not measured); the `cpu` row is 2.5% below the day before. Perplexity is M2c.2's to the last digit (the matmuls return the same bytes); prefill unchanged (the 4-row path); 74 splits.
+
+**Tile counts and the IME reference, 2026-10-11** (same benchmark and units as the strategy table above; `@t`: only the first t tiles work; `ime`: `scripts/ime-gemv-bench.cpp`, upstream's path B, with its default memory `HPAGE` (transparent huge pages through `madvise`) and with `SPACEMIT_MEM_BACKEND=POSIX` (`posix_memalign`: 4 KiB pages on this board, like the provider's buffers)):
+
+| Strategy | q | k, v | attn out | gate, up | down | down Q4_1 | head | per token |
+|---|---|---|---|---|---|---|---|---|
+| `staged` (32 columns, 8 tiles: the 1-row path) | 223 | 37 | 242 | 510 | 600 | 607 | 15208 | 92.9 ms |
+| `staged@6` | 231 | 68 | 246 | 497 | 583 | 597 | 14003 | 92.9 |
+| `staged@5` | 245 | 98 | 262 | 531 | 620 | 677 | 14925 | 101.0 |
+| `staged@4` | 270 | 122 | 280 | 591 | 664 | 791 | 15735 | 111.3 |
+| `staged:64` | 235 | 45 | 263 | 537 | 637 | 700 | 15089 | 98.0 |
+| `direct` (128 columns) | 259 | 43 | 254 | 604 | 599 | 583 | 16753 | 103.3 |
+| `direct:32` | 255 | 31 | 252 | 594 | 606 | 569 | 16793 | 101.7 |
+| `direct:32@6` | 232 | 61 | 232 | 539 | 540 | 560 | 15510 | 94.9 |
+| `direct:32@5` | 217 | 88 | 222 | 525 | 524 | 566 | 15944 | 94.9 |
+| `direct:32@4` | 217 | 111 | 215 | 544 | 550 | 628 | 17606 | 100.4 |
+| `direct:512` | 258 | 115 | 228 | 596 | 531 | 565 | 16669 | 104.6 |
+| `copy` (copies alone) | 225 | 27 | 234 | 542 | 561 | 574 | 15603 | 93.3 |
+| `copy@6` | 220 | 50 | 225 | 526 | 528 | 549 | 15619 | 92.2 |
+| `copy@4` | 233 | 108 | 236 | 577 | 585 | 631 | 18159 | 105.6 |
+| `copy@2` | 239 | 110 | 237 | 536 | 525 | 608 | 15028 | 97.9 |
+| `compute` (multiplications alone) | 68 | 29 | 68 | 138 | 146 | 206 | 3540 | 26.0 |
+| `ime`, huge pages | 206 | 45 | 208 | 462 | 461 | 513 | 14156 | 82.4 |
+| `ime`, 4 KiB pages | 227 | 47 | 220 | 457 | 501 | 525 | 13950 | 84.4 |
+
+- Strategy check 54/54 identical to direct. `ime` against ggml-cpu's plain path: NMSE 1.6e-6 (Q4_0), 5.8e-3 (Q4_1: its zero-point conversion, on random weights), 3.8e-5 (Q6_K requantized to Q8_0), so the IME path ran.
+- `ime` tg128 (llama-bench, same session, back to back): 11.05 ± 0.02 with huge pages, 10.80 ± 0.01 with 4 KiB pages, i.e. 2.1 ms per token, as the benchmark's 2.0.
+- Reading in `plan.md` ("1-row matmul bandwidth", results after adoption).
 
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.

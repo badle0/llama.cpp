@@ -466,7 +466,7 @@ Implementation notes: the dispatch calls `_m4` once and asserts at most 32 colum
 
 ### 1-row matmul bandwidth (2026-10-10)
 
-**Status:** measured on the K3 2026-10-11 (commit `a522799`; table in `build.md` §7). Staging the weights through TCM in 32-column slabs (`staged:32`) is 9.8% faster per token than today's direct reads and is adopted as the 1-row path (not yet committed). Pending, one K3 run: tg128 with it, the tile-count series, and the IME reference (its link failed).
+**Status:** measured on the K3 2026-10-11 (tables in `build.md` §7). Staging the weights through TCM in 32-column slabs (`staged:32`) is 9.8% faster per token than direct reads and is the 1-row path (commit `507cb52`): tg128 7.84 -> 8.31. Fewer tiles do not gain enough to adopt. Upstream's path B is still 10.5 ms per token faster: 2 ms of that is huge pages, the rest most likely its pair barrier ("Results after adoption" below). Next step to decide: one more round (huge pages, pair staggering) or M2e.
 
 **Question.** After M2c, Qwen3-4B generates at 127.6 ms per token against `ime`'s 90.7. About 99 ms of ours are 1-row matmuls streaming 2.46 GB of weights (Q4_0, Q4_1, the Q8_0 head), and every one of them measures 23.6-25.5 GB/s, whatever its format (`build.md` §7). `ime` streams the same 2.46 GB in at most 90.7 ms, so its 1-row matmuls run at 27.1 GB/s or more, about 29 if its other work takes about 5 ms (estimate). At 29 GB/s ours would take about 85 ms: about 14 ms less per token, +12% generation.
 
@@ -492,11 +492,24 @@ Implementation notes: the dispatch calls `_m4` once and asserts at most 32 colum
 **Results (K3, 2026-10-11; per-token totals of the 7 shapes, table in `build.md` §7):** direct 102.8 ms (23.9 GB/s); `staged:32` 92.7 ms (26.5 GB/s, -9.8%), the only strategy past the 5% bar; `staged:64` 98.1; `staged:256` 114.8; `range` 103.8; `direct:512` 106.0; prefetch hints 145-163; staging's copies alone 94.5, its multiplications alone 30.4.
 - `staged:32` gains on q (-10%), the attention output (-11%), gate and up (-14.5%; 41% of a token's weight bytes) and the head (-10%), and loses a little on the Q4_1 down projection (+4%). Longer slabs lose: a tile then spends longer in each copy.
 - Staging is bound by its copies: `staged:32` takes about the time of the copies alone, and the kernels multiply a slab from TCM about three times faster than DRAM delivers it (30.4 ms per token), so their work hides while other tiles copy.
-- Fewer tiles streaming at once get more bandwidth in total: `direct:512` leaves only 5 of 8 tiles busy at the 2560-column shapes and still beats balanced 8-tile direct reads (down projection 533 vs 607 us, 27 vs 23 GB/s; attention output 217 vs 253). Staging likely wins the same way: a tile multiplying for about a third of its time leaves about 5-6 tiles streaming. The in-tree path B enforces 4 with its pair barrier. Measured next with `@t`.
+- Fewer tiles streaming at once get more bandwidth in total: `direct:512` leaves only 5 of 8 tiles busy at the 2560-column shapes and still beats balanced 8-tile direct reads (down projection 533 vs 607 us, 27 vs 23 GB/s; attention output 217 vs 253). Staging likely wins the same way: a tile multiplying for about a third of its time leaves about 5-6 tiles streaming. The in-tree path B staggers the two cores of each pair with a barrier. Measured next with `@t`: true for direct reads, hardly for copies ("Results after adoption" below).
 - Zicbop prefetch hints cost 41-58%: dropped.
 - k and v (1.5 MB each) stay in a cache across the benchmark's 30 repetitions (30 us, 49 GB/s); a token reads them once, so that column does not represent the model.
 
 **Decision (2026-10-11, by the rule above):** `staged:32` is the 1-row path. Direct reads remain the fallback where a 32-column slab does not fit the TCM (none of Qwen3's shapes). `range`, `staged-range` and the prefetch strategies are removed; `FLAGOS_SPACEMIT_GEMV` keeps `staged`, `direct`, `copy`, `compute` and `@t` for measurements. Results are identical bytes, so accuracy cannot change; checked at 6 shapes, and on the Mac the whole `flagos-check-spacemit` and `test-backend-ops` also pass with a TCM stand-in, where the new path runs everywhere. Expected: about 10 ms less per token, tg128 7.84 -> about 8.5.
+
+**Results after adoption (K3, 2026-10-11; tables in `build.md` §7):**
+- In the model: tg128 7.84 -> 8.31 (+6.0%, 7.2 ms less per token against 10.4 predicted; k and v, cached in the benchmark, explain part of it); `llama-completion` 7.80 -> 8.64; perplexity and prefill unchanged.
+- Fewer tiles: `staged@6` ties `staged` per token (92.9 ms). It is faster on the long matmuls (head -8%, gate and up -3%, down -3%) and slower on q, the attention output and the cached k and v; without k and v about 2.5% faster, under the 5% bar, so the path stays on 8 tiles. `@5` and `@4` lose (101.0, 111.3): each tile multiplies a larger share. Direct reads gain from fewer tiles (`direct:32` on 5 or 6 tiles: 94.9 against 101.7) but stay behind staging. Copies alone barely depend on the number of tiles: 2 tiles 25.1 GB/s, 6 26.7, 8 26.4 (4: 23.3, unexplained; tiles 0-3 are CPUs 8-11). So staging wins mainly because `memcpy1d` reads DRAM faster than the kernels' own loads, and only a little through fewer streams.
+- The IME reference: 82.4 ms per token (29.9 GB/s), 11% below `staged`, at 28.4-30.4 GB/s on every shape where ours range from 23.3 to 27.5.
+- Huge pages: upstream allocates its weights with `mmap` and `madvise(MADV_HUGEPAGE)` (`ggml-cpu/spacemit/spine_mem_pool.cpp:447-480`), the provider with `posix_memalign` (`flagos-spacemit.cpp:139`), and transparent huge pages are madvise-only on this board (`build.md` §7). Upstream on 4 KiB pages (`SPACEMIT_MEM_BACKEND=POSIX`) takes 84.4 ms per token (+2.0) and generates at 10.80 instead of 11.05 t/s (+2.1 ms per token): pages are worth about 2 ms per token, a fifth of the gap.
+- On equal pages upstream is still 8.5 ms per token faster (84.4 vs 92.9): gate and up 3.8 ms, down 3.2, the head 1.3, the attention output 0.8; q equal. Ruled out as causes: the copy routine (the same `memcpy1d`, inline assembly for each vector length), the slabs (32 columns dealt round-robin in both), the activation (quantized by all tiles, then held in TCM, in both), and our TCM or runtime as such: with 6 tiles the head streams as fast as upstream's (29.5 vs 29.6 GB/s). The one known difference left is path B's pair barrier (`ggml-cpu/spacemit/ime.cpp:455, 471, 485`), which changes how the 8 cores share DRAM and how each matmul starts. Not proven.
+
+**Next (proposed 2026-10-11, user to decide; the "pair staggering" case of the decision rule):** either one more measurement round before M2e, or M2e now with huge pages moved into M2f. The round:
+1. The provider's buffers on huge pages (`mmap` + `madvise`, as upstream; Linux only), with a test switch for a same-session comparison. Expected about 2 ms less per token.
+2. Path B's pair staggering as a test strategy. It needs a wait between the two tiles of a pair inside a step, which §2.4 does not allow today: both tiles must make the same number of waits by construction, and the Mac's serial executor, which runs the tiles one after another, must skip them. Expected up to 8.5 ms less per token if it explains the rest.
+3. k and v read from DRAM in the benchmark (rotating through copies), so that the per-token totals predict the model.
+Adopt by the rule above, then remove `FLAGOS_SPACEMIT_GEMV`.
 
 **On the K3:**
 ```bash
@@ -507,6 +520,9 @@ awk '/^bench    gemv q/ { k = $3 ":" $4; if (!(k in seen)) { seen[k] = 1; col[++
 cmake --build build-ime --target ggml ggml-cpu -j 8 2>&1 | tail -1      # the IME build, current tree
 g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench.cpp build-ime/bin/libggml.so build-ime/bin/libggml-base.so build-ime/bin/libggml-cpu.so -Wl,-rpath,$PWD/build-ime/bin -o ~/ime-gemv-bench
 ~/tcmtest/tcmrelease --apply > /dev/null && OMP_THREAD_LIMIT=8 ~/ime-gemv-bench | tee ~/ime-gemv.txt
+# the same on 4 KiB pages, and upstream's generation with and without huge pages
+~/tcmtest/tcmrelease --apply > /dev/null && SPACEMIT_MEM_BACKEND=POSIX OMP_THREAD_LIMIT=8 ~/ime-gemv-bench 2>&1 | grep -E '^ime|mem_backend'
+for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SPACEMIT_MEM_BACKEND=$b ./build-ime/bin/llama-bench -m ~/models/Qwen3-4B-Q4_0.gguf -t 8 -p 0 -n 128 -fa 1 -mmp 0 -r 3 2>/dev/null | grep tg128)"; done
 ```
 
 ### M3 - AOT package (Design Phase 3, only if D9 is accepted)
