@@ -98,20 +98,20 @@ void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, 
     }
 }
 
-// How a single activation row (generation) is multiplied. Default: the weights staged through TCM 32 columns at a time
-// (memcpy1d), each slab multiplied there, slabs dealt round-robin to the tiles. Measured on the K3 (plan.md, "1-row
-// matmul bandwidth"): 10% less time per Qwen3-4B token than reading the weights straight from DRAM. The copies are the
-// limit, not the kernels (they multiply a slab from TCM about three times faster than DRAM delivers it), and memcpy1d
-// reads DRAM faster than the kernels' own loads do. Without room in TCM for a 32-column slab the weights are read
-// straight from DRAM.
-// test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>][@<tiles>], read at every call so a benchmark can switch:
-// staged[:c] (c = 32, the default); paired[:c] (c = 32): staged, the two tiles of each pair taking turns as in the
-// in-tree path B (gemv below); direct[:c] (c = 128): straight from DRAM, c columns per kernel call; copy[:c] and
-// compute[:c]: staging's copies alone, or its multiplications alone (one slab copied once), wrong results, timing only;
-// @t: only the first t tiles take part, the others wait (how the bandwidth depends on the number of streams)
+// How a single activation row (generation) is multiplied: the weights staged through TCM 32 columns at a time
+// (memcpy1d), each slab multiplied there, slabs dealt round-robin to the tiles, and the two tiles of each pair taking
+// turns as the in-tree path B does: while one copies its next slab, the other multiplies (gemv below). Measured on the
+// K3 (plan.md, "1-row matmul bandwidth"): staging takes 10% less time per Qwen3-4B token than reading the weights
+// straight from DRAM (memcpy1d reads DRAM faster than the kernels' own loads do; the kernels multiply a slab from TCM
+// about three times faster than DRAM delivers it), and the turns 5% less again (tg128 8.7 -> 9.2), as fast as the
+// in-tree path. Without room in TCM for a 32-column slab the weights are read straight from DRAM.
+// test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>][@<tiles>], read at every call, for comparisons: paired[:c]
+// (c = 32, the default); staged[:c] (c = 32): the same without the turns; direct[:c] (c = 128): straight from DRAM, c
+// columns per kernel call; copy[:c]: staging's copies alone, wrong results (the control of flagos-check-spacemit's
+// strategy check); @t: only the first t tiles take part, the others wait (also gives a tile without a partner)
 struct gemv_strategy {
-    enum kind_t { staged, paired, direct, copy_only, compute_only };
-    kind_t  kind  = staged;
+    enum kind_t { paired, staged, direct, copy_only };
+    kind_t  kind  = paired;
     int64_t cols  = nb_cols;
     int64_t tiles = 0;  // 0: all
 };
@@ -122,9 +122,10 @@ gemv_strategy gemv_strategy_from_env() {
         gemv_strategy::kind_t kind;
         int64_t               cols;
     } names[] = {
-        { "staged", gemv_strategy::staged, nb_cols },        { "paired", gemv_strategy::paired, nb_cols },
-        { "direct", gemv_strategy::direct, 4 * nb_cols },    { "copy", gemv_strategy::copy_only, nb_cols },
-        { "compute", gemv_strategy::compute_only, nb_cols },
+        { "paired", gemv_strategy::paired, nb_cols },
+        { "staged", gemv_strategy::staged, nb_cols },
+        { "direct", gemv_strategy::direct, 4 * nb_cols },
+        { "copy", gemv_strategy::copy_only, nb_cols },
     };
     gemv_strategy s;
     const char *  v = std::getenv("FLAGOS_SPACEMIT_GEMV");
@@ -150,7 +151,7 @@ gemv_strategy gemv_strategy_from_env() {
 }
 
 // one activation row, already quantized into the start of the tile's TCM, times all weight rows (gemv_strategy); false
-// when a pair wait failed (paired)
+// when a pair wait failed
 bool gemv(const gemv_strategy & s, const spacemit_tile & tile, const uint8_t * w, float * out, const mm_dims & d,
           bool reference) {
     const int64_t ith = tile.ith;
@@ -189,53 +190,48 @@ bool gemv(const gemv_strategy & s, const spacemit_tile & tile, const uint8_t * w
         }
     };
 
-    // paired: the in-tree path B (ggml-cpu/spacemit/ime.cpp:435-494). The two tiles of a pair take turns: the even one
-    // copies its first slab while the odd one waits; then in every round one multiplies while the other copies. Both
-    // wait 1 + rounds times, rounds being the even tile's number of slabs (the odd tile may have one slab fewer and
-    // still waits in that last round); a tile without a partner (an odd number of tiles) runs as staged
-    if (s.kind == gemv_strategy::paired) {
-        const int64_t step    = slab * nth;
-        const int64_t first   = (ith & ~int64_t(1)) * slab;  // the even tile's first slab
-        const int64_t rounds  = first < d.n ? div_up(d.n - first, step) : 0;
-        const bool    even    = ith % 2 == 0;
-        const bool    partner = (ith ^ 1) < nth;
-        const auto    wait    = [&] { return !partner || spacemit_pair_wait(tile); };
-        if (rounds == 0) {
-            return true;
-        }
-        int64_t n0 = ith * slab;
-        if (even) {
+    if (s.kind != gemv_strategy::paired) {  // staged, or its copies alone
+        for (int64_t n0 = ith * slab; n0 < d.n; n0 += slab * nth) {
             stage(n0);
-        }
-        if (!wait()) {
-            return false;
-        }
-        if (!even) {
-            stage(n0);
-        }
-        for (int64_t r = 0; r < rounds; r++, n0 += step) {
-            if (!even && !wait()) {
-                return false;
+            if (s.kind == gemv_strategy::staged) {
+                multiply(n0);
             }
-            multiply(n0);
-            if (even && !wait()) {
-                return false;
-            }
-            stage(n0 + step);
         }
         return true;
     }
 
-    if (s.kind == gemv_strategy::compute_only) {
-        stage(ith * slab);
+    // paired, the in-tree path B (ggml-cpu/spacemit/ime.cpp:435-494): the two tiles of a pair take turns. The even one
+    // copies its first slab while the odd one waits; then in every round one multiplies while the other copies. Both
+    // wait 1 + rounds times, rounds being the even tile's number of slabs (the odd tile may have one slab fewer and
+    // still waits in that last round); a tile without a partner (an odd number of tiles) runs as staged
+    const int64_t step    = slab * nth;
+    const int64_t first   = (ith & ~int64_t(1)) * slab;  // the even tile's first slab
+    const int64_t rounds  = first < d.n ? div_up(d.n - first, step) : 0;
+    const bool    even    = ith % 2 == 0;
+    const bool    partner = (ith ^ 1) < nth;
+    const auto    wait    = [&] { return !partner || spacemit_pair_wait(tile); };
+    if (rounds == 0) {
+        return true;
     }
-    for (int64_t n0 = ith * slab; n0 < d.n; n0 += slab * nth) {
-        if (s.kind != gemv_strategy::compute_only) {
-            stage(n0);
+    int64_t n0 = ith * slab;
+    if (even) {
+        stage(n0);
+    }
+    if (!wait()) {
+        return false;
+    }
+    if (!even) {
+        stage(n0);
+    }
+    for (int64_t r = 0; r < rounds; r++, n0 += step) {
+        if (!even && !wait()) {
+            return false;
         }
-        if (s.kind != gemv_strategy::copy_only) {
-            multiply(n0);
+        multiply(n0);
+        if (even && !wait()) {
+            return false;
         }
+        stage(n0 + step);
     }
     return true;
 }

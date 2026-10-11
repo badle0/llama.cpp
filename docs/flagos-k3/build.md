@@ -335,6 +335,42 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 - `ime` tg128 (llama-bench, same session, back to back): 11.05 ± 0.02 with huge pages, 10.80 ± 0.01 with 4 KiB pages, i.e. 2.1 ms per token, as the benchmark's 2.0.
 - Reading in `plan.md` ("1-row matmul bandwidth", results after adoption).
 
+**1-row round 2: the pairs taking turns, huge pages, 2026-10-11** (commit `2aa32d0`; `flagos-check-spacemit --bench-gemv`, every weight read from DRAM: each run takes the next of enough copies to fill 32 MB; us per 1-row matmul, per-token totals as above; the two page settings in two runs a few minutes apart):
+
+| Strategy | q | k, v | attn out | gate, up | down | down Q4_1 | head | per token |
+|---|---|---|---|---|---|---|---|---|
+| huge pages: `staged` (not valid, below) | 282 | 533 | 312 | 483 | 569 | 655 | 13789 | 129.1 ms |
+| `staged@6` | 242 | 83 | 262 | 511 | 593 | 671 | 13608 | 96.2 |
+| **`paired`** | 208 | 68 | 224 | 462 | 496 | 577 | 13125 | **85.0** |
+| `paired:64` | 211 | 70 | 226 | 465 | 517 | 597 | 13698 | 86.9 |
+| `paired@6` | 216 | 73 | 233 | 477 | 491 | 599 | 13175 | 87.0 |
+| `direct` | 230 | 68 | 247 | 523 | 560 | 581 | 14834 | 94.8 |
+| `copy` | 206 | 65 | 240 | 481 | 541 | 588 | 14975 | 90.0 |
+| `compute` | 76 | 40 | 89 | 139 | 191 | 256 | 3518 | 29.5 |
+| 4 KiB pages: `staged` | 236 | 89 | 247 | 604 | 554 | 609 | 14214 | 101.7 |
+| `staged@6` | 244 | 81 | 252 | 604 | 578 | 627 | 15448 | 103.6 |
+| `paired` | 222 | 73 | 231 | 549 | 527 | 555 | 14897 | 95.0 |
+| `paired:64` | 230 | 78 | 239 | 522 | 542 | 547 | 14607 | 94.3 |
+| `paired@6` | 230 | 76 | 238 | 510 | 569 | 583 | 13353 | 92.9 |
+| `direct` | 271 | 83 | 272 | 617 | 618 | 599 | 16571 | 108.6 |
+| `copy` | 237 | 72 | 239 | 559 | 545 | 605 | 15455 | 97.9 |
+| `compute` | 76 | 42 | 88 | 139 | 194 | 259 | 3546 | 29.8 |
+| `ime`, huge pages, weights rotated | 227 | 92 | 233 | 476 | 513 | 547 | 13218 | 89.2 |
+
+- Both runs pass every check; the strategy check gives 78/78 identical to direct on the AI cores, `paired` with real pair waits (no timeouts). Huge pages: 64 of 64 MiB of a test buffer (`always [madvise] never`), 0 with `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`.
+- The huge-page `staged` row is not valid: every copy of a weight had its own small output buffer, each on a whole huge page faulted in by its first write (about 0.75 ms each). The first strategy at each shape paid for those inside its timing: 18 for k and v (22 copies), 2 each for q and the attention output; the shapes with 1-3 copies were faulted in during the warm-up. The later rows and the 4 KiB run are not affected. Fixed afterwards: buffers under 2 MiB keep the default pages, and every copy runs once before the timing.
+- Generation (llama-bench tg128, back to back; two rounds interleaved, plus the first single runs):
+
+| tg128 (t/s) | huge pages | 4 KiB pages |
+|---|---|---|
+| `staged` | 8.77, 8.69, 8.75 | 8.66, 8.74, 8.64 |
+| `paired` | 9.20, 9.17, 9.18 | 9.06, 9.09 |
+
+  `paired` is 5.0% faster on huge pages (114.4 -> 108.9 ms per token) and 4.6% on 4 KiB pages; huge pages add 0.7% to `staged` (within the noise) and 1.2% to `paired`. The `staged` 4 KiB row matches round 1's configuration: 8.68 today against 8.31 then, so results move about 4% between sessions.
+- Pages of the model: during generation (`-n 512`) Rss 2813 MiB, AnonHugePages 2374 MiB, so the 2350 MiB weight buffer lies on huge pages (THP defrag `madvise`). The benchmark's larger page effect (`paired` 95.0 -> 85.0 ms) therefore comes from comparing two runs minutes apart on the shared board; the interleaved tg128 runs measure it.
+- The IME reference with its weights rotated: 89.2 ms per token (82.4 unrotated: the old benchmark also served mid-sized shapes partly from caches). `paired` on huge pages is 4.7% faster per token and faster or equal at every shape except the Q4_1 down projection (+5%).
+- Reading in `plan.md` ("1-row matmul bandwidth", round 2 results).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

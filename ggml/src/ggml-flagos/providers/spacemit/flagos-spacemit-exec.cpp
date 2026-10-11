@@ -9,6 +9,11 @@
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 #    include <spert.hpp>
+#else
+#    include <condition_variable>
+#    include <cstring>
+#    include <mutex>
+#    include <thread>
 #endif
 
 // the pair waits of one launch (spacemit_pair_wait). The counts only grow during the launch, so the waits of all its
@@ -171,8 +176,8 @@ class spert_executor final : public spacemit_executor {
 
 #else
 
-// the serial executor runs the two tiles of a pair one after another, so their pair waits can only be counted. On the
-// AI cores a pair whose tiles waited unequally often in a step would wait until the launch fails
+// with its tiles one after another, the host executor can only count their pair waits. On the AI cores a pair whose
+// tiles waited unequally often in a step would wait until the launch fails
 bool spacemit_pairs_balanced(const spacemit_pairs & p, uint32_t n_tiles) {
     for (uint32_t t = 0; t + 1 < n_tiles; t += 2) {
         if (p.by_tile[t] != p.by_tile[t + 1]) {
@@ -184,34 +189,86 @@ bool spacemit_pairs_balanced(const spacemit_pairs & p, uint32_t n_tiles) {
     return true;
 }
 
-// runs the tiles one after another on the calling thread; lets the full path be tested on hosts without the AI cores.
-// test-only: FLAGOS_SPACEMIT_TEST_TCM=<bytes> gives the tiles a stand-in for TCM in heap memory, so that the paths that
-// need TCM (the 1-row path, path A) run there too; one buffer serves all tiles, as they never run at the same time
-class serial_executor final : public spacemit_executor {
+// the barrier after each step when the host executor runs its tiles on threads
+class host_barrier {
   public:
-    serial_executor(uint32_t n_tiles, int64_t fail_step) : n_tiles(n_tiles), fail_step(fail_step) {
-        const char * value = std::getenv("FLAGOS_SPACEMIT_TEST_TCM");
-        const size_t size  = value != nullptr ? (size_t) std::max(0LL, std::atoll(value)) : 0;
-        tcm                = size > 0 ? ggml_aligned_malloc(size) : nullptr;
-        tcm_size           = tcm != nullptr ? size : 0;
+    explicit host_barrier(uint32_t n) : n(n) {}
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        const uint64_t               round = rounds;
+        if (++arrived == n) {
+            arrived = 0;
+            rounds++;
+            done.notify_all();
+        } else {
+            done.wait(lock, [&] { return rounds != round; });
+        }
     }
 
-    ~serial_executor() override {
+  private:
+    std::mutex              mutex;
+    std::condition_variable done;
+    const uint32_t          n;
+    uint32_t                arrived = 0;
+    uint64_t                rounds  = 0;
+};
+
+// runs the tiles on the calling thread, one after another; lets the full path be tested on hosts without the AI cores.
+// test-only: FLAGOS_SPACEMIT_TEST_TCM=<bytes> gives the tiles a stand-in for TCM in heap memory, so that the paths that
+// need TCM (the 1-row path, path A) run there too. FLAGOS_SPACEMIT_TEST_THREADS=1 runs the tiles of a launch at the same
+// time, on threads, as on the AI cores: each with its own TCM stand-in, a barrier after each step, spacemit_tile_main's
+// failure protocol, and pair waits that wait
+class host_executor final : public spacemit_executor {
+  public:
+    host_executor(uint32_t n_tiles, int64_t fail_step) : n_tiles(n_tiles), fail_step(fail_step) {
+        const char * threads_value = std::getenv("FLAGOS_SPACEMIT_TEST_THREADS");
+        threaded                   = threads_value != nullptr && std::strcmp(threads_value, "0") != 0;
+        const char * value         = std::getenv("FLAGOS_SPACEMIT_TEST_TCM");
+        const size_t size          = value != nullptr ? (size_t) std::max(0LL, std::atoll(value)) : 0;
+        tcm_stride                 = GGML_PAD(size, 64);
+        tcm_bytes                  = tcm_stride * (threaded ? n_tiles : 1);  // one stand-in per tile on threads
+        tcm                        = size > 0 ? ggml_aligned_malloc(tcm_bytes) : nullptr;
+        tcm_size                   = tcm != nullptr ? size : 0;
+    }
+
+    ~host_executor() override {
         if (tcm != nullptr) {
-            ggml_aligned_free(tcm, tcm_size);
+            ggml_aligned_free(tcm, tcm_bytes);
         }
     }
 
     bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
         spacemit_launch launch;
-        launch.steps            = steps.data();
-        launch.n_steps          = steps.size();
-        launch.fail_step        = fail_step;
+        launch.steps     = steps.data();
+        launch.n_steps   = steps.size();
+        launch.fail_step = fail_step;
+        if (threaded) {
+            host_barrier             barrier(n_tiles);
+            std::vector<std::thread> threads;
+            for (uint32_t ith = 0; ith < n_tiles; ith++) {
+                threads.emplace_back([&, ith] {
+                    const spacemit_tile tile = { ith,       n_tiles,        tcm_of(ith), tcm_size,
+                                                 workspace, workspace_size, &launch.pairs };
+                    for (size_t i = 0; i < launch.n_steps; i++) {
+                        if (!launch.failed.load() && !spacemit_run_step(launch, i, tile)) {
+                            launch.failed.store(true);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+            for (std::thread & t : threads) {
+                t.join();
+            }
+            return !launch.failed.load();
+        }
+
         launch.pairs.concurrent = false;
         for (size_t i = 0; i < steps.size() && !launch.failed.load(); i++) {
             for (uint32_t ith = 0; ith < n_tiles; ith++) {
                 if (!spacemit_run_step(launch, i,
-                                       { ith, n_tiles, tcm, tcm_size, workspace, workspace_size, &launch.pairs })) {
+                                       { ith, n_tiles, tcm_of(ith), tcm_size, workspace, workspace_size, &launch.pairs })) {
                     launch.failed.store(true);
                 }
             }
@@ -222,13 +279,22 @@ class serial_executor final : public spacemit_executor {
         return !launch.failed.load();
     }
 
-    const char * name() const override { return "serial (no spine-runtime)"; }
+    const char * name() const override {
+        return threaded ? "host threads (no spine-runtime)" : "serial (no spine-runtime)";
+    }
 
   private:
+    void * tcm_of(uint32_t ith) const {
+        return tcm == nullptr ? nullptr : static_cast<uint8_t *>(tcm) + (threaded ? ith * tcm_stride : 0);
+    }
+
     uint32_t n_tiles;
     int64_t  fail_step;
-    void *   tcm      = nullptr;
-    size_t   tcm_size = 0;
+    bool     threaded   = false;
+    void *   tcm        = nullptr;
+    size_t   tcm_size   = 0;
+    size_t   tcm_stride = 0;
+    size_t   tcm_bytes  = 0;
 };
 
 #endif
@@ -240,6 +306,6 @@ std::unique_ptr<spacemit_executor> spacemit_executor_create(spacemit_stream_poli
     return std::make_unique<spert_executor>(policy, n_cores, spacemit_test_fail_step());
 #else
     GGML_UNUSED(policy);
-    return std::make_unique<serial_executor>(n_cores, spacemit_test_fail_step());
+    return std::make_unique<host_executor>(n_cores, spacemit_test_fail_step());
 #endif
 }

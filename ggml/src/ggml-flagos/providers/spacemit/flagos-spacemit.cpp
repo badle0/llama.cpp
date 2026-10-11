@@ -84,12 +84,14 @@ ggml_guid g_backend_guid = { 0x46, 0x6c, 0x61, 0x67, 0x4f, 0x53, 0x2d, 0x53, 0x5
 //
 
 #if defined(MADV_HUGEPAGE)
+constexpr size_t SPACEMIT_HUGE_PAGE = size_t(2) << 20;
+
 // memory on 2 MiB transparent huge pages, as the in-tree path keeps its weights (ggml-cpu/spacemit/spine_mem_pool.cpp,
-// HPAGE): the K3 gives them only on request (madvise), and with 4 KiB pages that path's 1-row matmuls take 2 ms more
-// per Qwen3-4B token (plan.md, "1-row matmul bandwidth"). Whole huge pages from a huge page boundary; nullptr if the
-// mapping fails. If madvise is refused, the memory keeps the default pages.
+// HPAGE): the K3 gives them only on request (madvise). Measured on the K3 (plan.md, "1-row matmul bandwidth"): with the
+// weights on huge pages, Qwen3-4B generates about 1% faster (the in-tree path: 2%). Whole huge pages from a huge page
+// boundary; nullptr if the mapping fails. If madvise is refused, the memory keeps the default pages.
 void * spacemit_map_huge(size_t size, size_t & mapped) {
-    constexpr size_t huge = size_t(2) << 20;
+    constexpr size_t huge = SPACEMIT_HUGE_PAGE;
     const size_t     len  = GGML_PAD(size, huge);
     void *           raw  = mmap(nullptr, len + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) {
@@ -172,14 +174,15 @@ const char * spacemit_buffer_type_name(ggml_backend_buffer_type_t) {
     return "FlagOS:SpacemiT";
 }
 
-// ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it.
+// ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it. Buffers of at least one huge page
+// go on huge pages; a smaller one would gain nothing and still take a whole one (about 0.75 ms to fault in on the K3).
 // test-only: FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1 keeps the default pages, for comparison
 ggml_backend_buffer_t spacemit_buffer_type_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     void * data   = nullptr;
     size_t mapped = 0;
 #if defined(MADV_HUGEPAGE)
     const char * no_huge = std::getenv("FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES");
-    if (no_huge == nullptr || std::strcmp(no_huge, "0") == 0) {
+    if (size >= SPACEMIT_HUGE_PAGE && (no_huge == nullptr || std::strcmp(no_huge, "0") == 0)) {
         data = spacemit_map_huge(size, mapped);
     }
 #endif

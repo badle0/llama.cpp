@@ -62,6 +62,28 @@ static void set_env(const char * name, const char * value) {
 #endif
 }
 
+// sets an environment variable (nullptr: unsets it) and restores the caller's value when it goes out of scope, so that
+// a setting given to the whole run (FLAGOS_SPACEMIT_TEST_TCM, FLAGOS_SPACEMIT_TEST_THREADS) holds for the later checks
+class env_override {
+  public:
+    env_override(const char * name, const char * value) : name(name) {
+        const char * old = std::getenv(name);
+        had              = old != nullptr;
+        saved            = had ? old : "";
+        set_env(name, value);
+    }
+
+    ~env_override() { set_env(name.c_str(), had ? saved.c_str() : nullptr); }
+
+    env_override(const env_override &)             = delete;
+    env_override & operator=(const env_override &) = delete;
+
+  private:
+    std::string name;
+    std::string saved;
+    bool        had = false;
+};
+
 static std::vector<float> ramp(int64_t n, float scale, float offset) {
     std::vector<float> v(n);
     for (int64_t i = 0; i < n; i++) {
@@ -944,23 +966,33 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     return 0;
 }
 
-// the 1-row strategies of FLAGOS_SPACEMIT_GEMV (plan.md, "1-row matmul bandwidth"): the default (staged:32, unset), the
-// others, and some on fewer tiles (@t); bench_gemv() times them. For paired the shapes below also give a pair whose odd
-// tile has one slab fewer (480 and 1056 columns), pairs without work (paired:256) and a tile without a partner (@5)
-static const char * const k_gemv_strategies[] = { "staged",    "staged:64",  "staged:128", "staged:256",  "staged@5",
-                                                  "paired",    "paired:64",  "paired:256", "paired@5",    "direct",
+// the 1-row strategies of FLAGOS_SPACEMIT_GEMV (plan.md, "1-row matmul bandwidth"): the default (paired:32, unset), the
+// others, and some on fewer tiles (@t); bench_gemv() times paired, staged and direct. For paired the shapes below also
+// give a pair whose odd tile has one slab fewer (480 and 1056 columns), pairs without work (paired:256) and a tile
+// without a partner (@5)
+static const char * const k_gemv_strategies[] = { "paired",    "paired:64",  "paired:256", "paired@5",   "staged",
+                                                  "staged:64", "staged:128", "staged:256", "staged@5",   "direct",
                                                   "direct:32", "direct:512", "direct:32@6" };
 
 // every strategy gives the same bytes as reading the weights straight from DRAM: the same kernel on the same data, only
 // the weights' path (DRAM or a copy in TCM) and the tile of each column differ. The output is filled with NaN first, so
-// skipped columns show. The strategies need TCM: on a host without the AI cores the serial stand-in gets the K3's
-// 384 KiB (spine-runtime ignores the variable)
-static int check_gemv_strategies(ggml_backend_dev_t dev) {
-    set_env("FLAGOS_SPACEMIT_TEST_TCM", "393216");
-    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    set_env("FLAGOS_SPACEMIT_TEST_TCM", nullptr);
+// skipped columns show. The strategies need TCM: on a host without the AI cores the host executor gets a stand-in of
+// the K3's 384 KiB (spine-runtime ignores the variable), and the check runs twice there: with the tiles one after
+// another, which counts the pair waits, and on threads (FLAGOS_SPACEMIT_TEST_THREADS), where the waits wait
+static int check_gemv_strategies(ggml_backend_dev_t dev, bool host) {
+    env_override                gemv("FLAGOS_SPACEMIT_GEMV", nullptr);
+    std::vector<ggml_backend_t> backends;
+    for (const char * threads : { (const char *) nullptr, "1" }) {
+        if (threads != nullptr && !host) {
+            break;
+        }
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");
+        env_override on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
+        backends.push_back(ggml_backend_dev_init(dev, nullptr));
+        REQUIRE(backends.back() != nullptr);
+    }
     ggml_backend_t cpu = ggml_backend_cpu_init();
-    REQUIRE(backend != nullptr && cpu != nullptr);
+    REQUIRE(cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 8);
 
     struct shape { ggml_type type; int64_t k, n; };
@@ -980,7 +1012,7 @@ static int check_gemv_strategies(ggml_backend_dev_t dev) {
         mm_run run;
         REQUIRE(run.init(dev, w, 1, 9));
         set_env("FLAGOS_SPACEMIT_GEMV", "direct");
-        const double e = run.compare(dev, backend, cpu);
+        const double e = run.compare(dev, backends[0], cpu);
         if (e < 0.0 || e > k_mul_mat_max_nmse) {
             std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld with TCM: %s %.3e\n", ggml_type_name(s.type),
                          (long long) s.k, (long long) s.n, e < 0.0 ? "refused or failed" : "NMSE", e);
@@ -990,39 +1022,44 @@ static int check_gemv_strategies(ggml_backend_dev_t dev) {
         std::vector<float> ref(s.n), out(s.n);
         const std::vector<float> nan(s.n, NAN);
         ggml_backend_tensor_get(run.y, ref.data(), 0, ggml_nbytes(run.y));
-        const auto run_strategy = [&](const char * strategy) {
-            set_env("FLAGOS_SPACEMIT_GEMV", strategy);
-            ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
-            const bool ok = ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
-            ggml_backend_tensor_get(run.y, out.data(), 0, ggml_nbytes(run.y));
-            return ok && std::memcmp(out.data(), ref.data(), ggml_nbytes(run.y)) == 0;
-        };
-        for (const char * strategy : k_gemv_strategies) {
-            if (!run_strategy(strategy) || (strategy == k_gemv_strategies[0] && !run_strategy(nullptr))) {
-                std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld: strategy %s differs from direct\n",
-                             ggml_type_name(s.type), (long long) s.k, (long long) s.n, strategy);
-                g_failures++;
-            } else {
-                n_same++;
+        for (ggml_backend_t backend : backends) {
+            const auto run_strategy = [&](const char * strategy) {
+                set_env("FLAGOS_SPACEMIT_GEMV", strategy);
+                ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
+                const bool ok = ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(run.y, out.data(), 0, ggml_nbytes(run.y));
+                return ok && std::memcmp(out.data(), ref.data(), ggml_nbytes(run.y)) == 0;
+            };
+            for (const char * strategy : k_gemv_strategies) {
+                if (!run_strategy(strategy) || (strategy == k_gemv_strategies[0] && !run_strategy(nullptr))) {
+                    std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld: strategy %s differs from direct%s\n",
+                                 ggml_type_name(s.type), (long long) s.k, (long long) s.n, strategy,
+                                 backend != backends[0] ? " (tiles on threads)" : "");
+                    g_failures++;
+                } else {
+                    n_same++;
+                }
+                n_runs++;
             }
-            n_runs++;
-        }
-        // control: copy only stages the weights and never multiplies, so its output must differ; if it does not, the
-        // strategies were not used (no TCM: path C instead) and the comparisons above prove nothing
-        if (run_strategy("copy")) {
-            std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld: the 1-row strategies are not in use (no TCM?)\n",
-                         ggml_type_name(s.type), (long long) s.k, (long long) s.n);
-            g_failures++;
+            // control: copy only stages the weights and never multiplies, so its output must differ; if it does not,
+            // the strategies were not used (no TCM: path C instead) and the comparisons above prove nothing
+            if (run_strategy("copy")) {
+                std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld: the 1-row strategies are not in use (no TCM?)\n",
+                             ggml_type_name(s.type), (long long) s.k, (long long) s.n);
+                g_failures++;
+            }
         }
         set_env("FLAGOS_SPACEMIT_GEMV", nullptr);
     }
 
-    ggml_backend_free(backend);
+    for (ggml_backend_t backend : backends) {
+        ggml_backend_free(backend);
+    }
     ggml_backend_free(cpu);
-    std::printf("gemv     1-row strategies (the default staged:32, staged:64/128/256, staged@5, paired:32/64/256, paired@5, "
-                "direct:32/128/512, direct:32@6) at 6 shapes "
-                "with TCM: %d/%d identical to direct (copy-only control differs); direct vs CPU max NMSE %.2e (bound %.0e)%s\n",
-                n_same, n_runs, worst, k_mul_mat_max_nmse,
+    std::printf("gemv     1-row strategies (the default paired:32, paired:64/256, paired@5, staged:32/64/128/256, staged@5, "
+                "direct:32/128/512, direct:32@6) at 6 shapes with TCM%s: %d/%d identical to direct (copy-only control "
+                "differs); direct vs CPU max NMSE %.2e (bound %.0e)%s\n",
+                host ? ", tiles in turn and on threads" : "", n_same, n_runs, worst, k_mul_mat_max_nmse,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
@@ -1520,15 +1557,18 @@ static double ime_row_bytes(ggml_type type, int64_t k) {
 
 // the 1-row strategies (FLAGOS_SPACEMIT_GEMV; plan.md, "1-row matmul bandwidth") at every 1-row matmul shape of a
 // Qwen3-4B token, and the time each gives a whole token: the shapes weighted by how often a token runs them (q; k and v;
-// attention output; gate and up; down in Q4_0 and in Q4_1; the head). Besides the default (staged:32) and direct reads:
-// the two tiles of each pair taking turns (paired), staging's two halves alone (copy, compute; wrong results), and runs
-// on fewer tiles (@t). As in the model, where a token reads each matrix once, every run reads its weights from DRAM: it
-// takes the next of enough copies of the weight (32 MB together) to leave the caches (before 2026-10-11 k and v stayed
-// cached). Each run is its own launch, so per token these include about 250 launches the model does not pay
+// attention output; gate and up; down in Q4_0 and in Q4_1; the head): the default (paired), the same without the turns
+// (staged) and direct reads. As in the model, where a token reads each matrix once, every run reads its weights from
+// DRAM: it takes the next of enough copies of the weight (32 MB together) to leave the caches (before 2026-10-11 k and v
+// stayed cached). Every copy runs once before the timing, so that no run pays for faulting in its output. Each run is
+// its own launch, so per token these include about 250 launches the model does not pay
 static int bench_gemv(ggml_backend_dev_t dev) {
-    set_env("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the serial stand-in's TCM (check_gemv_strategies)
-    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    set_env("FLAGOS_SPACEMIT_TEST_TCM", nullptr);
+    env_override   gemv("FLAGOS_SPACEMIT_GEMV", nullptr);
+    ggml_backend_t backend = nullptr;
+    {
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM (check_gemv_strategies)
+        backend = ggml_backend_dev_init(dev, nullptr);
+    }
     REQUIRE(backend != nullptr);
     struct gemv_shape { ggml_type type; int64_t k, n; int per_token; };
     const gemv_shape shapes[] = {
@@ -1536,8 +1576,7 @@ static int bench_gemv(ggml_backend_dev_t dev) {
         { GGML_TYPE_Q4_0, 2560, 9728, 72 }, { GGML_TYPE_Q4_0, 9728, 2560, 32 }, { GGML_TYPE_Q4_1, 9728, 2560, 4 },
         { GGML_TYPE_Q6_K, 2560, 151936, 1 },
     };
-    const std::vector<std::string> strategies = { "staged", "staged@6", "paired", "paired:64",
-                                                  "paired@6", "direct",  "copy",   "compute" };
+    const std::vector<std::string> strategies = { "paired", "staged", "direct" };
     constexpr double    k_rotation_bytes = 32e6;
     std::vector<double> per_token(strategies.size(), 0.0);
     double              token_bytes = 0.0;
@@ -1552,6 +1591,7 @@ static int bench_gemv(ggml_backend_dev_t dev) {
             REQUIRE(ws.back()->init_with(dev, s.type, s.k, s.n, q, s.type == GGML_TYPE_Q6_K));
             runs.push_back(std::make_unique<mm_run>());
             REQUIRE(runs.back()->init(dev, *ws.back(), 1, 1));
+            CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
         }
         token_bytes += bytes * s.per_token;
         for (size_t i = 0; i < strategies.size(); i++) {
@@ -1729,8 +1769,12 @@ int main(int argc, char ** argv) {
     REQUIRE(!expect_none);
     CHECK(n_spacemit == 1);
 
+    // without spine-runtime the provider runs on the host executor (simulated device)
+    flagos_device_info info;
+    const bool         host = flagos_registry_get_device_info(global_index, &info) && info.profile.runtime != nullptr &&
+                      std::strcmp(info.profile.runtime, "none") == 0;
     if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
-        check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev) != 0 || check_rows(dev) != 0 ||
+        check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_rows(dev) != 0 ||
         check_layer(dev) != 0) {
         return 1;
     }
