@@ -13,7 +13,7 @@ Written 2026-10-07; updated as milestones land (M1 done 2026-10-08, M2a and M2b 
 3. **Memory**: the provider's buffer type holds weights in IME-repacked layout (`is_host = false`), stored once. The KV cache and other inputs stay in CPU buffers, which the provider reads directly (§2.3, D4: building on this from M2b, 2026-10-09; mentor confirmation pending).
 4. Execution: **one spine-runtime launch per split**. Each of the 8 tiles walks the split's steps (one or more per node), with a barrier after each step and the core's TCM as scratch. This is ggml-spacemit's model, except that its kernels also wait inside a node.
 5. Kernels: copy into the provider, milestone by milestone, only the IME GEMM, quantizer and repack functions it uses from the in-tree `ggml-cpu/spacemit` sources (byte-identical to ggml-spacemit's), and port ggml-spacemit's tiling and RVV ops, each behind its own op tests (D6, decided 2026-10-09, §2.5). The mentor allows changing ggml-spacemit's code freely (it is AI-generated); its X0 failures must be fixed, not copied. Neither source is validated yet: the upstream 1198/1198 `MUL_MAT` run never used the IME weight layout (`test-backend-ops` allocates in the CPU backend's plain buffer), `test-backend-ops` has no Q4_0 case that fits the IME 32x256 layout at all (§1), and ggml-spacemit fails part of the op tests on this board (`device-type.md` X0). FlagTree AOT kernels come later and only if the mentor wants them.
-6. **Attention without flash attention must work.** Under ACCEL, llama.cpp's default `-fa auto` switches flash attention off whenever the provider runs attention, because each layer's device is the CPU (confirmed in E1). The default path is therefore `MUL_MAT` on the KV cache plus masked `SOFT_MAX`; flash attention is used with `-fa on` (§2.4).
+6. **Attention without flash attention must work.** Under ACCEL, llama.cpp's default `-fa auto` switches flash attention off whenever the provider runs attention, because each layer's device is the CPU (confirmed in E1). The default path is therefore `MUL_MAT` on the KV cache plus masked `SOFT_MAX`; flash attention is used with `-fa on` (§2.4). With C5a (decided 2026-10-12 for M2e.1) `-fa auto` keeps flash attention when the provider runs it; attention without it stays correct on the CPU.
 7. Order follows Design §13.3: **M0** targets and baselines (no provider code) -> **M1** skeleton -> **M2** direct ops, quantized `MUL_MAT` first -> **M3** AOT package (conditional) -> **M4** fixed fusion (conditional). Design phases P5 (split compiler) and P6 (pre-placement partition) are not needed.
 
 ## 1. Facts this plan rests on
@@ -102,7 +102,7 @@ A2 rules:
 - Cores: 8. An environment variable may override it for experiments only (Design §15.6 gate 9).
 - TCM hygiene: release on every path. At probe, a read-only check warns (`GGML_LOG_WARN`) when blocks are held by dead threads and names `tcmrelease`.
 - Never enable `GGML_CPU_RISCV64_SPACEMIT` in the same build: two TCM users in one process.
-- Attention under ACCEL: with `-fa auto` (llama.cpp's default) flash attention is switched off whenever the provider runs attention, because each layer's device is the CPU (`src/llama-context.cpp:506-560`; confirmed in E1). The default path is therefore non-flash attention (`MUL_MAT` on F16/F32 KV, masked `SOFT_MAX`, `CONT`); it must be correct and fast (M2e). `-fa on` keeps flash attention. llama.cpp's own TODO at that check says the rule is wrong for other cases too; a fix that accepts an ACCEL backend running a CPU layer's attention is an upstream candidate (issue first).
+- Attention under ACCEL: with `-fa auto` (llama.cpp's default) flash attention is switched off whenever the provider runs attention, because each layer's device is the CPU (`src/llama-context.cpp:506-560`; confirmed in E1). The default path is therefore non-flash attention (`MUL_MAT` on F16/F32 KV, masked `SOFT_MAX`, `CONT`); it must be correct and fast (M2e). `-fa on` keeps flash attention. llama.cpp's own TODO at that check says the rule is wrong for other cases too; a fix that accepts an ACCEL backend running a CPU layer's attention is an upstream candidate (issue first). Decided 2026-10-12 (user): that fix goes into the fork as C5a, its own commit, with M2e.1, so the default path becomes flash attention on the provider; the path without flash attention moves to the provider only if the mentor rejects C5a (M2e.2; M2e design).
 
 ### 2.5 Kernel sources (D6: copy per milestone, decided 2026-10-09)
 
@@ -111,7 +111,7 @@ A2 rules:
 | quantized `MUL_MAT` | IME2 GEMM kernels, activation quantizers, `memcpy1d` and repack functions copied from in-tree `ggml-cpu/spacemit` (`ime2_kernels.cpp`, `rvv_kernels.cpp`, `repack.cpp` @ `ba360ef`), only the functions each milestone uses, bodies unchanged, origin noted; tiling and TCM staging ported from ggml-spacemit `ime.cpp` @ `4e782bc`: direct GEMV (1 row; ggml-spacemit uses it for Q4_0 only, we also for Q4_1, M2c design), path A (at least 113 rows and n <= 64 m, activations staged in TCM), path C (everything else). Path B (weight slabs in TCM, core-pair barrier) deferred (M2b design). `ime1_kernels.cpp` is not needed: IME1 serves X100/A60 cores, the A100 cores use IME2 (`ime_env.cpp:259-262`) | M2b, M2c |
 | `MUL_MAT_ID` | same, MoE kernels | M2c, only for an MoE target |
 | `ADD`, `MUL`, `SCALE`, `RMS_NORM`, `ROPE`, `SOFT_MAX`, `GLU`, `UNARY`, `GET_ROWS`, `SET_ROWS`, `CPY`/`CONT` | port from ggml-spacemit `rvv_kernels.cpp` (kernels take a small context struct). For `CPY`/`CONT` take upstream fix `f266648fa` (2026-09-16): permuted 2-byte (F16/BF16) copies called the 32-bit transpose; ggml-spacemit and our tree still have the bug, which likely explains X0's `CONT` failures (F16/BF16 only) | M2a, M2d |
-| attention: non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`) and `FLASH_ATTN_EXT` | RVV, ported from ggml-spacemit with its X0 failures fixed (both paths fail there); the fast flash-attention variant needs VLEN 1024, which the A100 cores have (M0.4) | M2e |
+| attention: non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`) and `FLASH_ATTN_EXT` | RVV, ported from ggml-spacemit with its X0 failures fixed (both paths fail there); the fast flash-attention variant needs VLEN 1024, which the A100 cores have (M0.4). Decided 2026-10-12 (M2e design): `FLASH_ATTN_EXT` first (M2e.1), copied from in-tree `rvv_kernels.cpp`, whose decode code ggml-spacemit shares, with three faults fixed; the non-flash path only if C5a is rejected (M2e.2) | M2e |
 | ops from FlagOS's shared Triton kernels | FlagTree SpacemiT backend, AOT package | M3 |
 
 Why copy (D6, decided 2026-10-09; options and evidence compared in the M2b review):
@@ -284,7 +284,7 @@ Design's order is simple ops first, then quantized matmul (§13.3). The K3 start
 | M2b | quantized `MUL_MAT` for Q4_0 in the IME 32x256 layout: repacking weight buffer, two-step execution, shared workspace, direct GEMV, path A, path C (design below) | `flagos-check-spacemit` against the CPU backend at the model's shapes; perplexity vs M0.6; `llama-bench -m <model> -t 8 ...`; `graph splits` in the load log (`-lv 4`); `spacemit_check.py --milestone m2b`. Not `test-backend-ops -o MUL_MAT`: no case fits the layout (§1) | correct; perplexity within the M0.6 range; tg and pp recorded (expect below IME baseline: every other op still runs on X100, with a split switch around each matmul) |
 | M2c (after M2d, decided 2026-10-10; done 2026-10-10 for the Qwen3 targets: M2c.1 Q4_1, M2c.2 Q6_K and Q8_0) | the target's other weight types: for Qwen3-4B Q4_0 these are Q4_1 (`ffn_down` in 4 layers; M2c.1, first) and Q6_K (output head; M2c.2), see the op matrix; Q8_0/Q4_K for later targets; `MUL_MAT_ID` for an MoE target (design below) | per type: `flagos-check-spacemit` against the CPU (no `test-backend-ops` case fits the IME layouts), KLD against the CPU's logits, perplexity; `spacemit_check.py --milestone m2c` | each claimed type within accuracy budget (KLD at most the IME baseline's, perplexity within 1%); lossy types decided with evidence |
 | M2d (before M2c, decided 2026-10-09) | the remaining ops of a layer except attention; for Qwen3-4B: `RMS_NORM`, `MUL`, `ADD`, `ROPE`, `SET_ROWS` (KV write into the CPU-resident cache), SwiGLU, `GET_ROWS` F32; plus the norm-pinning patch C5b if accepted (design below) | per op `test-backend-ops` on the provider, all claimed cases; `flagos-check-spacemit` (KV write into a CPU buffer, a Qwen3-like layer against the CPU); split count from `sched-summary.py`; perplexity; `spacemit_check.py --milestone m2d` | every claimed case passes; about 2 handoffs per layer in generation (with C5b) and in prefill; perplexity within 1% of the CPU; tg and pp recorded (IME-level speed needs M2c and M2e) |
-| M2e | attention, reading the CPU-resident KV cache directly: the non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`, `CONT`) that the default `-fa auto` uses, and `FLASH_ATTN_EXT` for `-fa on` | `test-backend-ops -o MUL_MAT`, `-o SOFT_MAX`, `-o FLASH_ATTN_EXT`; perplexity with `-fa auto` and `-fa on`; long-context run | default flags give correct output; whole layers on the K3 (a few splits per token); **tg at least the upstream IME path's and pp at least ggml-spacemit's best** (Qwen3-4B Q4_0: tg128 11.10, pp128 81.94, `build.md` §7; Qwen3-0.6B: 57.3 / 594 t/s) |
+| M2e (split 2026-10-12, M2e design) | attention, reading the CPU-resident KV cache directly. M2e.1 (first): `FLASH_ATTN_EXT` with the in-tree kernels, three faults fixed, plus C5a so that the default `-fa auto` keeps flash attention. M2e.2: the non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`, `CONT`), only if the mentor rejects C5a. M2e.3: decode attention at streaming speed, by measurement | `test-backend-ops -o FLASH_ATTN_EXT` (M2e.2 also `-o MUL_MAT`, `-o SOFT_MAX`); perplexity and KLD with `-fa auto` and `-fa on`; depth series to 4096 | default flags give correct output; whole layers on the K3 (a few splits per token); **tg at least the upstream IME path's and pp at least ggml-spacemit's best** (Qwen3-4B Q4_0: tg128 11.10, pp128 81.94, `build.md` §7; Qwen3-0.6B: 57.3 / 594 t/s) |
 | M2f | memory and weight round trip: THP for compute buffers | VmRSS about model + KV + compute (weights stored once); `get_tensor` returns the original bytes for every lossless layout, the converted tensor for lossy ones, and the nearest tensor of the original type for requantized ones (§2.3) | no double storage |
 
 ### M2b design (2026-10-09)
@@ -533,7 +533,7 @@ Mac, 2026-10-11: the 1-row strategy check gives 78/78 identical to direct (13 st
 
 Mac (adoption, 2026-10-11): `flagos-check-spacemit --expect-device` passes as it is, with the TCM stand-in, and with the TCM stand-in and every launch on threads. The strategy check gives 156/156 (78 with the tiles in turn, 78 on threads); with the TCM stand-in the layer check also runs its 1-row matmuls on the paired path, several in one launch. ThreadSanitizer with every launch on threads: all checks pass, 0 reports. `test-backend-ops`: the 12 op sets pass in all three modes. Syntax: the spine-runtime executor, the huge-page branch and the riscv64 kernels, 0 errors, no new warnings.
 
-**Open (2026-10-12): generation in a later context.** llama-bench creates a new context (a new provider backend, so a new spine-runtime stream) for every test. With the runner's flags (`-p 128 -n 128 -ub 128`) the tg128 test runs in the process's second context, right after the prompt test, and reads 8.66 against 9.2 when it runs alone (`build.md` §7); 8.66 is what `direct` gives (8.65, 8.72), as if the 1-row path ran without TCM. `ime` loses nothing the same way (11.02 against 11.05), which argues against heat. Possible causes: (a) a later stream gets no TCM, or the runtime's heap stand-in (spert falls back to `posix_memalign` when it cannot get a block, `k3-hardware.md` §4), or fewer than 8 cores; (b) the prompt test leaves something behind; (c) heat after all. A model in one context (llama-cli, llama-server, perplexity) generates in its first context, so (a) would touch benchmarks, not use; (b) or (c) would also touch a chat, whose prompt is processed right before generation. Experiments, no rebuild: two tg128 tests in one process (`-p 0 -n 128,128`: a second context without a prompt test); the runner's flags with `--delay 30` (heat); the runner's flags with `FLAGOS_SPACEMIT_GEMV` = `paired`, `staged`, `direct` (equal results mean no TCM in that context: the strategies then all fall back to direct reads).
+**Open (2026-10-12): generation right after heavy load.** The runner's tg128 reads about 5% below stand-alone llama-bench (8.68 against 9.2). Not its flags or its order of tests (`build.md` §7): on a rested board its flags give 9.23 (9.25 with 30 s of rest before each test), a second context in one process 9.16 and 9.20, and after a prompt test the 1-row strategies rank as when run alone (`paired` 9.23, `staged` 8.76, `direct` 8.69), so the path has its TCM there. Both slow measurements started right after minutes of full load on the X100 cores (the runner's CPU-only perplexity, which runs right before its llama-bench; the `cpu` depth runs). The provider still runs attention, the embedding lookup and the thread that drives the AI cores there, while `ime`, all on the A100 cores, was not slowed. Most likely heat, possibly another user's job; to confirm: read the clocks and temperatures, load the X100 cores for about 3 minutes, then measure tg128 at once and after a minute's rest. If it is heat, the runner should run llama-bench before the perplexity runs (its tg128 then reads about 5% above earlier runner runs). M2e moves attention to the AI cores, which should make the provider much less sensitive to the X100 cores' state.
 
 **On the K3, confirming the adoption:**
 ```bash
@@ -573,6 +573,98 @@ g++ -O2 -std=c++17 -pthread -Iggml/include docs/flagos-k3/scripts/ime-gemv-bench
 ~/tcmtest/tcmrelease --apply > /dev/null && SPACEMIT_MEM_BACKEND=POSIX OMP_THREAD_LIMIT=8 ~/ime-gemv-bench 2>&1 | grep -E '^ime|mem_backend'
 for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SPACEMIT_MEM_BACKEND=$b ./build-ime/bin/llama-bench -m ~/models/Qwen3-4B-Q4_0.gguf -t 8 -p 0 -n 128 -fa 1 -mmp 0 -r 3 2>/dev/null | grep tg128)"; done
 ```
+
+### M2e design (2026-10-12)
+
+**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. Not started. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3.
+
+**Goal:** attention on the AI cores, the last part of a Qwen3 layer on the X100 cores. It decides generation beyond about 1k tokens of context (`build.md` §7, 2026-10-12): from depth 0 to 4096 a Qwen3-4B token takes 452 ms more on the provider (attention on the X100 cores, about 110 us per position) and 66 ms more on `ime` (16 us); tg32 at depth 0 / 1024 / 4096: provider 9.70 / 6.74 / 1.80, `ime` 11.05 / 9.34 / 6.41. Attention on the CPU also splits each layer in two: 72 of the 74 handoffs per token.
+
+**Facts (verified in code):**
+- Two graphs (`src/llama-graph.cpp:2500-2633`). With flash attention: one `FLASH_ATTN_EXT` reading q (F32, a permuted view of the RoPE output), K and V (F16 views of the cache) and the mask (F16, `[n_kv, n_tokens, 1, n_stream]`, `:28-45`), precision F32; its output reaches the output projection through a reshape. Without: `MUL_MAT` (F16 K view x F32 q, broadcast over the query heads of each KV head), `SOFT_MAX` (F32 mask, scale), `MUL_MAT` (F16 V, which the cache then stores transposed, x F32), `CONT`. With an F16 cache nothing else sits between the KV writes and the output projection (the Hadamard rotations exist only for quantized caches, `src/llama-kv-cache.cpp:319-336`).
+- `-fa auto` (`src/llama-context.cpp:504-562`) builds a 1-token graph and turns flash attention off when a `FLASH_ATTN_EXT` node's device differs from its layer's. Under ACCEL every layer's device is the CPU, so flash attention stays on only while the CPU runs it. Once the provider claims `FLASH_ATTN_EXT`, `-fa auto` switches to the graph without flash attention, which the provider does not run: default runs would get attention on the X100 cores without flash attention, slower than today. So M2e needs C5a or that graph on the provider.
+- Cache (`src/llama-kv-cache.cpp:1249-1300`): a cell holds every KV head (Qwen3-4B: 8 x 128 F16, 2 KiB), so a head's K or V rows are 256 B long and 2 KiB apart; n_kv is padded to a multiple of 256 (`:1233-1247`), the padding masked with -inf.
+- ggml (`ggml/src/ggml.c:5402`): the mask is F16, contiguous, and broadcasts over heads and streams; q and K have the same dimension 3; only heads broadcast (GQA).
+- ggml-cpu (`ggml-cpu/ops.cpp:8468-9215`): at decode (1 token, n_kv >= 512) it splits the KV positions over the threads and merges partial results; its one-row kernel accumulates F16 V in F16; from 64 rows per head it uses 64 x 64 tiles accumulated in F32.
+- The in-tree IME path runs its own kernels for VLEN 1024 (`ggml-cpu/spacemit/ime.cpp:1151-1227`; `rvv_kernels.cpp:33-1628`, about 1100 lines with their helpers; ggml-spacemit `4e782bc` has the same decode code, its tiled kernel also trims masked tails): F32 q, F16 K and V, head sizes up to 128. Rows (query head x token) are split statically over the threads. At decode a thread takes the 4 (or 2) query heads of one KV head and stages 64 positions at a time in TCM (K transposed by strided stores): scores in F32, V accumulated in F16. From 64 rows per head, 64 x 64 tiles in TCM accumulated in F32. These kernels are what `ime`'s 66 ms at depth 4096 measures.
+- Three faults in the decode part, found by reading:
+  - (a) `float M[QLEN] = { -INFINITY }` (`rvv_kernels.cpp:669`) starts rows 1-3 at 0 instead of -inf. A row whose scores all lie far below 0 is then exponentiated against 0, its weights underflow in the F16 accumulator and its output becomes 0.
+  - (b) The dispatcher reads `mask->ne[2]` without a null check (`:1202-1210`), so a 1-token call without a mask crashes.
+  - (c) The 2- and 4-row kernels apply the first row's ALiBi slope to every row (computed from its head, passed at `:1269, 1290`, applied at `:710, 833`), though each query head has its own: wrong with ALiBi and GQA.
+  - (b) and (c) fit X0, where ggml-spacemit missed its ALiBi cases by NMSE about 0.006 and crashed right after the last head-size-40 ALiBi case, where `test-backend-ops` (`tests/test-backend-ops.cpp:9579`) starts the cases without a mask (`device-type.md` X0). Qwen3 meets none of them in practice: no ALiBi, always a mask, scores rarely all far below 0.
+- Speed of that decode kernel: `ime`'s 16 us per position per token is 0.44 us per position per layer and thread, about 900 cycles. That is about one DRAM round trip per position: each position's K and V rows are loaded and then used at once, and `memcpy2d` copies row by row (estimate, not measured). Streaming the same 147 KB per position and token at the 27 GB/s our 1-row path reaches would take 5.5 us.
+- `test-backend-ops` (`:6819-6935, 9579-9660`): NMSE bound 5e-4. With F16 K and V at head sizes 40-128: masks on and off, sinks, ALiBi, softcap, GQA 4 and 12, 3 streams, n_kv 113 / 512 / 1024, 1-75 rows, permuted layouts. Also the fork's Qwen3-4B decode case (8 KV heads x 4, n_kv 256, the cache's layout) and n_kv 4096 and 16384 with 512 rows.
+
+**M2e.1: `FLASH_ATTN_EXT` on the AI cores with the in-tree kernels, and C5a.**
+- Kernels: copy the in-tree VLEN-1024 kernels and the helpers they use into `flagos-spacemit-rvv-attn.cpp`, origin noted, changes marked `flagos`:
+  - the provider's interface (tile index, TCM, a workspace slice) instead of `ggml_compute_params`;
+  - (a) every row's maximum starts at -inf;
+  - (b) without a mask, rows group freely;
+  - (c) rows are grouped only when their slopes are equal (no ALiBi), else the 1-row kernel runs.
+  
+  A portable reference following ggml-cpu's one-row kernel, accumulating in F32, runs on the Mac and with `FLAGOS_SPACEMIT_TEST_REFERENCE=1`, as the M2d references do.
+- Op: one step, the rows split statically over the tiles as `ime` does.
+  - At decode each tile takes the query heads of one KV head (Qwen3-4B: 4, 0.6B: 2) with the 4-row (2-row) kernel. From 64 rows per head the tiled kernel runs, otherwise the 1-row kernel.
+  - No reduction step and no wait inside the step.
+  - Scratch in TCM (decode about 35 KiB, tiled 160 KiB of the 384); without TCM, the 1-row kernel and a workspace slice.
+  - The KV writes (`SET_ROWS`) run one step earlier in the same launch, so the barrier orders them before the reads.
+- Claim (exact): q F32 with contiguous rows; K and V F16 with contiguous rows, DK equal to q's row length, DK and DV in 1..128; mask absent or F16 covering n_kv and the rows; sinks absent or F32, one value per query head; precision F32 or default; dst F32 and contiguous; every operand in host memory (the CPU-resident cache, read in place, §2.3) or in ours. ALiBi and softcap are claimed only if their `test-backend-ops` cases pass on the K3 (Qwen3 uses neither).
+- C5a, a separate fork commit like C5b (`src/llama-context.cpp`, `resolve_fused_ops`): a fused node on an ACCEL device whose layer's device is the CPU does not count as a mismatch. `-fa auto` then keeps flash attention when the provider runs it (log: "Flash Attention enabled"). It covers llama.cpp's other fused ops of the same kind too; the TODO at that check already calls the rule wrong for other cases. Mentor to confirm (question 9).
+- Placement (prediction): 2 splits per token, from 74: the token embedding on the CPU, everything else on the provider.
+
+**Alternatives:**
+- The graph without flash attention on the provider instead of C5a (the milestone table's M2e). It needs three more op kinds: F16 x F32 `MUL_MAT` over strided views with head broadcast, masked `SOFT_MAX`, and `CONT`. It materializes the score matrix (Qwen3-4B prefill at depth 4096: 64 MiB per layer), and these are the very ops ggml-spacemit got wrong in X0. It is needed only because of the automatic check. Kept as M2e.2, if the mentor rejects C5a or `-fa off` must be fast.
+- Neither C5a nor M2e.2: only `-fa on` gains; `-fa auto` loses flash attention.
+- A new decode kernel first (M2e.3 below): faster at long context, but new code without a baseline on the board. M2e.1 gives that baseline and parity with `ime`.
+- ggml-cpu's generic kernel compiled into the provider: the provider cannot call ggml-cpu, so it would be a copy of code without VLEN-1024 vectorization.
+
+**Then M2e.3, by measurement (as the 1-row bandwidth work): decode attention at streaming speed.** Candidates:
+- (a) Split the KV positions over the tiles, as ggml-cpu does at decode. Each tile streams whole cells (every KV head) through TCM with `memcpy1d`, the pairs taking turns as in `paired`; a second step merges the 8 partial results per query head.
+- (b) A KV head per tile as in M2e.1, but 64 positions' rows copied into TCM with several loads in flight before they are used.
+
+Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token, so tg32 at depth 4096 from about 6.3 to 8-8.5 t/s (`ime` 6.41). Rule, fixed before measuring: adopt if attention at n_kv 4096 costs at least 20% less per token, confirmed by tg32 at depth 4096, with NMSE against the CPU within the bound (the outputs differ in rounding only).
+
+**Tests:**
+- `test-backend-ops -o FLASH_ATTN_EXT` on the Mac (host test device, reference) and on the K3 (RVV kernels and references): every claimed case passes; the 12 earlier op sets unchanged.
+- `flagos-check-spacemit`, against the CPU with the cache's layout (all KV heads in one cell of a CPU buffer), at Qwen3-4B's and 0.6B's head counts:
+  - decode at n_kv 256 with 37 valid positions, at 1024 and at 4096;
+  - 7 rows (1-row kernel); 128 rows with a causal mask (tiled);
+  - bound 5e-4; on the K3 also the RVV kernels against the reference.
+- Probes for the three faults, each gating:
+  - (a): one KV head whose scores all lie below -20 (q scaled), which the unfixed kernel returns as zeros for 3 of its 4 query heads;
+  - (b): no mask;
+  - (c): ALiBi with GQA.
+- The layer check runs attention on the provider too, so a whole layer is one launch.
+- Runner milestone m2e:
+  - the above;
+  - perplexity with `-fa auto` (C5a) and with `-fa on`;
+  - KLD against the CPU for both kernels (512-token batches: tiled; `-ub 1`: decode);
+  - 2 splits per token;
+  - llama-bench tg128 and pp128, the depth series tg32 at 0 / 1024 / 4096 for provider, `cpu` and `ime`, and pp512 at depth 4096.
+
+**Expected (estimates):**
+- About 9 ms less per token from 72 fewer handoffs, and attention at 16 instead of 110 us per position.
+- tg32 at depth 0 / 1024 / 4096 about 10.9 / 9.2 / 6.3 (`ime` 11.05 / 9.34 / 6.41): parity with `ime` at every depth.
+- tg128 about 10.5-11 (`ime` 11.0). The milestone's target of 11.10 may be missed by a few percent; the rest is per-op overhead, M4's area.
+- pp128 a few percent higher; prefill at depth gains most.
+- Accuracy: the same algorithms as the CPU's (F16 Q.K with F32 sums, softmax in F32, V in F16 at decode like the CPU's one-row kernel), so KLD within the noise of M2c.2's (0.0033 / 0.0022).
+
+**Exit (M2e.1):**
+- Every claimed case passes on the K3.
+- With C5a, `-fa auto` keeps flash attention on the provider and a token takes 2 splits.
+- Perplexity within 1% of the CPU and mean KLD at most 0.0005 above M2c.2's.
+- tg32 at depth 4096 at least 95% of `ime`'s.
+- tg128 and pp128 not below today's (9.2 and 83).
+
+**Risks:**
+- Further faults in the copied code. The probes, the reference and NMSE checks at long n_kv guard against them, and ALiBi and softcap are claimed only once verified.
+- C5a rejected: then M2e.2 is needed for default runs.
+- No TCM in a launch: the slower kernels run, as for the 1-row matmuls.
+- Runs right after heavy X100 load read low (the open note above). After M2e.1 the provider depends far less on the X100 cores.
+
+**Decisions (user, 2026-10-12):**
+1. C5a goes into the fork as its own commit, like C5b, so that `-fa auto` keeps flash attention on the provider. The mentor confirms it under question 9; if rejected, M2e.2 instead.
+2. M2e.1 first, with the in-tree kernels; M2e.3 afterwards, by measurement; no new decode kernel before that.
 
 ### M3 - AOT package (Design Phase 3, only if D9 is accepted)
 
@@ -620,7 +712,7 @@ Design §15.6 gates, as they apply to the K3: no `supports_op` false positives (
 | R2 | spine-runtime is a closed binary: `shared_buffer()` falls back to heap silently if TCM is unavailable (on this board it gets real TCM, 2026-10-07), all-or-nothing core grants, no exception handling around tiles | log a warning when the buffer is outside `/dev/tcm`; executor interface keeps option 2 open |
 | R3 | Stale TCM blocks after a crash block all later runs | probe-time warning; release on every path; `tcmrelease` documented |
 | R4 | Lossy repacks (Q4_1, Q4_K, Q6_K) change results. Q4_1 (M2c.1): on random weights the zero-point conversion changes a matmul by NMSE 5.9e-3, about doubling Q4_1's own error | claim only with KLD and perplexity evidence on the model (M2c); fallback for Q4_1: keep the exact minimum (M2c design). Q4_1 accepted 2026-10-10: on Qwen3-4B it raised the mean KLD against the CPU from 0.0024 to 0.0032 with 512-token batches (0.0020 with `-ub 1`), perplexity -0.10%. Q6_K (requantized to Q8_0) accepted 2026-10-10: +0.0001 (512-token batches) and +0.0002 (`-ub 1`), perplexity -0.16% |
-| R5 | Under ACCEL, `-fa auto` switches flash attention off when the provider runs attention, so default runs use non-flash attention | correct non-flash kernels (M2e); document `-fa on`; upstream fix candidate (§2.4) |
+| R5 | Under ACCEL, `-fa auto` switches flash attention off when the provider runs attention, so default runs use non-flash attention | C5a in the fork (decided 2026-10-12, its own commit with M2e.1; mentor to confirm); non-flash kernels on the provider (M2e.2) only if C5a is rejected; document `-fa on`; upstream fix candidate (§2.4) |
 | R6 | Under ACCEL, a provider op that refuses CPU buffers forces copies and splits (E1: 280 splits per generated token). Also many splits until M2d, while each matmul is surrounded by CPU ops | accept host buffers for non-weight operands (§2.3); X3 measures it; split count in every benchmark |
 | R7 | ggml-spacemit is AI-generated and over-claims (X0: wrong F16 matmul, masked softmax, CPY; aborts in RMS_NORM, ROPE) | port piece by piece with fixes and tests; the mentor allows changing it |
 | R8 | FlagTree SpacemiT is immature (no AOT tool, no tests, QEMU-only CI with VLEN 1024) | M3 is conditional and starts with one op |
@@ -632,7 +724,7 @@ Design §15.6 gates, as they apply to the K3: no `supports_op` false positives (
 
 Optional Common changes, each needing separate approval: C2 RVV/IME/TCM feature bits in `flagos-target.h` (append-only); C3 forward provider functions through `get_proc_address`; C4 `LOCAL_SCRATCH` memory cap.
 
-Outside FlagOS, needing the mentor's decision (fork patch or upstream llama.cpp issue): C5, in `src/llama-context.cpp`, (a) let the automatic flash-attention check accept an ACCEL backend that supports the op when the layer's device is the CPU (`:506-560`); (b) skip norm pinning when the layer's device is the CPU (`:2499-2520`, marked FIXME upstream; **implemented 2026-10-09** for M2d, skipping the pin only when an ACCEL backend supports the op, see M2d design). Without C5, ACCEL users need `-fa on` and get 30-39% slower generation (Qwen3-4B / 0.6B) (`device-type.md` §5, X3b).
+Outside FlagOS, needing the mentor's decision (fork patch or upstream llama.cpp issue): C5, in `src/llama-context.cpp`, (a) let the automatic flash-attention check accept an ACCEL backend that supports the op when the layer's device is the CPU (`:504-562`; **decided by the user 2026-10-12** for M2e.1, as its own commit like (b): once the provider claims `FLASH_ATTN_EXT`, `-fa auto` would otherwise turn flash attention off and leave attention on the X100 cores, see M2e design); (b) skip norm pinning when the layer's device is the CPU (`:2499-2520`, marked FIXME upstream; **implemented 2026-10-09** for M2d, skipping the pin only when an ACCEL backend supports the op, see M2d design). Without C5, ACCEL users need `-fa on` and get 30-39% slower generation (Qwen3-4B / 0.6B) (`device-type.md` §5, X3b).
 
 ## 7. Questions for the mentor
 
@@ -644,5 +736,5 @@ Outside FlagOS, needing the mentor's decision (fork patch or upstream llama.cpp 
 6. Is FlagTree AOT (M3) in scope, and should it be cross-compiled on x86 or built on the K3?
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, given they ship ggml-spacemit as an `ACCEL` backend?
 8. Should we report the TCM issues to SpacemiT (no dead-owner recovery; `try_wait` timeout unit about 12 µs, not 1 µs)? Also one CPU-backend crash in 8 runs whose register state the program cannot produce (`build.md` §7; targeted tests with about 80 million page faults did not reproduce it). And, found by reading: the 1-row Q4_1 IME kernel's active branch multiplies zero point and activation sum in 16 bits (R12).
-9. ACCEL gaps in llama.cpp (C5, §6): patch the automatic flash-attention check and norm pinning in our fork, or raise an upstream llama.cpp issue? (b), norm pinning, is now patched in the fork as a separate commit (`f1cf809`, 2026-10-09, needed for M2d; on the K3 it gives the same 83 splits for 1-token and 512-token graphs); keep it, or replace it with an upstream issue? Without them ACCEL needs `-fa on` and generates 30-39% slower (`device-type.md` §5, X3b).
+9. ACCEL gaps in llama.cpp (C5, §6): patch the automatic flash-attention check and norm pinning in our fork, or raise an upstream llama.cpp issue? (b), norm pinning, is now patched in the fork as a separate commit (`f1cf809`, 2026-10-09, needed for M2d; on the K3 it gives the same 83 splits for 1-token and 512-token graphs); keep it, or replace it with an upstream issue? Without them ACCEL needs `-fa on` and generates 30-39% slower (`device-type.md` §5, X3b). (a) is decided by the user for M2e.1 the same way (2026-10-12, M2e design: a fork patch in its own commit): once the provider runs flash attention, `-fa auto` without (a) would turn it off. Keep it as well? If not, the graph without flash attention goes on the provider instead (M2e.2).
 10. ~~Order after M2d~~ decided by the user 2026-10-10: M2c first, starting with the Q4_1 matmuls (M2c.1), then the Q6_K head (M2c.2), then M2e. The question was: M2c (Q4_1 and Q6_K on the AI cores), then M2e (attention)? Measured on the K3 (`build.md` §7, M2d): moving the 4 Q4_1 `ffn_down` matmuls alone raises pp128 from 53 to 83 t/s, past the prefill target, and moving the head saves about 12-25 ms per token; attention on the X100 cores costs +445 ms per token at a context of 4096 tokens (IME: +68 ms), so M2e decides generation speed at long context. M2e brings the flash-attention question of item 9 (C5a) back.

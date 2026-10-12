@@ -411,7 +411,15 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 | 4096 | 1.80 | 1.52 | 6.41 |
 
 - From depth 0 to 4096 a token takes 452 ms more on the provider, 488 on `cpu` and 66 on `ime` (M2d: 445 and 68): attention on the X100 cores costs about 7 times what it costs on the A100 cores. The faster matmuls lifted the provider at depth 0 by 32% since M2d (7.36), at 4096 by 5% (1.72), where it barely beats `cpu`. Beyond about 1k tokens M2e decides generation speed.
-- The runner's flags stand-alone (`llama-bench -p 128 -n 128 -ub 128 -r 3`): pp128 83.09 ± 1.13, tg128 8.66 ± 0.03, so the runner's lower tg128 comes from its flags, not from running after the perplexity runs. llama-bench creates a new context (and so a new provider backend and spine-runtime stream) for every test; with `-p 128` the tg128 test runs in the process's second context, after a prompt test. Its 8.66 matches the `direct` strategy (8.65, 8.72), as if the 1-row path ran without TCM there; `ime` loses nothing the same way (11.02 against 11.05). Cause open (`plan.md`, "1-row matmul bandwidth").
+- The runner's lower tg128. Its flags stand-alone (`llama-bench -p 128 -n 128 -ub 128 -r 3`), run right after the depth runs above: pp128 83.09 ± 1.13, tg128 8.66 ± 0.03, about what `direct` gives. Follow-ups on a rested board (2026-10-12; llama-bench creates a new context, so a new provider backend and spine-runtime stream, for every test):
+
+| Run | tg128 (t/s) |
+|---|---|
+| two tg128 tests in one process (`-p 0 -n 128,128`) | 9.16, 9.20 |
+| the runner's flags, 30 s of rest before each test (`--delay 30`) | 9.25 (pp128 83.60) |
+| the runner's flags, no rest: `paired` (the default), `staged`, `direct` | 9.23, 8.76, 8.69 |
+
+  So neither a later context nor the prompt test before slows generation, and the 1-row path has its TCM after a prompt test (the strategies rank as when run alone). The same command gave 8.66 and 9.23; what differed is what ran before: both slow measurements (8.66 here, the runner's 8.68) started right after minutes of full load on the X100 cores (the `cpu` depth runs with their 4096-token prefill; the runner's CPU-only perplexity, 8 x 512 tokens, right before its llama-bench). The provider still runs part of every token there (attention, the embedding lookup, the thread that drives the AI cores); `ime` runs all its threads on the A100 cores (`cpu_mask: ff00`) and was not slowed in the runner, where it follows the `cpu` llama-bench. Most likely heat on the X100 side, possibly another user's job; clocks not measured. On a rested board the provider's tg128 reads 9.16-9.27 (11 runs over two days; one disturbed run 9.00).
 - Prefill with and without huge pages (`-p 128 -n 0 -ub 128`, two rounds interleaved): 83.07 and 83.59 against 84.34 and 83.72 on 4 KiB pages, so huge pages cost prefill about 0.8% if anything (within the spread of single runs), while generation gains 1.3%.
 
 Manual checks:
