@@ -186,6 +186,11 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 | | `ime` | 547.19 | 54.39 | |
 
 - The runner's CPU-only perplexity run (provider disabled) crashed once: SIGSEGV reading address 0 in `libggml-cpu.so.0.19.0` at offset 0x99316, during its first pass (`dmesg`, 2026-10-09 12:59). The crashing instruction is a vector load in `ggml_vec_dot_q4_1_q8_1` (RVV version, `ggml-cpu/arch/riscv/quants.c:277`; `addr2line` on the library built 10-08 20:31), so it was one of Qwen3-4B's 4 Q4_1 `ffn_down` matmuls, which run on the X100 cores in CPU-only and provider mode alike until M2c. The fork does not modify the CPU backend, and upstream has not changed this function since our base; the identical rerun passed, and 5 more runs passed (1 crash in 8 CPU-only runs of Qwen3-4B). The disassembly rules out a code bug: at 0x992f6 the loop sets `a2 = a5 + 16` (the second half of the activation block `y[ib].qs`), and no instruction before the crashing load at 0x99316 writes `a2`; meanwhile two loads through `a5` succeeded (0x992fe, 0x9930e), so `a2` cannot be 0 by the program's own data flow. Not a llama.cpp bug; two explanations remain, both in the platform (kernel or X100 core): (a) `a2` was changed from outside the program, for example while the thread was in the kernel; (b) the load was valid but hit a page that needed a fault, and the fault address was recorded wrongly as 0 (the `dmesg` address is the core's report of the fault, not necessarily `a2`). Tests without llama.cpp (`scripts/vfault.c`), 2026-10-09: about 17 million page faults per run on 16-byte vector loads of the mapped model file (8 and 16 threads, the latter with 300k preemptions) and on scalar loads left the register intact every time (0 corrupted), so a page fault on a vector load does not by itself cause (a) at any rate near the crash's (about 1 per 100k-400k faults). Mode `x` (29 million faults in the middle of a 16-byte vector load crossing into an unmapped page) also passed: every byte loaded, the register intact, no misreported fault address. Transparent huge pages are `madvise`-only on this board and ggml never requests them, so background page merging cannot have moved the activation buffer either. Neither mechanism reproduces; the cause is unknown after one occurrence in 8 runs. Treated as platform noise: rerun a run that dies with signal 11, load `segv.so` during acceptance runs so a recurrence leaves a register dump, and report it to SpacemiT together with the TCM issues if it recurs (plan question 8). Crash reporter for another occurrence: `scripts/segv.c` (`LD_PRELOAD`; prints all registers and a backtrace).
+  - **Second occurrence, 2026-10-13, with registers.** The M2e.1 runner's CPU-only `llama-bench -p 512 -n 0 -d 4096` (provider disabled, after about 10 minutes of full load on the X100 cores from the CPU depth runs) got SIGSEGV with fault address 0 at the same instruction: `libggml-cpu.so.0 + 0x99316`, `ggml_vec_dot_q4_1_q8_1 + 0x40`, called from `ggml_compute_forward_mul_mat` on an OpenMP worker (`segv.so` dump in `build-flagos/m2e-logs/bench-cpu-depth-pp.err`; `segv.so` exits with 139, so the kernel logs no segfault line).
+  - The registers are exactly those of block 25 of one Q4_1 row's dot product, except `a2`: `a0` = 304 blocks (K 9728), `t1` = 25, `s4` = 0x17c0 = 6080 bytes per row (304 x 20), `s6` = the next weight row, `a3 = s6 - 6080 + 25 x 20 + 4` = `&x[25].qs`, `a5 = s0 + 4 + 25 x 36` = `&y[25].qs` (`s0` the activations, 36-byte Q8_1 blocks).
+  - `a2` is 0 where the code set it to `a5 + 16` (0x2b2789aa88) a few instructions before. This rules out (b): the register itself is 0, not a wrongly reported fault address. (a) remains: `a2` was cleared from outside the program's instruction stream, by a kernel path or by the core.
+  - Twice at the same instruction, with every other register intact, so not random corruption anywhere. A path that clears `a2` when the thread is interrupted between 0x992f6 and 0x99316 (two vector loads through `a5` run in between) would fit; unconfirmed. Both occurrences came in long CPU-only runs under full X100 load.
+  - Still not in llama.cpp, nor in the provider, which runs nothing heavy on the X100 cores since M2e.1. To report to SpacemiT (question 8) with this dump, the disassembly of 0x992d6-0x99316 of the current library and `uname -a`.
 - Prefill gains 2.1-2.4x over the X100 cores; generation does not (4B +5%, 0.6B -5%). Graph splits: 355 per token on 4B (178 CPU + 177 provider, about 5 round trips per layer, `sched-summary.py`), 277 on 0.6B; 1 without the provider.
 - Kernels (`flagos-check-spacemit --bench`, Qwen3-4B FFN shapes): 1 row 0.60 ms for 14 MB of weights, about 23 GB/s, the AI cores' memory bandwidth; 4 rows cost about the same as 1; at 128 rows path A reaches 960 GFLOP/s and path C 648 GFLOP/s. The CPU column of that benchmark uses ggml's plain Q4_0 path, not the repacked kernels llama.cpp uses (`REPACK = 1`), so it understates the X100 cores.
 - Estimated 4B generation budget (172 ms per token): Q4_0 matmuls on the AI cores about 85 ms; Q6_K output head on the X100 cores about 25 ms; other X100 work about 15 ms; the remaining about 45 ms are the 355 handoffs (about 0.13 ms each, consistent with X3b's 40 ms for 286 extra splits). `ime` avoids all handoffs: its CPU worker threads are pinned to the AI cores (`ggml-cpu/spacemit/ime.cpp:1692`), so the whole graph runs there.
@@ -421,6 +426,53 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 
   So neither a later context nor the prompt test before slows generation, and the 1-row path has its TCM after a prompt test (the strategies rank as when run alone). The same command gave 8.66 and 9.23; what differed is what ran before: both slow measurements (8.66 here, the runner's 8.68) started right after minutes of full load on the X100 cores (the `cpu` depth runs with their 4096-token prefill; the runner's CPU-only perplexity, 8 x 512 tokens, right before its llama-bench). The provider still runs part of every token there (attention, the embedding lookup, the thread that drives the AI cores); `ime` runs all its threads on the A100 cores (`cpu_mask: ff00`) and was not slowed in the runner, where it follows the `cpu` llama-bench. Most likely heat on the X100 side, possibly another user's job; clocks not measured. On a rested board the provider's tg128 reads 9.16-9.27 (11 runs over two days; one disturbed run 9.00).
 - Prefill with and without huge pages (`-p 128 -n 0 -ub 128`, two rounds interleaved): 83.07 and 83.59 against 84.34 and 83.72 on 4 KiB pages, so huge pages cost prefill about 0.8% if anything (within the spread of single runs), while generation gains 1.3%.
+
+**Provider M2e.1 (attention on the AI cores), 2026-10-13** (`FLASH_ATTN_EXT` with the in-tree VLEN-1024 kernels, six faults fixed, and C5a; commits `64e6cbd` (C5a) and `715b9bc`; `spacemit_check.py --milestone m2e --depth`: 37/37 on Qwen3-4B; llama-bench 3 runs, same flags as above):
+
+| Model | Mode | pp128 (t/s) | tg128 (t/s) | Perplexity |
+|---|---|---|---|---|
+| Qwen3-4B Q4_0 | `provider` | 87.70 | 11.27 | 9.782 (+0.08% vs `cpu`; the same with `-fa on` and `-fa auto`) |
+| | `cpu` | 21.06 | 5.61 | 9.774 |
+| | `ime` | 79.37 | 11.03 | - |
+
+| Depth (`-p 0 -n 32 -d 0,1024,4096 -r 1`; pp512 at depth 4096) | tg32 d0 | d1024 | d4096 | pp512 d4096 |
+|---|---|---|---|---|
+| `provider` | 11.25 | 9.53 | 6.48 | 24.87 |
+| `ime` | 11.09 | 9.34 | 6.34 | 25.13 |
+| `cpu` | 5.93 | 4.94 | 1.56 | crashed (below) |
+| `provider` before M2e.1 (2026-10-12) | 9.70 | 6.74 | 1.80 | - |
+
+- Correctness on the AI cores: `test-backend-ops -o FLASH_ATTN_EXT` 1324/1324 with the RVV kernels (all claimed cases: ALiBi, softcap, head sizes 40-128, so fix (f) holds and ALiBi and softcap stay claimed) and with the references (13/13 op sets); 1742 cases claimed in all; `flagos-check-spacemit` passes with the RVV and with the reference kernels, its attention checks and the three fault probes included.
+- Placement: `-fa auto` keeps flash attention on the provider ("Flash Attention enabled", C5a) and a token takes 2 graph splits (from 74), as predicted. Buffers unchanged (model 2349.87 MiB, compute 301.75 MiB).
+- Accuracy against the CPU's logits, as M2c.2:
+
+| Run | Mean KLD | M2c.2 |
+|---|---|---|
+| 512-token batches (tiled attention kernel) | 0.003354 ± 0.000231 | 0.00326 ± 0.00021 |
+| `-ub 1` (decode attention kernels) | 0.002050 ± 0.000155 | 0.00220 ± 0.00021 |
+
+  Both within one standard error of M2c.2's, far inside the exit limit (+0.0005): the copied kernels change the model's outputs no more than the CPU's attention did. Greedy text differs from the CPU's after 143 characters, coherent.
+- Speed:
+  - Generation +30% (runner tg128 8.68 -> 11.27; `llama-completion` 11.34 against 5.89 with the provider disabled).
+  - Prefill +5.5% (pp128 87.70).
+  - The extra cost per token from depth 0 to 4096 is now 16.0 us per position (`ime` 16.5; before 110 on the X100 cores), so depth 4096 generates 3.6x faster than before.
+  - Against `ime` in the same session: generation 1-2% ahead at every depth, pp128 10% ahead, pp512 at depth 4096 1% behind; parity within the noise.
+  - The project's targets for Qwen3-4B (M0: tg128 >= 11.1, pp128 >= 82) are met.
+  - The runner's tg128 (11.27) now matches `llama-completion`'s (11.34): the provider hardly uses the X100 cores any more, so their state after the heavy runs no longer shows (see `plan.md`, the open note under "1-row matmul bandwidth").
+- Attention benchmark (`flagos-check-spacemit --bench`; per call, one layer, 36 per token):
+
+| Shape | Provider | CPU (8 X100) |
+|---|---|---|
+| decode, n_kv 256 | 141 us (5.1 ms per token; 7.4 GB/s of K and V) | 439 us (15.8 ms) |
+| decode, n_kv 1024 | 475 us (17.1 ms; 8.8 GB/s) | 933 us (33.6 ms) |
+| decode, n_kv 4096 | 1722 us (62.0 ms; 9.7 GB/s) | 12037 us (433.3 ms) |
+| 128 tokens, n_kv 128 | 2952 us (106 ms per batch) | 5555 us (200 ms) |
+| 128 tokens, n_kv 4096 | 97963 us (3527 ms per batch) | 142071 us (5115 ms) |
+
+  - Decode attention reads K and V at 9.7 GB/s at n_kv 4096, a third of what the 1-row matmuls stream in the same run (28.2 GB/s): the latency bound the M2e design estimated, and M2e.3's headroom (about 62 -> 23 ms per token at 4096, tg32 there about 6.5 -> 8.7, estimate).
+  - Prefill attention at depth is compute-bound and slow: 8.6 GFLOP per layer for 128 tokens at n_kv 4096 in 98 ms, about 88 GFLOP/s (the IME matmuls reach 600-890 at 128 rows; the X100 cores 60). It is about 70% of pp512 at depth 4096 (`ime` has the same kernel and the same speed). The tiled kernel rereads and re-transposes K for every 64-token query tile and for each query head of a KV head.
+- Other benchmark lines: 1-row matmuls per token `paired` 87.2 ms (28.2 GB/s), `staged` 93.7, `direct` 99.4 (as in round 2); launch 11.5 us, per node 0.94 us (M2a: 9.9 and 0.79; with one launch per token since M2e.1, this costs about 1 ms per token).
+- The CPU-only pp512 at depth 4096 died with SIGSEGV in `ggml_vec_dot_q4_1_q8_1`: the crash of 2026-10-09 again, at the same instruction, this time with the registers (the crash entry under "Provider M2b" above, second occurrence).
 
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
