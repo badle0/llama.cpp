@@ -5,8 +5,10 @@
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
 //                    output heads (run as Q8_0) at 128 rows besides 1 and 7 (up to 128 x 2560 x 151936); slow without
 //                    the IME
-//   --bench          also measure launch cost, per-node cost, bandwidth, and Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul
-//                    time against the CPU, and the 1-row strategies of FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
+//   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
+//                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-4096, 128 tokens at n_kv 128
+//                    and 4096) against the CPU, and the 1-row strategies of FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's
+//                    shapes
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 // Without a flag, a host without the device skips the device checks.
 
@@ -1065,6 +1067,252 @@ static int check_gemv_strategies(ggml_backend_dev_t dev, bool host) {
 }
 
 //
+// M2e.1: FLASH_ATTN_EXT over the KV cache, against the CPU backend
+//
+
+// FLASH_ATTN_EXT as llama.cpp builds it over caches that hold every KV head of a position in one cell
+// (src/llama-kv-cache.cpp:1249-1300, V not transposed; src/llama-graph.cpp:2500-2545): views of the first n_kv cells
+// and q [d, n_head, n_tokens], each permuted (0, 2, 1, 3); scale 1/sqrt(d); precision F32
+static ggml_tensor * build_flash_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k_cache, ggml_tensor * v_cache,
+                                      ggml_tensor * mask, int64_t n_head_kv, int64_t n_kv, float max_bias) {
+    const int64_t d = q->ne[0];
+    ggml_tensor * k = ggml_view_4d(ctx, k_cache, d, n_head_kv, n_kv, 1, ggml_row_size(k_cache->type, d), k_cache->nb[1],
+                                   ggml_nbytes(k_cache), 0);
+    ggml_tensor * v = ggml_view_4d(ctx, v_cache, d, n_head_kv, n_kv, 1, ggml_row_size(v_cache->type, d), v_cache->nb[1],
+                                   ggml_nbytes(v_cache), 0);
+    ggml_tensor * a = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), ggml_permute(ctx, k, 0, 2, 1, 3),
+                                          ggml_permute(ctx, v, 0, 2, 1, 3), mask, 1.0f / std::sqrt((float) d), max_bias,
+                                          0.0f);
+    ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
+    return a;
+}
+
+static std::vector<ggml_fp16_t> random_f16(int64_t n, uint32_t seed, float scale) {
+    const std::vector<float> f = random_values(n, seed, scale);
+    std::vector<ggml_fp16_t> h(n);
+    ggml_fp32_to_fp16_row(f.data(), h.data(), n);
+    return h;
+}
+
+// n_head query and n_head_kv KV heads of d; n_tokens queries at positions n_past.. over the first n_kv cells, cell c
+// holding position c (one sequence, as llama.cpp fills its cache)
+struct attn_shape {
+    int64_t n_head, n_head_kv, d, n_kv, n_tokens, n_past;
+};
+
+// the mask's cells that a token sees (positions up to its own) read 0 (causal), or minus their distance to the token
+// as llama.cpp writes them for ALiBi (src/llama-kv-cache.cpp:1673); the others -inf. none: no mask, every cell seen
+enum class attn_mask { none, causal, alibi };
+
+// one FLASH_ATTN_EXT (build_flash_attn) on the provider, its output in the provider's buffer, and on the CPU backend,
+// both reading the same inputs in a CPU buffer: caches of n_kv + 32 cells (cells beyond the view hold data too, as when
+// the context is longer than n_kv), random K and V in [-1, 1); q in [-4, 4), which spreads the scores over about 1.3
+// standard deviations at d 128; the mask F16 [n_kv, n_tokens, 1, 1], `visible` added to every cell a token sees
+struct attn_run {
+    ggml_context *        ctx_host = nullptr, * ctx_dev = nullptr;
+    ggml_backend_buffer_t buf_host = nullptr, buf_dev = nullptr;
+    ggml_tensor *         out = nullptr, * out_ref = nullptr;
+    ggml_cgraph *         g_dev = nullptr, * g_cpu = nullptr;
+
+    bool init(ggml_backend_dev_t dev, const attn_shape & s, attn_mask mode, float visible, float max_bias,
+              uint32_t seed) {
+        ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+        ctx_host                = ggml_init(params);
+        ctx_dev                 = ggml_init(params);
+        const int64_t cells     = s.n_kv + 32;
+        ggml_tensor * k_cache   = ggml_new_tensor_2d(ctx_host, GGML_TYPE_F16, s.d * s.n_head_kv, cells);
+        ggml_tensor * v_cache   = ggml_new_tensor_2d(ctx_host, GGML_TYPE_F16, s.d * s.n_head_kv, cells);
+        ggml_tensor * q         = ggml_new_tensor_3d(ctx_host, GGML_TYPE_F32, s.d, s.n_head, s.n_tokens);
+        ggml_tensor * mask =
+            mode == attn_mask::none ? nullptr : ggml_new_tensor_4d(ctx_host, GGML_TYPE_F16, s.n_kv, s.n_tokens, 1, 1);
+        out_ref  = build_flash_attn(ctx_host, q, k_cache, v_cache, mask, s.n_head_kv, s.n_kv, max_bias);
+        out      = build_flash_attn(ctx_dev, q, k_cache, v_cache, mask, s.n_head_kv, s.n_kv, max_bias);
+        buf_host = ggml_backend_alloc_ctx_tensors_from_buft(ctx_host, ggml_backend_cpu_buffer_type());
+        buf_dev  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, ggml_backend_dev_buffer_type(dev));
+        if (buf_host == nullptr || buf_dev == nullptr) {
+            return false;
+        }
+        const std::vector<float> qv = random_values(ggml_nelements(q), seed, 4.0f);
+        ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
+        ggml_backend_tensor_set(k_cache, random_f16(ggml_nelements(k_cache), seed + 1, 1.0f).data(), 0,
+                                ggml_nbytes(k_cache));
+        ggml_backend_tensor_set(v_cache, random_f16(ggml_nelements(v_cache), seed + 2, 1.0f).data(), 0,
+                                ggml_nbytes(v_cache));
+        if (mask != nullptr) {
+            std::vector<ggml_fp16_t> m(ggml_nelements(mask));
+            for (int64_t t = 0; t < s.n_tokens; t++) {
+                const int64_t p = s.n_past + t;
+                for (int64_t c = 0; c < s.n_kv; c++) {
+                    const float value = mode == attn_mask::alibi ? visible - (float) (p - c) : visible;
+                    m[t * s.n_kv + c] = ggml_fp32_to_fp16(c <= p ? value : -INFINITY);
+                }
+            }
+            ggml_backend_tensor_set(mask, m.data(), 0, ggml_nbytes(mask));
+        }
+        g_dev = ggml_new_graph(ctx_dev);
+        g_cpu = ggml_new_graph(ctx_host);
+        ggml_build_forward_expand(g_dev, out);
+        ggml_build_forward_expand(g_cpu, out_ref);
+        return true;
+    }
+
+    ~attn_run() {
+        ggml_backend_buffer_free(buf_host);
+        ggml_backend_buffer_free(buf_dev);
+        ggml_free(ctx_host);
+        ggml_free(ctx_dev);
+    }
+
+    // NMSE of the provider's output against the CPU's (+inf if not finite); -1 if the provider refused the op or
+    // failed. worst_row: the largest NMSE of one row (ne[0] floats: one query head and token), since a fault in a few
+    // rows of the thousands of a batch hardly moves the first. The output is filled with NaN first, so rows that no
+    // tile writes show
+    double compare(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, double & worst_row) {
+        worst_row = -1.0;
+        if (!ggml_backend_dev_supports_op(dev, out)) {
+            return -1.0;
+        }
+        std::vector<float> o(ggml_nelements(out), NAN);
+        ggml_backend_tensor_set(out, o.data(), 0, ggml_nbytes(out));
+        if (ggml_backend_graph_compute(backend, g_dev) != GGML_STATUS_SUCCESS ||
+            ggml_backend_graph_compute(cpu, g_cpu) != GGML_STATUS_SUCCESS) {
+            return -1.0;
+        }
+        ggml_backend_tensor_get(out, o.data(), 0, ggml_nbytes(out));
+        const float * ref = static_cast<const float *>(out_ref->data);
+        worst_row         = 0.0;
+        for (int64_t r = 0; r < (int64_t) o.size(); r += out->ne[0]) {
+            worst_row = std::max(worst_row, nmse(o.data() + r, ref + r, out->ne[0]));
+        }
+        return nmse(o.data(), ref, (int64_t) o.size());
+    }
+};
+
+constexpr double k_attn_max_nmse = 5e-4;  // test-backend-ops' bound for FLASH_ATTN_EXT
+// a row's own bound: rows of the reference reach 4e-7 in the tiled cases and 2e-5 at decode over 4096 cells (the
+// CPU's 1-row kernel accumulates V in F16); a row given the wrong KV head or missing a KV tile 0.3 or more, while the
+// whole output of a tiled case stayed below 5e-4
+constexpr double k_attn_max_row_nmse = 5e-3;
+
+// over the whole output and the worst row (attn_run::compare); all < 0: refused or failed
+struct attn_error {
+    double all = -1.0, row = -1.0;
+};
+
+static attn_error attn_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, const attn_shape & s,
+                            attn_mask mode, float visible, float max_bias, uint32_t seed) {
+    attn_run   run;
+    attn_error e;
+    if (run.init(dev, s, mode, visible, max_bias, seed)) {
+        e.all = run.compare(dev, backend, cpu, e.row);
+    }
+    return e;
+}
+
+static void attn_report(const attn_error & e, const char * what, const attn_shape & s) {
+    if (e.all < 0.0 || e.all > k_attn_max_nmse || e.row > k_attn_max_row_nmse) {
+        std::fprintf(stderr,
+                     "FAIL: attention %s (%lld query and %lld KV heads of %lld, n_kv %lld, %lld tokens after %lld): "
+                     "%s %.3e (bound %.0e), worst row %.3e (bound %.0e)\n",
+                     what, (long long) s.n_head, (long long) s.n_head_kv, (long long) s.d, (long long) s.n_kv,
+                     (long long) s.n_tokens, (long long) s.n_past,
+                     e.all < 0.0       ? "refused or failed" :
+                     std::isinf(e.all) ? "output not finite" :
+                                         "NMSE",
+                     e.all, k_attn_max_nmse, e.row, k_attn_max_row_nmse);
+        g_failures++;
+    }
+}
+
+// FLASH_ATTN_EXT against the CPU backend, which runs the same algorithm (q rounded to F16, F32 scores, online softmax;
+// V accumulated in F16 by one row, in F32 by its 64 x 64 tiles from 64 tokens), so the NMSE measures rounding. On the
+// K3, with TCM, the cases select each of the provider's kernels: the 4-row (Qwen3-4B) and 2-row (0.6B) decode
+// kernels, the 1-row kernel (7 tokens), the tiled kernel (99 and 128 tokens). 128 tokens from position 0 fill whole
+// 64 x 64 tiles; 99 after 37 also take the tiled kernel's branches for rows that see none of a KV tile that other
+// rows of their tile see (54 rows per head, 2 of them in mixed 4-row groups) and its 1-row tail (3 rows of a 35-row
+// tile). Each probe gates one of the faults fixed in the copied kernels (plan.md, M2e design): (a) every score far
+// below 0, where rows whose maximum started at 0 came out as zeros (the decode kernels accumulate V in F16, where a
+// weight exp(s - 0) is 0 below about -17; below about -104 it is 0 in F32 too, which -120 shows in the F32 reference);
+// (b) no mask, which crashed; (c) ALiBi with GQA, where the grouped rows took the first row's slope
+static int check_flash_attn(ggml_backend_dev_t dev) {
+    // claimed exactly: llama.cpp's graph (here before allocation) at head sizes up to 128, without a mask too; not head
+    // size 256, F32 or quantized K and V, or K and V of different types
+    ggml_init_params params = { ggml_tensor_overhead() * 128, nullptr, true };
+    ggml_context *   ctx    = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    const auto fa = [&](int64_t d, ggml_type tk, ggml_type tv, bool with_mask) {
+        ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 32, 7);
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, tk, d * 8, 256);
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, tv, d * 8, 256);
+        ggml_tensor * m  = with_mask ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 7, 1, 1) : nullptr;
+        return build_flash_attn(ctx, q, kc, vc, m, 8, 256, 0.0f);
+    };
+    CHECK(ggml_backend_dev_supports_op(dev, fa(128, GGML_TYPE_F16, GGML_TYPE_F16, true)));
+    CHECK(ggml_backend_dev_supports_op(dev, fa(64, GGML_TYPE_F16, GGML_TYPE_F16, true)));
+    CHECK(ggml_backend_dev_supports_op(dev, fa(128, GGML_TYPE_F16, GGML_TYPE_F16, false)));
+    CHECK(!ggml_backend_dev_supports_op(dev, fa(256, GGML_TYPE_F16, GGML_TYPE_F16, true)));
+    CHECK(!ggml_backend_dev_supports_op(dev, fa(128, GGML_TYPE_F32, GGML_TYPE_F32, true)));
+    CHECK(!ggml_backend_dev_supports_op(dev, fa(128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true)));
+    CHECK(!ggml_backend_dev_supports_op(dev, fa(128, GGML_TYPE_F16, GGML_TYPE_Q8_0, true)));
+    ggml_free(ctx);
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 8);
+
+    struct attn_case { const char * what; attn_shape s; };
+    const attn_case cases[] = {
+        { "Qwen3-4B decode, 37 of 256 cells valid", { 32, 8, 128, 256, 1, 36 } },
+        { "Qwen3-4B decode", { 32, 8, 128, 1024, 1, 1023 } },
+        { "Qwen3-4B decode", { 32, 8, 128, 4096, 1, 4095 } },
+        { "Qwen3-4B batch", { 32, 8, 128, 256, 7, 100 } },
+        { "Qwen3-4B batch (tiled)", { 32, 8, 128, 256, 128, 0 } },
+        { "Qwen3-4B batch (tiled), partly masked KV tiles", { 32, 8, 128, 256, 99, 37 } },
+        { "Qwen3-0.6B decode, 300 of 512 cells valid", { 16, 8, 128, 512, 1, 299 } },
+        { "Qwen3-0.6B batch (tiled)", { 16, 8, 128, 256, 128, 0 } },
+    };
+    // runs and reports one case, returns its NMSE over the whole output (HUGE_VAL if refused or failed); worst_row over
+    // the cases and the probes
+    double     worst_row = 0.0;
+    const auto attn      = [&](const char * what, const attn_shape & s, attn_mask mode, float visible, float max_bias,
+                          uint32_t seed) {
+        const attn_error e = attn_nmse(dev, backend, cpu, s, mode, visible, max_bias, seed);
+        attn_report(e, what, s);
+        worst_row = e.all < 0.0 ? HUGE_VAL : std::max(worst_row, e.row);
+        return e.all < 0.0 ? HUGE_VAL : e.all;
+    };
+    double   worst = 0.0;
+    uint32_t seed  = 40;
+    for (const attn_case & c : cases) {
+        worst = std::max(worst, attn(c.what, c.s, attn_mask::causal, 0.0f, 0.0f, seed++));
+    }
+
+    const attn_shape decode = { 32, 8, 128, 256, 1, 36 };
+    double           e_low  = 0.0;
+    for (float visible : { -30.0f, -120.0f }) {
+        e_low = std::max(e_low,
+                         attn(visible > -100.0f ? "probe (a), every score far below 0 (mask -30 on the valid cells)" :
+                                                  "probe (a), every score far below 0 (mask -120 on the valid cells)",
+                              decode, attn_mask::causal, visible, 0.0f, 60));
+    }
+    const attn_shape all_cells = { 32, 8, 128, 256, 1, 255 };
+    const double     e_none    = attn("probe (b), no mask", all_cells, attn_mask::none, 0.0f, 0.0f, 61);
+    const double e_alibi = attn("probe (c), ALiBi (max_bias 8) with GQA 4", decode, attn_mask::alibi, 0.0f, 8.0f, 62);
+
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    std::printf(
+        "attn     FLASH_ATTN_EXT vs CPU (F16 KV cache in a CPU buffer, viewed as llama.cpp does; Qwen3-4B and "
+        "0.6B heads): %zu cases (decode at n_kv 256-4096, 7, 99 and 128 tokens), max NMSE %.2e (bound %.0e), "
+        "worst row %.2e (bound %.0e); probes: every score far below 0 (mask -30, -120) %.2e, no mask %.2e, "
+        "ALiBi with GQA 4 %.2e; claims exact (F16 K and V, head sizes to 128): checked%s\n",
+        sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, e_low, e_none,
+        e_alibi, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+    return 0;
+}
+
+//
 // M2d: the ops of a layer together in one launch, against the CPU backend
 //
 
@@ -1072,8 +1320,10 @@ struct layer_weights {
     ggml_tensor *attn_norm, *q_norm, *k_norm, *ffn_norm, *wq, *wk, *wv, *wo, *wg, *wu, *wd;
 };
 
-// a Qwen3-like layer (all dimensions small): d hidden, nh query and nkv key/value heads of hd, ff in the FFN
-constexpr int64_t k_d = 256, k_hd = 128, k_nh = 2, k_nkv = 1, k_ff = 512, k_slots = 16;
+// a Qwen3-like layer (all dimensions small): d hidden, nh query and nkv key/value heads of hd, ff in the FFN; a KV
+// cache of k_slots cells, the batch's positions from k_layer_pos on
+constexpr int64_t k_d = 256, k_hd = 128, k_nh = 2, k_nkv = 1, k_ff = 512, k_slots = 64;
+constexpr int32_t k_layer_pos = 40;
 
 // down: the FFN down projection's type (Qwen3-4B Q4_0 has Q4_1 there in its first 4 layers)
 static layer_weights new_layer_weights(ggml_context * ctx, ggml_type down) {
@@ -1122,14 +1372,17 @@ static void copy_layer_weights(const layer_weights & from, const layer_weights &
 }
 
 struct layer_out {
-    ggml_tensor *full, *out, *set_k, *set_v;  // full: the layer output of every token; out: the last token's row
+    ggml_tensor *full, *out;  // full: the layer output of every token; out: the last token's row
 };
 
-// norm, Q/K/V, Q and K norms, RoPE (NEOX), KV writes, output projection, residual, FFN norm, SwiGLU FFN, residual,
-// and the last token's row: every op of a Qwen3 layer except attention, whose output q stands in for here
-static layer_out build_layer(ggml_context * ctx, const layer_weights & w, ggml_tensor * x, ggml_tensor * pos,
-                             ggml_tensor * kv_idx, ggml_tensor * out_ids, ggml_tensor * k_cache, ggml_tensor * v_cache,
-                             int64_t n_tokens) {
+// norm, Q/K/V, Q and K norms, RoPE (NEOX), KV writes, attention, output projection, residual, FFN norm, SwiGLU FFN,
+// residual, and the last token's row: every op of a Qwen3 layer. The attention is flash attention over every cell of
+// the caches (build_flash_attn), so it reads the KV writes through views of the caches, not through the nodes: only
+// the graph's order puts the writes first. Expanded into gf in llama.cpp's order (src/llama-graph.cpp:2770-2790): q, v
+// and k, the KV writes, then the attention and the rest
+static layer_out build_layer(ggml_context * ctx, ggml_cgraph * gf, const layer_weights & w, ggml_tensor * x,
+                             ggml_tensor * pos, ggml_tensor * kv_idx, ggml_tensor * out_ids, ggml_tensor * k_cache,
+                             ggml_tensor * v_cache, ggml_tensor * mask, int64_t n_tokens) {
     const float   eps = 1e-6f;
     ggml_tensor * h   = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w.attn_norm);
     ggml_tensor * q   = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w.wq, h), k_hd, k_nh, n_tokens);
@@ -1139,16 +1392,20 @@ static layer_out build_layer(ggml_context * ctx, const layer_weights & w, ggml_t
     k               = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), w.k_norm);
     k = ggml_rope_ext(ctx, k, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_tensor * v = ggml_mul_mat(ctx, w.wv, h);
+    ggml_build_forward_expand(gf, q);
+    ggml_build_forward_expand(gf, v);
+    ggml_build_forward_expand(gf, k);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache, ggml_reshape_2d(ctx, k, k_hd * k_nkv, n_tokens), kv_idx));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache, v, kv_idx));
 
-    layer_out o;
-    o.set_k = ggml_set_rows(ctx, k_cache, ggml_reshape_2d(ctx, k, k_hd * k_nkv, n_tokens), kv_idx);
-    o.set_v = ggml_set_rows(ctx, v_cache, v, kv_idx);
-
-    ggml_tensor * f   = ggml_add(ctx, ggml_mul_mat(ctx, w.wo, ggml_reshape_2d(ctx, q, k_hd * k_nh, n_tokens)), x);
-    ggml_tensor * g   = ggml_mul(ctx, ggml_rms_norm(ctx, f, eps), w.ffn_norm);
-    ggml_tensor * s   = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w.wg, g), ggml_mul_mat(ctx, w.wu, g));
-    o.full            = ggml_add(ctx, ggml_mul_mat(ctx, w.wd, s), f);
-    o.out             = ggml_get_rows(ctx, o.full, out_ids);
+    layer_out     o;
+    ggml_tensor * a = build_flash_attn(ctx, q, k_cache, v_cache, mask, k_nkv, k_slots, 0.0f);
+    ggml_tensor * f = ggml_add(ctx, ggml_mul_mat(ctx, w.wo, ggml_reshape_2d(ctx, a, k_hd * k_nh, n_tokens)), x);
+    ggml_tensor * g = ggml_mul(ctx, ggml_rms_norm(ctx, f, eps), w.ffn_norm);
+    ggml_tensor * s = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w.wg, g), ggml_mul_mat(ctx, w.wu, g));
+    o.full          = ggml_add(ctx, ggml_mul_mat(ctx, w.wd, s), f);
+    o.out           = ggml_get_rows(ctx, o.full, out_ids);
+    ggml_build_forward_expand(gf, o.out);
     return o;
 }
 
@@ -1159,7 +1416,8 @@ static std::vector<float> f16_to_f32(const std::vector<uint8_t> & bytes) {
 }
 
 // a layer chains three quantized matmuls, each quantizing its activations to 8 bits; on the Mac the whole output's NMSE
-// against the CPU is about 4.0e-4 at 7 tokens, above a single matmul's bound
+// against the CPU is about 5.4e-4 at 7 tokens (4.0e-4 with q standing in for the attention, before M2e.1), above a
+// single matmul's bound. The FFN gives most of it: the attention's own output differs by 4e-5
 constexpr double k_layer_max_nmse = 1e-3;
 
 // every contiguous F32 node of a computed graph is finite. In a layer a NaN from a norm, RoPE or SwiGLU would
@@ -1179,9 +1437,12 @@ static bool graph_finite(ggml_cgraph * g) {
     return true;
 }
 
-// the layer on the provider, with the KV cache in a CPU buffer and the norm and quantized weights in the provider's
-// buffer (where llama.cpp puts them), against the same layer on the CPU backend; returns the larger NMSE of the whole
-// output and the caches, or -1 when refused, failed, or the last-token row is not an exact copy of the provider's output
+// the layer on the provider, with the KV cache and the mask in a CPU buffer and the norm and quantized weights in the
+// provider's buffer (where llama.cpp puts them), against the same layer on the CPU backend; returns the larger NMSE of
+// the whole output and the caches, or -1 when refused, failed, or the last-token row is not an exact copy of the
+// provider's output. The batch's tokens go to scattered cells (3 + 5t), the positions before it fill the other cells in
+// order and the rest stay empty; every cell first holds random K and V (stale data in the empty ones), and the causal
+// mask lets a token see the cells of its own position and the earlier ones
 static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int64_t n_tokens,
                          ggml_type down) {
     ggml_init_params params = { ggml_tensor_overhead() * 128 + ggml_graph_overhead() * 2, nullptr, true };
@@ -1199,6 +1460,7 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
     ggml_tensor * vc_d    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * kc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * vc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    ggml_tensor * mask    = ggml_new_tensor_4d(ctx_h, GGML_TYPE_F16, k_slots, n_tokens, 1, 1);
     const layer_weights wd = new_layer_weights(ctx_wd, down);
     const layer_weights wc = new_layer_weights(ctx_wc, down);
 
@@ -1215,28 +1477,42 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
     const std::vector<float> xv = random_values(k_d * n_tokens, 5, 1.0f);
     std::vector<int32_t>     pv(n_tokens);
     std::vector<int64_t>     iv(n_tokens);
+    std::vector<int32_t>     cell_pos(k_slots, -1);  // -1: empty
     for (int64_t t = 0; t < n_tokens; t++) {
-        pv[t] = (int32_t) (40 + t);
-        iv[t] = (3 + 5 * t) % k_slots;  // distinct slots
+        pv[t]           = (int32_t) (k_layer_pos + t);
+        iv[t]           = (3 + 5 * t) % k_slots;  // distinct cells
+        cell_pos[iv[t]] = pv[t];
+    }
+    for (int32_t c = 0, p = 0; c < k_slots && p < k_layer_pos; c++) {
+        if (cell_pos[c] < 0) {
+            cell_pos[c] = p++;
+        }
+    }
+    std::vector<ggml_fp16_t> mv(k_slots * n_tokens);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t c = 0; c < k_slots; c++) {
+            mv[t * k_slots + c] = ggml_fp32_to_fp16(cell_pos[c] >= 0 && cell_pos[c] <= pv[t] ? 0.0f : -INFINITY);
+        }
     }
     const int32_t last = (int32_t) (n_tokens - 1);
     ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
     ggml_backend_tensor_set(pos, pv.data(), 0, ggml_nbytes(pos));
     ggml_backend_tensor_set(kv_idx, iv.data(), 0, ggml_nbytes(kv_idx));
     ggml_backend_tensor_set(out_ids, &last, 0, sizeof(last));
+    ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
+    uint32_t cache_seed = 6;
+    for (const auto & caches : { std::pair<ggml_tensor *, ggml_tensor *>{ kc_d, kc_c }, { vc_d, vc_c } }) {
+        const std::vector<ggml_fp16_t> h = random_f16(ggml_nelements(caches.first), cache_seed++, 1.0f);
+        ggml_backend_tensor_set(caches.first, h.data(), 0, ggml_nbytes(caches.first));
+        ggml_backend_tensor_set(caches.second, h.data(), 0, ggml_nbytes(caches.second));
+    }
 
-    const layer_out od = build_layer(ctx_gd, wd, x, pos, kv_idx, out_ids, kc_d, vc_d, n_tokens);
-    const layer_out oc = build_layer(ctx_gc, wc, x, pos, kv_idx, out_ids, kc_c, vc_c, n_tokens);
-    ggml_backend_buffer_t bgd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gd, ggml_backend_dev_buffer_type(dev));
-    ggml_backend_buffer_t bgc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gc, ggml_backend_cpu_buffer_type());
     ggml_cgraph *         gd  = ggml_new_graph(ctx_gd);
     ggml_cgraph *         gc  = ggml_new_graph(ctx_gc);
-    for (ggml_tensor * t : { od.out, od.set_k, od.set_v }) {
-        ggml_build_forward_expand(gd, t);
-    }
-    for (ggml_tensor * t : { oc.out, oc.set_k, oc.set_v }) {
-        ggml_build_forward_expand(gc, t);
-    }
+    const layer_out       od  = build_layer(ctx_gd, gd, wd, x, pos, kv_idx, out_ids, kc_d, vc_d, mask, n_tokens);
+    const layer_out       oc  = build_layer(ctx_gc, gc, wc, x, pos, kv_idx, out_ids, kc_c, vc_c, mask, n_tokens);
+    ggml_backend_buffer_t bgd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gd, ggml_backend_dev_buffer_type(dev));
+    ggml_backend_buffer_t bgc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gc, ggml_backend_cpu_buffer_type());
 
     double worst = -1.0;
     if (bgd != nullptr && bgc != nullptr && ggml_backend_graph_compute(backend, gd) == GGML_STATUS_SUCCESS &&
@@ -1500,9 +1776,11 @@ static int check_layer(ggml_backend_dev_t dev) {
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
-    std::printf("layer    Qwen3-like layer in one launch vs CPU (1 and 7 tokens, down projection Q4_0 and Q4_1, all rows; "
-                "KV cache in a CPU buffer, weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e%s\n",
-                worst, k_layer_max_nmse, e_rope, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+    std::printf("layer    Qwen3-like layer with flash attention in one launch vs CPU (1 and 7 tokens after %d "
+                "positions, down projection Q4_0 and Q4_1, all rows; KV cache of %lld cells and mask in a CPU buffer, "
+                "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e%s\n",
+                k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope,
+                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
 
@@ -1616,6 +1894,53 @@ static int bench_gemv(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// flash attention at Qwen3-4B's heads (32 query, 8 KV of 128; attn_run): a token at n_kv 256, 1024 and 4096, every
+// cell valid, and a 128-token batch at n_kv 128 and 4096, causal; the provider against the CPU backend (8 threads) on
+// the same graph. As in the model, where each layer has its own cache, every call reads its cache from DRAM: it takes
+// the next of enough copies (32 MB together, as bench_gemv). GB/s counts the n_kv cells' K and V bytes once; a token
+// (or batch) is 36 layers' calls, each its own launch here
+static int bench_attn(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 8);
+    struct attn_bench { int64_t n_kv, n_tokens; int iterations; };
+    for (const attn_bench & b : { attn_bench{ 256, 1, 30 }, { 1024, 1, 20 }, { 4096, 1, 10 }, { 128, 128, 10 },
+                                  { 4096, 128, 2 } }) {
+        const attn_shape s        = { 32, 8, 128, b.n_kv, b.n_tokens, b.n_kv - b.n_tokens };
+        const double     kv_bytes = 2.0 * (double) (s.n_kv * s.n_head_kv * s.d) * sizeof(ggml_fp16_t);
+        const size_t     copies   = (size_t) std::min(32.0, std::ceil(32e6 / kv_bytes));
+        std::vector<std::unique_ptr<attn_run>> runs;
+        for (size_t c = 0; c < copies; c++) {
+            runs.push_back(std::make_unique<attn_run>());
+            REQUIRE(runs.back()->init(dev, s, attn_mask::causal, 0.0f, 0.0f, (uint32_t) c));
+            CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
+        }
+        bool         ok    = true;
+        size_t       next  = 0;
+        const double t_dev = time_us(
+            [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
+            b.iterations);
+        const double t_cpu = time_us(
+            [&] { ok &= ggml_backend_graph_compute(cpu, runs[next++ % copies]->g_cpu) == GGML_STATUS_SUCCESS; },
+            b.iterations);
+        CHECK(ok);
+        if (b.n_tokens == 1) {
+            std::printf("bench    attn decode n_kv %4lld: provider %7.0f us (%6.1f ms per token, %5.1f GB/s of K and "
+                        "V), cpu %7.0f us (%6.1f ms, %5.1f GB/s)\n",
+                        (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, kv_bytes / t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3,
+                        kv_bytes / t_cpu / 1e3);
+        } else {
+            std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), cpu %8.0f us "
+                        "(%7.1f ms)\n",
+                        (long long) s.n_tokens, (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3);
+        }
+    }
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    return 0;
+}
+
 static int bench(ggml_backend_dev_t dev) {
     const int64_t    n_small = 64;
     const int64_t    n_big   = 16 * 1024 * 1024;
@@ -1713,7 +2038,7 @@ static int bench(ggml_backend_dev_t dev) {
     }
     ggml_backend_free(backend);
     ggml_backend_free(cpu8);
-    return bench_gemv(dev);
+    return bench_attn(dev) != 0 ? 1 : bench_gemv(dev);
 }
 
 int main(int argc, char ** argv) {
@@ -1775,7 +2100,7 @@ int main(int argc, char ** argv) {
                       std::strcmp(info.profile.runtime, "none") == 0;
     if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_rows(dev) != 0 ||
-        check_layer(dev) != 0) {
+        check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 : run_gemv && bench_gemv(dev) != 0) {

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../../.." || exit 1
 INC="docs/flagos-k3/scripts/rvv-syntax"
 SDK=$(xcrun --show-sdk-path) || exit 1
 LOGS=${TMPDIR:-/tmp}
-[ $# -gt 0 ] || set -- flagos-spacemit-rvv-kernels.cpp flagos-spacemit-kernels.cpp flagos-spacemit-ime-kernels.cpp flagos-spacemit-ime.cpp
+[ $# -gt 0 ] || set -- flagos-spacemit-rvv-kernels.cpp flagos-spacemit-kernels.cpp flagos-spacemit-ime-kernels.cpp flagos-spacemit-ime.cpp flagos-spacemit-rvv-attn.cpp flagos-spacemit-attn.cpp
 status=0
 for f in "$@"; do
   log="$LOGS/rvv-syntax-$f.log"

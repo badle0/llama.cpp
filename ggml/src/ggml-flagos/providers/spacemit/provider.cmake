@@ -21,7 +21,11 @@ list(APPEND FLAGOS_SOURCES
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.cpp")
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-attn.h"
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-attn.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.h"
+    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.cpp")
 list(APPEND FLAGOS_PRIVATE_DEFINITIONS GGML_FLAGOS_HAVE_SPACEMIT)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
@@ -61,7 +65,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
 
     # only the kernels need the vector ISA; they run on the A100 cores (RVV 1024)
     set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.cpp"
-                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.cpp" PROPERTIES
+                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-attn.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.cpp" PROPERTIES
         COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba;-mabi=lp64d")
     set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.cpp" PROPERTIES
         COMPILE_OPTIONS "${FLAGOS_SPACEMIT_IME_MARCH};-mabi=lp64d")

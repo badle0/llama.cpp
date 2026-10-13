@@ -1,5 +1,6 @@
 #include "flagos-spacemit-ops.h"
 
+#include "flagos-spacemit-attn.h"
 #include "flagos-spacemit-ime.h"
 #include "flagos-spacemit-kernels.h"
 #include "flagos-spacemit-weights.h"
@@ -109,6 +110,7 @@ SPACEMIT_ONE_STEP_OP(k_rope_f32, spacemit_kernel_rope_f32, spacemit_rope_workspa
 SPACEMIT_ONE_STEP_OP(k_set_rows, spacemit_kernel_set_rows, nullptr);
 SPACEMIT_ONE_STEP_OP(k_get_rows_f32, spacemit_kernel_get_rows_f32, nullptr);
 SPACEMIT_ONE_STEP_OP(k_swiglu_f32, spacemit_kernel_swiglu_f32, nullptr);
+SPACEMIT_ONE_STEP_OP(k_flash_attn, spacemit_kernel_flash_attn, nullptr);
 
 static const spacemit_kernel_fn k_mul_mat_ime_steps[] = { spacemit_mul_mat_quantize, spacemit_mul_mat_gemm };
 static const spacemit_op        k_mul_mat_ime         = { k_mul_mat_ime_steps, 2, spacemit_mul_mat_workspace };
@@ -139,6 +141,9 @@ const spacemit_op * spacemit_find_op(const ggml_tensor * op, ggml_backend_buffer
             break;
         case GGML_OP_MUL_MAT:
             impl = spacemit_mul_mat_ime_supported(op, own_buft) ? &k_mul_mat_ime : nullptr;
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            impl = spacemit_flash_attn_supported(op) ? &k_flash_attn : nullptr;
             break;
         default:
             break;

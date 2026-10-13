@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Acceptance run for the SpacemiT provider milestones (plan.md M1, M2a, M2b, M2d, M2c, M2c.2). Run on the K3; standard
-# library only.
+# Acceptance run for the SpacemiT provider milestones (plan.md M1, M2a, M2b, M2d, M2c, M2c.2, M2e.1). Run on the K3;
+# standard library only.
 #   all:  (--build) configure and build build-flagos/; FlagOS Common checks; flagos-check-spacemit with the
 #         device present and with FLAGOS_SPACEMIT_DISABLE=1; llama.cpp lists the device; op claims; a model
 #         gives identical output with the provider enabled and disabled
@@ -22,8 +22,18 @@
 #         flagos-check-spacemit adds Q8_0 against the CPU and Q6_K against the CPU's Q6_K and, with a tight bound that
 #         checks the requantization, against the CPU's Q8_0 of the same values, up to Qwen3's output heads (151936
 #         rows); the benchmark adds Q6_K at Qwen3-4B's output head
-# Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c|m2c2] [--build] [--build-dir DIR] [--model GGUF]
-#                          [--ppl-text FILE] [--ime-build DIR] [--skip-support] [--segv SO]
+#   m2e:  as m2c2, with attention (M2e.1): it claims FLASH_ATTN_EXT too (F16 K and V, head sizes up to 128), whose
+#         test-backend-ops cases pass with the RVV and with the reference kernels; flagos-check-spacemit adds attention
+#         against the CPU with the KV cache's layout and the probes for the three faults of the copied kernels; the
+#         model run's default -fa auto keeps flash attention on the provider (C5a; FAIL with llama.cpp's warning if it
+#         turns it off, or if the graphs take as many splits as the model has layers, as when the CPU runs attention)
+#         and a token takes 2 graph splits; perplexity with -fa on and with -fa auto (attention on the provider), each
+#         within 1% of the CPU; mean KLD against the CPU's logits with 512-token batches (tiled kernel) and -ub 1
+#         (decode kernels), to compare by hand with M2c.2's (Qwen3-4B: 0.0033 and 0.0022, build.md §7)
+#   --depth (m2b and later): after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth
+#         4096 for the provider, the CPU and (if built) the upstream IME build; FAIL if the provider's runs miss one
+# Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c|m2c2|m2e] [--build] [--build-dir DIR] [--model GGUF]
+#                          [--ppl-text FILE] [--ime-build DIR] [--skip-support] [--depth] [--segv SO]
 import argparse
 import csv
 import io
@@ -106,7 +116,7 @@ def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
                        env_extra=env_extra, timeout=timeout)
     detail = "; ".join(ln for ln in out.splitlines()
                        if ln.startswith(("device", "flagos ", "ops ", "matmul   Q4_0", "matmul   Q4_1", "matmul   Q8_0",
-                                         "matmul   Q6_K", "gemv ", "rows ", "layer")))
+                                         "matmul   Q6_K", "gemv ", "rows ", "attn ", "layer")))
     fails = [ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln]
     report(name, rc == 0, detail if rc == 0 else "; ".join(fails[:3]) or last_line(err))
     for ln in out.splitlines():
@@ -118,7 +128,7 @@ def check_tools(bdir, logs, milestone):
     for tool in ["provider", "target", "graph-plan", "registry"]:
         rc, out, err = run([str(bdir / "bin" / f"flagos-check-{tool}")], logs / f"check-{tool}")
         report(f"flagos-check-{tool}", rc == 0, last_line(out) if rc == 0 else f"{last_line(err or out)} (rc={rc})")
-    if milestone in ("m2b", "m2d", "m2c", "m2c2"):
+    if milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
         check_spacemit(bdir, logs, "flagos-check-spacemit (device present, Qwen3-4B shapes)", "check-spacemit", ["--full"],
                        timeout=900)
         # the same with the reference kernels on the AI cores: tells a kernel error from a tiling error
@@ -153,6 +163,9 @@ def support(bdir, logs, milestone):
     elif milestone == "m2c2":
         # Q8_0 and Q6_K MUL_MAT cases with rows a multiple of 32 fit the q8_0 32x32 layout
         ok = rc == 0 and set(ops) == set(M2D_OPS) | {"MUL_MAT"}
+    elif milestone == "m2e":
+        # as m2c2, plus the FLASH_ATTN_EXT cases with F16 K and V and head sizes up to 128
+        ok = rc == 0 and set(ops) == set(M2D_OPS) | {"MUL_MAT", "FLASH_ATTN_EXT"}
     else:
         # no MUL_MAT case of test-backend-ops fits the IME layout (plan.md §1), so MUL_MAT may show 0 claims
         ok = rc == 0 and "ADD" in ops and set(ops) <= {"ADD", "MUL_MAT"}
@@ -171,11 +184,13 @@ def op_test(bdir, logs, op, env_extra=None, tag=""):
 
 
 def op_correctness(bdir, logs, milestone):
-    if milestone not in ("m2d", "m2c", "m2c2"):
+    if milestone not in ("m2d", "m2c", "m2c2", "m2e"):
         report("test-backend-ops ADD", *op_test(bdir, logs, "ADD"))
         return
-    # from M2c.2 test-backend-ops has MUL_MAT cases the provider claims; op_test needs at least one to run
-    ops = M2D_OPS + (["MUL_MAT"] if milestone == "m2c2" else []) + M2D_GRAPHS
+    # from M2c.2 test-backend-ops has MUL_MAT cases the provider claims (op_test needs at least one to run), from M2e.1
+    # FLASH_ATTN_EXT cases
+    ops = (M2D_OPS + (["MUL_MAT"] if milestone in ("m2c2", "m2e") else []) +
+           (["FLASH_ATTN_EXT"] if milestone == "m2e" else []) + M2D_GRAPHS)
     for op in ops:
         report(f"test-backend-ops {op}", *op_test(bdir, logs, op))
     # the same with the reference kernels on the AI cores, in one line
@@ -210,6 +225,47 @@ def tokens_per_second(log):
     return float(m.group(1)) if m else None
 
 
+FA_ENABLED = "Flash Attention enabled"
+FA_DISABLED = "Flash Attention not supported, set to disabled"
+
+
+def flash_attn_auto(log):
+    """Outcome of -fa auto (src/llama-context.cpp resolve_fused_ops) in the last context the log creates: ("enabled"
+    or "disabled", its log lines), or (None, "") if the log has no such check (flash attention set explicitly, or the
+    run failed before it)."""
+    lines = [ln.strip() for ln in ANSI.sub("", log).splitlines()]
+    # the memory fit pass (common/fit.cpp) creates a context of its own first, logged from -lv 5: the last outcome counts
+    last = max((i for i, ln in enumerate(lines) if ln.endswith((FA_ENABLED, FA_DISABLED))), default=None)
+    if last is None:
+        return None, ""
+    if lines[last].endswith(FA_ENABLED):
+        return "enabled", lines[last]
+    # the warning before it names the devices of the layer and of the op
+    why = next((ln for ln in reversed(lines[:last]) if "Flash Attention is assigned to device" in ln), "")
+    return "disabled", "; ".join(ln for ln in (why, lines[last]) if ln)
+
+
+def splits_per_token(log):
+    """Graph splits of the 1-token graph in the last context the log creates, or None."""
+    found = re.findall(r"graph splits = (\d+)(?: \(with bs=\d+\), (\d+) \(with bs=1\))?", log)
+    return int(found[-1][1] or found[-1][0]) if found else None
+
+
+def attention_on_provider(log, rc):
+    """(ok, detail): -fa auto kept flash attention in the last context the log creates, and its graphs (batch and 1
+    token) take fewer splits than the model has layers. "enabled" alone holds as well when the provider declines the
+    model's FLASH_ATTN_EXT and the CPU runs it (the node's device is then its layer's), which splits every layer in two
+    (M2c.2: 74 per Qwen3-4B token)."""
+    state, fa_lines = flash_attn_auto(log)
+    found = re.findall(r"graph splits = (\d+)(?: \(with bs=\d+\), (\d+) \(with bs=1\))?", log)
+    splits = [int(n) for n in found[-1] if n] if found else []
+    m = re.search(r"print_info: n_layer\s+=\s+(\d+)", log)
+    layers = int(m.group(1)) if m else None
+    ok = state == "enabled" and bool(splits) and layers is not None and max(splits) < layers
+    return ok, (f"{fa_lines or f'no flash-attention check in the log (rc={rc})'}; graph splits "
+                f"{'/'.join(map(str, splits)) or '?'}, layers {layers or '?'}")
+
+
 def model_run(bdir, logs, model, milestone):
     if not Path(model).is_file():
         report("model run", False, f"model not found: {model}")
@@ -219,7 +275,7 @@ def model_run(bdir, logs, model, milestone):
     rc_on, text_on, log_on = run(cmd, logs / "model-enabled", env_extra=preload, env_drop=("FLAGOS_SPACEMIT_DISABLE",))
     rc_off, text_off, log_off = run(cmd, logs / "model-disabled", env_extra={"FLAGOS_SPACEMIT_DISABLE": "1", **preload})
     report("model runs", rc_on == 0 and rc_off == 0, f"rc enabled={rc_on}, disabled={rc_off}")
-    if milestone in ("m2b", "m2d", "m2c", "m2c2"):
+    if milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
         # the IME kernels quantize activations differently from the CPU, so greedy text may drift; perplexity decides
         same = next((i for i, (a, b) in enumerate(zip(text_on, text_off)) if a != b), min(len(text_on), len(text_off)))
         info("model output", "identical to the CPU" if text_on == text_off else f"differs from the CPU after {same} characters")
@@ -235,60 +291,145 @@ def model_run(bdir, logs, model, milestone):
     if milestone == "m1":
         report("nothing placed on the provider", not placed, "no provider buffers in use" if not placed else ", ".join(placed))
         report("graph splits unchanged", splits[0] == splits[1] and bool(splits[0]), f"enabled {splits[0]}, disabled {splits[1]}")
-    elif milestone in ("m2b", "m2d", "m2c", "m2c2"):
+    elif milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
         report("weights placed on the provider", any(p.startswith("model") for p in placed), ", ".join(placed) or "none in use")
-        info("graph splits", f"enabled {splits[0]}, disabled {splits[1]}")
+        if milestone == "m2e":
+            # the run leaves -fa at its default, auto; with C5a llama.cpp keeps flash attention on the provider
+            report("-fa auto keeps flash attention on the provider (C5a)", *attention_on_provider(log_on, rc_on))
+            # exit M2e.1 (plan.md): only the token embedding stays on the CPU
+            n_split = splits_per_token(log_on)
+            report("a token takes 2 graph splits", n_split == 2,
+                   f"per token with the provider {n_split}; enabled {splits[0]}, disabled {splits[1]}")
+        else:
+            info("graph splits", f"enabled {splits[0]}, disabled {splits[1]}")
     else:
         info("provider buffers", ", ".join(placed) or "none in use")
         info("graph splits", f"enabled {splits[0]}, disabled {splits[1]}")
     info("generation speed", f"enabled {speed[0]} t/s, disabled {speed[1]} t/s")
 
 
-def perplexity(bdir, logs, model, text):
+def perplexity(bdir, logs, model, text, milestone):
     if not Path(text).is_file():
         report("perplexity", False, f"text not found: {text}")
         return
-    # as M0.6 (build.md §7): 8 x 512 tokens, flash attention on
+    # as M0.6 (build.md §7): 8 x 512 tokens, flash attention on; from M2e.1 also the provider with the default -fa auto,
+    # which keeps flash attention on it with C5a (the CPU alone always keeps it, so one CPU run serves both)
     cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-t", "8",
-           "-fa", "on", "-lv", "4"]
-    ppl, problems = [], []
-    for name, extra, drop in [("enabled", {}, ("FLAGOS_SPACEMIT_DISABLE",)), ("disabled", {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]:
-        rc, out, err = run(cmd, logs / f"ppl-{name}", env_extra={**extra, **preload}, env_drop=drop, timeout=3600)
+           "-lv", "4"]
+    # from M2e.1 the CPU run also saves its logits for the KLD runs (about 600 MB at Qwen3's vocabulary)
+    kld_base = logs / "kld-base.bin"
+    runs = [("enabled", ["-fa", "on"], {}, ("FLAGOS_SPACEMIT_DISABLE",)),
+            ("disabled", ["-fa", "on"] + (["--kl-divergence-base", str(kld_base)] if milestone == "m2e" else []),
+             {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]
+    if milestone == "m2e":
+        kld_base.unlink(missing_ok=True)
+        runs.append(("enabled-fa-auto", [], {}, ("FLAGOS_SPACEMIT_DISABLE",)))
+    ppl, problems, fa_auto = {}, {}, None
+    for name, fa, extra, drop in runs:
+        rc, out, err = run([*cmd, *fa], logs / f"ppl-{name}", env_extra={**extra, **preload}, env_drop=drop,
+                           timeout=3600)
         m = re.search(r"Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)", out + err)
-        ppl.append(float(m.group(1)) if rc == 0 and m else None)
-        if ppl[-1] is None:
+        ppl[name] = float(m.group(1)) if rc == 0 and m else None
+        problems[name] = ""
+        if ppl[name] is None:
             # a negative rc is the signal that ended the run (-9: killed, e.g. out of memory; -11: segfault)
-            problems.append(f"{name} run gave no result: rc={rc}, last log line: {last_line(err or out)[:100]}" +
-                            (f"; segv.so report in {logs / f'ppl-{name}.err'}" if "=== segv.so" in err else ""))
-    ok = None not in ppl and abs(ppl[0] / ppl[1] - 1.0) <= 0.01
-    detail = f"provider {ppl[0]}, CPU {ppl[1]}" + (f" ({100.0 * (ppl[0] / ppl[1] - 1.0):+.2f}%)" if None not in ppl else "")
-    report("perplexity within 1% of the CPU", ok, "; ".join([detail, *problems]))
+            problems[name] = (f"{name} run gave no result: rc={rc}, last log line: {last_line(err or out)[:100]}" +
+                              (f"; segv.so report in {logs / f'ppl-{name}.err'}" if "=== segv.so" in err else ""))
+        if not fa:
+            fa_auto = attention_on_provider(err, rc)
+    cpu = ppl["disabled"]
+    checks = [("enabled", "")]
+    if milestone == "m2e":
+        checks = [("enabled", " (-fa on)"), ("enabled-fa-auto", " (-fa auto)")]
+    for name, label in checks:
+        both = None not in (ppl[name], cpu)
+        ok = both and abs(ppl[name] / cpu - 1.0) <= 0.01
+        detail = f"provider {ppl[name]}, CPU {cpu}" + (f" ({100.0 * (ppl[name] / cpu - 1.0):+.2f}%)" if both else "")
+        report(f"perplexity within 1% of the CPU{label}", ok,
+               "; ".join(s for s in (detail, problems[name], problems["disabled"]) if s))
+    if fa_auto is not None:
+        # the -fa auto run measures the provider's attention only if it ran there
+        report("perplexity -fa auto: flash attention on the provider", *fa_auto)
+    if milestone == "m2e":
+        kl_divergence(bdir, logs, model, text, kld_base)
 
 
-def llama_bench(bdir, logs, model, ime_build, tcm_dir):
+def kl_divergence(bdir, logs, model, text, base):
+    """Mean KLD of the provider's logits against the CPU's (base, from the CPU's perplexity run): with 512-token
+    batches (the tiled kernel) and with -ub 1 (the decode kernels; about 10 minutes for Qwen3-4B), as build.md §6."""
+    if not base.is_file():
+        report("KLD against the CPU", False, f"no CPU logits: {base} (the CPU perplexity run failed)")
+        return
+    cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-t", "8",
+           "-fa", "on", "--kl-divergence-base", str(base), "--kl-divergence"]
+    for label, ub, tag in (("512-token batches", [], ""), ("-ub 1", ["-ub", "1"], "-ub1")):
+        rc, out, err = run([*cmd, *ub], logs / f"kld{tag}", env_extra=preload, env_drop=("FLAGOS_SPACEMIT_DISABLE",),
+                           timeout=3600)
+        m = re.search(r"Mean\s+KLD:\s+([0-9.]+)\s+\S+\s+([0-9.]+)", out + err)
+        report(f"KLD against the CPU ({label})", rc == 0 and m is not None,
+               f"mean {m.group(1)} +/- {m.group(2)}" if rc == 0 and m else
+               f"no result: rc={rc}, last log line: {last_line(err or out)[:100]}")
+    base.unlink(missing_ok=True)
+
+
+def llama_bench(bdir, logs, model, ime_build, tcm_dir, depth):
     # as M0.5 (build.md §7), 3 repetitions
     args = ["-m", model, "-t", "8", "-p", "128", "-n", "128", "-ub", "128", "-fa", "1", "-mmp", "0", "-r", "3", "-o", "csv"]
+    # --depth: generation against context depth as measured 2026-10-12 (build.md §7), after the runs above
+    depth_args = ["-m", model, "-t", "8", "-p", "0", "-n", "32", "-d", "0,1024,4096", "-fa", "1", "-mmp", "0", "-r", "1",
+                  "-o", "csv"]
+    depths = [0, 1024, 4096]
+    # and prefill at depth (plan.md, M2e design), in a run of its own so the tg32 series stays as measured
+    pp_depth_args = ["-m", model, "-t", "8", "-p", "512", "-n", "0", "-d", "4096", "-fa", "1", "-mmp", "0", "-r", "1",
+                     "-o", "csv"]
     modes = [("provider", bdir, {}, ("FLAGOS_SPACEMIT_DISABLE",)), ("cpu", bdir, {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]
     if ime_build and (Path(ime_build) / "bin" / "llama-bench").is_file():
         modes.append(("ime", Path(ime_build), {}, ()))
-    for name, bd, extra, drop in modes:
-        release = tcm_tool(tcm_dir, "tcmrelease")
+    release = tcm_tool(tcm_dir, "tcmrelease")
+
+    def bench_rows(name, bd, extra, drop, bench_args, tag, timeout):
         if name == "ime" and release:
-            run([release, "--apply"], logs / "tcm-release-ime", timeout=120)
-        rc, out, err = run([str(bd / "bin" / "llama-bench"), *args], logs / f"bench-{name}", env_extra={**extra, **preload},
-                           env_drop=drop, timeout=1800)
+            run([release, "--apply"], logs / f"tcm-release-ime{tag}", timeout=120)
+        rc, out, _ = run([str(bd / "bin" / "llama-bench"), *bench_args], logs / f"bench-{name}{tag}",
+                         env_extra={**extra, **preload}, env_drop=drop, timeout=timeout)
+        # a run cut off by the timeout still gives the rows it finished
+        return rc, list(csv.DictReader(io.StringIO(out)))
+
+    for name, bd, extra, drop in modes:
+        rc, rows = bench_rows(name, bd, extra, drop, args, "", 1800)
         speeds = {}
-        for row in csv.DictReader(io.StringIO(out)):
+        for row in rows:
             if row.get("n_prompt") == "128" and row.get("n_gen") == "0":
                 speeds["pp128"] = float(row["avg_ts"])
             elif row.get("n_prompt") == "0" and row.get("n_gen") == "128":
                 speeds["tg128"] = float(row["avg_ts"])
         info(f"llama-bench {name}", ", ".join(f"{k} {v:.2f} t/s" for k, v in speeds.items()) or f"no result (rc={rc})")
+    if not depth:
+        return
+    for name, bd, extra, drop in modes:
+        # llama-bench processes each depth's prompt, untimed, before its test: most of the run's time. It prints each
+        # row as its test ends and exits at a failed test, so a crash or the timeout keeps the earlier rows
+        rc, rows = bench_rows(name, bd, extra, drop, depth_args, "-depth", 3600)
+        tg = {int(row["n_depth"]): float(row["avg_ts"]) for row in rows
+              if row.get("n_prompt") == "0" and row.get("n_gen") == "32" and row.get("n_depth", "").isdigit()}
+        rc_pp, rows = bench_rows(name, bd, extra, drop, pp_depth_args, "-depth-pp", 3600)
+        pp = next((float(row["avg_ts"]) for row in rows
+                   if row.get("n_prompt") == "512" and row.get("n_gen") == "0" and row.get("n_depth") == "4096"), None)
+        missing = [f"tg32 d{d}" for d in depths if d not in tg] + (["pp512 d4096"] if pp is None else [])
+        complete = not missing and rc == 0 and rc_pp == 0
+        detail = "; ".join(s for s in (
+            ("tg32 " + ", ".join(f"d{d} {v:.2f}" for d, v in sorted(tg.items())) + " t/s") if tg else "",
+            f"pp512 d4096 {pp:.2f} t/s" if pp is not None else "",
+            "" if complete else f"missing {', '.join(missing) or 'none'} (rc={rc}, {rc_pp})") if s)
+        if name == "provider":
+            report(f"llama-bench depth {name}", complete, detail)
+        else:
+            info(f"llama-bench depth {name}", detail)
 
 
 def main():
     ap = argparse.ArgumentParser(description="acceptance run for the FlagOS SpacemiT provider (run on the K3)")
-    ap.add_argument("--milestone", choices=["m1", "m2a", "m2b", "m2d", "m2c", "m2c2"], default="m2c2",
+    ap.add_argument("--milestone", choices=["m1", "m2a", "m2b", "m2d", "m2c", "m2c2", "m2e"], default="m2e",
                     help="expectations to check (default: %(default)s)")
     ap.add_argument("--build", action="store_true", help="configure and build before checking")
     ap.add_argument("--build-dir", default=str(REPO / "build-flagos"), help="FlagOS build directory (default: %(default)s)")
@@ -298,6 +439,9 @@ def main():
     ap.add_argument("--ppl-text", default=os.path.expanduser("~/ppl.txt"), help="perplexity text (m2b; default: %(default)s)")
     ap.add_argument("--ime-build", default=str(REPO / "build-ime"), help="upstream IME build for llama-bench (m2b; skipped if absent)")
     ap.add_argument("--skip-support", action="store_true", help="skip the test-backend-ops support listing")
+    ap.add_argument("--depth", action="store_true",
+                    help="llama-bench: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 for each mode "
+                         "(m2b and later; long)")
     ap.add_argument("--segv", default="", help="crash reporter (scripts/segv.c built as .so) to preload into the model runs")
     args = ap.parse_args()
     if args.segv:
@@ -320,14 +464,14 @@ def main():
     list_devices(bdir, logs)
     if not args.skip_support:
         support(bdir, logs, args.milestone)
-    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2"):
+    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2", "m2e"):
         op_correctness(bdir, logs, args.milestone)
         bench(bdir, logs)
     model_run(bdir, logs, args.model, args.milestone)
-    if args.milestone in ("m2b", "m2d", "m2c", "m2c2"):
-        perplexity(bdir, logs, args.model, args.ppl_text)
-        llama_bench(bdir, logs, args.model, args.ime_build, args.tcm_dir)
-    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2"):
+    if args.milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
+        perplexity(bdir, logs, args.model, args.ppl_text, args.milestone)
+        llama_bench(bdir, logs, args.model, args.ime_build, args.tcm_dir, args.depth)
+    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2", "m2e"):
         tcm_hygiene(args.tcm_dir, logs)
 
     n_fail = results.count(False)
