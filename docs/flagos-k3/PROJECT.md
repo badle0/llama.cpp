@@ -8,6 +8,7 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 - `docs/flagos-k3/plan.md` — build plan for the SpacemiT provider: architecture, decisions D3–D9, milestones M0–M4 with tests and exit criteria, risks
 - `docs/flagos-k3/device-type.md` — GPU vs IGPU vs ACCEL: what the type controls in llama.cpp, what "right behavior" means (R1–R6), predictions and experiments X0–X6
 - `docs/flagos-k3/code-tour.md` — reading guide to the provider's code, stop by stop, each compared with the AMD provider, with links to the lines
+- `docs/flagos-k3/upstream-changes.md` — every change this fork makes to upstream llama.cpp/ggml or to the mentor's FlagOS code, with commit, lines, reason and status
 
 ## 1. Task
 
@@ -76,6 +77,7 @@ While changing code:
 - No redundant prints. Use `GGML_LOG_DEBUG` / `GGML_LOG_WARN` / `GGML_LOG_ERROR` for diagnostics worth keeping; remove ad-hoc `printf`s before finishing.
 - Keep terminal output focused: pipe long builds to a log and grep for `error:|FAILED`.
 - Never weaken `supports_op`: return true only for exactly what the kernel handles (see `upstream-review.md`).
+- Any change outside `providers/spacemit/` and `docs/flagos-k3/` (upstream llama.cpp/ggml files, or the mentor's FlagOS code) gets an entry in `upstream-changes.md` in the same commit, ideally a commit of its own; removing such a change removes its entry (user, 2026-10-13).
 - Do not change system configuration on the shared board (cgroups, `/proc`, drivers). Reading is fine.
 
 After any code change, always report:

@@ -662,6 +662,7 @@ for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SP
 **Then M2e.3, by measurement (as the 1-row bandwidth work): attention during generation at streaming speed.** Candidates:
 - (a) Split the KV positions over the tiles, as ggml-cpu does for one token per call. Each tile streams whole cells (every KV head) through TCM with `memcpy1d`, the pairs taking turns as in `paired`; a second step merges the 8 partial results per query head.
 - (b) A KV head per tile as in M2e.1, but 64 positions' rows copied into TCM with several loads in flight before they are used.
+- (c) The KV cache on huge pages: set aside by the user 2026-10-13. It is no kernel change: it needs llama.cpp to allocate the cache differently (an upstream change, `upstream-changes.md`) or a system setting the shared board rules out, and huge pages slowed parallel streams 2.2x in L1.
 
 Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token, so tg32 at depth 4096 from about 6.3 to 8-8.5 t/s (`ime` 6.41). Rule, fixed before measuring: adopt if attention at n_kv 4096 costs at least 20% less per token, confirmed by tg32 at depth 4096, with NMSE against the CPU within the bound (the outputs differ in rounding only).
 
@@ -755,6 +756,7 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
   - the tiled cases' rows are held to 1e-5 in NMSE against the CPU (5e-3 for the others; the tiled rows matched to 8.4e-7 on the K3);
   - a tiled case at depth, 128 tokens after 3968 with flat scores (q's values scaled by 1): there a row that misses one visible position is off by a median 1.9e-4, at least 6e-5 (simulated), so the bound catches it; with the other cases' peaked scores one position in a 4096-position row could stay below it (median 5e-6);
   - `forward_tiled` asserts that a register group holds a tile's row (VLEN 1024), so a shorter VLEN fails instead of counting part of each row.
+  - On the K3 (commit `fc1240a`): every check passes. The tiled rows' worst NMSE is 6.2e-7 with the case at depth, 16x under the bound and about 100x under the smallest simulated miss (6e-5); the one-chunk cases are unchanged (9.7e-5, worst row 1.4e-4).
 - What remains of the check: an estimated 15 us per diagonal or fully masked tile, from the 64 vector-to-scalar moves. Counting all rows in one register would remove most of it (roughly 10% of the tiled kernel's time at depth 0, pp512 about +1.5%); not planned.
 
 **Tests:**

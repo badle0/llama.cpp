@@ -33,7 +33,7 @@ This file supplements the repository-root `AGENTS.md` for FlagOS and SpacemiT K3
 Before editing:
 
 1. Inspect the relevant code and verify claims with file and line references. Distinguish observed behavior from assumptions.
-2. Prefer the smallest change that achieves the task. Avoid modifying upstream or mentor code outside the needed scope.
+2. Prefer the smallest change that achieves the task. Avoid modifying upstream or mentor code outside the needed scope. Any change outside `ggml/src/ggml-flagos/providers/spacemit/` and `docs/flagos-k3/` gets an entry in `docs/flagos-k3/upstream-changes.md` in the same commit, ideally a commit of its own.
 3. Briefly explain the chosen approach, realistic alternatives, and why the alternatives are less suitable for this change.
 
 During implementation:

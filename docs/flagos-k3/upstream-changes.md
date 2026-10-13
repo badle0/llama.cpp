@@ -1,0 +1,79 @@
+# Changes to upstream and mentor code
+
+Every change this fork makes outside `ggml/src/ggml-flagos/providers/spacemit/` and `docs/flagos-k3/`: to upstream llama.cpp or ggml files, or to the mentor's FlagOS code. The baseline is the mentor's `feature/flagos-amd-890-opt` at `5794e12`, where this fork starts.
+
+Rule: a change outside those two directories gets an entry here in the same commit, ideally in a commit of its own. Removing a change removes its entry.
+
+Check the list against the tree:
+
+```bash
+git diff --stat 5794e12..HEAD -- . ':(exclude)ggml/src/ggml-flagos/providers/spacemit' ':(exclude)docs/flagos-k3'
+```
+
+Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edit was made and later undone: every file touched shows its net change.
+
+## Upstream llama.cpp and ggml
+
+### U1. Norms of CPU layers left to the scheduler when an ACCEL backend runs them (C5b)
+
+- Where: `src/llama-context.cpp`, `llama_context::graph_get_cb()`, lines 2522-2533 (12 lines added).
+- Commit: `f1cf809` (2026-10-09), on its own.
+- What: for batches under 32 tokens (and with full offload), llama.cpp pins every `norm` and `l_last` node to its layer's device. Under ACCEL's default device selection, a layer not on a GPU has the CPU as its device, so each norm was pinned to the CPU although the provider runs the ops around it. The change returns before pinning when the layer's device is the CPU and an ACCEL backend supports the node.
+- Why: whole layers on the AI cores (M2d). Without it ACCEL generates 30-39% slower (Qwen3-4B / 0.6B, X3b, `device-type.md` §5).
+- Status: approved by the user 2026-10-09; the mentor to confirm (`PROJECT.md` question 9).
+- Known issue: its comment says "every layer's device is the CPU", true only without a GPU. The code checks the layer's device type, so it is right. C5a's comment had the same overstatement and was corrected (U2); this one is not yet (comment only).
+
+### U2. A fused op that an ACCEL backend runs for a CPU layer is no mismatch (C5a)
+
+- Where: `src/llama-context.cpp`, `llama_context::resolve_fused_ops()`, lines 533-541 (9 lines added, 1 changed).
+- Commit: `64e6cbd` (2026-10-13), on its own, with the buffer-type check.
+- What: under `-fa auto`, llama.cpp turns a fused op (flash attention) off when the device the scheduler gave it differs from its layer's device. With ACCEL the layer is on the CPU and the op on the ACCEL device, so flash attention was turned off. The change treats that case as no mismatch when the ACCEL device supports the layer's buffer type (the KV cache's), that is, reads those tensors in place.
+- Why: flash attention on the provider under default flags (M2e.1): 2 graph splits per token instead of 74. Without it `-fa auto` would need M2e.2 (the graph without flash attention on the provider), or every run `-fa on`.
+- Status: decided by the user 2026-10-12, as a commit of its own; the mentor to confirm (question 9).
+
+### U3. Build option `GGML_FLAGOS_SPACEMIT`
+
+- Where: `ggml/CMakeLists.txt:204`, 1 line beside the mentor's `GGML_FLAGOS_*` options.
+- Commit: `4389005` (M1, 2026-10-08).
+- What: builds the SpacemiT provider; off by default, no effect when off.
+
+### U4. Claude Code project context
+
+- Where: `CLAUDE.md`, 3 lines that import `docs/flagos-k3/PROJECT.md`.
+- Commit: `213bbf7` (2026-09-24).
+- What: tooling only, no effect on any build. Fork-only: leave it out of anything proposed upstream.
+
+## The mentor's FlagOS code (outside `providers/spacemit`)
+
+### M1. `ggml_backend_flagos_reg_devices()` no longer registers the backend (macOS link fix)
+
+- Where: `ggml/src/ggml-flagos/flagos-registry.cpp:391-395`; the body is now a comment.
+- Commit: `eaa25ff` (2026-09-24), the fix this fork's base adds to `5794e12`.
+- What: in builds without `GGML_BACKEND_DL` the function called `ggml_backend_register(ggml_backend_flagos_reg())`, which made the backend library depend on libggml, the library that links it: an undefined symbol on macOS. `ggml-backend-reg.cpp` (`GGML_USE_FLAGOS`) or the dynamic loader registers the backend instead.
+- Status: to report to the mentor. The function is public (`ggml-flagos.h:20`, `GGML_BACKEND_API`) and now does nothing on every platform. Nothing in this tree calls it; a program outside that relied on it to register the backend would no longer get it.
+
+### M2. The SpacemiT provider in the registry
+
+- Where: `ggml/src/ggml-flagos/flagos-registry.cpp:21-23` (declaration) and `:81-83` (`flagos_compiled_providers()`), under `GGML_FLAGOS_HAVE_SPACEMIT`; 7 lines.
+- Commit: `4389005` (M1).
+- What: compiles the provider into the registry as the Denglin and AMD providers are.
+
+### M3. The provider's build and its check program
+
+- Where: `ggml/src/ggml-flagos/CMakeLists.txt:42-44` (includes `providers/spacemit/provider.cmake`), `:46` (the "no provider" message also checks the option), `:156-160` (target `flagos-check-spacemit`: not built by default, builds without `GGML_BACKEND_DL` only).
+- Commits: `4389005` (M1); `72e0666` (M2c.2) links the check program with `Threads::Threads`, for the 8 threads that quantize the output head's reference weights.
+
+## Local and uncommitted
+
+- `AGENTS.md` (repository root): the user's 6 lines pointing agents to `docs/flagos-k3/PROJECT.md` and `docs/flagos-k3/AGENTS.md`. Kept out of commits by the user.
+
+## Proposed, not made
+
+- The KV cache on huge pages (M2e.3 candidate (c)): would need llama.cpp to allocate the cache differently, or a system setting the shared board rules out. Set aside by the user 2026-10-13.
+- The in-tree IME path's tiled attention kernel checks every mask value one at a time (`ggml/src/ggml-cpu/spacemit/rvv_kernels.cpp:1470-1474`), a third of its time (L2, `build.md` §7). Not changed here: for the report to SpacemiT.
+- C5b's comment (U1).
+
+## Not changed
+
+- `ggml/src/ggml-cpu/spacemit/` (the in-tree IME path): copied from, never modified.
+- `tests/test-backend-ops.cpp`: untouched; its Qwen3-4B one-token attention case is in the baseline.
