@@ -172,7 +172,7 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 
 - `ime` reproduces SpacemiT's published numbers for this model (79.74 / 11.29) within 1-2%, and has the fastest generation.
 - Perplexity differs by at most 0.27% across modes, far inside the +/- 0.70 error bar: the upstream IME kernels are accurate on a real model (the first check that actually uses the IME weight layout; `test-backend-ops` does not).
-- ggml-spacemit as shipped generates 39% slower than `ime` (ACCEL with its own buffers only plus norm pinning, `device-type.md` §5). With both fixed it is 3% slower in generation and 4% faster in prefill.
+- ggml-spacemit as shipped generates 39% slower than `ime` (ACCEL with its own buffers only plus norm pinning, `device-type.md` §5). With both fixed it is 3% slower in generation and 4% faster in prompt processing.
 - Targets for the provider (M2e exit): tg128 >= 11.1 (`ime`) and pp128 >= 82 (`spacemit-best`) on this model.
 **Provider M2b (Q4_0 matmuls on the AI cores), 2026-10-09** (`spacemit_check.py --milestone m2b`: llama-bench 3 runs, same flags; modes run back to back, not interleaved; perplexity as above):
 
@@ -191,7 +191,7 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
   - `a2` is 0 where the code set it to `a5 + 16` (0x2b2789aa88) a few instructions before. This rules out (b): the register itself is 0, not a wrongly reported fault address. (a) remains: `a2` was cleared from outside the program's instruction stream, by a kernel path or by the core.
   - Twice at the same instruction, with every other register intact, so not random corruption anywhere. A path that clears `a2` when the thread is interrupted between 0x992f6 and 0x99316 (two vector loads through `a5` run in between) would fit; unconfirmed. Both occurrences came in long CPU-only runs under full X100 load.
   - Still not in llama.cpp, nor in the provider, which runs nothing heavy on the X100 cores since M2e.1. To report to SpacemiT (question 8) with this dump, the disassembly of 0x992d6-0x99316 of the current library and `uname -a`.
-- Prefill gains 2.1-2.4x over the X100 cores; generation does not (4B +5%, 0.6B -5%). Graph splits: 355 per token on 4B (178 CPU + 177 provider, about 5 round trips per layer, `sched-summary.py`), 277 on 0.6B; 1 without the provider.
+- Prompt processing gains 2.1-2.4x over the X100 cores; generation does not (4B +5%, 0.6B -5%). Graph splits: 355 per token on 4B (178 CPU + 177 provider, about 5 round trips per layer, `sched-summary.py`), 277 on 0.6B; 1 without the provider.
 - Kernels (`flagos-check-spacemit --bench`, Qwen3-4B FFN shapes): 1 row 0.60 ms for 14 MB of weights, about 23 GB/s, the AI cores' memory bandwidth; 4 rows cost about the same as 1; at 128 rows path A reaches 960 GFLOP/s and path C 648 GFLOP/s. The CPU column of that benchmark uses ggml's plain Q4_0 path, not the repacked kernels llama.cpp uses (`REPACK = 1`), so it understates the X100 cores.
 - Estimated 4B generation budget (172 ms per token): Q4_0 matmuls on the AI cores about 85 ms; Q6_K output head on the X100 cores about 25 ms; other X100 work about 15 ms; the remaining about 45 ms are the 355 handoffs (about 0.13 ms each, consistent with X3b's 40 ms for 286 extra splits). `ime` avoids all handoffs: its CPU worker threads are pinned to the AI cores (`ggml-cpu/spacemit/ime.cpp:1692`), so the whole graph runs there.
 - IME confirmed active (separate check, `-lv 4`): `CPU_RISCV64_SPACEMIT model buffer size = 2349.12 MiB` (repacked weights) next to `CPU_Mapped model buffer size = 2246.67 MiB` (the mmap'd GGUF), `graph splits = 1`. The single split (no backend handoffs) is the structural reason the IME path generates fastest. The baseline run itself lacked these lines (library INFO messages need `-lv 4`; fixed in the script).
@@ -209,12 +209,12 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 
 - Correctness on the A100 cores: every `test-backend-ops` set passes with the ported RVV kernels and with the references (ADD 54, MUL 46, RMS_NORM 52, ROPE 165, SET_ROWS 87, GET_ROWS 9, SWIGLU 12; RMS_NORM_MUL_ADD 30, ADD_RMS_NORM 25, RMS_NORM_MUL_ROPE 144, ROPE_SET_ROWS 24). `flagos-check-spacemit` layer NMSE 4.15e-4 with the RVV and IME kernels and 3.84e-4 with the references (Mac 3.97e-4); ROPE with heads of 256 (the RVV rotation) NMSE 5.9e-16; Q4_0 matmuls 40 cases, max NMSE 2.8e-5. Robustness: 20 consecutive `flagos-check-spacemit` runs (8,000 deliberately failing launches) with no failure or hang.
 - Placement (`GGML_SCHED_DEBUG=2`, needs `-lv 5`; `sched-summary.py`): 83 splits per token, 42 CPU + 41 provider = 1 (token embedding) + 36 x 2 (layer, attention) + 2 (last layer part, output head) + 4 x 2 (Q4_1 `ffn_down`); the same for 512-token and 1-token graphs, so C5b works. The CPU runs only `FLASH_ATTN_EXT` x36, the 4 Q4_1 and the Q6_K head `MUL_MAT`s and the embedding `GET_ROWS`. Copies per token: `Qcur` x36, `ffn_swiglu` x4, `result_norm` x1, about 0.75 MB; K and V go straight into the CPU-resident cache.
-- Generation: 171.8 -> 139.7 ms per token; 272 fewer splits at about 0.118 ms each, as M2b's handoff model predicted (estimate was 7.5-8 t/s). Prefill only +4%: handoffs cost per ubatch, so 128-token batches gain little (the plan's 60-65 t/s estimate was wrong).
+- Generation: 171.8 -> 139.7 ms per token; 272 fewer splits at about 0.118 ms each, as M2b's handoff model predicted (estimate was 7.5-8 t/s). Prompt processing only +4%: handoffs cost per ubatch, so 128-token batches gain little (the plan's 60-65 t/s estimate was wrong).
 - Accuracy against the CPU's logits (`llama-perplexity --kl-divergence`, 8 x 512 tokens): mean KLD 0.00238 (IME 0.00339), 99% KLD 0.0215 (0.0266), max 0.127 (0.350), same top token 97.0% (96.9%). M2d is at least as close to the CPU as the upstream IME path; the CPU still runs the output head and the Q4_1 matmuls, which IME quantizes. Use IME's KLD as the ceiling for M2c. (The absolute `PPL(Q)/PPL(base)` values, 1.010 and 1.008, are both about 0.8% above the plain perplexity runs; likely the saved base clips log-probabilities 16 nats below the top logit, `tools/perplexity/perplexity.cpp:86`.)
 - Flash attention off (`-fa off`): perplexity 9.8052 vs `cpu` 9.7652 (+0.41%), so the transposed V write (one-element rows on one tile) and the CPU's non-flash attention are correct; pp128 -20% (52.95 -> 42.59), tg128 -8.5% (7.09 -> 6.49). `-fa auto` keeps flash attention on under M2d (attention runs on the layer's device, the CPU).
 - Context 2048 (2 chunks): perplexity 7.7498 vs `cpu` 7.7232 (+0.34%). A 1,000-token prompt in 8 ubatches (7 without outputs) generates correctly.
 - Generation against context depth (`llama-bench -n 32 -d`): provider 7.36 / 5.61 / 1.72 t/s at depth 0 / 1024 / 4096, `cpu` 5.61 / 4.75 / 1.65, `ime` 11.17 / 9.35 / 6.35. Attention on the X100 cores costs +445 ms per token at depth 4096 (IME on the A100 cores: +68 ms): beyond about 1k tokens of context, attention dominates and M2e decides generation speed.
-- What limits speed (requantized copies, speed only: `llama-quantize --allow-requantize`): moving the 4 Q4_1 `ffn_down` matmuls to the AI cores (`--tensor-type ffn_down=q4_0`) raises pp128 53.31 -> 83.01 (+56%) and tg128 6.95 -> 7.26; they are 3% of the FLOPs but took 36% of prefill, because ggml-cpu repacks only Q4_0 (no Q4_1 in `ggml-cpu/repack.cpp`). Also moving the output head (`--pure`, Q4_0 head) gives pp128 85.00, tg128 8.19: the Q6_K head on the X100 costs about 25 ms per token. With the Q4_1 matmuls moved, pp512 (`-ub 512`) is 87.19 against `ime` 87.56 (original model: 54.26): our matmul paths match IME for large batches, and path B is not needed.
+- What limits speed (requantized copies, speed only: `llama-quantize --allow-requantize`): moving the 4 Q4_1 `ffn_down` matmuls to the AI cores (`--tensor-type ffn_down=q4_0`) raises pp128 53.31 -> 83.01 (+56%) and tg128 6.95 -> 7.26; they are 3% of the FLOPs but took 36% of prompt processing, because ggml-cpu repacks only Q4_0 (no Q4_1 in `ggml-cpu/repack.cpp`). Also moving the output head (`--pure`, Q4_0 head) gives pp128 85.00, tg128 8.19: the Q6_K head on the X100 costs about 25 ms per token. With the Q4_1 matmuls moved, pp512 (`-ub 512`) is 87.19 against `ime` 87.56 (original model: 54.26): our matmul paths match IME for large batches, and path B is not needed.
 - Microbenchmarks (`--bench`): launch 11.2 us, barrier 0.89 us per node (M2a 9.9 / 0.79); 16M-float ADD 22.7 GB/s with the ported RVV kernel (M2a's hand-written one: 21.3); matmul timings unchanged from M2b.
 - Qwen3-0.6B: 65 splits per token (1 + 28 x 2 + 2 + 3 x 2: 28 layers, 3 with Q4_1 `ffn_down`), M2b 277. tg128 26.75 -> 29.03 (+8.5%), much less than on 4B: the output head (tied to the token embedding; about 128 MB per token if Q6_K like 4B's, type not checked) stays on the X100 cores and is roughly a third of the 34 ms per token (estimate), so M2c matters more here. The `cpu` row varies between days (tg128 28.17 at M2b, 26.03 now), so compare within a run. Perplexity +0.61%, within 1%; the smaller model is more sensitive to the IME's 8-bit activations.
 
@@ -229,18 +229,18 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 
 - Correctness on the A100 cores (`flagos-check-spacemit --full`, IME kernels): Q4_1 against the CPU on the converted weights, 20 cases up to 512 rows and up to 9728 x 2560 (the 4B `ffn_down`), max NMSE 9.7e-7 (bound 5e-4; the Mac's reference 1.1e-6). The zero-point probe (zero point 15 against 32 equal activations) gives 3.0e-7 for 1 row and for 4, so the 1-row kernel's exact branch, which the provider enables, computes like the 4-row kernel (upstream's 16-bit branch would give about 4.6, shown by emulation on the Mac). Q4_0 unchanged: 40 cases, 2.8e-5. With the reference kernels the layer NMSE is 3.84e-4, as in M2d. Every `test-backend-ops` set still passes with both kernel sets; no `MUL_MAT` case fits the IME layouts. The conversion alone changes a matmul on random weights by NMSE 5.86e-3, a CPU computation that gives the same value on the Mac: both machines produce the same zero points.
 - Placement: 75 splits per token, as predicted (M2d 83): the 4 layers with a Q4_1 `ffn_down` no longer go back to the X100 cores for it. Provider buffers: model 1955.75 MiB, compute 72 MiB.
-- Prefill: pp128 53.00 -> 83.49 (+58%), above `ime` (79.29) and the prefill target of 82 (`spacemit-best`, M0.5 above), so the pp half of the M2e exit is met. The same as with the requantized model (83.01), although the Q4_1 kernel is 1.1-1.5x slower than Q4_0's at 4-128 rows: the 4 matmuls are 3% of the FLOPs, so their extra 14 ms per 128-token batch is under 1% of prefill.
+- Prompt processing: pp128 53.00 -> 83.49 (+58%), above `ime` (79.29) and the pp128 target of 82 (`spacemit-best`, M0.5 above), so the pp half of the M2e exit is met. The same as with the requantized model (83.01), although the Q4_1 kernel is 1.1-1.5x slower than Q4_0's at 4-128 rows: the 4 matmuls are 3% of the FLOPs, so their extra 14 ms per 128-token batch is under 1% of prompt processing.
 - Generation: tg128 7.16 -> 7.22, within the variation between days (the `cpu` row went 5.95 -> 5.58); provider over `cpu` 1.20 -> 1.29; `llama-completion` 7.46 t/s against 5.97 with the provider disabled. The same-day comparison with the requantized model (+4.5%, M2d above) is the better estimate. What remains to `ime`'s 11.05 is the Q6_K output head on the X100 cores (about 25 ms per token, M2c.2) and attention (M2e).
 - Accuracy against the CPU's logits (`llama-perplexity --kl-divergence`, 8 x 512 tokens, 2,040 scored; commands in §6):
 
 | Run | Mean KLD | 99% KLD | Max KLD | Same top token |
 |---|---|---|---|---|
-| M2c.1, 512-token batches (prefill path) | 0.00316 ± 0.00022 | 0.0244 | 0.241 | 96.86 ± 0.39% |
+| M2c.1, 512-token batches (batched paths) | 0.00316 ± 0.00022 | 0.0244 | 0.241 | 96.86 ± 0.39% |
 | M2c.1, `-ub 1` (generation path) | 0.00203 ± 0.00020 | 0.0175 | 0.287 | 97.30 ± 0.36% |
 | M2d, 512-token batches | 0.00238 | 0.0215 | 0.127 | 97.0% |
 | `ime`, 512-token batches | 0.00339 | 0.0266 | 0.350 | 96.9% |
 
-  The prefill path rose 0.0008 over M2d (about 3 standard errors): the cost of the zero-point conversion and the 8-bit activations in the 4 Q4_1 matmuls. It equals `ime` within one standard error. The generation path, measured here for the first time in any milestone, is the more accurate one: in prefill the 4-row Q4_0 quantizer (`quantize_a_4row_i8_hp`) gives 4 consecutive tokens one shared activation scale per 32 values; in generation each token has its own (the Q4_1 kernels keep per-row scales in both). This is also the first model-level check of M2b's 1-row Q4_0 kernel (fp16 accumulation).
+  The 512-token batches rose 0.0008 over M2d (about 3 standard errors): the cost of the zero-point conversion and the 8-bit activations in the 4 Q4_1 matmuls. It equals `ime` within one standard error. The generation path, measured here for the first time in any milestone, is the more accurate one: in batches the 4-row Q4_0 quantizer (`quantize_a_4row_i8_hp`) gives 4 consecutive tokens one shared activation scale per 32 values; in generation each token has its own (the Q4_1 kernels keep per-row scales in both). This is also the first model-level check of M2b's 1-row Q4_0 kernel (fp16 accumulation).
 - Microbenchmarks (`--bench`, the 4B `ffn_down` shape 9728 x 2560, in us; Q4_0 at the same shape; the CPU column is what llama.cpp runs for Q4_1, since ggml-cpu does not repack it):
 
 | Rows | Q4_1 provider | Q4_0 provider | Q4_1 `cpu` |
@@ -265,7 +265,7 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 - Correctness on the A100 cores (IME kernels, `--full`): Q8_0 against the CPU 14 cases, max NMSE 4.45e-8; Q6_K against the CPU's Q6_K 14 cases (both heads, 151936 rows, at 1, 7 and 128 rows), 5.93e-5 (bound 5e-4); Q6_K against the CPU's Q8_0 of the same values (the requantization alone) 5.07e-7 (bound 5e-6). All identical to the Mac's reference kernels to three digits: both 8-bit IME kernels are exact per 32-value block, and both machines store the same head bytes. `test-backend-ops -o MUL_MAT` passes its 3 claimed cases (Q8_0 2880 x 2880, Q6_K 2048 x 6144, Q6_K 151936 x 2048) with the IME and with the reference kernels: the first `test-backend-ops` cases for an IME matmul. Q4_0 and Q4_1 unchanged (2.81e-5, 9.68e-7, probe 3.02e-7).
 - Placement: 74 splits per token, as predicted (M2c.1 75). Provider buffers: model 2349.87 MiB (+394.1 MiB, the head as Q8_0; `ime`'s repacked buffer is 2349.12 MiB), compute 301.75 MiB (from 72: the logits and the head's activations now live in the provider's compute buffer instead of the CPU's).
 - The head (`--bench`, 2560 x 151936): 1 row 16.6 ms on the AI cores against 26.0 ms on the X100 cores, i.e. 413 MB at 24.9 GB/s, the same bandwidth as the Q4_0/Q4_1 1-row matmuls: the direct path does not lose for Q8_0 here (ggml-spacemit took path B for it). 4 rows 17.0 ms (memory-bound), 16 rows 27.7 ms (CPU 279 ms).
-- Generation: tg128 7.22 -> 7.84 (+8.6%; 138.5 -> 127.6 ms per token; the `cpu` row is 1.8% higher than at M2c.1, so about +7% net of the day). The head saves 9.4 ms and one split about 0.1 ms. `llama-completion` 7.80 t/s against 5.85 with the provider disabled. Prefill unchanged (84.50, noise): a prompt batch computes the head for its last token only.
+- Generation: tg128 7.22 -> 7.84 (+8.6%; 138.5 -> 127.6 ms per token; the `cpu` row is 1.8% higher than at M2c.1, so about +7% net of the day). The head saves 9.4 ms and one split about 0.1 ms. `llama-completion` 7.80 t/s against 5.85 with the provider disabled. Prompt processing unchanged (84.50, noise): a prompt batch computes the head for its last token only.
 - Accuracy against the CPU's logits (same base file and commands as M2c.1):
 
 | Run | Mean KLD | 99% KLD | Max KLD | Same top token |
@@ -311,7 +311,7 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 | | `cpu` | 21.11 | 5.54 | 9.7740 |
 | | `ime` | 79.37 | 11.01 | - |
 
-- Generation: tg128 7.84 -> 8.31 (+6.0%; 127.6 -> 120.3 ms per token); `llama-completion` 7.80 -> 8.64 t/s against 5.48 with the provider disabled. The benchmark predicted 10.4 ms less per token (8.54 t/s). Part of the difference: k and v come from a cache in the benchmark but from DRAM in the model, where 4 slabs per tile leave staging little to overlap (estimate 1-1.5 ms, not measured); the `cpu` row is 2.5% below the day before. Perplexity is M2c.2's to the last digit (the matmuls return the same bytes); prefill unchanged (the 4-row path); 74 splits.
+- Generation: tg128 7.84 -> 8.31 (+6.0%; 127.6 -> 120.3 ms per token); `llama-completion` 7.80 -> 8.64 t/s against 5.48 with the provider disabled. The benchmark predicted 10.4 ms less per token (8.54 t/s). Part of the difference: k and v come from a cache in the benchmark but from DRAM in the model, where 4 slabs per tile leave staging little to overlap (estimate 1-1.5 ms, not measured); the `cpu` row is 2.5% below the day before. Perplexity is M2c.2's to the last digit (the matmuls return the same bytes); prompt processing unchanged (the 4-row path); 74 splits.
 
 **Tile counts and the IME reference, 2026-10-11** (same benchmark and units as the strategy table above; `@t`: only the first t tiles work; `ime`: `scripts/ime-gemv-bench.cpp`, upstream's path B, with its default memory `HPAGE` (transparent huge pages through `madvise`) and with `SPACEMIT_MEM_BACKEND=POSIX` (`posix_memalign`: 4 KiB pages on this board, like the provider's buffers)):
 
@@ -392,7 +392,7 @@ Baselines (M0.5, M0.6): `scripts/m0-baselines.sh <model>` runs every mode interl
 
 - Every check passes with `paired` as the default (the strategy check 78/78 on the AI cores); huge pages 64 of 64 MiB; 74 splits; perplexity M2c.2's to the last digit (the matmuls return the same bytes).
 - Generation against round 1's run of the same runner (`staged`, 4 KiB pages): tg128 8.31 -> 8.68 (+4.5%), `llama-completion` 8.64 -> 8.91 t/s (+3.1%; 32 tokens, the noisiest of the three), with the `cpu` and `ime` rows as then (5.54 and 11.01), so the board ran as then. The runner's llama-bench reads about 5% below the stand-alone `-p 0 -n 128` command in both rounds (`staged` on 4 KiB pages 8.31 against 8.68; `paired` on huge pages 8.68 against 9.18); compare runner with runner and stand-alone with stand-alone.
-- Prefill 83.1, 1.5% below the last two runs while `cpu` and `ime` held within 0.3%: small, possibly noise. Prefill uses path A, untouched, and the 1-row path only for the head of each batch's last token.
+- pp128 83.1, 1.5% below the last two runs while `cpu` and `ime` held within 0.3%: small, possibly noise. Prompt processing uses path A, untouched, and the 1-row path only for the head of each batch's last token.
 - The benchmark's `staged` row is now valid on huge pages: `paired` is 6.4% below it (round 2 estimated about 92), and 2.9% below the in-tree path's 89.2 (round 2).
 
 **Experiments with the switches, 2026-10-11** (stand-alone `llama-bench -t 8 -p 0 -n 128 -fa 1 -mmp 0 -r 3`; tg128 in t/s, ± the spread of the 3 runs; huge pages unless noted; in the order run):
@@ -424,8 +424,8 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 | the runner's flags, 30 s of rest before each test (`--delay 30`) | 9.25 (pp128 83.60) |
 | the runner's flags, no rest: `paired` (the default), `staged`, `direct` | 9.23, 8.76, 8.69 |
 
-  So neither a later context nor the prompt test before slows generation, and the 1-row path has its TCM after a prompt test (the strategies rank as when run alone). The same command gave 8.66 and 9.23; what differed is what ran before: both slow measurements (8.66 here, the runner's 8.68) started right after minutes of full load on the X100 cores (the `cpu` depth runs with their 4096-token prefill; the runner's CPU-only perplexity, 8 x 512 tokens, right before its llama-bench). The provider still runs part of every token there (attention, the embedding lookup, the thread that drives the AI cores); `ime` runs all its threads on the A100 cores (`cpu_mask: ff00`) and was not slowed in the runner, where it follows the `cpu` llama-bench. Most likely heat on the X100 side, possibly another user's job; clocks not measured. On a rested board the provider's tg128 reads 9.16-9.27 (11 runs over two days; one disturbed run 9.00).
-- Prefill with and without huge pages (`-p 128 -n 0 -ub 128`, two rounds interleaved): 83.07 and 83.59 against 84.34 and 83.72 on 4 KiB pages, so huge pages cost prefill about 0.8% if anything (within the spread of single runs), while generation gains 1.3%.
+  So neither a later context nor the prompt test before slows generation, and the 1-row path has its TCM after a prompt test (the strategies rank as when run alone). The same command gave 8.66 and 9.23; what differed is what ran before: both slow measurements (8.66 here, the runner's 8.68) started right after minutes of full load on the X100 cores (the `cpu` depth runs with their 4096-token prompts; the runner's CPU-only perplexity, 8 x 512 tokens, right before its llama-bench). The provider still runs part of every token there (attention, the embedding lookup, the thread that drives the AI cores); `ime` runs all its threads on the A100 cores (`cpu_mask: ff00`) and was not slowed in the runner, where it follows the `cpu` llama-bench. Most likely heat on the X100 side, possibly another user's job; clocks not measured. On a rested board the provider's tg128 reads 9.16-9.27 (11 runs over two days; one disturbed run 9.00).
+- Prompt processing with and without huge pages (`-p 128 -n 0 -ub 128`, two rounds interleaved): 83.07 and 83.59 against 84.34 and 83.72 on 4 KiB pages, so huge pages cost prompt processing about 0.8% if anything (within the spread of single runs), while generation gains 1.3%.
 
 **Provider M2e.1 (attention on the AI cores), 2026-10-13** (`FLASH_ATTN_EXT` with the in-tree VLEN-1024 kernels, six faults fixed, and C5a; commits `64e6cbd` (C5a) and `715b9bc`; `spacemit_check.py --milestone m2e --depth`: 37/37 on Qwen3-4B; llama-bench 3 runs, same flags as above):
 
@@ -449,12 +449,12 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 | Run | Mean KLD | M2c.2 |
 |---|---|---|
 | 512-token batches (tiled attention kernel) | 0.003354 ± 0.000231 | 0.00326 ± 0.00021 |
-| `-ub 1` (decode attention kernels) | 0.002050 ± 0.000155 | 0.00220 ± 0.00021 |
+| `-ub 1` (one-chunk attention kernels) | 0.002050 ± 0.000155 | 0.00220 ± 0.00021 |
 
   Both within one standard error of M2c.2's, far inside the exit limit (+0.0005): the copied kernels change the model's outputs no more than the CPU's attention did. Greedy text differs from the CPU's after 143 characters, coherent.
 - Speed:
   - Generation +30% (runner tg128 8.68 -> 11.27; `llama-completion` 11.34 against 5.89 with the provider disabled).
-  - Prefill +5.5% (pp128 87.70).
+  - Prompt processing +5.5% (pp128 87.70).
   - The extra cost per token from depth 0 to 4096 is now 16.0 us per position (`ime` 16.5; before 110 on the X100 cores), so depth 4096 generates 3.6x faster than before.
   - Against `ime` in the same session: generation 1-2% ahead at every depth, pp128 10% ahead, pp512 at depth 4096 1% behind; parity within the noise.
   - The project's targets for Qwen3-4B (M0: tg128 >= 11.1, pp128 >= 82) are met.
@@ -463,18 +463,18 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 
 | Shape | Provider | CPU (8 X100) |
 |---|---|---|
-| decode, n_kv 256 | 141 us (5.1 ms per token; 7.4 GB/s of K and V) | 439 us (15.8 ms) |
-| decode, n_kv 1024 | 475 us (17.1 ms; 8.8 GB/s) | 933 us (33.6 ms) |
-| decode, n_kv 4096 | 1722 us (62.0 ms; 9.7 GB/s) | 12037 us (433.3 ms) |
+| 1 token, n_kv 256 | 141 us (5.1 ms per token; 7.4 GB/s of K and V) | 439 us (15.8 ms) |
+| 1 token, n_kv 1024 | 475 us (17.1 ms; 8.8 GB/s) | 933 us (33.6 ms) |
+| 1 token, n_kv 4096 | 1722 us (62.0 ms; 9.7 GB/s) | 12037 us (433.3 ms) |
 | 128 tokens, n_kv 128 | 2952 us (106 ms per batch) | 5555 us (200 ms) |
 | 128 tokens, n_kv 4096 | 97963 us (3527 ms per batch) | 142071 us (5115 ms) |
 
-  - Decode attention reads K and V at 9.7 GB/s at n_kv 4096, a third of what the 1-row matmuls stream in the same run (28.2 GB/s): the latency bound the M2e design estimated, and M2e.3's headroom (about 62 -> 23 ms per token at 4096, tg32 there about 6.5 -> 8.7, estimate).
-  - Prefill attention at depth is compute-bound and slow: 8.6 GFLOP per layer for 128 tokens at n_kv 4096 in 98 ms, about 88 GFLOP/s (the IME matmuls reach 600-890 at 128 rows; the X100 cores 60). It is about 70% of pp512 at depth 4096 (`ime` has the same kernel and the same speed). The tiled kernel rereads and re-transposes K for every 64-token query tile and for each query head of a KV head. (Found later, L2 below: a third of this time was the kernel's scalar check of every mask value; ggml-spacemit's kernel, adopted in L3, avoids it.)
+  - With one token per call, attention (the one-chunk kernels) reads K and V at 9.7 GB/s at n_kv 4096, a third of what the 1-row matmuls stream in the same run (28.2 GB/s): the latency bound the M2e design estimated, and M2e.3's headroom (about 62 -> 23 ms per token at 4096, tg32 there about 6.5 -> 8.7, estimate).
+  - The tiled kernel at depth is compute-bound and slow: 8.6 GFLOP per layer for 128 tokens at n_kv 4096 in 98 ms, about 88 GFLOP/s (the IME matmuls reach 600-890 at 128 rows; the X100 cores 60). It is about 70% of pp512 at depth 4096 (`ime` has the same kernel and the same speed). The tiled kernel rereads and re-transposes K for every 64-token query tile and for each query head of a KV head. (Found later, L2 below: a third of this time was the kernel's scalar check of every mask value; ggml-spacemit's kernel, adopted in L3, avoids it.)
 - Other benchmark lines: 1-row matmuls per token `paired` 87.2 ms (28.2 GB/s), `staged` 93.7, `direct` 99.4 (as in round 2); launch 11.5 us, per node 0.94 us (M2a: 9.9 and 0.79; with one launch per token since M2e.1, this costs about 1 ms per token).
 - The CPU-only pp512 at depth 4096 died with SIGSEGV in `ggml_vec_dot_q4_1_q8_1`: the crash of 2026-10-09 again, at the same instruction, this time with the registers (the crash entry under "Provider M2b" above, second occurrence).
 
-**Decode attention across three backends, 2026-10-13** (L1 of the ggml-spacemit comparison, `plan.md` M2e.3; `test-backend-ops perf -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128,nh=8,nr23=\[4,1\],kv=(4096|8192|16384),nb=1,'`, i.e. Qwen3-4B's decode shape: 8 KV heads x 4 query heads, head size 128, 1 token; us per run; `tcmrelease` before each run):
+**One-chunk attention kernels across three backends, 2026-10-13** (L1 of the ggml-spacemit comparison, `plan.md` M2e.3; `test-backend-ops perf -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128,nh=8,nr23=\[4,1\],kv=(4096|8192|16384),nb=1,'`, i.e. Qwen3-4B's shape in generation: 8 KV heads x 4 query heads, head size 128, 1 token; us per run; `tcmrelease` before each run):
 
 | n_kv | provider (huge pages) | provider (`FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`) | ggml-spacemit `4e782bc` (huge pages, its default) | ggml-spacemit (`SPACEMIT_MEM_BACKEND=posix`) | IME path (`build-ime`, CPU backend, 4 KiB pages) |
 |---|---|---|---|---|---|
@@ -482,16 +482,16 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 | 8192 | 3891 | 1856 | 3883 | 1873 | 1893 |
 | 16384 | 7713 | 3775 | 7810 | 3768 | 3821 |
 
-- The three backends run the same decode kernel (ggml-spacemit's decode code is identical to the in-tree one; ours is that copy with faults (a)-(c) fixed). On 4 KiB pages all three are equal within 2%: 0.23 us per position, 17.9 GB/s of K and V. So ggml-spacemit's decode attention offers nothing to adopt.
+- The three backends run the same one-chunk kernel (ggml-spacemit's one-chunk code is identical to the in-tree one; ours is that copy with faults (a)-(c) fixed). On 4 KiB pages all three are equal within 2%: 0.23 us per position, 17.9 GB/s of K and V. So ggml-spacemit's one-chunk kernels offer nothing to adopt.
 - On huge pages the same runs take 2.1-2.2x as long, at every size. `test-backend-ops` puts the tensors in the tested backend's own buffer (`tests/test-backend-ops.cpp:1553`): huge pages for the provider and for ggml-spacemit, 4 KiB pages for the CPU backend.
   - In these cases the 8 KV heads lie exactly 512 x n_kv bytes apart (2, 4 or 8 MiB; K is allocated as [128, 2 n_kv, 8]), so the 8 tiles stream addresses a multiple of 2 MiB apart.
   - On 2 MiB pages the physical addresses keep that alignment, so the streams collide in the same cache sets or memory banks. On 4 KiB pages the physical frames are scattered.
   - The model is not affected: its KV cache is in llama.cpp's CPU buffer on 4 KiB pages, with the heads 256 B apart (`k3-hardware.md` §2).
 - Against our benchmark: the same kernel reads K and V at 17.9 GB/s when each tile streams its own contiguous region (here), but at 9.7 GB/s on the real cache's layout (`bench attn` above, also 4 KiB pages), where every tile reads its head's 256 B of each 2 KiB cell and so touches every page.
   - The harnesses differ: `test-backend-ops` reuses its tensors, the benchmark rotates copies. But at n_kv 16384 the tensors are 64 MiB and the time per position stays flat, so both measure DRAM.
-  - So the cache layout's access pattern costs about 45% of decode attention: what M2e.3's candidate (a) removes (`plan.md`).
+  - So the cache layout's access pattern costs the one-chunk kernels about 45% of their bandwidth: what M2e.3's candidate (a) removes (`plan.md`).
 
-**Prompt attention: ggml-spacemit's tiled kernel in the provider, 2026-10-13** (L2 of the ggml-spacemit comparison, `plan.md` M2e.3; commit `68207bf`, test-only `FLAGOS_SPACEMIT_ATTN=trim`; `flagos-check-spacemit --expect-device --bench-attn`, the two kernels taking turns twice, the faster turn of each; Qwen3-4B's heads, us per call, one layer):
+**Tiled attention kernel: ggml-spacemit's in the provider, 2026-10-13** (L2 of the ggml-spacemit comparison, `plan.md` M2e.3; commit `68207bf`, test-only `FLAGOS_SPACEMIT_ATTN=trim`; `flagos-check-spacemit --expect-device --bench-attn`, the two kernels taking turns twice, the faster turn of each; Qwen3-4B's heads, us per call, one layer):
 
 | Shape | in-tree kernel | ggml-spacemit's | change |
 |---|---|---|---|
@@ -510,10 +510,32 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - Why it is faster: mostly not the trimming.
   - The in-tree kernel reads all 4096 mask values of every 64 x 64 tile, one at a time, to see whether it can skip the tile. ggml-spacemit's walks each row back from its end and stops at the first visible value: one read per row of a visible tile.
   - A fit gives about 16 ns per value read (32 cycles at 2.0 GHz) plus 32 us per diagonal tile from the trimming. Fitted on two shapes, it predicts the other two within 2% and 17%, and the model's gains within 0.4 points (pp128 +1.9%, pp512 +7.2%, depth +33.7%).
-  - So that check was a third of the in-tree kernel's time, at every depth. Prefill attention at depth (M2e.1 above: 88 GFLOP/s) now runs at about 130 GFLOP/s.
+  - So that check was a third of the in-tree kernel's time, at every depth. The tiled kernel at depth (M2e.1 above: 88 GFLOP/s) now runs at about 130 GFLOP/s.
   - Why a scalar loop over the mask copy (in TCM) costs 32 cycles a value is not verified: scalar loads from TCM, or the AI cores' scalar floating-point path. L4 (`plan.md`) tests the figure.
-  - The in-tree IME path runs the in-tree kernel, so its prefill at depth carries the same cost (for the SpacemiT report).
+  - The in-tree IME path runs the in-tree kernel, so its prompt processing at depth carries the same cost (for the SpacemiT report).
 - Decision (L3, by the rule fixed before measuring): adopted; `forward_tiled` is ggml-spacemit's kernel since then.
+
+**Tiled attention kernel: the remaining scalar mask reads (L4), 2026-10-13** (commit `a832349`, test-only `FLAGOS_SPACEMIT_ATTN=vscan`, the same harnesses; us per call):
+
+| Shape | scalar counts (L3's kernel) | vector counts | change |
+|---|---|---|---|
+| 128 tokens, n_kv 128 | 2152 | 1713 | -20.4% |
+| 512 tokens, n_kv 512 | 25630 | 18677 | -27.1% |
+| 128 tokens after 3968 (n_kv 4096) | 66206 | 63567 | -4.0% |
+| 512 tokens after 4096 (n_kv 4608) | 296075 | 279597 | -5.6% |
+
+| llama-bench, as above | scalar counts | vector counts | change |
+|---|---|---|---|
+| pp128 | 89.48, 89.14 | 92.33, 91.93 | +3.2% |
+| pp512 | 92.49, 91.07 | 95.40, 95.77 | +4.2% |
+| pp512 at depth 4096 | 33.17 | 34.49 | +4.0% |
+
+- Outputs bit-identical (3/3 tiled cases); test-backend-ops passes every case with it. The scalar-count column repeats L2's ggml-spacemit column within 1%: the adoption kept its speed.
+- Per tile (fit over the four shapes): the vector counts save about 4.5 us on a fully visible tile, 28 us on a diagonal one, 50 us on a fully masked one.
+  - So each of a visible tile's 64 scalar reads (one per row, 256 B apart) cost about 70 ns; in sequence a read cost about 16 ns (L2; `k3-hardware.md` §2).
+  - From these savings the model's gains were predicted within 0.5 points before llama-bench ran.
+- Decision (L4, by its rule): adopted.
+- L3 and L4 together, against M2e.1's in-tree kernel (two sessions): pp128 87.2 -> 92.1, pp512 85.1 -> 95.6, pp512 at depth 4096 24.9 -> 34.5 (`ime` 25.13).
 
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
@@ -528,7 +550,6 @@ Experiment switches of the provider (environment variables; test-only unless not
 | `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
 | `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
 | `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |
-| `FLAGOS_SPACEMIT_ATTN=vscan` | prompt attention on the K3 (64 rows or more), read at every call | the tiled kernel counts each row's unmasked columns with vector instructions instead of a scalar loop; outputs identical (L4, `plan.md` M2e.3) |
 | `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
 | `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
 | `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and path A run; `flagos-check-spacemit` sets 393216 for its 1-row checks |

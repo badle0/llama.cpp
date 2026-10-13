@@ -152,7 +152,7 @@ Conclusions:
 | | ACCEL, strict buffers | ACCEL, reads CPU buffers | GPU / IGPU |
 |---|---|---|---|
 | Perplexity | 14.5404 (`-fa on`) | 14.5404 | 14.5404 |
-| Graph splits, prefill / generation | 58 / 280 | 2 / **224** | 2 / 2 |
+| Graph splits, prompt processing / generation | 58 / 280 | 2 / **224** | 2 / 2 |
 | SPACEMIT compute buffer | 1612 MiB | 298.75 MiB | 298.75 MiB |
 | pp128 / pp128 @1024 (t/s) | 561.3 / 270.1 | 595.4 / 289.0 | 596.6 / 293.8 (GPU) |
 | tg128 / tg128 @1024 (t/s) | 21.3 / 12.5 | **35.0 / 21.6** | 57.4 / 35.2 (GPU) |
@@ -189,7 +189,7 @@ Conclusion for D3 (ACCEL): **ACCEL reaches GPU-type speed and accuracy (within 1
 | tg128 @ d1024 | 6.90 (-24.3%) | 9.12 | 9.19 |
 
 - 288 = 36 layers x 4 norms x 2, as predicted. ACCEL without pinning equals GPU type within 0.8%; results are bit-identical in all modes.
-- Prefill is unaffected (the rule only applies to batches under 32 tokens).
+- Prompt processing is unaffected (the rule only applies to batches under 32 tokens).
 - Cost per extra split, from time per token: 0.6B about 53 us (80 us at depth 1024), 4B about 140 us (123 us at depth 1024). It is not a fixed per-switch cost; it grows with model size. Cause not measured (candidates: ggml-spacemit creating a spine-runtime stream per `graph_compute`, cache effects of moving 2560-wide activations between core types). My prediction of about 15% loss for 4B was wrong: the loss is 30%.
 - Reference: SpacemiT's published upstream-IME numbers for this model (`docs/build-riscv64-spacemit.md`) are pp128 79.74, tg128 11.29; ggml-spacemit here is +3.1% / -4.7% against them (different build and run, not an A/B).
 

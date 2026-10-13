@@ -305,7 +305,8 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
         n_stride = std::min(n_stride, div_up(max_n_stride, nb_cols) * nb_cols);
     }
 
-    // path A (prefill): each tile stages 4 quantized rows in TCM and streams all weights past them
+    // path A (batches with 4 rows for every tile): each tile stages 4 quantized rows in TCM and streams all weights
+    // past them
     if (n_stride == d.n && tcm != nullptr && (size_t) (row_align * d.a_row_bytes) <= tile.tcm_size) {
         for (int64_t m0 = ith * row_align; m0 < d.m; m0 += row_align * nth) {
             const int64_t rows = std::min(d.m - m0, row_align);

@@ -1,7 +1,7 @@
 // Flash attention for VLEN 1024 (plan.md, M2e design), K3 builds only.
 //
 // Copied from the in-tree IME path, ggml/src/ggml-cpu/spacemit/rvv_kernels.cpp @ 81b0d882a (called from
-// ime.cpp:1151-1227; ggml-spacemit 4e782bc has the same decode code):
+// ime.cpp:1151-1227; ggml-spacemit 4e782bc has the same one-chunk kernels):
 // helpers align_up (33-35), flash_attn_ext_supported_d/shape_vlen1024_vf16 (37-43), reduce_sum_f32m4/m2_vlen1024
 // (45-55), rvv_expf_approx_f32m2 (57-88), rvv_tanh_approx_f32m2 (90-100), rvv_softcap_tanh_inplace_f32 (102-116),
 // rvv_softmax_exp_inplace_f32 (118-131), rvv_add_max_inplace_f32 (133-151), rvv_softcap_add_max_inplace_f32
@@ -25,9 +25,9 @@
 //   weight when there is no mask (ggml-cpu's tiled kernel has the same fault, ops.cpp:8894-8906); ggml-spacemit's
 //   applies it only up to each row's last column, so the padding is never touched;
 // - (e) rvv_transposed_s16_mn_to_nm's asm declares the vector registers and memory it writes and stays behind a call;
-// - (f) it advances its destination by the vl each strip gets, not by VLMAX (DK 65-127 could transpose wrongly).
-// Test-only (plan.md M2e.3, L4): forward_tiled's vector_scan counts each row's columns with vector instructions,
-// rvv_active_columns and rvv_last_column_visible, instead of its scalar loop over the mask.
+// - (f) it advances its destination by the vl each strip gets, not by VLMAX (DK 65-127 could transpose wrongly);
+// - forward_tiled finds each row's last unmasked column with vector instructions (rvv_active_columns,
+//   rvv_last_column_visible) instead of ggml-spacemit's scalar loop over the mask copy in TCM (plan.md M2e.3, L4).
 // flagos-spacemit-attn.cpp decides when these apply.
 
 #include "flagos-spacemit-rvv-attn.h"
@@ -578,8 +578,8 @@ static inline void rvv_pv_accumulate(float *       dst,
     }
 }
 
-// flagos (test-only, plan.md M2e.3, L4): the number of columns of a row up to and including its last one that is not
-// -inf, 0 if there is none, as forward_tiled's scalar loop counts them (NaN counts as not -inf there too); n <= 64
+// flagos (plan.md M2e.3, L4): the number of columns of a row up to and including its last one that is not -inf, 0 if
+// there is none (NaN counts as not -inf), as ggml-spacemit's scalar loop counted them; n <= 64
 static inline int rvv_active_columns(const float * row, int n) {
     const size_t      vl      = __riscv_vsetvl_e32m2(n);
     const vbool16_t   visible = __riscv_vmfne_vf_f32m2_b16(__riscv_vle32_v_f32m2(row, vl), -INFINITY, vl);
@@ -589,8 +589,8 @@ static inline int rvv_active_columns(const float * row, int n) {
     return (int) __riscv_vmv_x_s_u32m1_u32(last);
 }
 
-// flagos (test-only, L4): whether column n - 1 is not -inf in each of the rows (rows <= 64, stride in floats), so that
-// every row's count is n
+// flagos (L4): whether column n - 1 is not -inf in each of the rows (rows <= 64, stride in floats), so that every
+// row's count is n
 static inline bool rvv_last_column_visible(const float * tile, int64_t stride, int rows, int n) {
     const size_t       vl   = __riscv_vsetvl_e32m2(rows);
     const vfloat32m2_t last = __riscv_vlse32_v_f32m2(tile + n - 1, stride * (int64_t) sizeof(float), vl);
@@ -1173,13 +1173,9 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
 // flagos: the interface of flagos-spacemit-rvv-attn.h; no ggml_compute_params, and the caller's scratch replaces the
 // thread's slice of params->wdata or its TCM. ggml-spacemit's kernel (plan.md M2e.3, L3): each query row stops at its
 // last unmasked column of a KV tile (the K transpose and the V copy at the tile's largest), and a tile in which every
-// row is masked is skipped; it uses this file's helpers, so fixes (e) and (f) apply
-void forward_tiled(const ggml_tensor * dst,
-                   int64_t             ir0,
-                   int64_t             ir1,
-                   void *              scratch,
-                   size_t              scratch_size,
-                   bool                vector_scan) {
+// row is masked is skipped; it uses this file's helpers, so fixes (e) and (f) apply. The last columns come from vector
+// instructions (L4, marked)
+void forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1333,23 +1329,16 @@ void forward_tiled(const ggml_tensor * dst,
                                            kv_tile, slope);
 
                 max_active_kv = 0;
-                // flagos (test-only, plan.md M2e.3, L4): with vector_scan the same counts come from vector
-                // instructions, all at once when every row's last column is visible
-                if (vector_scan && rvv_last_column_visible(mask32, KV_TILE_SZ, tile_rows, kv_tile)) {
+                // flagos (plan.md M2e.3, L4): the counts from vector instructions, all at once when every row's last
+                // column is visible. ggml-spacemit walked each row back from its end a value at a time, and scalar
+                // reads of the mask copy in TCM are slow (about 16 ns each in sequence, 70 ns scattered)
+                if (rvv_last_column_visible(mask32, KV_TILE_SZ, tile_rows, kv_tile)) {
                     std::fill_n(active_kv, tile_rows, kv_tile);
                     max_active_kv = kv_tile;
                 } else {
                     for (int tq = 0; tq < tile_rows; tq++) {
-                        int tk = kv_tile;
-                        if (vector_scan) {
-                            tk = rvv_active_columns(mask32 + tq * KV_TILE_SZ, kv_tile);
-                        } else {
-                            while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
-                                --tk;
-                            }
-                        }
-                        active_kv[tq] = tk;
-                        max_active_kv = std::max(max_active_kv, tk);
+                        active_kv[tq] = rvv_active_columns(mask32 + tq * KV_TILE_SZ, kv_tile);
+                        max_active_kv = std::max(max_active_kv, active_kv[tq]);
                     }
                 }
 

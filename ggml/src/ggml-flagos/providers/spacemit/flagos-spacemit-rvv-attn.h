@@ -20,20 +20,15 @@ bool supported_shape(int64_t DK, int64_t DV);
 
 // rows [ir0, ir1) of dst = FLASH_ATTN_EXT(q, k, v, mask, sinks), a row being one query (token i1, head i2, stream i3)
 // in ggml-cpu's order, ir = (i3 * ne_q2 + i2) * ne_q1 + i1. With tcm (not null), and without ALiBi, rows that share
-// K, V and the mask row (at decode the query heads of one KV head) go 4 or 2 at a time through it, else one at a time
+// K, V and the mask row (with one token per call, the query heads of one KV head) go 4 or 2 at a time through it,
+// else one at a time
 void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * tcm, size_t tcm_size);
 
-// the same rows in tiles of up to 64 rows of one head (prefill), in scratch: float-aligned, at least
+// the same rows in tiles of up to 64 rows of one head (calls of 64 tokens or more), in scratch: float-aligned, at least
 // tiled_scratch_bytes(DK, DV) bytes (160 KiB at DK = DV = 128), e.g. the tile's TCM. Each row stops at its last
-// unmasked column of every 64-position KV tile. vector_scan (test-only, plan.md M2e.3, L4): find those columns with
-// vector instructions instead of a scalar loop; the same results
+// unmasked column of every 64-position KV tile
 size_t tiled_scratch_bytes(int64_t DK, int64_t DV);
-void   forward_tiled(const ggml_tensor * dst,
-                     int64_t             ir0,
-                     int64_t             ir1,
-                     void *              scratch,
-                     size_t              scratch_size,
-                     bool                vector_scan = false);
+void   forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size);
 
 }  // namespace spacemit_rvv_attn
 

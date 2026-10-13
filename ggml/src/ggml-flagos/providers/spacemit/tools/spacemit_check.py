@@ -29,7 +29,7 @@
 #         turns it off, or if the graphs take as many splits as the model has layers, as when the CPU runs attention)
 #         and a token takes 2 graph splits; perplexity with -fa on and with -fa auto (attention on the provider), each
 #         within 1% of the CPU; mean KLD against the CPU's logits with 512-token batches (tiled kernel) and -ub 1
-#         (decode kernels), to compare by hand with M2c.2's (Qwen3-4B: 0.0033 and 0.0022, build.md §7)
+#         (one-chunk kernels), to compare by hand with M2c.2's (Qwen3-4B: 0.0033 and 0.0022, build.md §7)
 #   --depth (m2b and later): after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth
 #         4096 for the provider, the CPU and (if built) the upstream IME build; FAIL if the provider's runs miss one
 # Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c|m2c2|m2e] [--build] [--build-dir DIR] [--model GGUF]
@@ -356,7 +356,7 @@ def perplexity(bdir, logs, model, text, milestone):
 
 def kl_divergence(bdir, logs, model, text, base):
     """Mean KLD of the provider's logits against the CPU's (base, from the CPU's perplexity run): with 512-token
-    batches (the tiled kernel) and with -ub 1 (the decode kernels; about 10 minutes for Qwen3-4B), as build.md §6."""
+    batches (the tiled kernel) and with -ub 1 (the one-chunk kernels; about 10 minutes for Qwen3-4B), as build.md §6."""
     if not base.is_file():
         report("KLD against the CPU", False, f"no CPU logits: {base} (the CPU perplexity run failed)")
         return
@@ -379,7 +379,7 @@ def llama_bench(bdir, logs, model, ime_build, tcm_dir, depth):
     depth_args = ["-m", model, "-t", "8", "-p", "0", "-n", "32", "-d", "0,1024,4096", "-fa", "1", "-mmp", "0", "-r", "1",
                   "-o", "csv"]
     depths = [0, 1024, 4096]
-    # and prefill at depth (plan.md, M2e design), in a run of its own so the tg32 series stays as measured
+    # and prompt processing at depth (plan.md, M2e design), in a run of its own so the tg32 series stays as measured
     pp_depth_args = ["-m", model, "-t", "8", "-p", "512", "-n", "0", "-d", "4096", "-fa", "1", "-mmp", "0", "-r", "1",
                      "-o", "csv"]
     modes = [("provider", bdir, {}, ("FLAGOS_SPACEMIT_DISABLE",)), ("cpu", bdir, {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]
