@@ -1116,7 +1116,7 @@ struct attn_run {
     ggml_cgraph *         g_dev = nullptr, * g_cpu = nullptr;
 
     bool init(ggml_backend_dev_t dev, const attn_shape & s, attn_mask mode, float visible, float max_bias,
-              uint32_t seed) {
+              uint32_t seed, float q_scale = 4.0f) {
         ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
         ctx_host                = ggml_init(params);
         ctx_dev                 = ggml_init(params);
@@ -1133,7 +1133,7 @@ struct attn_run {
         if (buf_host == nullptr || buf_dev == nullptr) {
             return false;
         }
-        const std::vector<float> qv = random_values(ggml_nelements(q), seed, 4.0f);
+        const std::vector<float> qv = random_values(ggml_nelements(q), seed, q_scale);
         ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
         ggml_backend_tensor_set(k_cache, random_f16(ggml_nelements(k_cache), seed + 1, 1.0f).data(), 0,
                                 ggml_nbytes(k_cache));
@@ -1194,6 +1194,15 @@ constexpr double k_attn_max_nmse = 5e-4;  // test-backend-ops' bound for FLASH_A
 // CPU's 1-row kernel accumulates V in F16); a row given the wrong KV head or missing a KV tile 0.3 or more, while the
 // whole output of a tiled case stayed below 5e-4
 constexpr double k_attn_max_row_nmse = 5e-3;
+// the tiled kernel's rows have their own, tighter bound. It accumulates V in F32 as the CPU's tiled kernel does, and
+// its rows matched to 8.4e-7 on the K3 (4.5e-7 with the reference). A row that misses one visible position, as a wrong
+// mask count would make it (plan.md M2e.3, L4), is off in NMSE by a median 1.9e-4 at 4096 positions (6e-5 at least)
+// when the scores are flat (q's values scaled by 1, as in the case at depth), and by a median 1.3e-3 at 512
+// (simulated); the general bound lets those pass. The other cases' peaked scores (q scaled by 4) can hide one position
+// in a long row even from this bound (median 5e-6 at 4096), not in rows of up to a few hundred. From 64 tokens per
+// call, with TCM, the provider runs the tiled kernel
+constexpr double  k_attn_max_row_nmse_tiled = 1e-5;
+constexpr int64_t k_attn_tiled_tokens       = 64;
 
 // over the whole output and the worst row (attn_run::compare); all < 0: refused or failed
 struct attn_error {
@@ -1201,17 +1210,18 @@ struct attn_error {
 };
 
 static attn_error attn_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, const attn_shape & s,
-                            attn_mask mode, float visible, float max_bias, uint32_t seed) {
+                            attn_mask mode, float visible, float max_bias, uint32_t seed, float q_scale = 4.0f) {
     attn_run   run;
     attn_error e;
-    if (run.init(dev, s, mode, visible, max_bias, seed)) {
+    if (run.init(dev, s, mode, visible, max_bias, seed, q_scale)) {
         e.all = run.compare(dev, backend, cpu, e.row);
     }
     return e;
 }
 
-static void attn_report(const attn_error & e, const char * what, const attn_shape & s) {
-    if (e.all < 0.0 || e.all > k_attn_max_nmse || e.row > k_attn_max_row_nmse) {
+static void attn_report(const attn_error & e, const char * what, const attn_shape & s,
+                        double row_bound = k_attn_max_row_nmse) {
+    if (e.all < 0.0 || e.all > k_attn_max_nmse || e.row > row_bound) {
         std::fprintf(stderr,
                      "FAIL: attention %s (%lld query and %lld KV heads of %lld, n_kv %lld, %lld tokens after %lld): "
                      "%s %.3e (bound %.0e), worst row %.3e (bound %.0e)\n",
@@ -1220,7 +1230,7 @@ static void attn_report(const attn_error & e, const char * what, const attn_shap
                      e.all < 0.0       ? "refused or failed" :
                      std::isinf(e.all) ? "output not finite" :
                                          "NMSE",
-                     e.all, k_attn_max_nmse, e.row, k_attn_max_row_nmse);
+                     e.all, k_attn_max_nmse, e.row, row_bound);
         g_failures++;
     }
 }
@@ -1231,10 +1241,12 @@ static void attn_report(const attn_error & e, const char * what, const attn_shap
 // kernels (one token), the 1-row one (7 tokens), the tiled kernel (99 and 128 tokens). 128 tokens from position 0 fill
 // whole 64 x 64 tiles; 99 after 37 also take the tiled kernel's branches for rows that see none of a KV tile that other
 // rows of their tile see (54 rows per head, 2 of them in mixed 4-row groups) and its 1-row tail (3 rows of a 35-row
-// tile). Each probe gates one of the faults fixed in the copied kernels (plan.md, M2e design): (a) every score far
-// below 0, where rows whose maximum started at 0 came out as zeros (the one-chunk kernels accumulate V in F16, where a
-// weight exp(s - 0) is 0 below about -17; below about -104 it is 0 in F32 too, which -120 shows in the F32 reference);
-// (b) no mask, which crashed; (c) ALiBi with GQA, where the grouped rows took the first row's slope
+// tile); 128 after 3968, with flat scores, give it rows that see about 4000 positions, where the tiled cases' tighter
+// row bound catches a single position its mask counts miss. Each probe gates one of the faults fixed in the copied
+// kernels (plan.md, M2e design): (a) every score far below 0, where rows whose maximum started at 0 came out as zeros
+// (the one-chunk kernels accumulate V in F16, where a weight exp(s - 0) is 0 below about -17; below about -104 it is 0
+// in F32 too, which -120 shows in the F32 reference); (b) no mask, which crashed; (c) ALiBi with GQA, where the grouped
+// rows took the first row's slope
 static int check_flash_attn(ggml_backend_dev_t dev) {
     // claimed exactly: llama.cpp's graph (here before allocation) at head sizes up to 128, without a mask too; not head
     // size 256, F32 or quantized K and V, or K and V of different types
@@ -1262,7 +1274,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     REQUIRE(backend != nullptr && cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 8);
 
-    struct attn_case { const char * what; attn_shape s; };
+    struct attn_case { const char * what; attn_shape s; float q_scale = 4.0f; };
     const attn_case cases[] = {
         { "Qwen3-4B 1 token, 37 of 256 cells valid", { 32, 8, 128, 256, 1, 36 } },
         { "Qwen3-4B 1 token", { 32, 8, 128, 1024, 1, 1023 } },
@@ -1272,21 +1284,24 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         { "Qwen3-4B batch (tiled), partly masked KV tiles", { 32, 8, 128, 256, 99, 37 } },
         { "Qwen3-0.6B 1 token, 300 of 512 cells valid", { 16, 8, 128, 512, 1, 299 } },
         { "Qwen3-0.6B batch (tiled)", { 16, 8, 128, 256, 128, 0 } },
+        { "Qwen3-4B batch (tiled) at depth, flat scores", { 32, 8, 128, 4096, 128, 3968 }, 1.0f },
     };
-    // runs and reports one case, returns its NMSE over the whole output (HUGE_VAL if refused or failed); worst_row over
-    // the cases and the probes
-    double     worst_row = 0.0;
+    // runs and reports one case, returns its NMSE over the whole output (HUGE_VAL if refused or failed); worst_row and
+    // worst_row_tiled over the cases and the probes, below and from k_attn_tiled_tokens tokens
+    double     worst_row = 0.0, worst_row_tiled = 0.0;
     const auto attn      = [&](const char * what, const attn_shape & s, attn_mask mode, float visible, float max_bias,
-                          uint32_t seed) {
-        const attn_error e = attn_nmse(dev, backend, cpu, s, mode, visible, max_bias, seed);
-        attn_report(e, what, s);
-        worst_row = e.all < 0.0 ? HUGE_VAL : std::max(worst_row, e.row);
+                          uint32_t seed, float q_scale = 4.0f) {
+        const attn_error e     = attn_nmse(dev, backend, cpu, s, mode, visible, max_bias, seed, q_scale);
+        const bool       tiled = s.n_tokens >= k_attn_tiled_tokens;
+        attn_report(e, what, s, tiled ? k_attn_max_row_nmse_tiled : k_attn_max_row_nmse);
+        double & worst_of = tiled ? worst_row_tiled : worst_row;
+        worst_of          = e.all < 0.0 ? HUGE_VAL : std::max(worst_of, e.row);
         return e.all < 0.0 ? HUGE_VAL : e.all;
     };
     double   worst = 0.0;
     uint32_t seed  = 40;
     for (const attn_case & c : cases) {
-        worst = std::max(worst, attn(c.what, c.s, attn_mask::causal, 0.0f, 0.0f, seed++));
+        worst = std::max(worst, attn(c.what, c.s, attn_mask::causal, 0.0f, 0.0f, seed++, c.q_scale));
     }
 
     const attn_shape one_token = { 32, 8, 128, 256, 1, 36 };
@@ -1306,11 +1321,13 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     ggml_backend_free(cpu);
     std::printf(
         "attn     FLASH_ATTN_EXT vs CPU (F16 KV cache in a CPU buffer, viewed as llama.cpp does; Qwen3-4B and "
-        "0.6B heads): %zu cases (1 token at n_kv 256-4096, 7, 99 and 128 tokens), max NMSE %.2e (bound %.0e), "
-        "worst row %.2e (bound %.0e); probes: every score far below 0 (mask -30, -120) %.2e, no mask %.2e, "
-        "ALiBi with GQA 4 %.2e; claims exact (F16 K and V, head sizes to 128): checked%s\n",
-        sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, e_low, e_none,
-        e_alibi, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+        "0.6B heads): %zu cases (1 token at n_kv 256-4096; 7, 99 and 128 tokens; 128 after 3968), max NMSE %.2e "
+        "(bound %.0e), worst row %.2e (bound %.0e), of the tiled cases %.2e (bound %.0e); probes: every score far "
+        "below 0 (mask -30, -120) %.2e, no mask %.2e, ALiBi with GQA 4 %.2e; claims exact (F16 K and V, head sizes "
+        "to 128): checked%s\n",
+        sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, worst_row_tiled,
+        k_attn_max_row_nmse_tiled, e_low, e_none, e_alibi,
+        std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
 

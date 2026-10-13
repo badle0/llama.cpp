@@ -719,7 +719,7 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
   - A fit gives about 16 ns (32 cycles) per value read plus 32 us per diagonal tile from the trimming. Fitted on two shapes, it predicts the other two within 2% and 17%, and the model's gains within 0.4 points.
   - So that check was a third of the in-tree kernel's time at every depth; the prediction had put it at 1%. Why a scalar read of the mask copy (in TCM) costs 32 cycles is not verified.
 - Decision (L3), by the rule: adopted 2026-10-13. `forward_tiled` is now ggml-spacemit's kernel, with its `rvv_qk_dot_tile`; the in-tree tiled kernel, the copy and the switch are gone.
-  - Acceptance on the K3, to run: every check, test-backend-ops, runner m2e. Perplexity and KLD are expected identical to M2e.1's (9.782; 0.003354 and 0.002050), since the outputs were bit-identical.
+  - Accepted on the K3 2026-10-13 (commit `a832349`, runner m2e without `--depth`: 36/36). Perplexity 9.782 with `-fa on` and `-fa auto` and mean KLD 0.003354 / 0.002050 are M2e.1's to the last digit, and the greedy text leaves the CPU's at the same character (143), as bit-identical outputs predict; pp128 87.70 -> 89.41, tg128 11.27 -> 11.28 (`build.md` §7).
 
 **L4: the scalar mask reads that remain** (measured and adopted 2026-10-13; results below and in `build.md` §7):
 - What remains: the adopted kernel still reads the mask one value at a time wherever a row's tail is masked.
@@ -750,14 +750,19 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
   - The vector counts cost more than estimated: each row's count moves from a vector register to a scalar one, which waits for the vector unit.
   - The model's gains, predicted from these per-tile savings before llama-bench ran, matched within 0.5 points.
 - Decision, by the rule: adopted 2026-10-13. The vector counts are the only path; the scalar loop and the switch are gone. The outputs are unchanged bit for bit, so L3's acceptance run covers L4 too.
+- L3's acceptance run covers L4: the outputs are bit-identical, so perplexity and KLD stay M2e.1's.
+- Guards, added after adoption (2026-10-13), because a wrong count could now pass the NMSE checks, the byte-for-byte comparison having gone with the switch:
+  - the tiled cases' rows are held to 1e-5 in NMSE against the CPU (5e-3 for the others; the tiled rows matched to 8.4e-7 on the K3);
+  - a tiled case at depth, 128 tokens after 3968 with flat scores (q's values scaled by 1): there a row that misses one visible position is off by a median 1.9e-4, at least 6e-5 (simulated), so the bound catches it; with the other cases' peaked scores one position in a 4096-position row could stay below it (median 5e-6);
+  - `forward_tiled` asserts that a register group holds a tile's row (VLEN 1024), so a shorter VLEN fails instead of counting part of each row.
 - What remains of the check: an estimated 15 us per diagonal or fully masked tile, from the 64 vector-to-scalar moves. Counting all rows in one register would remove most of it (roughly 10% of the tiled kernel's time at depth 0, pp512 about +1.5%); not planned.
 
 **Tests:**
 - `test-backend-ops -o FLASH_ATTN_EXT` on the Mac (host test device, reference) and on the K3 (RVV kernels and references): every claimed case passes; the 12 earlier op sets unchanged.
 - `flagos-check-spacemit`, against the CPU with the cache's layout (all KV heads in one cell of a CPU buffer), at Qwen3-4B's and 0.6B's head counts:
   - 1 token at n_kv 256 with 37 valid positions, at 1024 and at 4096;
-  - 7 rows (1-row kernel); 128 rows with a causal mask (tiled);
-  - bound 5e-4; on the K3 also the RVV kernels against the reference.
+  - 7 rows (1-row one-chunk kernel); 128 rows with a causal mask (tiled), and 128 after 3968 with flat scores (tiled, rows of about 4000 positions; added with L4's guards);
+  - bound 5e-4; each row 5e-3, the tiled cases' rows 1e-5 (L4's guards); on the K3 also the RVV kernels against the reference.
 - Probes for the three faults, each gating:
   - (a): one KV head whose scores all lie below -20 (q scaled), which the unfixed kernel returns as zeros for 3 of its 4 query heads;
   - (b): no mask;

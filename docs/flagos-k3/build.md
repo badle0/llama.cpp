@@ -537,6 +537,12 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - Decision (L4, by its rule): adopted.
 - L3 and L4 together, against M2e.1's in-tree kernel (two sessions): pp128 87.2 -> 92.1, pp512 85.1 -> 95.6, pp512 at depth 4096 24.9 -> 34.5 (`ime` 25.13).
 
+**Acceptance run after L3, 2026-10-13** (commit `a832349`: ggml-spacemit's tiled kernel the default, `vscan` behind its switch; `spacemit_check.py --milestone m2e` on Qwen3-4B, without `--depth`: 36/36, M2e.1's 37 less the depth check):
+- Accuracy: perplexity 9.782 with `-fa on` and with `-fa auto` (CPU 9.774, +0.08%); mean KLD 0.003354 ± 0.000231 (512-token batches) and 0.002050 ± 0.000155 (`-ub 1`). All four are M2e.1's to the last digit, and the greedy text leaves the CPU's at the same character (143): what bit-identical attention outputs predict. L4's outputs are bit-identical to these, so this holds for it too.
+- Placement unchanged: `-fa auto` keeps flash attention on the provider (C5a), 2 graph splits per token, buffers 2349.87 / 301.75 MiB, no TCM block left held.
+- Speed (llama-bench, 3 runs): provider pp128 89.41, tg128 11.28 (M2e.1: 87.70, 11.27); `ime` 79.39, 11.00; `cpu` 20.87, 5.59. `llama-completion` 11.41 t/s against 5.6 with the provider disabled.
+- The benchmark measured the `vscan` switch a third time: -20.7% (128 tokens, depth 0), -26.9% (512, depth 0), -4.4% (128 after 3968), -5.9% (512 after 4096), as in L4's runs. 1-row matmuls per token: `paired` 85.9 ms (28.7 GB/s), `staged` 91.5, `direct` 96.7.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

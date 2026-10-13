@@ -1245,6 +1245,10 @@ void forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scr
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
+    // flagos (L4): the mask counts take a KV tile's row, and one column of the query tile, in one register group; with
+    // a shorter VLEN they would count only part of it, silently
+    GGML_ASSERT(__riscv_vsetvlmax_e32m2() >= (size_t) std::max(Q_TILE_SZ, KV_TILE_SZ));
+
     // Per-thread scratch layout:
     // Q_f32:   Q_TILE_SZ * DK
     // KQ:      Q_TILE_SZ * KV_TILE_SZ
