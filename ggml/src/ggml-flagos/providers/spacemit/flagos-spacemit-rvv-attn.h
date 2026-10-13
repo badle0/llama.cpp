@@ -24,13 +24,16 @@ bool supported_shape(int64_t DK, int64_t DV);
 void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * tcm, size_t tcm_size);
 
 // the same rows in tiles of up to 64 rows of one head (prefill), in scratch: float-aligned, at least
-// tiled_scratch_bytes(DK, DV) bytes (160 KiB at DK = DV = 128), e.g. the tile's TCM
+// tiled_scratch_bytes(DK, DV) bytes (160 KiB at DK = DV = 128), e.g. the tile's TCM. Each row stops at its last
+// unmasked column of every 64-position KV tile. vector_scan (test-only, plan.md M2e.3, L4): find those columns with
+// vector instructions instead of a scalar loop; the same results
 size_t tiled_scratch_bytes(int64_t DK, int64_t DV);
-void   forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size);
-
-// test-only: ggml-spacemit's variant of forward_tiled, which skips each query row's masked tail of every KV tile;
-// same requirements and results (plan.md M2e.3, L2: FLAGOS_SPACEMIT_ATTN=trim)
-void forward_tiled_trim(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size);
+void   forward_tiled(const ggml_tensor * dst,
+                     int64_t             ir0,
+                     int64_t             ir1,
+                     void *              scratch,
+                     size_t              scratch_size,
+                     bool                vector_scan = false);
 
 }  // namespace spacemit_rvv_attn
 

@@ -10,7 +10,8 @@
 //                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the 1-row strategies of
 //                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
 //   --bench-gemv     of the benchmarks only the 1-row strategies
-//   --bench-attn     of the benchmarks only flash attention (both tiled kernels at prompt shapes, plan.md M2e.3 L2)
+//   --bench-attn     of the benchmarks only flash attention (at prompt shapes also FLAGOS_SPACEMIT_ATTN=vscan, plan.md
+//                    M2e.3 L4)
 // Without a flag, a host without the device skips the device checks.
 
 #include "ggml-alloc.h"
@@ -1323,36 +1324,41 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     const double     e_none    = attn("probe (b), no mask", all_cells, attn_mask::none, 0.0f, 0.0f, 61);
     const double e_alibi = attn("probe (c), ALiBi (max_bias 8) with GQA 4", decode, attn_mask::alibi, 0.0f, 8.0f, 62);
 
-    // L2 of the ggml-spacemit comparison (plan.md M2e.3): ggml-spacemit's tiled kernel (test-only switch
-    // FLAGOS_SPACEMIT_ATTN=trim) on the tiled cases, against ours and against the CPU. Its trimming leaves out only
-    // terms that are exactly 0, so the outputs should equal ours bit for bit (the vector unit's unordered row sums could
-    // still differ in the last bit); within the bounds against the CPU either way. Without the RVV kernels (the Mac)
-    // both settings run the reference, which checks only the switch
-    int    n_tiled = 0, n_same = 0;
-    double e_trim = 0.0, e_between = 0.0;
+    // L4 (plan.md M2e.3): the tiled kernel with FLAGOS_SPACEMIT_ATTN=vscan, which counts each row's columns with
+    // vector instructions, on the tiled cases, against the default and against the CPU. The counts are the same
+    // integers, so the outputs must equal the default's bit for bit. Without the RVV kernels (the Mac, or
+    // FLAGOS_SPACEMIT_TEST_REFERENCE) both settings run the reference, which checks only the switch
+    const bool reference = host || std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr;
+    int        n_tiled = 0, n_same = 0;
+    double     e_vscan = 0.0, e_between = 0.0;
     for (const attn_case & c : cases) {
         if (c.s.n_tokens < 64) {
             continue;
         }
         attn_run run;
         REQUIRE(run.init(dev, c.s, attn_mask::causal, 0.0f, 0.0f, seed++));
-        std::vector<float> ours, trim;
+        std::vector<float> scalar, vscan;
         {
             env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
-            REQUIRE(run.dev_output(backend, ours));
+            REQUIRE(run.dev_output(backend, scalar));
         }
         {
-            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "trim");
-            REQUIRE(run.dev_output(backend, trim));
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "vscan");
+            REQUIRE(run.dev_output(backend, vscan));
         }
         REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
-        const int64_t    n = (int64_t) trim.size(), row = run.out->ne[0];
-        const attn_error e = attn_errors(trim.data(), static_cast<const float *>(run.out_ref->data), n, row);
-        attn_report(e, "ggml-spacemit's tiled kernel (FLAGOS_SPACEMIT_ATTN=trim)", c.s);
-        e_trim    = std::max(e_trim, std::max(e.all, e.row));
-        e_between = std::max(e_between, nmse(trim.data(), ours.data(), n));
-        n_same += std::memcmp(trim.data(), ours.data(), trim.size() * sizeof(float)) == 0;
+        const int64_t    n = (int64_t) vscan.size(), row = run.out->ne[0];
+        const attn_error e = attn_errors(vscan.data(), static_cast<const float *>(run.out_ref->data), n, row);
+        attn_report(e, "tiled kernel with FLAGOS_SPACEMIT_ATTN=vscan", c.s);
+        e_vscan   = std::max(e_vscan, std::max(e.all, e.row));
+        e_between = std::max(e_between, nmse(vscan.data(), scalar.data(), n));
+        n_same += std::memcmp(vscan.data(), scalar.data(), vscan.size() * sizeof(float)) == 0;
         n_tiled++;
+    }
+    if (n_same != n_tiled) {
+        std::fprintf(stderr, "FAIL: FLAGOS_SPACEMIT_ATTN=vscan changed %d of %d tiled outputs (NMSE up to %.3e)\n",
+                     n_tiled - n_same, n_tiled, e_between);
+        g_failures++;
     }
 
     ggml_backend_free(backend);
@@ -1364,12 +1370,10 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
         "ALiBi with GQA 4 %.2e; claims exact (F16 K and V, head sizes to 128): checked%s\n",
         sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, e_low, e_none,
         e_alibi, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
-    std::printf("attn     ggml-spacemit's tiled kernel (FLAGOS_SPACEMIT_ATTN=trim) on the %d tiled cases: %d/%d outputs "
-                "identical to ours (NMSE between them up to %.2e), max NMSE vs CPU %.2e (whole and per row)%s\n",
-                n_tiled, n_same, n_tiled, e_between, e_trim,
-                host || std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ?
-                    "; reference kernels, so both settings ran the reference" :
-                    "");
+    std::printf("attn     tiled kernel with FLAGOS_SPACEMIT_ATTN=vscan (vector column counts) on the %d tiled cases: "
+                "%d/%d outputs identical to the default's, max NMSE vs CPU %.2e (whole and per row)%s\n",
+                n_tiled, n_same, n_tiled, e_vscan,
+                reference ? "; reference kernels, so both settings ran the reference" : "");
     return 0;
 }
 
@@ -1957,9 +1961,9 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 
 // flash attention at Qwen3-4B's heads (32 query, 8 KV of 128; attn_run): a token at n_kv 256, 1024 and 4096, every
 // cell valid, and prompt batches, causal: 128 tokens at n_kv 128 and 4096, 512 at n_kv 512 and 4608 (depth 0 and
-// 4096); the provider against the CPU backend (8 threads) on the same graph. At prompt shapes the provider runs both
-// tiled kernels, ours and ggml-spacemit's (FLAGOS_SPACEMIT_ATTN=trim; plan.md M2e.3, L2), taking turns twice and
-// keeping each one's faster turn, so that a drift in the board's speed does not favour either. As in the model, where
+// 4096); the provider against the CPU backend (8 threads) on the same graph. At prompt shapes the provider runs the
+// tiled kernel by default and with FLAGOS_SPACEMIT_ATTN=vscan (plan.md M2e.3, L4), taking turns twice and keeping
+// each one's faster turn, so that a drift in the board's speed does not favour either. As in the model, where
 // each layer has its own cache, every call reads its cache from DRAM: it takes the next of enough copies (32 MB
 // together, as bench_gemv). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls,
 // each its own launch here
@@ -1988,11 +1992,11 @@ static int bench_attn(ggml_backend_dev_t dev) {
                 [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
                 b.iterations);
         };
-        double t_dev = dev_us(nullptr), t_trim = 0.0;
+        double t_dev = dev_us(nullptr), t_vscan = 0.0;
         if (b.n_tokens > 1) {
-            t_trim = dev_us("trim");
-            t_dev  = std::min(t_dev, dev_us(nullptr));
-            t_trim = std::min(t_trim, dev_us("trim"));
+            t_vscan = dev_us("vscan");
+            t_dev   = std::min(t_dev, dev_us(nullptr));
+            t_vscan = std::min(t_vscan, dev_us("vscan"));
         }
         const double t_cpu = time_us(
             [&] { ok &= ggml_backend_graph_compute(cpu, runs[next++ % copies]->g_cpu) == GGML_STATUS_SUCCESS; },
@@ -2004,10 +2008,10 @@ static int bench_attn(ggml_backend_dev_t dev) {
                         (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, kv_bytes / t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3,
                         kv_bytes / t_cpu / 1e3);
         } else {
-            std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), trim %8.0f us "
+            std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), vscan %8.0f us "
                         "(%+5.1f%%), cpu %8.0f us (%7.1f ms)\n",
-                        (long long) s.n_tokens, (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, t_trim,
-                        100.0 * (t_trim / t_dev - 1.0), t_cpu, 36 * t_cpu / 1e3);
+                        (long long) s.n_tokens, (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, t_vscan,
+                        100.0 * (t_vscan / t_dev - 1.0), t_cpu, 36 * t_cpu / 1e3);
         }
     }
     ggml_backend_free(backend);

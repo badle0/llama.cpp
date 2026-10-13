@@ -677,7 +677,7 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
   - (a)'s split of the positions (contiguous ranges n_kv / 8 cells apart, 1 MiB at n_kv 4096) and candidate (c) (the cache on huge pages) must avoid that: stagger the range starts or deal blocks of cells round-robin.
   - Measure every strategy with the test cache on 4 KiB pages and on huge pages.
 
-**L2 and L3: ggml-spacemit's prompt kernel inside the provider** (implemented 2026-10-13; to run on the K3):
+**L2 and L3: ggml-spacemit's prompt kernel inside the provider** (measured and adopted 2026-10-13; results below and in `build.md` §7):
 - What runs: `forward_tiled_trim` in `flagos-spacemit-rvv-attn.cpp`, ggml-spacemit's tiled kernel (`4e782bc`, `rvv_kernels.cpp:1306-1641`).
   - Unchanged except where it meets the provider: its scratch is the tile's TCM, as `forward_tiled`'s; its `rvv_qk_dot_tile`, which takes the K tile's row stride apart from the column count, is renamed `rvv_qk_dot_tile_stride`.
   - Switch: `FLAGOS_SPACEMIT_ATTN=trim`, test-only, read at every call, so one process can time both kernels.
@@ -710,6 +710,36 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
   - `forward_tiled_trim` and the switch go;
   - test-backend-ops and the 512-token KLD run again (expected unchanged).
 - Otherwise both go, and the result is recorded here.
+- Results on the K3, 2026-10-13 (commit `68207bf`):
+  - Correct: outputs bit-identical to ours in all three tiled cases; test-backend-ops passes every case with `trim`.
+  - Per call: 128 tokens at depth 0 -26%, 512 at depth 0 -31%, 128 after 3968 -33%, 512 after 4096 -33%.
+  - Model: pp128 87.17 -> 89.18 (+2.3%), pp512 85.11 -> 90.89 (+6.8%), pp512 at depth 4096 24.86 -> 33.22 (+34%; `ime` 25.13).
+- The predictions held for pp128 only, and for the wrong reason: most of the gain is not the trimming.
+  - The in-tree kernel read all 4096 mask values of every KV tile one at a time, to see whether it could skip the tile. `trim` reads one per row of a visible tile.
+  - A fit gives about 16 ns (32 cycles) per value read plus 32 us per diagonal tile from the trimming. Fitted on two shapes, it predicts the other two within 2% and 17%, and the model's gains within 0.4 points.
+  - So that check was a third of the in-tree kernel's time at every depth; the prediction had put it at 1%. Why a scalar read of the mask copy (in TCM) costs 32 cycles is not verified.
+- Decision (L3), by the rule: adopted 2026-10-13. `forward_tiled` is now ggml-spacemit's kernel, with its `rvv_qk_dot_tile`; the in-tree tiled kernel, the copy and the switch are gone.
+  - Acceptance on the K3, to run: every check, test-backend-ops, runner m2e. Perplexity and KLD are expected identical to M2e.1's (9.782; 0.003354 and 0.002050), since the outputs were bit-identical.
+
+**L4: the scalar mask reads that remain** (implemented 2026-10-13; to run on the K3):
+- What remains: the adopted kernel still reads the mask one value at a time wherever a row's tail is masked.
+  - 4096 values per fully masked tile (skipped after the reads), about 2100 per diagonal tile, 64 per visible tile.
+  - With n_kv padded to 256, a 128-token prompt from depth 0 has 5 fully masked tiles of the 8 per head, and a 512-token one 28 of 64.
+- Change, behind `FLAGOS_SPACEMIT_ATTN=vscan` (test-only, read at every call): the same counts from vector instructions.
+  - One strided load of the tile's last column tells whether every row's last column is visible (the case at depth); then every count is the tile's width.
+  - Otherwise each row's count is one vector compare and a maximum over its 64 columns (`rvv_active_columns`).
+  - The counts are the same integers as the scalar loop's, so the outputs must be bit-identical.
+- Predictions, from L2's fit (16 ns per scalar read) and an estimated 2.5 us per tile for the vector counts (0.1 us when every row is visible):
+  - Per call: 128 tokens at depth 0 about -23%, 512 at depth 0 about -32%, 128 after 3968 about -1.5%, 512 after 4096 about -3.4%.
+  - Model: pp128 about +4% (89.2 -> 92.7), pp512 about +5.5% (90.9 -> 95.9), pp512 at depth 4096 about +2.4% (33.2 -> 34.0).
+  - pp128 gains more than its benchmark shape suggests: in the model its n_kv is 256, not 128, so two of its four KV tiles are padding, all masked.
+  - If 512 tokens from depth 0 gains much less than 20%, the scalar reads are not what L2 removed and the 16 ns figure is wrong.
+- Checks and measurements on the K3: L2's 1-4 with `vscan` in place of `trim`; 1 now fails on any output that differs from the default's.
+- Rule, fixed before measuring: adopt `vscan` if all of these hold:
+  - 1 and 2 pass;
+  - 3 shows at least 5% less time at 128 or 512 tokens from depth 0, and no prompt shape more than 2% slower;
+  - 4 shows no setting more than 1% below the default.
+- Adopting: the vector counts are the only path, and the scalar loop and the switch go. Otherwise the switch goes.
 
 **Tests:**
 - `test-backend-ops -o FLASH_ATTN_EXT` on the Mac (host test device, reference) and on the K3 (RVV kernels and references): every claimed case passes; the 12 earlier op sets unchanged.

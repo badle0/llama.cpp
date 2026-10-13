@@ -470,7 +470,7 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 | 128 tokens, n_kv 4096 | 97963 us (3527 ms per batch) | 142071 us (5115 ms) |
 
   - Decode attention reads K and V at 9.7 GB/s at n_kv 4096, a third of what the 1-row matmuls stream in the same run (28.2 GB/s): the latency bound the M2e design estimated, and M2e.3's headroom (about 62 -> 23 ms per token at 4096, tg32 there about 6.5 -> 8.7, estimate).
-  - Prefill attention at depth is compute-bound and slow: 8.6 GFLOP per layer for 128 tokens at n_kv 4096 in 98 ms, about 88 GFLOP/s (the IME matmuls reach 600-890 at 128 rows; the X100 cores 60). It is about 70% of pp512 at depth 4096 (`ime` has the same kernel and the same speed). The tiled kernel rereads and re-transposes K for every 64-token query tile and for each query head of a KV head.
+  - Prefill attention at depth is compute-bound and slow: 8.6 GFLOP per layer for 128 tokens at n_kv 4096 in 98 ms, about 88 GFLOP/s (the IME matmuls reach 600-890 at 128 rows; the X100 cores 60). It is about 70% of pp512 at depth 4096 (`ime` has the same kernel and the same speed). The tiled kernel rereads and re-transposes K for every 64-token query tile and for each query head of a KV head. (Found later, L2 below: a third of this time was the kernel's scalar check of every mask value; ggml-spacemit's kernel, adopted in L3, avoids it.)
 - Other benchmark lines: 1-row matmuls per token `paired` 87.2 ms (28.2 GB/s), `staged` 93.7, `direct` 99.4 (as in round 2); launch 11.5 us, per node 0.94 us (M2a: 9.9 and 0.79; with one launch per token since M2e.1, this costs about 1 ms per token).
 - The CPU-only pp512 at depth 4096 died with SIGSEGV in `ggml_vec_dot_q4_1_q8_1`: the crash of 2026-10-09 again, at the same instruction, this time with the registers (the crash entry under "Provider M2b" above, second occurrence).
 
@@ -491,6 +491,30 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
   - The harnesses differ: `test-backend-ops` reuses its tensors, the benchmark rotates copies. But at n_kv 16384 the tensors are 64 MiB and the time per position stays flat, so both measure DRAM.
   - So the cache layout's access pattern costs about 45% of decode attention: what M2e.3's candidate (a) removes (`plan.md`).
 
+**Prompt attention: ggml-spacemit's tiled kernel in the provider, 2026-10-13** (L2 of the ggml-spacemit comparison, `plan.md` M2e.3; commit `68207bf`, test-only `FLAGOS_SPACEMIT_ATTN=trim`; `flagos-check-spacemit --expect-device --bench-attn`, the two kernels taking turns twice, the faster turn of each; Qwen3-4B's heads, us per call, one layer):
+
+| Shape | in-tree kernel | ggml-spacemit's | change |
+|---|---|---|---|
+| 128 tokens, n_kv 128 | 2929 | 2160 | -26.3% |
+| 512 tokens, n_kv 512 | 36569 | 25408 | -30.5% |
+| 128 tokens after 3968 (n_kv 4096) | 98641 | 65992 | -33.1% |
+| 512 tokens after 4096 (n_kv 4608) | 438415 | 294116 | -32.9% |
+
+| llama-bench, Qwen3-4B Q4_0 (`-t 8 -fa 1 -mmp 0`; two rounds of `-r 3` taking turns, depth `-r 1`) | in-tree kernel | ggml-spacemit's | change |
+|---|---|---|---|
+| pp128 | 87.15, 87.19 | 89.14, 89.21 | +2.3% |
+| pp512 | 85.27, 84.94 | 90.82, 90.95 | +6.8% |
+| pp512 at depth 4096 | 24.86 | 33.22 | +33.6% (`ime` 25.13 in M2e.1's session) |
+
+- Correct: outputs bit-identical to the in-tree kernel's in all three tiled cases (NMSE against the CPU 8.4e-7); `test-backend-ops -o FLASH_ATTN_EXT` passes every case with it.
+- Why it is faster: mostly not the trimming.
+  - The in-tree kernel reads all 4096 mask values of every 64 x 64 tile, one at a time, to see whether it can skip the tile. ggml-spacemit's walks each row back from its end and stops at the first visible value: one read per row of a visible tile.
+  - A fit gives about 16 ns per value read (32 cycles at 2.0 GHz) plus 32 us per diagonal tile from the trimming. Fitted on two shapes, it predicts the other two within 2% and 17%, and the model's gains within 0.4 points (pp128 +1.9%, pp512 +7.2%, depth +33.7%).
+  - So that check was a third of the in-tree kernel's time, at every depth. Prefill attention at depth (M2e.1 above: 88 GFLOP/s) now runs at about 130 GFLOP/s.
+  - Why a scalar loop over the mask copy (in TCM) costs 32 cycles a value is not verified: scalar loads from TCM, or the AI cores' scalar floating-point path. L4 (`plan.md`) tests the figure.
+  - The in-tree IME path runs the in-tree kernel, so its prefill at depth carries the same cost (for the SpacemiT report).
+- Decision (L3, by the rule fixed before measuring): adopted; `forward_tiled` is ggml-spacemit's kernel since then.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
@@ -504,7 +528,7 @@ Experiment switches of the provider (environment variables; test-only unless not
 | `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
 | `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
 | `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |
-| `FLAGOS_SPACEMIT_ATTN=trim` | prompt attention on the K3 (64 rows or more), read at every call | ggml-spacemit's tiled kernel instead of ours: it skips each query row's masked tail of every KV tile (L2 of the ggml-spacemit comparison, `plan.md` M2e.3) |
+| `FLAGOS_SPACEMIT_ATTN=vscan` | prompt attention on the K3 (64 rows or more), read at every call | the tiled kernel counts each row's unmasked columns with vector instructions instead of a scalar loop; outputs identical (L4, `plan.md` M2e.3) |
 | `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
 | `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
 | `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and path A run; `flagos-check-spacemit` sets 393216 for its 1-row checks |

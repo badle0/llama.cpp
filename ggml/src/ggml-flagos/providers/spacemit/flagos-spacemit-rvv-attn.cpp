@@ -1,16 +1,19 @@
 // Flash attention for VLEN 1024 (plan.md, M2e design), K3 builds only.
 //
 // Copied from the in-tree IME path, ggml/src/ggml-cpu/spacemit/rvv_kernels.cpp @ 81b0d882a (called from
-// ime.cpp:1151-1227; ggml-spacemit 4e782bc has the same decode code, its tiled kernel also trims masked tails):
+// ime.cpp:1151-1227; ggml-spacemit 4e782bc has the same decode code):
 // helpers align_up (33-35), flash_attn_ext_supported_d/shape_vlen1024_vf16 (37-43), reduce_sum_f32m4/m2_vlen1024
 // (45-55), rvv_expf_approx_f32m2 (57-88), rvv_tanh_approx_f32m2 (90-100), rvv_softcap_tanh_inplace_f32 (102-116),
 // rvv_softmax_exp_inplace_f32 (118-131), rvv_add_max_inplace_f32 (133-151), rvv_softcap_add_max_inplace_f32
 // (153-177), rvv_zero_f32, rvv_scale_f32, rvv_add_inplace_f32, rvv_max_f32 (179-235), rvv_pack_f32_as_scaled_f16,
 // rvv_pack_scaled_f16_as_f32, rvv_pack_scaled_f32_as_f32 (237-306), rvv_transposed_s16_mn_to_nm (390-470),
-// rvv_qk_dot_tile_f16_x1/x4, rvv_pv_accumulate_f16_x1/x4, rvv_qk_dot_tile, rvv_pv_accumulate (472-620), memcpy2d
+// rvv_qk_dot_tile_f16_x1/x4, rvv_pv_accumulate_f16_x1/x4, rvv_pv_accumulate (472-620), memcpy2d
 // (1115-1119); kernels flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow (650-911) and _m1 (913-1009),
-// forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16 (1121-1303) as forward_one_chunk and
-// forward_flash_attn_ext_f16_tiled_vlen1024_vf16 (1305-1628) as forward_tiled.
+// forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16 (1121-1303) as forward_one_chunk.
+// forward_tiled is ggml-spacemit's version of the tiled kernel (spacemit-com/llama.cpp 4e782bc,
+// ggml/src/ggml-spacemit/rvv_kernels.cpp:1306-1641, with its rvv_qk_dot_tile, 582-598), which stops each query row at
+// its last unmasked column of every KV tile; it replaced the in-tree one (1305-1628), whose check of every mask value
+// of every KV tile took a third of its time (plan.md M2e.3, L2 and L3).
 // Changes, each marked "flagos":
 // - the interface: no ggml_compute_params; forward_tiled works in the caller's scratch (tiled_scratch_bytes) instead
 //   of params->wdata or a TCM it picks itself; ggml-cpu's tile sizes as a local ggml_fa_tile_config; memcpy2d copies
@@ -18,13 +21,13 @@
 // - (a) the 2- and 4-row kernel starts every row's maximum at -inf, not only the first row's;
 // - (b) the dispatcher handles a missing mask (it read mask->ne without a null check);
 // - (c) rows are grouped only without ALiBi (the grouped kernels apply the first row's slope to every row);
-// - (d) the tiled kernel's softcap leaves the -inf padding of a short last KV tile alone (tanh made it -softcap, a
-//   nonzero weight when there is no mask; ggml-cpu's tiled kernel has the same fault, ops.cpp:8894-8906);
+// - (d) the in-tree tiled kernel's softcap turned the -inf padding of a short last KV tile into -softcap, a nonzero
+//   weight when there is no mask (ggml-cpu's tiled kernel has the same fault, ops.cpp:8894-8906); ggml-spacemit's
+//   applies it only up to each row's last column, so the padding is never touched;
 // - (e) rvv_transposed_s16_mn_to_nm's asm declares the vector registers and memory it writes and stays behind a call;
 // - (f) it advances its destination by the vl each strip gets, not by VLMAX (DK 65-127 could transpose wrongly).
-// Test-only, for comparing the two (plan.md M2e.3, L2): ggml-spacemit's tiled kernel as forward_tiled_trim and its
-// rvv_qk_dot_tile as rvv_qk_dot_tile_stride (spacemit-com/llama.cpp 4e782bc, ggml/src/ggml-spacemit/rvv_kernels.cpp:
-// 1306-1641 and 582-598), changed only in the interface, as forward_tiled.
+// Test-only (plan.md M2e.3, L4): forward_tiled's vector_scan counts each row's columns with vector instructions,
+// rvv_active_columns and rvv_last_column_visible, instead of its scalar loop over the mask.
 // flagos-spacemit-attn.cpp decides when these apply.
 
 #include "flagos-spacemit-rvv-attn.h"
@@ -532,32 +535,15 @@ static inline void rvv_pv_accumulate_f16_x4(float *          dst0,
     }
 }
 
+// flagos: ggml-spacemit's version (4e782bc, rvv_kernels.cpp:582-598), as forward_tiled: it takes the K tile's row
+// stride apart from the number of positions
 static inline void rvv_qk_dot_tile(float *       dst,
                                    const float * q_row,
                                    const float * k_pack,
                                    int64_t       dk,
+                                   int64_t       kv_stride,
                                    int64_t       kv_tile,
                                    float         scale) {
-    const size_t vl  = __riscv_vsetvl_e32m4(kv_tile);
-    vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-
-    for (int64_t d = 0; d < dk; ++d) {
-        const vfloat32m4_t k_vec = __riscv_vle32_v_f32m4(k_pack + d * kv_tile, vl);
-        acc                      = __riscv_vfmacc_vf_f32m4(acc, q_row[d] * scale, k_vec, vl);
-    }
-
-    __riscv_vse32_v_f32m4(dst, acc, vl);
-}
-
-// flagos: ggml-spacemit's rvv_qk_dot_tile (4e782bc, rvv_kernels.cpp:582-598), renamed: it takes the K tile's row
-// stride apart from the number of positions; only forward_tiled_trim's F32 path calls it
-static inline void rvv_qk_dot_tile_stride(float *       dst,
-                                          const float * q_row,
-                                          const float * k_pack,
-                                          int64_t       dk,
-                                          int64_t       kv_stride,
-                                          int64_t       kv_tile,
-                                          float         scale) {
     const size_t vl  = __riscv_vsetvl_e32m4(kv_tile);
     vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
 
@@ -590,6 +576,25 @@ static inline void rvv_pv_accumulate(float *       dst,
         d_left -= vl;
         d_off += vl;
     }
+}
+
+// flagos (test-only, plan.md M2e.3, L4): the number of columns of a row up to and including its last one that is not
+// -inf, 0 if there is none, as forward_tiled's scalar loop counts them (NaN counts as not -inf there too); n <= 64
+static inline int rvv_active_columns(const float * row, int n) {
+    const size_t      vl      = __riscv_vsetvl_e32m2(n);
+    const vbool16_t   visible = __riscv_vmfne_vf_f32m2_b16(__riscv_vle32_v_f32m2(row, vl), -INFINITY, vl);
+    const vuint32m2_t count   = __riscv_vadd_vx_u32m2(__riscv_vid_v_u32m2(vl), 1, vl);
+    const vuint32m2_t counts  = __riscv_vmerge_vvm_u32m2(__riscv_vmv_v_x_u32m2(0, vl), count, visible, vl);
+    const vuint32m1_t last    = __riscv_vredmaxu_vs_u32m2_u32m1(counts, __riscv_vmv_v_x_u32m1(0, 1), vl);
+    return (int) __riscv_vmv_x_s_u32m1_u32(last);
+}
+
+// flagos (test-only, L4): whether column n - 1 is not -inf in each of the rows (rows <= 64, stride in floats), so that
+// every row's count is n
+static inline bool rvv_last_column_visible(const float * tile, int64_t stride, int rows, int n) {
+    const size_t       vl   = __riscv_vsetvl_e32m2(rows);
+    const vfloat32m2_t last = __riscv_vlse32_v_f32m2(tile + n - 1, stride * (int64_t) sizeof(float), vl);
+    return __riscv_vcpop_m_b16(__riscv_vmfne_vf_f32m2_b16(last, -INFINITY, vl), vl) == vl;
 }
 
 template <size_t QLEN>
@@ -1166,8 +1171,15 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
 }
 
 // flagos: the interface of flagos-spacemit-rvv-attn.h; no ggml_compute_params, and the caller's scratch replaces the
-// thread's slice of params->wdata or its TCM
-void forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size) {
+// thread's slice of params->wdata or its TCM. ggml-spacemit's kernel (plan.md M2e.3, L3): each query row stops at its
+// last unmasked column of a KV tile (the K transpose and the V copy at the tile's largest), and a tile in which every
+// row is masked is skipped; it uses this file's helpers, so fixes (e) and (f) apply
+void forward_tiled(const ggml_tensor * dst,
+                   int64_t             ir0,
+                   int64_t             ir1,
+                   void *              scratch,
+                   size_t              scratch_size,
+                   bool                vector_scan) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1306,327 +1318,6 @@ void forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scr
 
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
-
-            rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
-            rvv_zero_f32(V32, KV_TILE_SZ * DV);
-
-            // skip the tile entirely if all the masks are -inf
-            if (mask) {
-                bool                can_skip = true;
-                const ggml_fp16_t * mp_row =
-                    (const ggml_fp16_t *) ((const char *) mask->data + iq1 * mask->nb[1] +
-                                           (iq2 % mask->ne[2]) * mask->nb[2] + (iq3 % mask->ne[3]) * mask->nb[3]);
-                rvv_pack_scaled_f16_as_f32(mask32, KV_TILE_SZ * sizeof(float), mp_row + ic, mask->nb[1], tile_rows,
-                                           kv_tile, slope);
-
-                for (int tq = 0; tq < tile_rows; tq++) {
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
-                        }
-                    }
-                    // Pad remaining mask entries with -inf
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
-                    }
-                }
-
-                if (can_skip) {
-                    continue;
-                }
-            }
-
-            if (kv_type == GGML_TYPE_F16) {
-                rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
-                                            (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1, kv_tile,
-                                            DK);
-
-                int tq = 0;
-                for (; tq + 3 < tile_rows; tq += 4) {
-                    rvv_qk_dot_tile_f16_x4(KQ + (tq + 0) * KV_TILE_SZ, KQ + (tq + 1) * KV_TILE_SZ,
-                                           KQ + (tq + 2) * KV_TILE_SZ, KQ + (tq + 3) * KV_TILE_SZ,
-                                           Q_f16 + (tq + 0) * DK, Q_f16 + (tq + 1) * DK, Q_f16 + (tq + 2) * DK,
-                                           Q_f16 + (tq + 3) * DK, K_f16, DK, kv_tile);
-                }
-                for (; tq < tile_rows; ++tq) {
-                    rvv_qk_dot_tile_f16_x1(KQ + tq * KV_TILE_SZ, Q_f16 + tq * DK, K_f16, DK, kv_tile);
-                }
-            } else {
-                for (int tk = 0; tk < kv_tile; tk++) {
-                    const char *  k_data = (const char *) k->data + (ic + tk) * nbk1 + ik2 * nbk2 + ik3 * nbk3;
-                    float *       k_col  = K_f32 + tk;
-                    const float * k_src  = (const float *) k_data;
-                    for (int64_t dk = 0; dk < DK; ++dk) {
-                        k_col[dk * KV_TILE_SZ] = k_src[dk];
-                    }
-                }
-
-                for (int tq = 0; tq < tile_rows; ++tq) {
-                    rvv_qk_dot_tile(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ, scale);
-                }
-            }
-
-            // Set padded KQ entries to -inf so softmax gives them zero weight
-            if (kv_tile < KV_TILE_SZ) {
-                for (int tq = 0; tq < tile_rows; tq++) {
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
-                    }
-                }
-            }
-
-            if (logit_softcap != 0.0f) {
-                // flagos: (d) only the kv_tile valid columns; over all KV_TILE_SZ, tanh turned the -inf padding above
-                // into -logit_softcap, which without a mask gave the padding positions weight in the row sum
-                rvv_softcap_tanh_inplace_f32(KQ, KV_TILE_SZ, tile_rows, kv_tile, logit_softcap);
-            }
-
-            if (mask) {
-                rvv_add_inplace_f32(KQ, KV_TILE_SZ, mask32, KV_TILE_SZ, tile_rows, KV_TILE_SZ);
-            }
-
-            bool skip[Q_TILE_SZ] = {};
-
-            for (int tq = 0; tq < tile_rows; tq++) {
-                float * kq_row = KQ + tq * KV_TILE_SZ;
-
-                const float tile_max = rvv_max_f32(kq_row, KV_TILE_SZ);
-
-                if (tile_max == -INFINITY) {
-                    skip[tq] = true;
-                    continue;
-                }
-
-                const float Mold = M[tq];
-                const float Mnew = fmaxf(Mold, tile_max);
-
-                if (Mnew > Mold) {
-                    const float ms = expf(Mold - Mnew);
-                    rvv_scale_f32(VKQ32 + tq * DV, ms, DV);
-                    S[tq] *= ms;
-                }
-                M[tq] = Mnew;
-
-                S[tq] += rvv_softmax_exp_inplace_f32(kq_row, KV_TILE_SZ, Mnew);
-            }
-
-            // Pack V as contiguous [KV_TILE_SZ][DV].
-            if (kv_type == GGML_TYPE_F16) {
-                const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, kv_tile, DV * sizeof(_Float16));
-
-                int tq = 0;
-                for (; tq + 3 < tile_rows; tq += 4) {
-                    if (skip[tq + 0] || skip[tq + 1] || skip[tq + 2] || skip[tq + 3]) {
-                        for (int i = 0; i < 4; ++i) {
-                            if (!skip[tq + i]) {
-                                rvv_pv_accumulate_f16_x1(VKQ32 + (tq + i) * DV, KQ + (tq + i) * KV_TILE_SZ, V_f16,
-                                                         KV_TILE_SZ, DV);
-                            }
-                        }
-                        continue;
-                    }
-
-                    rvv_pv_accumulate_f16_x4(VKQ32 + (tq + 0) * DV, VKQ32 + (tq + 1) * DV, VKQ32 + (tq + 2) * DV,
-                                             VKQ32 + (tq + 3) * DV, KQ + (tq + 0) * KV_TILE_SZ,
-                                             KQ + (tq + 1) * KV_TILE_SZ, KQ + (tq + 2) * KV_TILE_SZ,
-                                             KQ + (tq + 3) * KV_TILE_SZ, V_f16, KV_TILE_SZ, DV);
-                }
-                for (; tq < tile_rows; ++tq) {
-                    if (!skip[tq]) {
-                        rvv_pv_accumulate_f16_x1(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V_f16, KV_TILE_SZ, DV);
-                    }
-                }
-            } else {
-                const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V32, DV * sizeof(float), v_data, nbv1, kv_tile, DV * sizeof(float));
-
-                for (int tq = 0; tq < tile_rows; ++tq) {
-                    if (!skip[tq]) {
-                        rvv_pv_accumulate(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V32, KV_TILE_SZ, DV);
-                    }
-                }
-            }
-        }
-
-        // sinks (apply only to valid rows in the tile)
-        if (sinks) {
-            const float s = ((float *) ((char *) sinks->data))[h];
-
-            for (int tq = 0; tq < tile_rows; tq++) {
-                float ms = 1.0f;
-                float vs = 1.0f;
-
-                if (s > M[tq]) {
-                    ms = expf(M[tq] - s);
-                    rvv_scale_f32(VKQ32 + tq * DV, ms, DV);
-                } else {
-                    vs = expf(s - M[tq]);
-                }
-
-                float S_temp = S[tq] * ms + vs;
-                S[tq]        = S_temp == 0.0f ? 0.0f : 1.0f / S_temp;
-            }
-        } else {
-            for (int tq = 0; tq < tile_rows; tq++) {
-                const float S_inv = S[tq] == 0.0f ? 0.0f : 1.0f / S[tq];
-                S[tq]             = S_inv;
-            }
-        }
-
-        float * dst_ptr = (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + (iq1) *ne1) * nb1);
-        rvv_pack_scaled_f32_as_f32(dst_ptr, nb1 * ne1, VKQ32, DV * sizeof(float), tile_rows, DV, S);
-
-        ir += tile_rows;
-    }
-}
-
-// flagos: ggml-spacemit's tiled kernel (spacemit-com/llama.cpp 4e782bc, ggml/src/ggml-spacemit/rvv_kernels.cpp:
-// 1306-1641), test-only (FLAGOS_SPACEMIT_ATTN=trim, plan.md M2e.3, L2). It is forward_tiled except that each
-// query row skips the masked tail of each KV tile: the K transpose, the V copy, Q.K, softcap, mask, softmax and
-// P.V run over the columns up to the row's last unmasked one. Copied unchanged but for the interface (marked);
-// it uses this file's helpers, so fixes (e) and (f) apply, and (d) does not arise (no column past a row's
-// active ones is touched)
-void forward_tiled_trim(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size) {
-    const ggml_tensor * q     = dst->src[0];
-    const ggml_tensor * k     = dst->src[1];
-    const ggml_tensor * v     = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
-
-    GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
-    GGML_TENSOR_LOCALS(size_t, nbq, q, nb)
-    GGML_TENSOR_LOCALS(int64_t, nek, k, ne)
-    GGML_TENSOR_LOCALS(size_t, nbk, k, nb)
-    GGML_TENSOR_LOCALS(int64_t, nev, v, ne)
-    GGML_TENSOR_LOCALS(size_t, nbv, v, nb)
-    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
-    GGML_TENSOR_LOCALS(size_t, nb, dst, nb)
-
-    const int64_t DK = nek0;
-    const int64_t DV = nev0;
-    const int64_t N  = neq1;
-
-    GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
-
-    GGML_ASSERT(ne0 == DV);
-    GGML_ASSERT(ne2 == N);
-
-    // input tensor rows must be contiguous
-    GGML_ASSERT(nbq0 == ggml_type_size(q->type));
-    GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
-
-    GGML_ASSERT(neq0 == DK);
-    GGML_ASSERT(nek0 == DK);
-    GGML_ASSERT(nev0 == DV);
-
-    GGML_ASSERT(neq1 == N);
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
-    GGML_ASSERT(k->type == v->type);
-    const ggml_type kv_type = k->type;
-
-    // broadcast factors
-    const int64_t rk2 = neq2 / nek2;
-    const int64_t rk3 = neq3 / nek3;
-
-    const int64_t rv2 = neq2 / nev2;
-    const int64_t rv3 = neq3 / nev3;
-
-    float * param_list    = (float *) dst->op_params;
-    float   scale         = param_list[0];
-    float   max_bias      = param_list[1];
-    float   logit_softcap = param_list[2];
-
-    if (logit_softcap != 0) {
-        scale /= logit_softcap;
-    }
-
-    const uint32_t n_head      = neq2;
-    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
-
-    const float m0 = powf(2.0f, -(max_bias) / n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
-
-    static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
-    static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
-
-    // Per-thread scratch layout:
-    // Q_f32:   Q_TILE_SZ * DK
-    // KQ:      Q_TILE_SZ * KV_TILE_SZ
-    // mask32:  Q_TILE_SZ * KV_TILE_SZ
-    // VKQ32:   Q_TILE_SZ * DV
-    // V32:     KV_TILE_SZ * DV
-    // K_f32:   DK * KV_TILE_SZ (transposed K tile)
-    // flagos: in the caller's scratch (tiled_scratch_bytes), float-aligned for the vector loads and stores, as
-    // forward_tiled
-    GGML_ASSERT(scratch != nullptr && (uintptr_t) scratch % alignof(float) == 0 &&
-                scratch_size >= tiled_scratch_bytes(DK, DV));
-    float * base = (float *) scratch;
-
-    float   S_M_Buf[Q_TILE_SZ * 2];  // buffer to hold S, M, bias for one tile to reduce register pressure in main loop
-    float * S = S_M_Buf;
-    float * M = S_M_Buf + Q_TILE_SZ;
-
-    int ir = ir0;
-    while (ir < ir1) {
-        // q indices for the start of this tile
-        const int iq3 = ir / (neq2 * neq1);
-        const int iq2 = (ir - iq3 * neq2 * neq1) / neq1;
-        const int iq1 = (ir - iq3 * neq2 * neq1 - iq2 * neq1);
-
-        // Number of valid rows in this tile:
-        // - limited by tile size (Q_TILE_SZ)
-        // - limited by chunk boundary (ir1 - ir)
-        // - limited by head boundary (neq1 - iq1) to avoid crossing into next head
-        const int tile_rows = MIN(Q_TILE_SZ, MIN((int) (ir1 - ir), (int) (neq1 - iq1)));
-        GGML_ASSERT(tile_rows > 0);
-
-        const uint32_t h = iq2;  // head index
-        const float    slope =
-            (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2 * (h - n_head_log2) + 1) : 1.0f;
-
-        for (int i = 0; i < Q_TILE_SZ; ++i) {
-            S[i] = 0.;
-            M[i] = -INFINITY;
-        }
-
-        float *    Q_f32  = base;
-        float *    KQ     = (float *) ((char *) base + Q_TILE_SZ * DK * sizeof(float));
-        float *    mask32 = KQ + Q_TILE_SZ * KV_TILE_SZ;
-        float *    VKQ32  = mask32 + Q_TILE_SZ * KV_TILE_SZ;
-        float *    V32    = VKQ32 + Q_TILE_SZ * DV;
-        float *    K_f32  = V32 + KV_TILE_SZ * DV;
-        _Float16 * Q_f16  = (_Float16 *) Q_f32;
-        _Float16 * V_f16  = (_Float16 *) V32;
-        _Float16 * K_f16  = (_Float16 *) K_f32;
-
-        rvv_zero_f32(VKQ32, Q_TILE_SZ * DV);
-
-        // k indices
-        const int ik3 = iq3 / rk3;
-        const int ik2 = iq2 / rk2;
-
-        // v indices
-        const int iv3 = iq3 / rv3;
-        const int iv2 = iq2 / rv2;
-
-        const float * pq = (const float *) ((char *) q->data + (iq1 * nbq1 + iq2 * nbq2 + iq3 * nbq3));
-        if (kv_type == GGML_TYPE_F16) {
-            rvv_pack_f32_as_scaled_f16((uint8_t *) Q_f16, DK * sizeof(_Float16), (uint8_t *) pq, nbq1, tile_rows, DK,
-                                       scale);
-        } else {
-            memcpy2d(Q_f32, DK * sizeof(float), pq, nbq1, tile_rows, DK * sizeof(float));
-        }
-
-        for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
-            const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
             int       active_kv[Q_TILE_SZ];
             int       max_active_kv = kv_tile;
 
@@ -1642,13 +1333,24 @@ void forward_tiled_trim(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void 
                                            kv_tile, slope);
 
                 max_active_kv = 0;
-                for (int tq = 0; tq < tile_rows; tq++) {
-                    int tk = kv_tile;
-                    while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
-                        --tk;
+                // flagos (test-only, plan.md M2e.3, L4): with vector_scan the same counts come from vector
+                // instructions, all at once when every row's last column is visible
+                if (vector_scan && rvv_last_column_visible(mask32, KV_TILE_SZ, tile_rows, kv_tile)) {
+                    std::fill_n(active_kv, tile_rows, kv_tile);
+                    max_active_kv = kv_tile;
+                } else {
+                    for (int tq = 0; tq < tile_rows; tq++) {
+                        int tk = kv_tile;
+                        if (vector_scan) {
+                            tk = rvv_active_columns(mask32 + tq * KV_TILE_SZ, kv_tile);
+                        } else {
+                            while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
+                                --tk;
+                            }
+                        }
+                        active_kv[tq] = tk;
+                        max_active_kv = std::max(max_active_kv, tk);
                     }
-                    active_kv[tq] = tk;
-                    max_active_kv = std::max(max_active_kv, tk);
                 }
 
                 if (max_active_kv == 0) {
@@ -1692,8 +1394,8 @@ void forward_tiled_trim(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void 
 
                 for (int tq = 0; tq < tile_rows; ++tq) {
                     if (active_kv[tq] > 0) {
-                        rvv_qk_dot_tile_stride(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ,
-                                              active_kv[tq], scale);  // flagos: renamed helper
+                        rvv_qk_dot_tile(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ, active_kv[tq],
+                                        scale);
                     }
                 }
             }
