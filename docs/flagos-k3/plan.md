@@ -576,7 +576,7 @@ for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SP
 
 ### M2e design (2026-10-12)
 
-**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3. **M2e.1 done on the K3 2026-10-13** (implemented 2026-10-12, commits `64e6cbd` (C5a) and `715b9bc`; results below and in `build.md` §7).
+**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3. **M2e.1 done on the K3 2026-10-13** (implemented 2026-10-12, commits `64e6cbd` (C5a) and `715b9bc`; results below and in `build.md` §7). With L3 and L4 (ggml-spacemit's tiled kernel, vector mask counts), the final run the same day (`build.md` §7, "M2e's final state"): 37/37, accuracy unchanged to the last digit, pp128 92.27 and pp512 at depth 4096 34.56 against `ime`'s 79.13 and 25.13, generation unchanged (tg32 at depth 4096 6.49, `ime` 6.40).
 
 **M2e.1 implementation (2026-10-12):**
 - Files:

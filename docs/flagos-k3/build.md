@@ -543,6 +543,22 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - Speed (llama-bench, 3 runs): provider pp128 89.41, tg128 11.28 (M2e.1: 87.70, 11.27); `ime` 79.39, 11.00; `cpu` 20.87, 5.59. `llama-completion` 11.41 t/s against 5.6 with the provider disabled.
 - The benchmark measured the `vscan` switch a third time: -20.7% (128 tokens, depth 0), -26.9% (512, depth 0), -4.4% (128 after 3968), -5.9% (512 after 4096), as in L4's runs. 1-row matmuls per token: `paired` 85.9 ms (28.7 GB/s), `staged` 91.5, `direct` 96.7.
 
+**M2e's final state (M2e.1 with L3 and L4), 2026-10-13** (commit `633284c`, code as `fc1240a`; `spacemit_check.py --milestone m2e --depth` on Qwen3-4B Q4_0: 37/37):
+
+| Qwen3-4B Q4_0 | provider | `ime` | `cpu` | provider against `ime` |
+|---|---|---|---|---|
+| pp128 | 92.27 | 79.13 | 21.38 | +16.6% |
+| tg128 | 11.30 | 11.03 | 5.92 | +2.4% |
+| tg32 at depth 0 / 1024 / 4096 | 11.38 / 9.56 / 6.49 | 11.12 / 9.37 / 6.40 | 5.68 / 4.67 / 1.53 | +2.3 / +2.0 / +1.4% |
+| pp512 at depth 4096 | 34.56 | 25.13 | 11.89 | +37.5% |
+
+- Every prediction held: pp128 about 92, generation unchanged (M2e.1: tg128 11.27, tg32 11.25 / 9.53 / 6.48), pp512 at depth 4096 about 34.5 (M2e.1: 24.87, +39%).
+- Accuracy: perplexity 9.782 with `-fa on` and `-fa auto` (+0.08% against the CPU), mean KLD 0.003354 / 0.002050, greedy text off the CPU's at character 143: M2e.1's to the last digit. Placement unchanged: C5a, 2 graph splits per token, the same buffers, no TCM block left held.
+- Against the CPU: pp128 4.3x, tg128 1.9x, tg32 at depth 4096 4.2x, pp512 at depth 4096 2.9x.
+- The CPU-only pp512 at depth 4096 completed this time (11.89 t/s), where M2e.1's run crashed (above): the crash is intermittent, two occurrences, then one clean run of the same test.
+- At depth 4096 a token takes 154 ms: attention 65.6 ms (the benchmark's 1-token line at n_kv 4096) and the 1-row matmuls about 88 ms. Attention in generation is now 43% of a token there: M2e.3's target.
+- Noise, not changes: the X100 side had one-off outliers (the `cpu` column of the 1-row Q4_0 2560 x 9728 matmul 3944 us, twice its usual; the CPU-only `llama-completion` 5.95 t/s against 5.6 in the run before). On the provider side the benchmark moved by 1-3% against the run before (1-row matmuls per token 87.9 against 85.9 ms, 1-token attention at n_kv 4096 1822 against 1786 us, one 1-row line 467 against 421 us) while tg128 held (11.30 against 11.28).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
