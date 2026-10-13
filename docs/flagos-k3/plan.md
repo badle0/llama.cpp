@@ -576,7 +576,40 @@ for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SP
 
 ### M2e design (2026-10-12)
 
-**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. Not started. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3.
+**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3. **M2e.1 implemented 2026-10-12, not yet committed; Mac checks pass, K3 run pending** (below).
+
+**M2e.1 implementation (2026-10-12):**
+- Files:
+  - `flagos-spacemit-rvv-attn.{h,cpp}`: the copied kernels (in-tree `rvv_kernels.cpp` @ `81b0d88`; every change marked `flagos`).
+  - `flagos-spacemit-attn.{h,cpp}`: the claim, the per-tile dispatch and the portable reference.
+  - `flagos-spacemit-ops.cpp`: the one-step op.
+  - `provider.cmake`: the two files get the vector ISA, like the other kernels.
+  - `tests/check_spacemit.cpp` and `tools/spacemit_check.py`: the checks and the runner below.
+  - C5a in `src/llama-context.cpp:533-540`.
+- Fixes in the copied code:
+  - (a) to (c) as designed.
+  - Three more found while copying and reviewing: (d) the tiled kernel applied the softcap to the padding of a short last KV tile, so without a mask the padding got weight (ggml-cpu's tiled kernel has the same fault; the provider then differs from the CPU there by an estimated 1e-5); (e) the K-transpose asm overwrote v0-v7 and memory without declaring them (now declared, the function not inlined); (f) the same asm advanced by VLMAX instead of the vl each strip gets, wrong for head sizes 65-127 if the A100 returns vl < VLMAX (a Python model of the asm checks all shapes under three legal vl policies).
+- Deviations from the design:
+  - Without TCM (or with less than the tiled kernel's 160 KiB) every row takes the 1-row kernel; there is no workspace slice.
+  - ALiBi and softcap are claimed already. If any of their `test-backend-ops` cases fails on the K3, the claim drops `max_bias > 0` and `logit_softcap != 0`.
+- Mac results (host test device, reference kernels; three modes: serial, with the TCM stand-in, and on threads):
+  - `test-backend-ops -o FLASH_ATTN_EXT`: the provider claims 1324 of 5143 cases (exactly the F16-KV ones with head sizes up to 128) and passes all 1324; the 12 earlier op sets unchanged.
+  - `flagos-check-spacemit`:
+    - attention against the CPU with the cache's layout (Qwen3-4B and 0.6B heads; decode at n_kv 256-4096; 7, 99 and 128 tokens): max NMSE 1.2e-5 (bound 5e-4), worst row 1.7e-5 (bound 5e-3);
+    - the probes for (a) (masks at -30 and -120; -30 catches the fault only in an F16 accumulator, as on the K3), (b) and (c) pass;
+    - the layer check now runs attention on the provider (a whole layer in one launch): max NMSE 5.4e-4 (bound 1e-3; 4.0e-4 before, from the FFN getting different data, not from attention);
+    - mutations of the reference are each caught (mask ignored, one ALiBi slope per group, maxima starting at 0, a tile skipped, the wrong K head, the wrong head for a last row).
+  - ThreadSanitizer on threads: 0 reports. UBSan: none in provider code.
+  - C5a, on a 2-layer random Qwen3 model (Q4_0): `-fa auto` logs "Flash Attention enabled" and all attention nodes run on the provider, reading the CPU cache in place. With C5a reverted (a scratch copy), llama.cpp logs "set to disabled" and the graph goes from 6 to 10 splits. The 6 come from the toy model's shapes (a Q4_0 embedding, `ffn_down` with K 384), not from attention. The provider's attention matches the CPU's attention there to NMSE 1e-12.
+  - riscv64 syntax check: 0 errors. 7 distinct warnings in copied code (sign-compare, an unused variable), kept unchanged as M2b kept its 2.
+- Review (five lenses, each finding checked by two verifiers): 6 findings, all confirmed and fixed. These were (f) above, the test bound per row besides the whole-tensor NMSE, an unaligned tiled case (99 tokens after 37), and three in the runner: the C5a check now also requires attention on the provider (splits below the layer count), `--depth` reports missing depths, and the KLD runs and pp512 at depth 4096 were added.
+- Runner milestone m2e (now the default):
+  - checks the claimed op set, `test-backend-ops` including `FLASH_ATTN_EXT` (also with the reference kernels), and the attention lines of `flagos-check-spacemit`;
+  - the model run: C5a keeps flash attention on the provider, and a token takes 2 splits (FAIL otherwise);
+  - perplexity with `-fa on` and `-fa auto`, each within 1% of the CPU;
+  - mean KLD against the CPU at the default batch and at `-ub 1`, compared with M2c.2's by hand;
+  - `--depth`: tg32 at depths 0, 1024 and 4096, and pp512 at depth 4096, for the provider, the CPU and the IME build.
+- Open for the K3: GCC must assemble the changed asm; the RVV kernels' results (the probes and `test-backend-ops` at head sizes 72, 80 and 96 exercise (f)); the 2 splits per token; speed against `ime`. Optional hardening suggested by the review, not applied: C5a could also require that the ACCEL device accepts the layer's buffer type (true for the provider; it would guard other ACCEL backends).
 
 **Goal:** attention on the AI cores, the last part of a Qwen3 layer on the X100 cores. It decides generation beyond about 1k tokens of context (`build.md` §7, 2026-10-12): from depth 0 to 4096 a Qwen3-4B token takes 452 ms more on the provider (attention on the X100 cores, about 110 us per position) and 66 ms more on `ime` (16 us); tg32 at depth 0 / 1024 / 4096: provider 9.70 / 6.74 / 1.80, `ime` 11.05 / 9.34 / 6.41. Attention on the CPU also splits each layer in two: 72 of the 74 handoffs per token.
 
