@@ -474,6 +474,23 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - Other benchmark lines: 1-row matmuls per token `paired` 87.2 ms (28.2 GB/s), `staged` 93.7, `direct` 99.4 (as in round 2); launch 11.5 us, per node 0.94 us (M2a: 9.9 and 0.79; with one launch per token since M2e.1, this costs about 1 ms per token).
 - The CPU-only pp512 at depth 4096 died with SIGSEGV in `ggml_vec_dot_q4_1_q8_1`: the crash of 2026-10-09 again, at the same instruction, this time with the registers (the crash entry under "Provider M2b" above, second occurrence).
 
+**Decode attention across three backends, 2026-10-13** (L1 of the ggml-spacemit comparison, `plan.md` M2e.3; `test-backend-ops perf -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128,nh=8,nr23=\[4,1\],kv=(4096|8192|16384),nb=1,'`, i.e. Qwen3-4B's decode shape: 8 KV heads x 4 query heads, head size 128, 1 token; us per run; `tcmrelease` before each run):
+
+| n_kv | provider (huge pages) | provider (`FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`) | ggml-spacemit `4e782bc` (huge pages, its default) | ggml-spacemit (`SPACEMIT_MEM_BACKEND=posix`) | IME path (`build-ime`, CPU backend, 4 KiB pages) |
+|---|---|---|---|---|---|
+| 4096 | 2053 | 935 | 2019 | 944 | 946 |
+| 8192 | 3891 | 1856 | 3883 | 1873 | 1893 |
+| 16384 | 7713 | 3775 | 7810 | 3768 | 3821 |
+
+- The three backends run the same decode kernel (ggml-spacemit's decode code is identical to the in-tree one; ours is that copy with faults (a)-(c) fixed). On 4 KiB pages all three are equal within 2%: 0.23 us per position, 17.9 GB/s of K and V. So ggml-spacemit's decode attention offers nothing to adopt.
+- On huge pages the same runs take 2.1-2.2x as long, at every size. `test-backend-ops` puts the tensors in the tested backend's own buffer (`tests/test-backend-ops.cpp:1553`): huge pages for the provider and for ggml-spacemit, 4 KiB pages for the CPU backend.
+  - In these cases the 8 KV heads lie exactly 512 x n_kv bytes apart (2, 4 or 8 MiB; K is allocated as [128, 2 n_kv, 8]), so the 8 tiles stream addresses a multiple of 2 MiB apart.
+  - On 2 MiB pages the physical addresses keep that alignment, so the streams collide in the same cache sets or memory banks. On 4 KiB pages the physical frames are scattered.
+  - The model is not affected: its KV cache is in llama.cpp's CPU buffer on 4 KiB pages, with the heads 256 B apart (`k3-hardware.md` §2).
+- Against our benchmark: the same kernel reads K and V at 17.9 GB/s when each tile streams its own contiguous region (here), but at 9.7 GB/s on the real cache's layout (`bench attn` above, also 4 KiB pages), where every tile reads its head's 256 B of each 2 KiB cell and so touches every page.
+  - The harnesses differ: `test-backend-ops` reuses its tensors, the benchmark rotates copies. But at n_kv 16384 the tensors are 64 MiB and the time per position stays flat, so both measure DRAM.
+  - So the cache layout's access pattern costs about 45% of decode attention: what M2e.3's candidate (a) removes (`plan.md`).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

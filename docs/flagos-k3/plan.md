@@ -665,6 +665,18 @@ for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SP
 
 Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token, so tg32 at depth 4096 from about 6.3 to 8-8.5 t/s (`ime` 6.41). Rule, fixed before measuring: adopt if attention at n_kv 4096 costs at least 20% less per token, confirmed by tg32 at depth 4096, with NMSE against the CPU within the bound (the outputs differ in rounding only).
 
+**Inputs for M2e.3, measured 2026-10-13** (the ggml-spacemit comparison's first layer, L1; `build.md` §7, "Decode attention across three backends"):
+- ggml-spacemit's decode attention runs at our speed (same code), so nothing to adopt there.
+  - The only real difference in its attention is the prompt (tiled) kernel, which trims the masked tail of each 64-position KV tile per query row.
+  - That is still to measure inside the provider (L2: a strategy behind the M2e.3 test switch, outputs expected byte-identical; prediction about 2% of pp128 at depth 0, under 1% at depth 4096; adopt at 5% or more).
+- The cache layout costs about 45%. With the current kernel, each tile streaming its own contiguous region reaches 17.9 GB/s of K and V, against 9.7 GB/s on llama.cpp's cache layout, where every tile reads 256 B of every 2 KiB cell.
+  - Candidate (a) removes that pattern. On that measurement alone it would take decode attention at depth 4096 from about 62 to about 34 ms per token, tg32 at depth 4096 about 6.5 -> 7.9 (estimate).
+  - Beyond that the stream-only / compute-only split decides: per position the kernel's arithmetic now takes at most 0.23 us (its whole time on contiguous streams), and 28 GB/s would need 0.15.
+  - (b) keeps the strided pattern and only adds loads in flight, so it is expected to gain less than (a); it stays in the comparison.
+- Huge pages cost 2.2x when the 8 tiles stream from addresses a multiple of 2 MiB apart (`k3-hardware.md` §2).
+  - (a)'s split of the positions (contiguous ranges n_kv / 8 cells apart, 1 MiB at n_kv 4096) and candidate (c) (the cache on huge pages) must avoid that: stagger the range starts or deal blocks of cells round-robin.
+  - Measure every strategy with the test cache on 4 KiB pages and on huge pages.
+
 **Tests:**
 - `test-backend-ops -o FLASH_ATTN_EXT` on the Mac (host test device, reference) and on the K3 (RVV kernels and references): every claimed case passes; the 12 earlier op sets unchanged.
 - `flagos-check-spacemit`, against the CPU with the cache's layout (all KV heads in one cell of a CPU buffer), at Qwen3-4B's and 0.6B's head counts:
