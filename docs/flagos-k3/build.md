@@ -559,6 +559,26 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - At depth 4096 a token takes 154 ms: attention 65.6 ms (the benchmark's 1-token line at n_kv 4096) and the 1-row matmuls about 88 ms. Attention in generation is now 43% of a token there: M2e.3's target.
 - Noise, not changes: the X100 side had one-off outliers (the `cpu` column of the 1-row Q4_0 2560 x 9728 matmul 3944 us, twice its usual; the CPU-only `llama-completion` 5.95 t/s against 5.6 in the run before). On the provider side the benchmark moved by 1-3% against the run before (1-row matmuls per token 87.9 against 85.9 ms, 1-token attention at n_kv 4096 1822 against 1786 us, one 1-row line 467 against 421 us) while tg128 held (11.30 against 11.28).
 
+**Qwen3-0.6B at M2e's final state, 2026-10-13** (commit `633284c`; `spacemit_check.py --milestone m2e` with its default model, without `--build` or `--depth`: 34/34, the 4B run's checks less configure and build):
+
+| Qwen3-0.6B Q4_0 | provider | `ime` | `cpu` | provider against `ime` |
+|---|---|---|---|---|
+| pp128 | 654.10 | 553.20 | 150.01 | +18.2% |
+| tg128 | 55.60 | 54.25 | 26.83 | +2.5% |
+
+- M2e's exit for 0.6B:
+  - pp128 at least 594 (ggml-spacemit's best, M0): met, +10%.
+  - tg128 at least the IME path's: met in the same session, +2.5%. The M0 figure (57.3) is not reached, but the IME path measured 5% under its own M0 figure in this session, the known variation between sessions.
+- Against M2d (0.6B): pp128 369.32 -> 654.10 (+77%), tg128 29.03 -> 55.60 (+92%). `llama-completion` 56.34 t/s against 30.73 with the provider off.
+- Generation is mostly weight streaming: 18.0 ms per token, of which the 395 MiB of weights at the benchmark's 28.7 GB/s take about 14.4 ms. Attention at this context is about 2 ms (estimate from the 4B benchmark).
+- Accuracy passes, with the thinnest margin so far:
+  - perplexity 14.5068 against the CPU's 14.3795, +0.89% (bound 1%; M2d +0.61%, 4B now +0.08%);
+  - mean KLD 0.014712 ± 0.000669 (512-token batches) and 0.012409 ± 0.000565 (`-ub 1`), the first for 0.6B, 4-6x 4B's, with the same order (batches above `-ub 1`) as on 4B;
+  - greedy text off the CPU's after 88 characters (4B: 143), coherent.
+
+  Where the error comes from is not measured. The IME path's own perplexity and KLD on 0.6B would tell whether it is the int8 activations both share.
+- Placement as on 4B: C5a, 2 graph splits per token; model 394.71 MiB, compute 298.75 MiB.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

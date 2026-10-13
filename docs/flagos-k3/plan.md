@@ -284,7 +284,7 @@ Design's order is simple ops first, then quantized matmul (§13.3). The K3 start
 | M2b | quantized `MUL_MAT` for Q4_0 in the IME 32x256 layout: repacking weight buffer, two-step execution, shared workspace, direct GEMV, path A, path C (design below) | `flagos-check-spacemit` against the CPU backend at the model's shapes; perplexity vs M0.6; `llama-bench -m <model> -t 8 ...`; `graph splits` in the load log (`-lv 4`); `spacemit_check.py --milestone m2b`. Not `test-backend-ops -o MUL_MAT`: no case fits the layout (§1) | correct; perplexity within the M0.6 range; tg and pp recorded (expect below IME baseline: every other op still runs on X100, with a split switch around each matmul) |
 | M2c (after M2d, decided 2026-10-10; done 2026-10-10 for the Qwen3 targets: M2c.1 Q4_1, M2c.2 Q6_K and Q8_0) | the target's other weight types: for Qwen3-4B Q4_0 these are Q4_1 (`ffn_down` in 4 layers; M2c.1, first) and Q6_K (output head; M2c.2), see the op matrix; Q8_0/Q4_K for later targets; `MUL_MAT_ID` for an MoE target (design below) | per type: `flagos-check-spacemit` against the CPU (no `test-backend-ops` case fits the IME layouts), KLD against the CPU's logits, perplexity; `spacemit_check.py --milestone m2c` | each claimed type within accuracy budget (KLD at most the IME baseline's, perplexity within 1%); lossy types decided with evidence |
 | M2d (before M2c, decided 2026-10-09) | the remaining ops of a layer except attention; for Qwen3-4B: `RMS_NORM`, `MUL`, `ADD`, `ROPE`, `SET_ROWS` (KV write into the CPU-resident cache), SwiGLU, `GET_ROWS` F32; plus the norm-pinning patch C5b if accepted (design below) | per op `test-backend-ops` on the provider, all claimed cases; `flagos-check-spacemit` (KV write into a CPU buffer, a Qwen3-like layer against the CPU); split count from `sched-summary.py`; perplexity; `spacemit_check.py --milestone m2d` | every claimed case passes; about 2 handoffs per layer in generation (with C5b) and in prompt processing; perplexity within 1% of the CPU; tg and pp recorded (IME-level speed needs M2c and M2e) |
-| M2e (split 2026-10-12, M2e design; M2e.1 done 2026-10-13) | attention, reading the CPU-resident KV cache directly. M2e.1 (first): `FLASH_ATTN_EXT` with the in-tree kernels, three faults fixed, plus C5a so that the default `-fa auto` keeps flash attention. M2e.2: the non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`, `CONT`), only if the mentor rejects C5a. M2e.3: attention during generation at streaming speed, by measurement | `test-backend-ops -o FLASH_ATTN_EXT` (M2e.2 also `-o MUL_MAT`, `-o SOFT_MAX`); perplexity and KLD with `-fa auto` and `-fa on`; depth series to 4096 | default flags give correct output; whole layers on the K3 (a few splits per token); **tg at least the upstream IME path's and pp at least ggml-spacemit's best** (Qwen3-4B Q4_0: tg128 11.10, pp128 81.94, `build.md` §7; Qwen3-0.6B: 57.3 / 594 t/s) |
+| M2e (split 2026-10-12, M2e design; M2e.1 done 2026-10-13) | attention, reading the CPU-resident KV cache directly. M2e.1 (first): `FLASH_ATTN_EXT` with the in-tree kernels, three faults fixed, plus C5a so that the default `-fa auto` keeps flash attention. M2e.2: the non-flash path (`MUL_MAT` F16/F32 batched, masked `SOFT_MAX`, `CONT`), only if the mentor rejects C5a. M2e.3: attention during generation at streaming speed, by measurement (designed 2026-10-13) | `test-backend-ops -o FLASH_ATTN_EXT` (M2e.2 also `-o MUL_MAT`, `-o SOFT_MAX`); perplexity and KLD with `-fa auto` and `-fa on`; depth series to 4096 | default flags give correct output; whole layers on the K3 (a few splits per token); **tg at least the upstream IME path's and pp at least ggml-spacemit's best** (Qwen3-4B Q4_0: tg128 11.10, pp128 81.94, `build.md` §7; Qwen3-0.6B: 57.3 / 594 t/s) |
 | M2f | memory and weight round trip: THP for compute buffers | VmRSS about model + KV + compute (weights stored once); `get_tensor` returns the original bytes for every lossless layout, the converted tensor for lossy ones, and the nearest tensor of the original type for requantized ones (§2.3) | no double storage |
 
 ### M2b design (2026-10-09)
@@ -576,7 +576,7 @@ for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SP
 
 ### M2e design (2026-10-12)
 
-**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3. **M2e.1 done on the K3 2026-10-13** (implemented 2026-10-12, commits `64e6cbd` (C5a) and `715b9bc`; results below and in `build.md` §7). With L3 and L4 (ggml-spacemit's tiled kernel, vector mask counts), the final run the same day (`build.md` §7, "M2e's final state"): 37/37, accuracy unchanged to the last digit, pp128 92.27 and pp512 at depth 4096 34.56 against `ime`'s 79.13 and 25.13, generation unchanged (tg32 at depth 4096 6.49, `ime` 6.40).
+**Status:** designed 2026-10-12; both decisions taken by the user the same day (end of this section): C5a in the fork as its own commit, and M2e.1 first. The M2e row of the milestone table now lists M2e.1, M2e.2 (the graph without flash attention, only if the mentor rejects C5a) and M2e.3. **M2e.1 done on the K3 2026-10-13** (implemented 2026-10-12, commits `64e6cbd` (C5a) and `715b9bc`; results below and in `build.md` §7). With L3 and L4 (ggml-spacemit's tiled kernel, vector mask counts), the final run the same day (`build.md` §7, "M2e's final state"): 37/37, accuracy unchanged to the last digit, pp128 92.27 and pp512 at depth 4096 34.56 against `ime`'s 79.13 and 25.13, generation unchanged (tg32 at depth 4096 6.49, `ime` 6.40). Qwen3-0.6B the same day (34/34): pp128 654.10 and tg128 55.60 against `ime`'s 553.20 and 54.25 in the same session, so the exit holds for it too; M0's tg figure 57.3 is not reached, but `ime` measured 5% under its own. Perplexity +0.89% against the CPU (bound 1%): the thinnest margin so far, source not measured.
 
 **M2e.1 implementation (2026-10-12):**
 - Files:
@@ -659,7 +659,7 @@ for b in HPAGE POSIX; do ~/tcmtest/tcmrelease --apply > /dev/null; echo "$b $(SP
 - A new kernel for generation first (M2e.3 below): faster at long context, but new code without a baseline on the board. M2e.1 gives that baseline and parity with `ime`.
 - ggml-cpu's generic kernel compiled into the provider: the provider cannot call ggml-cpu, so it would be a copy of code without VLEN-1024 vectorization.
 
-**Then M2e.3, by measurement (as the 1-row bandwidth work): attention during generation at streaming speed.** Candidates:
+**Then M2e.3, by measurement (as the 1-row bandwidth work): attention during generation at streaming speed.** Designed in full 2026-10-13 ("M2e.3 design" below); the first list of candidates:
 - (a) Split the KV positions over the tiles, as ggml-cpu does for one token per call. Each tile streams whole cells (every KV head) through TCM with `memcpy1d`, the pairs taking turns as in `paired`; a second step merges the 8 partial results per query head.
 - (b) A KV head per tile as in M2e.1, but 64 positions' rows copied into TCM with several loads in flight before they are used.
 - (c) The KV cache on huge pages: set aside by the user 2026-10-13. It is no kernel change: it needs llama.cpp to allocate the cache differently (an upstream change, `upstream-changes.md`) or a system setting the shared board rules out, and huge pages slowed parallel streams 2.2x in L1.
@@ -800,6 +800,77 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 **Decisions (user, 2026-10-12):**
 1. C5a goes into the fork as its own commit, like C5b, so that `-fa auto` keeps flash attention on the provider. The mentor confirms it under question 9; if rejected, M2e.2 instead.
 2. M2e.1 first, with the in-tree kernels; M2e.3 afterwards, by measurement; no new kernel for generation before that.
+
+### M2e.3 design: attention during generation at streaming speed
+
+**Status:** designed 2026-10-13, nothing implemented. Built on M2e's final state (`build.md` §7) and on what L1-L4 measured. The candidates are kernel changes inside the provider: the same op, inputs, outputs and math. None changes llama.cpp, the model or the KV cache. Inference-level options (a quantized KV cache, another cache layout, speculative decoding) are out of scope; (c), the cache on huge pages, is set aside (above).
+
+**Where the time goes now (Qwen3-4B, depth 4096):**
+- A token takes 154 ms: attention 65.6 ms (36 calls of 1822 us at n_kv 4096), the 1-row matmuls about 88 ms. Attention is 43% of a token, and its share grows with context; at depth 1024 it is about 17%.
+- At one token per call each of the 8 tiles takes the 4 query heads of one KV head (2 for Qwen3-0.6B) and runs the grouped one-chunk kernel (`flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow`). For each of up to 64 positions it reads the mask value, loads the head's K row and V row (256 B each, from cells 2 KiB apart), and writes them into TCM (K transposed). Then it computes the scores of the chunk, the softmax update and the V accumulation (in F16), from TCM.
+- A call reads 16 MiB of K and V at n_kv 4096. That is 9.2 GB/s, or 0.445 us per position for the 8 tiles together.
+  - The same kernel on contiguous streams (each head's rows adjacent, L1) takes 0.228 us per position (17.9 GB/s).
+  - The 1-row matmuls stream at 28 GB/s, which would be 0.146 us per position: the practical ceiling, 21.6 ms per token at depth 4096.
+- So the strided pattern costs about half of attention's time: one 256-B row at a time from each 2 KiB cell, two dependent loads per position, staging and computing in turn.
+  - The inner loops also take scalar operands from TCM: 8 q values per position in the scores, 4 probabilities per position in the V loop. Scalar reads of TCM were slow in L2-L4 (16-70 ns).
+  - But these reads cannot be what limits the contiguous case. Its 0.228 us per position leaves no room for 12 reads at 16 ns besides the 0.146 us the bytes need, unless they overlap the loads. On the real layout the strided loads most likely dominate.
+- Prefetch hints are not a candidate: Zicbop `prefetch.r` made the 1-row matmuls 41-58% slower (2026-10-11). Staging through TCM with copies worked there (`staged`, then `paired`).
+
+**Round 1: measure inside the current kernel** (small code, one K3 session). A test switch `FLAGOS_SPACEMIT_ATTN` takes comma-separated settings, read at every call; it acts on the grouped one-chunk kernel only:
+- `stream` (test-only, wrong outputs, like `FLAGOS_SPACEMIT_GEMV=copy`): stage K, V and the mask values as now, skip the scores, softmax and V accumulation. Its time is the staging.
+- `compute` (test-only, wrong outputs): stage the first chunk only, and let every later chunk reuse it. Its time is the arithmetic, the mask reads and one chunk's staging.
+- `cached`, candidate (e): q and the chunk's scores/probabilities in a stack array (2 KiB, L1-cached) instead of TCM, so the inner loops' scalar operands come from ordinary memory. The values and the order of operations are unchanged, so the outputs must be bit-identical.
+- `burst`, candidate (b): stage a chunk's K and V rows with several rows' loads in flight (load 8 rows into separate vector registers, then store them), instead of one row at a time between stores. Bit-identical too.
+- With `stream` and `compute` against the default, the round says whether the kernel is bound by staging, by arithmetic, or by both in turn: `stream` + `compute` close to the total means they never overlap.
+
+**Predictions (estimates):**
+- `stream` close to the total on the real layout (strided loads dominate); `compute` well under half of it.
+- `cached`: 0-10% less attention time (it can only help where the arithmetic is on the critical path).
+- `burst`: 10-40% less. Same layout, more memory parallelism; the contiguous case shows what a better access pattern is worth (-49%).
+- In the model, each 10% less attention is about 4% faster generation at depth 4096 and about 2% at depth 1024; nothing changes at depth 0.
+
+**Rule for `cached` and `burst`** (each, and both together), fixed before measuring, as L4's:
+- outputs identical to the default's in every 1-token check case; test-backend-ops passes every case with the setting;
+- at least 5% less 1-token attention time at n_kv 4096 (`--bench-attn`, taking turns), and no 1-token shape more than 2% slower;
+- tg32 at depth 4096 (llama-bench, taking turns) not more than 1% below the default.
+- Adopting: the setting becomes the kernel's only path and the switch value goes. `stream` and `compute` never become paths; they leave with the round.
+
+**Round 2: (a), split the positions over the tiles** (only if round 1 leaves attention at n_kv 4096 above about 1.0 ms per call, that is, well short of contiguous-stream speed):
+- At one token per call, from n_kv 512 (ggml-cpu's threshold at decode; the crossover is measured), each tile takes blocks of 64 positions dealt round-robin. Block b goes to tile b mod 8, so the tiles' streams are adjacent rather than 1 MiB apart (L1's power-of-two rule).
+- Each tile copies whole cells into TCM with `spacemit_ime::copy`, the routine behind the 1-row path's 28 GB/s. A 64-position block is one contiguous range of K (128 KiB) and one of V (128 KiB); 32-position slabs leave room for double buffering, or the two tiles of a pair take turns as in `paired`.
+- For each of the 8 KV heads in the slab: transpose its K rows (stride 2 KiB in TCM) with `rvv_transposed_s16_mn_to_nm`, score its 4 query heads, update their running maximum and sum, and accumulate V in F32 (V rows read at a 2 KiB stride, which needs a strided variant of the V helper). Mask values come by vector loads, and q and the scores live in cached memory (round 1's lesson).
+- Step 1 writes each tile's partial results to the workspace: per query head the maximum, the sum and 128 floats, 8 x 32 x 130 floats = 133 KB. Step 2, after the executor's barrier, merges the 8 partials per query head (each tile takes 4 heads), applies the sinks, and writes dst.
+- This uses the provider's existing machinery: an op of two steps with a workspace, as the matmul's quantize-and-multiply. `spacemit_find_op` picks it by shape; every other call keeps the current kernels.
+- Outputs change in rounding: F32 instead of F16 accumulation, and the merge's order. They are checked against the CPU and with KLD.
+- Prediction: at least the contiguous case's 0.23 us per position, about 1.0 ms per call at n_kv 4096 (-45 to -50%), attention 34-36 ms per token, tg32 at depth 4096 about 6.5 -> 8.1 (+25%). If its staging and arithmetic overlap, toward the 28 GB/s ceiling: about 0.6 ms per call, about 9 t/s at depth 4096.
+- Rule, fixed before measuring:
+  - at least 20% less 1-token attention time at n_kv 4096 than round 1's result, no 1-token shape slower;
+  - tg32 at depth 4096 at least 8% higher, taking turns;
+  - NMSE against the CPU within the bounds, perplexity within 1% of the CPU, mean KLD at `-ub 1` at most 0.0005 above M2e's 0.002050 (Qwen3-4B);
+  - on Qwen3-0.6B too, whose perplexity is already +0.89% (added 2026-10-13, before any measurement): perplexity within 1% of the CPU, mean KLD at `-ub 1` at most 0.0005 above 0.012409;
+  - test-backend-ops passes every case.
+
+**Not candidates:** prefetch hints (above). Candidate (c), the KV cache on huge pages (set aside). The 1-row one-chunk kernel (`_m1`), which runs for batches of 2-63 tokens, ALiBi and launches without TCM: it is no part of generation for the Qwen3 targets.
+
+**Tests:**
+- `flagos-check-spacemit`: the 1-token cases (n_kv 256 with 37 valid, 1024, 4096; Qwen3-0.6B 300 of 512). For `cached` and `burst`, each output compared byte for byte with the default's. For (a), more cases:
+  - n_kv 8192;
+  - a padded tail (4000 valid of 4096);
+  - n_kv not a multiple of 64 x 8;
+  - ALiBi, softcap and sinks;
+  - GQA 4, 2 and 1;
+  - head sizes 64 and 128.
+- `test-backend-ops -o FLASH_ATTN_EXT` with every setting that keeps the outputs (all claimed cases).
+- `--bench-attn`: the 1-token shapes at n_kv 256, 1024, 4096 and 8192, every setting against the default, taking turns twice, the faster turn of each.
+- llama-bench tg32 at depths 1024 and 4096, taking turns. For (a) also the runner (perplexity, KLD at `-ub 1`).
+
+**Exit (M2e.3):** every adopted change passed its rule; attention per token at depth 4096 and the tg32 depth series recorded against M2e's final state; accuracy as M2e.1's exit; all checks pass.
+
+**Risks:**
+- The A100's vector unit may not keep several loads in flight (then `burst` shows nothing), and the scalar-read cost may not apply to these loops (then `cached` shows nothing). Both are cheap to measure.
+- `stream` and `compute` produce wrong outputs by design. They stay out of every correctness check, like `FLAGOS_SPACEMIT_GEMV=copy`.
+- (a) is the largest change: a second step per attention call (about 1 us per layer), a 133 KB workspace, new strided helpers, and changed rounding.
+- The benchmark rotates copies of the cache so that reads come from DRAM; at small n_kv the model's cache may partly stay in the caches.
 
 ### M3 - AOT package (Design Phase 3, only if D9 is accepted)
 
