@@ -28,6 +28,10 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
 size_t tiled_scratch_bytes(int64_t DK, int64_t DV);
 void   forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size);
 
+// test-only: ggml-spacemit's variant of forward_tiled, which skips each query row's masked tail of every KV tile;
+// same requirements and results (plan.md M2e.3, L2: FLAGOS_SPACEMIT_ATTN=trim)
+void forward_tiled_trim(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size);
+
 }  // namespace spacemit_rvv_attn
 
 #endif  // GGML_FLAGOS_SPACEMIT_RVV

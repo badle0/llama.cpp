@@ -1,5 +1,5 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
-// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench | --bench-gemv]
+// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -7,9 +7,10 @@
 //                    the IME
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
 //                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-4096, 128 tokens at n_kv 128
-//                    and 4096) against the CPU, and the 1-row strategies of FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's
-//                    shapes
+//                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the 1-row strategies of
+//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
 //   --bench-gemv     of the benchmarks only the 1-row strategies
+//   --bench-attn     of the benchmarks only flash attention (both tiled kernels at prompt shapes, plan.md M2e.3 L2)
 // Without a flag, a host without the device skips the device checks.
 
 #include "ggml-alloc.h"
@@ -1163,6 +1164,17 @@ struct attn_run {
         ggml_free(ctx_dev);
     }
 
+    // the provider's output, filled with NaN first so rows that no tile writes show; false if it failed
+    bool dev_output(ggml_backend_t backend, std::vector<float> & o) {
+        o.assign(ggml_nelements(out), NAN);
+        ggml_backend_tensor_set(out, o.data(), 0, ggml_nbytes(out));
+        if (ggml_backend_graph_compute(backend, g_dev) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        ggml_backend_tensor_get(out, o.data(), 0, ggml_nbytes(out));
+        return true;
+    }
+
     // NMSE of the provider's output against the CPU's (+inf if not finite); -1 if the provider refused the op or
     // failed. worst_row: the largest NMSE of one row (ne[0] floats: one query head and token), since a fault in a few
     // rows of the thousands of a batch hardly moves the first. The output is filled with NaN first, so rows that no
@@ -1199,6 +1211,17 @@ struct attn_error {
     double all = -1.0, row = -1.0;
 };
 
+// o against ref, over all n values and per row of row_len values
+static attn_error attn_errors(const float * o, const float * ref, int64_t n, int64_t row_len) {
+    attn_error e;
+    e.all = nmse(o, ref, n);
+    e.row = 0.0;
+    for (int64_t r = 0; r < n; r += row_len) {
+        e.row = std::max(e.row, nmse(o + r, ref + r, row_len));
+    }
+    return e;
+}
+
 static attn_error attn_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, const attn_shape & s,
                             attn_mask mode, float visible, float max_bias, uint32_t seed) {
     attn_run   run;
@@ -1234,7 +1257,7 @@ static void attn_report(const attn_error & e, const char * what, const attn_shap
 // below 0, where rows whose maximum started at 0 came out as zeros (the decode kernels accumulate V in F16, where a
 // weight exp(s - 0) is 0 below about -17; below about -104 it is 0 in F32 too, which -120 shows in the F32 reference);
 // (b) no mask, which crashed; (c) ALiBi with GQA, where the grouped rows took the first row's slope
-static int check_flash_attn(ggml_backend_dev_t dev) {
+static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     // claimed exactly: llama.cpp's graph (here before allocation) at head sizes up to 128, without a mask too; not head
     // size 256, F32 or quantized K and V, or K and V of different types
     ggml_init_params params = { ggml_tensor_overhead() * 128, nullptr, true };
@@ -1300,6 +1323,38 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     const double     e_none    = attn("probe (b), no mask", all_cells, attn_mask::none, 0.0f, 0.0f, 61);
     const double e_alibi = attn("probe (c), ALiBi (max_bias 8) with GQA 4", decode, attn_mask::alibi, 0.0f, 8.0f, 62);
 
+    // L2 of the ggml-spacemit comparison (plan.md M2e.3): ggml-spacemit's tiled kernel (test-only switch
+    // FLAGOS_SPACEMIT_ATTN=trim) on the tiled cases, against ours and against the CPU. Its trimming leaves out only
+    // terms that are exactly 0, so the outputs should equal ours bit for bit (the vector unit's unordered row sums could
+    // still differ in the last bit); within the bounds against the CPU either way. Without the RVV kernels (the Mac)
+    // both settings run the reference, which checks only the switch
+    int    n_tiled = 0, n_same = 0;
+    double e_trim = 0.0, e_between = 0.0;
+    for (const attn_case & c : cases) {
+        if (c.s.n_tokens < 64) {
+            continue;
+        }
+        attn_run run;
+        REQUIRE(run.init(dev, c.s, attn_mask::causal, 0.0f, 0.0f, seed++));
+        std::vector<float> ours, trim;
+        {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+            REQUIRE(run.dev_output(backend, ours));
+        }
+        {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "trim");
+            REQUIRE(run.dev_output(backend, trim));
+        }
+        REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
+        const int64_t    n = (int64_t) trim.size(), row = run.out->ne[0];
+        const attn_error e = attn_errors(trim.data(), static_cast<const float *>(run.out_ref->data), n, row);
+        attn_report(e, "ggml-spacemit's tiled kernel (FLAGOS_SPACEMIT_ATTN=trim)", c.s);
+        e_trim    = std::max(e_trim, std::max(e.all, e.row));
+        e_between = std::max(e_between, nmse(trim.data(), ours.data(), n));
+        n_same += std::memcmp(trim.data(), ours.data(), trim.size() * sizeof(float)) == 0;
+        n_tiled++;
+    }
+
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf(
@@ -1309,6 +1364,12 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         "ALiBi with GQA 4 %.2e; claims exact (F16 K and V, head sizes to 128): checked%s\n",
         sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, e_low, e_none,
         e_alibi, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+    std::printf("attn     ggml-spacemit's tiled kernel (FLAGOS_SPACEMIT_ATTN=trim) on the %d tiled cases: %d/%d outputs "
+                "identical to ours (NMSE between them up to %.2e), max NMSE vs CPU %.2e (whole and per row)%s\n",
+                n_tiled, n_same, n_tiled, e_between, e_trim,
+                host || std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ?
+                    "; reference kernels, so both settings ran the reference" :
+                    "");
     return 0;
 }
 
@@ -1895,10 +1956,13 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 }
 
 // flash attention at Qwen3-4B's heads (32 query, 8 KV of 128; attn_run): a token at n_kv 256, 1024 and 4096, every
-// cell valid, and a 128-token batch at n_kv 128 and 4096, causal; the provider against the CPU backend (8 threads) on
-// the same graph. As in the model, where each layer has its own cache, every call reads its cache from DRAM: it takes
-// the next of enough copies (32 MB together, as bench_gemv). GB/s counts the n_kv cells' K and V bytes once; a token
-// (or batch) is 36 layers' calls, each its own launch here
+// cell valid, and prompt batches, causal: 128 tokens at n_kv 128 and 4096, 512 at n_kv 512 and 4608 (depth 0 and
+// 4096); the provider against the CPU backend (8 threads) on the same graph. At prompt shapes the provider runs both
+// tiled kernels, ours and ggml-spacemit's (FLAGOS_SPACEMIT_ATTN=trim; plan.md M2e.3, L2), taking turns twice and
+// keeping each one's faster turn, so that a drift in the board's speed does not favour either. As in the model, where
+// each layer has its own cache, every call reads its cache from DRAM: it takes the next of enough copies (32 MB
+// together, as bench_gemv). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls,
+// each its own launch here
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -1906,7 +1970,7 @@ static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_cpu_set_n_threads(cpu, 8);
     struct attn_bench { int64_t n_kv, n_tokens; int iterations; };
     for (const attn_bench & b : { attn_bench{ 256, 1, 30 }, { 1024, 1, 20 }, { 4096, 1, 10 }, { 128, 128, 10 },
-                                  { 4096, 128, 2 } }) {
+                                  { 4096, 128, 2 }, { 512, 512, 4 }, { 4608, 512, 2 } }) {
         const attn_shape s        = { 32, 8, 128, b.n_kv, b.n_tokens, b.n_kv - b.n_tokens };
         const double     kv_bytes = 2.0 * (double) (s.n_kv * s.n_head_kv * s.d) * sizeof(ggml_fp16_t);
         const size_t     copies   = (size_t) std::min(32.0, std::ceil(32e6 / kv_bytes));
@@ -1916,11 +1980,20 @@ static int bench_attn(ggml_backend_dev_t dev) {
             REQUIRE(runs.back()->init(dev, s, attn_mask::causal, 0.0f, 0.0f, (uint32_t) c));
             CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
         }
-        bool         ok    = true;
-        size_t       next  = 0;
-        const double t_dev = time_us(
-            [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
-            b.iterations);
+        bool       ok   = true;
+        size_t     next = 0;
+        const auto dev_us = [&](const char * attn) {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", attn);
+            return time_us(
+                [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
+                b.iterations);
+        };
+        double t_dev = dev_us(nullptr), t_trim = 0.0;
+        if (b.n_tokens > 1) {
+            t_trim = dev_us("trim");
+            t_dev  = std::min(t_dev, dev_us(nullptr));
+            t_trim = std::min(t_trim, dev_us("trim"));
+        }
         const double t_cpu = time_us(
             [&] { ok &= ggml_backend_graph_compute(cpu, runs[next++ % copies]->g_cpu) == GGML_STATUS_SUCCESS; },
             b.iterations);
@@ -1931,9 +2004,10 @@ static int bench_attn(ggml_backend_dev_t dev) {
                         (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, kv_bytes / t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3,
                         kv_bytes / t_cpu / 1e3);
         } else {
-            std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), cpu %8.0f us "
-                        "(%7.1f ms)\n",
-                        (long long) s.n_tokens, (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3);
+            std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), trim %8.0f us "
+                        "(%+5.1f%%), cpu %8.0f us (%7.1f ms)\n",
+                        (long long) s.n_tokens, (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, t_trim,
+                        100.0 * (t_trim / t_dev - 1.0), t_cpu, 36 * t_cpu / 1e3);
         }
     }
     ggml_backend_free(backend);
@@ -2047,6 +2121,7 @@ int main(int argc, char ** argv) {
     bool full          = false;
     bool run_bench     = false;
     bool run_gemv      = false;
+    bool run_attn      = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -2058,8 +2133,11 @@ int main(int argc, char ** argv) {
             run_bench = true;
         } else if (std::strcmp(argv[i], "--bench-gemv") == 0) {
             run_gemv = true;
+        } else if (std::strcmp(argv[i], "--bench-attn") == 0) {
+            run_attn = true;
         } else {
-            std::fprintf(stderr, "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-gemv]\n",
+            std::fprintf(stderr,
+                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn]\n",
                          argv[0]);
             return 2;
         }
@@ -2100,10 +2178,10 @@ int main(int argc, char ** argv) {
                       std::strcmp(info.profile.runtime, "none") == 0;
     if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_rows(dev) != 0 ||
-        check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
+        check_flash_attn(dev, host) != 0 || check_layer(dev) != 0) {
         return 1;
     }
-    if (run_bench ? bench(dev) != 0 : run_gemv && bench_gemv(dev) != 0) {
+    if (run_bench ? bench(dev) != 0 : (run_gemv && bench_gemv(dev) != 0) || (run_attn && bench_attn(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

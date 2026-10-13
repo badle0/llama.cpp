@@ -668,7 +668,7 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 **Inputs for M2e.3, measured 2026-10-13** (the ggml-spacemit comparison's first layer, L1; `build.md` §7, "Decode attention across three backends"):
 - ggml-spacemit's decode attention runs at our speed (same code), so nothing to adopt there.
   - The only real difference in its attention is the prompt (tiled) kernel, which trims the masked tail of each 64-position KV tile per query row.
-  - That is still to measure inside the provider (L2: a strategy behind the M2e.3 test switch, outputs expected byte-identical; prediction about 2% of pp128 at depth 0, under 1% at depth 4096; adopt at 5% or more).
+  - Measured inside the provider in L2 and decided in L3 (next block).
 - The cache layout costs about 45%. With the current kernel, each tile streaming its own contiguous region reaches 17.9 GB/s of K and V, against 9.7 GB/s on llama.cpp's cache layout, where every tile reads 256 B of every 2 KiB cell.
   - Candidate (a) removes that pattern. On that measurement alone it would take decode attention at depth 4096 from about 62 to about 34 ms per token, tg32 at depth 4096 about 6.5 -> 7.9 (estimate).
   - Beyond that the stream-only / compute-only split decides: per position the kernel's arithmetic now takes at most 0.23 us (its whole time on contiguous streams), and 28 GB/s would need 0.15.
@@ -676,6 +676,40 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 - Huge pages cost 2.2x when the 8 tiles stream from addresses a multiple of 2 MiB apart (`k3-hardware.md` §2).
   - (a)'s split of the positions (contiguous ranges n_kv / 8 cells apart, 1 MiB at n_kv 4096) and candidate (c) (the cache on huge pages) must avoid that: stagger the range starts or deal blocks of cells round-robin.
   - Measure every strategy with the test cache on 4 KiB pages and on huge pages.
+
+**L2 and L3: ggml-spacemit's prompt kernel inside the provider** (implemented 2026-10-13; to run on the K3):
+- What runs: `forward_tiled_trim` in `flagos-spacemit-rvv-attn.cpp`, ggml-spacemit's tiled kernel (`4e782bc`, `rvv_kernels.cpp:1306-1641`).
+  - Unchanged except where it meets the provider: its scratch is the tile's TCM, as `forward_tiled`'s; its `rvv_qk_dot_tile`, which takes the K tile's row stride apart from the column count, is renamed `rvv_qk_dot_tile_stride`.
+  - Switch: `FLAGOS_SPACEMIT_ATTN=trim`, test-only, read at every call, so one process can time both kernels.
+  - Fixes (e) and (f) reach it through the shared helpers; (d) cannot occur in it (it applies the softcap only to each row's visible columns); (a)-(c) are decode-kernel faults.
+- The only difference from ours: per query row and KV tile it finds the last column the mask leaves visible.
+  - Scores, mask, softmax and the V accumulation stop there; a group of 4 rows stops at the largest of its 4.
+  - K is transposed and V copied only up to the tile's largest.
+  - Both kernels skip fully masked tiles; the rest is the same code.
+- Where that saves work: in the diagonal tiles of the causal mask only (aligned to 64 there, about 53% of their V loop runs). Of the tiles processed, these are:
+  - 2 of 3 at 128 tokens from depth 0, 8 of 36 at 512 tokens from depth 0;
+  - 2 of 127 at 128 tokens after 3968, 8 of 548 at 512 after 4096.
+- Predictions (estimates):
+  - Per call (`--bench-attn`):
+    - 128 tokens at n_kv 128: 15-30% less time. The low end holds if a vector instruction takes as long with fewer columns; then only the V loop gains.
+    - 512 tokens at n_kv 512: 5-10% less.
+    - The two depth shapes: about 1% less (its mask scan stops at a row's last visible column; ours reads all 64).
+  - Model: attention is 7% of pp128 at depth 0 (106 of 1460 ms per batch), so pp128 about +2%, pp512 at depth 0 about +1.5%, and at depth 4096 under +1%, inside the noise.
+  - Outputs: equal to ours bit for bit, except perhaps the last bit where a diagonal tile's row sum is reduced over fewer lanes (an unordered vector sum). Within the NMSE bounds against the CPU either way.
+- Checks and measurements on the K3:
+  1. `flagos-check-spacemit --expect-device`: every check. A new line compares the tiled cases (Qwen3-4B 128 tokens and 99 after 37, Qwen3-0.6B 128 tokens) between the two kernels and against the CPU.
+  2. `FLAGOS_SPACEMIT_ATTN=trim test-backend-ops -o FLASH_ATTN_EXT -b FlagOS:SpacemiT:0`: every case passes (1324 with ours).
+  3. `flagos-check-spacemit --bench-attn`: both kernels per call at the four prompt shapes, taking turns twice, the faster turn of each.
+  4. `llama-bench` pp128 and pp512 at depth 0, both settings taking turns, twice; pp512 at depth 4096 once per setting (slow).
+- Rule (L3), fixed before measuring: adopt `trim` if all of these hold:
+  - 1 and 2 pass;
+  - 3 shows at least 5% less time at 128 or 512 tokens from depth 0, and no prompt shape more than 2% slower;
+  - 4 shows no setting more than 1% below ours.
+- Adopting:
+  - `forward_tiled` takes the masked-tail handling (one tiled kernel; our comments and fixes kept);
+  - `forward_tiled_trim` and the switch go;
+  - test-backend-ops and the 512-token KLD run again (expected unchanged).
+- Otherwise both go, and the result is recorded here.
 
 **Tests:**
 - `test-backend-ops -o FLASH_ATTN_EXT` on the Mac (host test device, reference) and on the K3 (RVV kernels and references): every claimed case passes; the 12 earlier op sets unchanged.

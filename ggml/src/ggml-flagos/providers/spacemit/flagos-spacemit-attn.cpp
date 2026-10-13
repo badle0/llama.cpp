@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -23,6 +25,13 @@ constexpr int64_t max_head_size = 128;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 // from this many tokens per head the tiled kernel runs (ggml-cpu's ggml_fa_tile_config::Q, as in ime.cpp)
 constexpr int64_t tiled_min_rows = 64;
+
+// test-only: FLAGOS_SPACEMIT_ATTN=trim runs ggml-spacemit's tiled kernel instead of the in-tree one (it skips each
+// query row's masked tail of every KV tile; plan.md M2e.3, L2), read at every call so a benchmark can switch
+bool tiled_trim_from_env() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN");
+    return v != nullptr && std::strcmp(v, "trim") == 0;
+}
 #endif
 
 bool divides(int64_t d, int64_t n) {
@@ -210,7 +219,11 @@ bool spacemit_kernel_flash_attn(const spacemit_tile & tile, ggml_tensor * dst) {
     if (!spacemit_use_reference() && __riscv_vlenb() == 128 && spacemit_rvv_attn::supported_shape(DK, DV)) {
         if (q->ne[1] >= tiled_min_rows && tile.tcm != nullptr &&
             tile.tcm_size >= spacemit_rvv_attn::tiled_scratch_bytes(DK, DV)) {
-            spacemit_rvv_attn::forward_tiled(dst, ir0, ir1, tile.tcm, tile.tcm_size);
+            if (tiled_trim_from_env()) {
+                spacemit_rvv_attn::forward_tiled_trim(dst, ir0, ir1, tile.tcm, tile.tcm_size);
+            } else {
+                spacemit_rvv_attn::forward_tiled(dst, ir0, ir1, tile.tcm, tile.tcm_size);
+            }
         } else {
             spacemit_rvv_attn::forward_one_chunk(dst, ir0, ir1, tile.tcm, tile.tcm_size);
         }
