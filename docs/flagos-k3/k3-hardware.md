@@ -33,6 +33,8 @@ Everything here was measured on the board (2026-09-24) unless marked otherwise.
   - Evidence: two kernels that differ only in how many mask values they read a value at a time (the in-tree and ggml-spacemit tiled attention kernels; then ggml-spacemit's against vector counts), fitted over four shapes each; the fits predicted the model's speed-ups within 0.5 points.
   - Not measured directly, and the cause is unknown: the scalar path to TCM may be uncached or long-latency (TCM exists to feed the vector and matrix units).
   - Rule for kernels on the AI cores: no per-value scalar loops over data in TCM. Use vector compares and reductions, and keep vector-to-scalar moves (a reduction's result, `vcpop`) out of inner loops: each one waits for the vector unit.
+  - Where the reads are independent of each other and interleaved with vector work they cost much less. In the grouped one-chunk attention kernel (12 such reads per position), moving them to cached memory saved 4-6% per call at short context and about 1% of generation at depth 4096 (M2e.3 round 1, 2026-10-14).
+- **Loads in flight on the AI cores (measured 2026-10-14, M2e.3 round 1, `build.md` §7).** Issuing 8 independent 256-B row loads (rows 2 KiB apart) before storing them, instead of load-store one row at a time, made the staging 13-14% faster over 128-512 KiB per core, but 16-26% slower over 2-4 MiB. Cause unknown; more loads in flight are not simply better here.
 
 ## 3. SpacemiT software present
 

@@ -585,6 +585,30 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - The CPU run behind that base gave PPL 14.3706, where the runner's identical CPU run gave 14.3795: CPU runs are not bit-reproducible here (0.06%; cause not checked), far below the noise that matters above.
 - Placement as on 4B: C5a, 2 graph splits per token; model 394.71 MiB, compute 298.75 MiB.
 
+**M2e.3 round 1: the grouped one-chunk kernel's settings, 2026-10-14** (`plan.md` "M2e.3 design"; test-only `FLAGOS_SPACEMIT_ATTN`; `flagos-check-spacemit --expect-device --bench-attn`, every setting and the default taking turns twice, the faster turn of each; us per one-token call, Qwen3-4B's heads; in brackets against the default):
+
+| n_kv | default | `stream` | `stream,burst` | `compute` | `cached` | `burst` | `cached,burst` |
+|---|---|---|---|---|---|---|---|
+| 256 | 139 | 117 (-15.8%) | 101 (-27.2%) | 71 (-48.7%) | 133 (-4.3%) | 125 (-9.8%) | 128 (-7.6%) |
+| 1024 | 476 | 387 (-18.6%) | 338 (-29.0%) | 159 (-66.6%) | 450 (-5.5%) | 413 (-13.1%) | 424 (-10.9%) |
+| 4096 | 1633 | 1307 (-19.9%) | 1511 (-7.4%) | 506 (-69.0%) | 1771 (+8.5%) | 1813 (+11.0%) | 1655 (+1.3%) |
+| 8192 | 3404 | 2547 (-25.2%) | 3197 (-6.1%) | 984 (-71.1%) | 3654 (+7.3%) | 3815 (+12.1%) | 3298 (-3.1%) |
+
+| tg32, llama-bench (Qwen3-4B Q4_0, `-fa 1 -mmp 0`, two rounds taking turns) | depth 1024 | depth 4096 |
+|---|---|---|
+| default | 9.60, 9.59 | 6.59, 6.55 |
+| `cached` | 9.58, 9.63 (+0.1%) | 6.61, 6.62 (+0.7%) |
+| `burst` | 9.57, 9.54 (-0.4%) | 6.49, 6.47 (-1.4%) |
+| `cached,burst` | 9.62, 9.63 (+0.3%) | 6.66, 6.65 (+1.3%) |
+
+- Correct: `cached`, `burst` and `cached,burst` give the default's outputs byte for byte on the four one-token cases; test-backend-ops passes every case with each.
+- The kernel is bound by its staging. At n_kv 4096, staging alone (`stream`) takes 80% of the call and the arithmetic alone (`compute`) 31%; at 8192, 75% and 29%. The two add up to 104-111%, the excess being the per-position mask reads and loop that both keep, so the phases run one after the other, without overlap.
+- `cached`: -4 to -6% per call at short context, nothing worth having at depth (+0.7% tg32 at depth 4096). Its +7-9% per call at n_kv 4096 and 8192 is not borne out by the model, and is not consistent with `cached,burst` either: noise at those two shapes.
+  - In this kernel the 12 scalar reads of TCM per position cost little: unlike the old tiled kernel's mask scan, where each read decided the next, they are independent and interleaved with vector work.
+- `burst`: with 8 rows' loads in flight the staging gets faster over a short cache (`stream,burst` against `stream`: -14% at 256 positions, -13% at 1024) and slower over a long one (+16% at 4096, +26% at 8192). In the model it costs 1.4% at depth 4096. Why is not known (more requests in flight at 2 KiB strides may load the address translation or the DRAM).
+- The model's differences are smaller than the benchmark's at long context: for effects of a few percent there, the model is the better judge.
+- Decision (by the rule fixed before measuring): nothing adopted. None reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

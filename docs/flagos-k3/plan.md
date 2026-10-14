@@ -803,7 +803,7 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 
 ### M2e.3 design: attention during generation at streaming speed
 
-**Status:** designed 2026-10-13. Round 1 implemented 2026-10-14, to run on the K3: the switch, the four settings, an identity check and the benchmark rows (below). Built on M2e's final state (`build.md` §7) and on what L1-L4 measured. The candidates are kernel changes inside the provider: the same op, inputs, outputs and math. None changes llama.cpp, the model or the KV cache. Inference-level options (a quantized KV cache, another cache layout, speculative decoding) are out of scope; (c), the cache on huge pages, is set aside (above).
+**Status:** designed 2026-10-13. Round 1 implemented and measured 2026-10-14 (results below and in `build.md` §7): nothing adopted; round 2 is due by its own condition. Built on M2e's final state (`build.md` §7) and on what L1-L4 measured. The candidates are kernel changes inside the provider: the same op, inputs, outputs and math. None changes llama.cpp, the model or the KV cache. Inference-level options (a quantized KV cache, another cache layout, speculative decoding) are out of scope; (c), the cache on huge pages, is set aside (above).
 
 **Where the time goes now (Qwen3-4B, depth 4096):**
 - A token takes 154 ms: attention 65.6 ms (36 calls of 1822 us at n_kv 4096), the 1-row matmuls about 88 ms. Attention is 43% of a token, and its share grows with context; at depth 1024 it is about 17%.
@@ -841,6 +841,15 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 - at least 5% less 1-token attention time at n_kv 4096 (`--bench-attn`, taking turns), and no 1-token shape more than 2% slower;
 - tg32 at depth 4096 (llama-bench, taking turns) not more than 1% below the default.
 - Adopting: the setting becomes the kernel's only path and the switch value goes. `stream` and `compute` never become paths; they leave with the round.
+
+**Round 1 results (K3, 2026-10-14; `build.md` §7):**
+- `cached`, `burst` and `cached,burst` keep the outputs byte for byte (four one-token cases, test-backend-ops).
+- The kernel is bound by its staging, and staging and arithmetic run one after the other. At n_kv 4096, staging alone takes 80% of a call (1307 of 1633 us), the arithmetic alone 31%; at 8192, 75% and 29%.
+- `cached`: -4 to -6% per call at n_kv 256 and 1024; at depth the model moves by +0.7% (tg32 at depth 4096). Its +7-9% at n_kv 4096 and 8192 in the benchmark is noise (not borne out by the model, nor consistent with `cached,burst`). The scalar TCM reads cost little in this kernel: independent of each other and interleaved with vector work.
+- `burst`: staging -13 to -14% over 256-1024 positions, +16 to +26% over 4096-8192 (`stream,burst` against `stream`); in the model -1.4% at depth 4096.
+- The predictions held for the decomposition (`stream` close to the total, `compute` well under half) and for `cached` (0-10%), not for `burst` (10-40% predicted).
+- Decision, by the rule: nothing adopted. No setting reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%. The four settings leave the kernel. The switch can stay for round 2's comparison.
+- For round 2: attention at n_kv 4096 is 1.63 ms per call, above the 1.0 ms that calls for it. The staging's access pattern is the limit, which (a) replaces. Overlapping staging with arithmetic (double buffering, or the two tiles of a pair taking turns) is worth up to the smaller phase, about 30%. For effects of a few percent at long context the model, not the benchmark, decides.
 
 **Round 2: (a), split the positions over the tiles** (only if round 1 leaves attention at n_kv 4096 above about 1.0 ms per call, that is, well short of contiguous-stream speed):
 - At one token per call, from n_kv 512 (ggml-cpu's threshold at decode; the crossover is measured), each tile takes blocks of 64 positions dealt round-robin. Block b goes to tile b mod 8, so the tiles' streams are adjacent rather than 1 MiB apart (L1's power-of-two rule).
