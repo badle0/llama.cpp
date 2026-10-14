@@ -646,6 +646,31 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - Decision (by the rule fixed before measuring, `plan.md`): adopted. `split,paired` is 4.1% ahead of `split` at depth 4096, more than the rule's 2% margin, so the split with the turns is the default for the calls it takes: one token and one stream from n_kv 512, llama.cpp's cache layout, no ALiBi or softcap. `FLAGOS_SPACEMIT_ATTN=split` (without the turns, the same outputs) and `one-chunk` (the kernels before) stay for comparisons, and the benchmark adds a one-token shape at n_kv 512, where the split starts.
 - Not covered: several sequences generating at once (several streams, or several tokens per call) keep the one-chunk kernels, as ggml-cpu keeps its own split of the positions to one stream (`ggml-cpu/ops.cpp:9115`).
 
+**Acceptance run after M2e.3 round 2, 2026-10-14** (code as the adoption commit: the split with the turns the default; `spacemit_check.py --milestone m2e --depth` on Qwen3-4B Q4_0: 35/35; with its default model, Qwen3-0.6B, without `--depth`: 34/34):
+
+| Qwen3-4B Q4_0 | provider | `ime` | `cpu` | provider at M2e's final state |
+|---|---|---|---|---|
+| pp128 | 92.53 | 79.29 | 21.14 | 92.27 |
+| tg128 | 11.25 | 11.02 | 5.71 | 11.30 |
+| tg32 at depth 0 / 1024 / 4096 | 11.30 / 9.93 / 7.83 | 11.13 / 9.35 / 6.33 | 5.86 / 4.71 / 1.59 | 11.38 / 9.56 / 6.49 |
+| pp512 at depth 4096 | 34.63 | 25.14 | 12.02 | 34.56 |
+
+- Generation at depth, against M2e's final state: +3.9% at depth 1024 and +20.6% at 4096. Against the IME path in the same session: +1.5 / +6.2 / +23.7% at depths 0 / 1024 / 4096.
+  - A token at depth 4096 takes 127.7 ms (154.1 before). Each position of context costs 9.6 us per token (16.2 before; the IME path 16.6).
+  - Depth 0 and prompt processing are unchanged within the noise: the split runs only for one token per call, from n_kv 512.
+- Accuracy (4B): perplexity 9.782 against the CPU's 9.7772 (+0.05%), with `-fa on` and `-fa auto`. Mean KLD 0.003364 ± 0.000231 (512-token batches) and 0.002021 ± 0.000142 (`-ub 1 -b 512`).
+  - The provider's perplexity is M2e's to the last digit, since its 512-token batches do not take the split. The CPU's moved (9.774 before), and the two KLD values moved with it, by 1-2e-5.
+  - Greedy text leaves the CPU's at character 143, as before.
+- Placement unchanged: C5a keeps flash attention on the provider, 2 graph splits per token, no TCM block left held. `llama-completion` 11.26 t/s against 5.88 with the provider off.
+- Benchmark: one-token attention 1109 us at n_kv 4096 (one-chunk kernels 1771, -37%) and 2080 at 8192 (3332, -38%). The 1-row matmuls take 86.8 ms per token (28.4 GB/s), as before.
+- Qwen3-0.6B (34/34): pp128 667.19 and tg128 55.78 against the IME path's 550.78 and 54.27 (+21.1%, +2.8%; M2e's final state 654.10 and 55.60).
+  - Perplexity 14.5068 against the CPU's 14.3786 (+0.89%): the provider's value is unchanged, the CPU's moved again (14.3795 before).
+  - Mean KLD 0.014773 ± 0.000741 (512-token batches) and 0.012145 ± 0.000541 (`-ub 1 -b 512`, the first with one-token ubatches on 0.6B, so not comparable with M2e's 0.012409).
+  - Greedy text leaves the CPU's after 88 characters, as before; `llama-completion` 56.87 t/s against 28.52.
+- Two findings of the benchmark, the same in the check run before it:
+  - At n_kv 512 every tile has one block, and the default is slower than the one-chunk kernels: 262 against 252 us (+3.9%; 260 against 253 in the run before). The split without the turns takes 210 (-20%). That breaks round 2's "no one-token shape slower"; it costs about 2% of a token, at depths 256-511 only. The remedy, no turns when no tile has more than one block, awaits the user's decision (`plan.md`).
+  - The split without the turns varies between runs where the turns do not. At n_kv 4096 it took 1303, 1093 and 1172 us in three runs; the turns 1132, 1108 and 1109; the one-chunk kernels 1743, 1753 and 1771. So at depth the turns are the robust choice.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
