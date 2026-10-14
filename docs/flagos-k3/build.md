@@ -607,7 +607,7 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
   - In this kernel the 12 scalar reads of TCM per position cost little: unlike the old tiled kernel's mask scan, where each read decided the next, they are independent and interleaved with vector work.
 - `burst`: with 8 rows' loads in flight the staging gets faster over a short cache (`stream,burst` against `stream`: -14% at 256 positions, -13% at 1024) and slower over a long one (+16% at 4096, +26% at 8192). In the model it costs 1.4% at depth 4096. Why is not known (more requests in flight at 2 KiB strides may load the address translation or the DRAM).
 - The model's differences are smaller than the benchmark's at long context: for effects of a few percent there, the model is the better judge.
-- Decision (by the rule fixed before measuring): nothing adopted. None reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%.
+- Decision (by the rule fixed before measuring): nothing adopted. None reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%. The settings and their switch were removed the same day; the benchmark keeps the one-token shape at n_kv 8192.
 
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
@@ -622,7 +622,6 @@ Experiment switches of the provider (environment variables; test-only unless not
 | `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
 | `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
 | `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |
-| `FLAGOS_SPACEMIT_ATTN=<s>[,<s>...]` | the grouped one-chunk attention kernels (one token per call) on the K3, read at every call | M2e.3 round 1 (`plan.md`): `stream` times the staging of K and V alone, `compute` the arithmetic alone (both: wrong outputs, for the benchmark only); `cached` (q and the scores in cached memory, not TCM) and `burst` (8 positions' rows loaded before they are stored) keep the outputs bit for bit; combinable, e.g. `cached,burst` or `stream,burst` |
 | `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
 | `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
 | `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and path A run; `flagos-check-spacemit` sets 393216 for its 1-row checks |

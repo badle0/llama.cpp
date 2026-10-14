@@ -848,7 +848,8 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 - `cached`: -4 to -6% per call at n_kv 256 and 1024; at depth the model moves by +0.7% (tg32 at depth 4096). Its +7-9% at n_kv 4096 and 8192 in the benchmark is noise (not borne out by the model, nor consistent with `cached,burst`). The scalar TCM reads cost little in this kernel: independent of each other and interleaved with vector work.
 - `burst`: staging -13 to -14% over 256-1024 positions, +16 to +26% over 4096-8192 (`stream,burst` against `stream`); in the model -1.4% at depth 4096.
 - The predictions held for the decomposition (`stream` close to the total, `compute` well under half) and for `cached` (0-10%), not for `burst` (10-40% predicted).
-- Decision, by the rule: nothing adopted. No setting reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%. The four settings leave the kernel. The switch can stay for round 2's comparison.
+- Decision, by the rule: nothing adopted. No setting reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%.
+- Removed 2026-10-14 (user), with their switch: the kernel, its header and the dispatcher are `fc1240a`'s again, and the check program keeps only the benchmark's one-token shape at n_kv 8192. Round 2 brings its own switch: (a) is a separate two-step op, so the choice sits where the op is selected, not in the grouped kernel.
 - For round 2: attention at n_kv 4096 is 1.63 ms per call, above the 1.0 ms that calls for it. The staging's access pattern is the limit, which (a) replaces. Overlapping staging with arithmetic (double buffering, or the two tiles of a pair taking turns) is worth up to the smaller phase, about 30%. For effects of a few percent at long context the model, not the benchmark, decides.
 
 **Round 2: (a), split the positions over the tiles** (only if round 1 leaves attention at n_kv 4096 above about 1.0 ms per call, that is, well short of contiguous-stream speed):

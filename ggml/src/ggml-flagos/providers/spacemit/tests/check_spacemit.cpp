@@ -6,9 +6,9 @@
 //                    output heads (run as Q8_0) at 128 rows besides 1 and 7 (up to 128 x 2560 x 151936); slow without
 //                    the IME
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
-//                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-4096, 128 tokens at n_kv 128
-//                    and 4096, 512 at n_kv 512 and 4608; at one token also FLAGOS_SPACEMIT_ATTN's settings) against
-//                    the CPU, and the 1-row strategies of FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
+//                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-8192, 128 tokens at n_kv 128
+//                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the 1-row strategies of
+//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 //   --bench-attn     of the benchmarks only flash attention
 // Without a flag, a host without the device skips the device checks.
@@ -1164,17 +1164,6 @@ struct attn_run {
         ggml_free(ctx_dev);
     }
 
-    // the provider's output, filled with NaN first so rows that no tile writes show; false if it failed
-    bool dev_output(ggml_backend_t backend, std::vector<float> & o) {
-        o.assign(ggml_nelements(out), NAN);
-        ggml_backend_tensor_set(out, o.data(), 0, ggml_nbytes(out));
-        if (ggml_backend_graph_compute(backend, g_dev) != GGML_STATUS_SUCCESS) {
-            return false;
-        }
-        ggml_backend_tensor_get(out, o.data(), 0, ggml_nbytes(out));
-        return true;
-    }
-
     // NMSE of the provider's output against the CPU's (+inf if not finite); -1 if the provider refused the op or
     // failed. worst_row: the largest NMSE of one row (ne[0] floats: one query head and token), since a fault in a few
     // rows of the thousands of a batch hardly moves the first. The output is filled with NaN first, so rows that no
@@ -1258,7 +1247,7 @@ static void attn_report(const attn_error & e, const char * what, const attn_shap
 // (the one-chunk kernels accumulate V in F16, where a weight exp(s - 0) is 0 below about -17; below about -104 it is 0
 // in F32 too, which -120 shows in the F32 reference); (b) no mask, which crashed; (c) ALiBi with GQA, where the grouped
 // rows took the first row's slope
-static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
+static int check_flash_attn(ggml_backend_dev_t dev) {
     // claimed exactly: llama.cpp's graph (here before allocation) at head sizes up to 128, without a mask too; not head
     // size 256, F32 or quantized K and V, or K and V of different types
     ggml_init_params params = { ggml_tensor_overhead() * 128, nullptr, true };
@@ -1328,39 +1317,6 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     const double e_alibi =
         attn("probe (c), ALiBi (max_bias 8) with GQA 4", one_token, attn_mask::alibi, 0.0f, 8.0f, 62);
 
-    // M2e.3 round 1 (plan.md): the grouped one-chunk kernels with FLAGOS_SPACEMIT_ATTN=cached, burst and both must give
-    // the default's outputs bit for bit on the one-token cases; stream and compute are only timed (bench_attn), their
-    // outputs being wrong by design. Without the RVV kernels (the Mac, FLAGOS_SPACEMIT_TEST_REFERENCE) every setting
-    // runs the reference, which checks only the switch
-    const bool         reference        = host || std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr;
-    const char * const one_chunk_kept[] = { "cached", "burst", "cached,burst" };
-    int                n_one_token = 0, n_same[3] = {};
-    for (const attn_case & c : cases) {
-        if (c.s.n_tokens != 1) {
-            continue;
-        }
-        attn_run run;
-        REQUIRE(run.init(dev, c.s, attn_mask::causal, 0.0f, 0.0f, seed++, c.q_scale));
-        std::vector<float> base, other;
-        {
-            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
-            REQUIRE(run.dev_output(backend, base));
-        }
-        for (int k = 0; k < 3; k++) {
-            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", one_chunk_kept[k]);
-            REQUIRE(run.dev_output(backend, other));
-            n_same[k] += std::memcmp(base.data(), other.data(), base.size() * sizeof(float)) == 0;
-        }
-        n_one_token++;
-    }
-    for (int k = 0; k < 3; k++) {
-        if (n_same[k] != n_one_token) {
-            std::fprintf(stderr, "FAIL: FLAGOS_SPACEMIT_ATTN=%s changed %d of %d one-token outputs\n",
-                         one_chunk_kept[k], n_one_token - n_same[k], n_one_token);
-            g_failures++;
-        }
-    }
-
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf(
@@ -1372,10 +1328,6 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
         sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, worst_row_tiled,
         k_attn_max_row_nmse_tiled, e_low, e_none, e_alibi,
         std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
-    std::printf("attn     one-chunk settings (FLAGOS_SPACEMIT_ATTN) on the %d one-token cases: cached %d/%d, "
-                "burst %d/%d, cached,burst %d/%d outputs identical to the default's%s\n",
-                n_one_token, n_same[0], n_one_token, n_same[1], n_one_token, n_same[2], n_one_token,
-                reference ? "; reference kernels, so every setting ran the reference" : "");
     return 0;
 }
 
@@ -1965,20 +1917,13 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 // every cell valid, and prompt batches, causal: 128 tokens at n_kv 128 and 4096, 512 at n_kv 512 and 4608 (depth 0 and
 // 4096); the provider against the CPU backend (8 threads) on the same graph. As in the model, where each layer has its
 // own cache, every call reads its cache from DRAM: it takes the next of enough copies (32 MB together, as bench_gemv).
-// GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own launch here. At
-// one token the provider also runs the grouped one-chunk kernels' settings of FLAGOS_SPACEMIT_ATTN (plan.md M2e.3,
-// round 1), each against the default
+// GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own launch here
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 8);
     struct attn_bench { int64_t n_kv, n_tokens; int iterations; };
-    // at one token the grouped one-chunk kernels' settings of FLAGOS_SPACEMIT_ATTN (plan.md M2e.3, round 1): stream and
-    // compute time the staging and the arithmetic alone (wrong outputs), stream,burst burst's staging alone
-    static const char * const one_chunk_settings[] = { "stream", "stream,burst", "compute",
-                                                       "cached", "burst",        "cached,burst" };
-    constexpr int             n_settings           = (int) (sizeof(one_chunk_settings) / sizeof(one_chunk_settings[0]));
     for (const attn_bench & b : { attn_bench{ 256, 1, 30 }, { 1024, 1, 20 }, { 4096, 1, 10 }, { 8192, 1, 5 },
                                   { 128, 128, 10 }, { 4096, 128, 2 }, { 512, 512, 4 }, { 4608, 512, 2 } }) {
         const attn_shape s        = { 32, 8, 128, b.n_kv, b.n_tokens, b.n_kv - b.n_tokens };
@@ -1990,26 +1935,11 @@ static int bench_attn(ggml_backend_dev_t dev) {
             REQUIRE(runs.back()->init(dev, s, attn_mask::causal, 0.0f, 0.0f, (uint32_t) c));
             CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
         }
-        bool       ok   = true;
-        size_t     next = 0;
-        const auto dev_us = [&](const char * attn) {
-            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", attn);
-            return time_us(
-                [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
-                b.iterations);
-        };
-        // every setting, the default included, takes two turns and keeps the faster
-        double t_dev = dev_us(nullptr);
-        double t_set[n_settings];
-        std::fill_n(t_set, n_settings, HUGE_VAL);
-        if (b.n_tokens == 1) {
-            for (int turn = 0; turn < 2; turn++) {
-                for (int k = 0; k < n_settings; k++) {
-                    t_set[k] = std::min(t_set[k], dev_us(one_chunk_settings[k]));
-                }
-                t_dev = std::min(t_dev, dev_us(nullptr));
-            }
-        }
+        bool         ok    = true;
+        size_t       next  = 0;
+        const double t_dev = time_us(
+            [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
+            b.iterations);
         const double t_cpu = time_us(
             [&] { ok &= ggml_backend_graph_compute(cpu, runs[next++ % copies]->g_cpu) == GGML_STATUS_SUCCESS; },
             b.iterations);
@@ -2019,12 +1949,6 @@ static int bench_attn(ggml_backend_dev_t dev) {
                         "V), cpu %7.0f us (%6.1f ms, %5.1f GB/s)\n",
                         (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, kv_bytes / t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3,
                         kv_bytes / t_cpu / 1e3);
-            std::printf("bench    attn 1 token n_kv %4lld, FLAGOS_SPACEMIT_ATTN:", (long long) s.n_kv);
-            for (int k = 0; k < n_settings; k++) {
-                std::printf("%s %s %.0f us (%+.1f%%)", k == 0 ? "" : ";", one_chunk_settings[k], t_set[k],
-                            100.0 * (t_set[k] / t_dev - 1.0));
-            }
-            std::printf("\n");
         } else {
             std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), cpu %8.0f us "
                         "(%7.1f ms)\n",
@@ -2199,7 +2123,7 @@ int main(int argc, char ** argv) {
                       std::strcmp(info.profile.runtime, "none") == 0;
     if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_rows(dev) != 0 ||
-        check_flash_attn(dev, host) != 0 || check_layer(dev) != 0) {
+        check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 : (run_gemv && bench_gemv(dev) != 0) || (run_attn && bench_attn(dev) != 0)) {
