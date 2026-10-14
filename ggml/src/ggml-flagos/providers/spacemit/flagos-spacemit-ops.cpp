@@ -115,7 +115,8 @@ SPACEMIT_ONE_STEP_OP(k_flash_attn, spacemit_kernel_flash_attn, nullptr);
 static const spacemit_kernel_fn k_mul_mat_ime_steps[] = { spacemit_mul_mat_quantize, spacemit_mul_mat_gemm };
 static const spacemit_op        k_mul_mat_ime         = { k_mul_mat_ime_steps, 2, spacemit_mul_mat_workspace };
 
-// M2e.3 round 2 (test-only until adopted): one-token attention split over the tiles, partial results then their merge
+// M2e.3 round 2 (adopted 2026-10-14; the paired op is the default): one-token attention split over the tiles, partial
+// results then their merge
 static const spacemit_kernel_fn k_flash_attn_split_steps[]        = { spacemit_kernel_flash_attn_split_partial,
                                                                       spacemit_kernel_flash_attn_split_merge };
 static const spacemit_op        k_flash_attn_split                = { k_flash_attn_split_steps, 2,

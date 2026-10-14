@@ -27,7 +27,10 @@
 // - (e) rvv_transposed_s16_mn_to_nm's asm declares the vector registers and memory it writes and stays behind a call;
 // - (f) it advances its destination by the vl each strip gets, not by VLMAX (DK 65-127 could transpose wrongly);
 // - forward_tiled finds each row's last unmasked column with vector instructions (rvv_active_columns,
-//   rvv_last_column_visible) instead of ggml-spacemit's scalar loop over the mask copy in TCM (plan.md M2e.3, L4).
+//   rvv_last_column_visible) instead of ggml-spacemit's scalar loop over the mask copy in TCM (plan.md M2e.3, L4);
+// - new code on these helpers: a tile's part of the split of one-token calls over the tiles (plan.md M2e.3, round 2):
+//   split_layout, split_begin, split_stage, split_compute and split_end, with strided variants of
+//   rvv_pv_accumulate_f16_x1/x4 (V summed in F32) and rvv_any_visible.
 // flagos-spacemit-attn.cpp decides when these apply.
 
 #include "flagos-spacemit-rvv-attn.h"

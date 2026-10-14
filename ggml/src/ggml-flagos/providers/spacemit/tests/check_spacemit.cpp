@@ -11,7 +11,7 @@
 //                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
-//                    split,paired)
+//                    one-chunk, against the default)
 // Without a flag, a host without the device skips the device checks.
 
 #include "ggml-alloc.h"
@@ -1321,8 +1321,11 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         worst_of          = e.all < 0.0 ? HUGE_VAL : std::max(worst_of, e.row);
         return e.all < 0.0 ? HUGE_VAL : e.all;
     };
-    double   worst = 0.0;
-    uint32_t seed  = 40;
+    // the cases and probes check the one-chunk and tiled kernels: one-token calls from n_kv 512 take the split by
+    // default (M2e.3 round 2, checked below, where each run sets the switch itself)
+    env_override one_chunk_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
+    double       worst = 0.0;
+    uint32_t     seed  = 40;
     for (const attn_case & c : cases) {
         worst = std::max(worst, attn(c.what, c.s, attn_mask::causal, 0.0f, 0.0f, seed++, c.q_scale));
     }
@@ -1340,12 +1343,14 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     const double e_alibi =
         attn("probe (c), ALiBi (max_bias 8) with GQA 4", one_token, attn_mask::alibi, 0.0f, 8.0f, 62);
 
-    // M2e.3 round 2 (plan.md): one-token calls split over the tiles (FLAGOS_SPACEMIT_ATTN=split; split,paired with the
-    // turns of each pair) against the CPU. V summed in F32 and the tiles' partial results merged change the rounding,
-    // so the outputs differ from the one-chunk kernels' (counted: that the split ran) and must stay within the bounds.
-    // The cases take its edges: a last block of 40 positions (n_kv 1000), blocks the mask hides (4000 of 4096 valid),
-    // n_kv 8192, GQA 2 and 1, head size 64, no mask. Without the RVV kernels (the Mac, FLAGOS_SPACEMIT_TEST_REFERENCE)
-    // the split's reference runs
+    // M2e.3 round 2 (plan.md; the default since 2026-10-14): one-token calls split over the tiles, with the turns of
+    // each pair (the default) and without them (FLAGOS_SPACEMIT_ATTN=split), against the CPU. V summed in F32 and the
+    // tiles' partial results merged change the rounding, so the outputs differ from the one-chunk kernels'
+    // (FLAGOS_SPACEMIT_ATTN=one-chunk; counted: that the split ran) and must stay within the bounds. Both settings deal
+    // each tile the same blocks in the same order, so their outputs must be identical (a turn that skips or repeats a
+    // block breaks that). The cases take its edges: a last block of 40 positions (n_kv 1000), blocks the mask hides
+    // (4000 of 4096 valid), n_kv 8192, GQA 2 and 1, head size 64, no mask. Without the RVV kernels (the Mac,
+    // FLAGOS_SPACEMIT_TEST_REFERENCE) the split's reference runs
     struct split_case {
         const char * what;
         attn_shape   s;
@@ -1361,50 +1366,57 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         { "head size 64, 1 token", { 32, 8, 64, 1024, 1, 1023 }, attn_mask::causal },
         { "Qwen3-4B 1 token, no mask", { 32, 8, 128, 1024, 1, 1023 }, attn_mask::none },
     };
-    const char * const split_settings[] = { "split", "split,paired" };
-    int                n_split = 0, n_split_differ = 0;
+    // the switch's value per setting (nullptr: the default) and its name in the reports
+    const char * const split_settings[][2] = { { nullptr, "the default, with the turns" },
+                                               { "split", "FLAGOS_SPACEMIT_ATTN=split, without the turns" } };
+    int                n_split = 0, n_split_differ = 0, n_turns_same = 0;
     double             e_split = 0.0, e_split_row = 0.0;
-    for (const char * setting : split_settings) {
-        for (const split_case & c : split_cases) {
-            attn_run run;
-            REQUIRE(run.init(dev, c.s, c.mode, 0.0f, 0.0f, seed++));
-            std::vector<float> one_chunk, split;
-            {
-                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
-                REQUIRE(run.dev_output(backend, one_chunk));
-            }
-            {
-                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", setting);
-                REQUIRE(run.dev_output(backend, split));
-            }
-            REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
-            const int64_t     n    = (int64_t) split.size();
-            const attn_error  e    = attn_errors(split.data(), static_cast<const float *>(run.out_ref->data), n,
+    for (const split_case & c : split_cases) {
+        attn_run run;
+        REQUIRE(run.init(dev, c.s, c.mode, 0.0f, 0.0f, seed++));
+        REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
+        std::vector<float> one_chunk, split[2];
+        {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
+            REQUIRE(run.dev_output(backend, one_chunk));
+        }
+        for (int k = 0; k < 2; k++) {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", split_settings[k][0]);
+            REQUIRE(run.dev_output(backend, split[k]));
+            const int64_t     n    = (int64_t) split[k].size();
+            const attn_error  e    = attn_errors(split[k].data(), static_cast<const float *>(run.out_ref->data), n,
                                                  run.out->ne[0]);
-            const std::string what = std::string("split (FLAGOS_SPACEMIT_ATTN=") + setting + "), " + c.what;
+            const std::string what = std::string("split (") + split_settings[k][1] + "), " + c.what;
             attn_report(e, what.c_str(), c.s);
             e_split     = std::max(e_split, e.all);
             e_split_row = std::max(e_split_row, e.row);
-            n_split_differ += std::memcmp(split.data(), one_chunk.data(), split.size() * sizeof(float)) != 0;
+            n_split_differ += std::memcmp(split[k].data(), one_chunk.data(), n * sizeof(float)) != 0;
             n_split++;
         }
+        const bool same = std::memcmp(split[0].data(), split[1].data(), split[0].size() * sizeof(float)) == 0;
+        if (!same) {
+            std::fprintf(stderr, "FAIL: attention split, %s: the outputs with and without the turns differ\n", c.what);
+            g_failures++;
+        }
+        n_turns_same += same;
     }
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf(
-        "attn     FLASH_ATTN_EXT vs CPU (F16 KV cache in a CPU buffer, viewed as llama.cpp does; Qwen3-4B and "
-        "0.6B heads): %zu cases (1 token at n_kv 256-4096; 7, 99 and 128 tokens; 128 after 3968), max NMSE %.2e "
-        "(bound %.0e), worst row %.2e (bound %.0e), of the tiled cases %.2e (bound %.0e); probes: every score far "
-        "below 0 (mask -30, -120) %.2e, no mask %.2e, ALiBi with GQA 4 %.2e; claims exact (F16 K and V, head sizes "
-        "to 128): checked%s\n",
+        "attn     FLASH_ATTN_EXT vs CPU, one-chunk and tiled kernels (F16 KV cache in a CPU buffer, viewed as "
+        "llama.cpp does; Qwen3-4B and 0.6B heads): %zu cases (1 token at n_kv 256-4096; 7, 99 and 128 tokens; 128 "
+        "after 3968), max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e), of the tiled cases %.2e (bound %.0e); "
+        "probes: every score far below 0 (mask -30, -120) %.2e, no mask %.2e, ALiBi with GQA 4 %.2e; claims exact "
+        "(F16 K and V, head sizes to 128): checked%s\n",
         sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, worst_row_tiled,
         k_attn_max_row_nmse_tiled, e_low, e_none, e_alibi,
         std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
-    std::printf("attn     split over the tiles (FLAGOS_SPACEMIT_ATTN=split; split,paired) on %d one-token cases: max "
-                "NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); %d/%d outputs differ from the one-chunk "
-                "kernels' (the split ran)\n",
-                n_split, e_split, k_attn_max_nmse, e_split_row, k_attn_max_row_nmse, n_split_differ, n_split);
+    std::printf("attn     split over the tiles (the default; FLAGOS_SPACEMIT_ATTN=split without the turns) on %d "
+                "one-token cases: max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); %d/%d outputs differ from "
+                "the one-chunk kernels' (the split ran); with and without the turns identical in %d/%zu cases\n",
+                n_split, e_split, k_attn_max_nmse, e_split_row, k_attn_max_row_nmse, n_split_differ, n_split,
+                n_turns_same, sizeof(split_cases) / sizeof(split_cases[0]));
     return 0;
 }
 
@@ -1990,21 +2002,22 @@ static int bench_gemv(ggml_backend_dev_t dev) {
     return 0;
 }
 
-// flash attention at Qwen3-4B's heads (32 query, 8 KV of 128; attn_run): a token at n_kv 256, 1024, 4096 and 8192,
-// every cell valid, and prompt batches, causal: 128 tokens at n_kv 128 and 4096, 512 at n_kv 512 and 4608 (depth 0 and
-// 4096); the provider against the CPU backend (8 threads) on the same graph. As in the model, where each layer has its
-// own cache, every call reads its cache from DRAM: it takes the next of enough copies (32 MB together, as bench_gemv).
-// GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own launch here. At
-// one token the provider also runs the split over the tiles (FLAGOS_SPACEMIT_ATTN=split and split,paired; plan.md
-// M2e.3, round 2), each against the default
+// flash attention at Qwen3-4B's heads (32 query, 8 KV of 128; attn_run): a token at n_kv 256, 512, 1024, 4096 and
+// 8192, every cell valid, and prompt batches, causal: 128 tokens at n_kv 128 and 4096, 512 at n_kv 512 and 4608 (depth
+// 0 and 4096); the provider against the CPU backend (8 threads) on the same graph. As in the model, where each layer
+// has its own cache, every call reads its cache from DRAM: it takes the next of enough copies (32 MB together, as
+// bench_gemv). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own
+// launch here. At one token the default (from n_kv 512 the split over the tiles with the turns; plan.md M2e.3, round 2)
+// also against FLAGOS_SPACEMIT_ATTN=split (the split without the turns) and one-chunk (the kernels before round 2)
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 8);
     struct attn_bench { int64_t n_kv, n_tokens; int iterations; };
-    for (const attn_bench & b : { attn_bench{ 256, 1, 30 }, { 1024, 1, 20 }, { 4096, 1, 10 }, { 8192, 1, 5 },
-                                  { 128, 128, 10 }, { 4096, 128, 2 }, { 512, 512, 4 }, { 4608, 512, 2 } }) {
+    for (const attn_bench & b : { attn_bench{ 256, 1, 30 }, { 512, 1, 25 }, { 1024, 1, 20 }, { 4096, 1, 10 },
+                                  { 8192, 1, 5 }, { 128, 128, 10 }, { 4096, 128, 2 }, { 512, 512, 4 },
+                                  { 4608, 512, 2 } }) {
         const attn_shape s        = { 32, 8, 128, b.n_kv, b.n_tokens, b.n_kv - b.n_tokens };
         const double     kv_bytes = 2.0 * (double) (s.n_kv * s.n_head_kv * s.d) * sizeof(ggml_fp16_t);
         const size_t     copies   = (size_t) std::min(32.0, std::ceil(32e6 / kv_bytes));
@@ -2022,14 +2035,15 @@ static int bench_attn(ggml_backend_dev_t dev) {
                 [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
                 b.iterations);
         };
-        // at one token the split (M2e.3 round 2) against the default: each takes two turns and keeps the faster
-        static const char * const split_settings[] = { "split", "split,paired" };
+        // at one token the default against the split without the turns and the one-chunk kernels (M2e.3 round 2):
+        // each takes two turns and keeps the faster
+        static const char * const other_settings[] = { "split", "one-chunk" };
         double                    t_dev            = dev_us(nullptr);
-        double                    t_split[2]       = { HUGE_VAL, HUGE_VAL };
+        double                    t_other[2]       = { HUGE_VAL, HUGE_VAL };
         if (b.n_tokens == 1) {
             for (int turn = 0; turn < 2; turn++) {
                 for (int k = 0; k < 2; k++) {
-                    t_split[k] = std::min(t_split[k], dev_us(split_settings[k]));
+                    t_other[k] = std::min(t_other[k], dev_us(other_settings[k]));
                 }
                 t_dev = std::min(t_dev, dev_us(nullptr));
             }
@@ -2044,10 +2058,10 @@ static int bench_attn(ggml_backend_dev_t dev) {
                         (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, kv_bytes / t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3,
                         kv_bytes / t_cpu / 1e3);
             std::printf("bench    attn 1 token n_kv %4lld, FLAGOS_SPACEMIT_ATTN: split %.0f us (%+.1f%%, %.1f GB/s); "
-                        "split,paired %.0f us (%+.1f%%, %.1f GB/s)%s\n",
-                        (long long) s.n_kv, t_split[0], 100.0 * (t_split[0] / t_dev - 1.0), kv_bytes / t_split[0] / 1e3,
-                        t_split[1], 100.0 * (t_split[1] / t_dev - 1.0), kv_bytes / t_split[1] / 1e3,
-                        s.n_kv < 512 ? " (below the split's 512 positions: the default ran)" : "");
+                        "one-chunk %.0f us (%+.1f%%, %.1f GB/s)%s\n",
+                        (long long) s.n_kv, t_other[0], 100.0 * (t_other[0] / t_dev - 1.0), kv_bytes / t_other[0] / 1e3,
+                        t_other[1], 100.0 * (t_other[1] / t_dev - 1.0), kv_bytes / t_other[1] / 1e3,
+                        s.n_kv < 512 ? " (below the split's 512 positions: all three ran the one-chunk kernels)" : "");
         } else {
             std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), cpu %8.0f us "
                         "(%7.1f ms)\n",

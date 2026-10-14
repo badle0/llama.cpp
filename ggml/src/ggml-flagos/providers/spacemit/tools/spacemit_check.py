@@ -28,8 +28,9 @@
 #         model run's default -fa auto keeps flash attention on the provider (C5a; FAIL with llama.cpp's warning if it
 #         turns it off, or if the graphs take as many splits as the model has layers, as when the CPU runs attention)
 #         and a token takes 2 graph splits; perplexity with -fa on and with -fa auto (attention on the provider), each
-#         within 1% of the CPU; mean KLD against the CPU's logits with 512-token batches (tiled kernel) and -ub 1
-#         (one-chunk kernels), to compare by hand with M2c.2's (Qwen3-4B: 0.0033 and 0.0022, build.md §7)
+#         within 1% of the CPU; mean KLD against the CPU's logits with 512-token batches (tiled kernel) and -ub 1 -b
+#         512 (one token per ubatch: from n_kv 512 the split over the tiles), to compare by hand with build.md §7
+#         (Qwen3-4B at M2e.3 round 2: 0.003354 and 0.002001)
 #   --depth (m2b and later): after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth
 #         4096 for the provider, the CPU and (if built) the upstream IME build; FAIL if the provider's runs miss one
 # Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c|m2c2|m2e] [--build] [--build-dir DIR] [--model GGUF]
@@ -355,14 +356,16 @@ def perplexity(bdir, logs, model, text, milestone):
 
 
 def kl_divergence(bdir, logs, model, text, base):
-    """Mean KLD of the provider's logits against the CPU's (base, from the CPU's perplexity run): with 512-token
-    batches (the tiled kernel) and with -ub 1 (the one-chunk kernels; about 10 minutes for Qwen3-4B), as build.md §6."""
+    """Mean KLD of the provider's logits against the CPU's (base, from the CPU's perplexity run), as build.md §6: with
+    512-token batches (4 sequences of 128 tokens per ubatch: the tiled kernel) and with -ub 1 -b 512 (one sequence, so
+    every ubatch is one token as in generation: the 1-row matmuls, the split over the tiles from n_kv 512; about 10
+    minutes for Qwen3-4B). With the default batch, -ub 1 would put a token of each of 2 sequences into every ubatch."""
     if not base.is_file():
         report("KLD against the CPU", False, f"no CPU logits: {base} (the CPU perplexity run failed)")
         return
     cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-t", "8",
            "-fa", "on", "--kl-divergence-base", str(base), "--kl-divergence"]
-    for label, ub, tag in (("512-token batches", [], ""), ("-ub 1", ["-ub", "1"], "-ub1")):
+    for label, ub, tag in (("512-token batches", [], ""), ("-ub 1 -b 512", ["-ub", "1", "-b", "512"], "-ub1")):
         rc, out, err = run([*cmd, *ub], logs / f"kld{tag}", env_extra=preload, env_drop=("FLAGOS_SPACEMIT_DISABLE",),
                            timeout=3600)
         m = re.search(r"Mean\s+KLD:\s+([0-9.]+)\s+\S+\s+([0-9.]+)", out + err)

@@ -1,5 +1,6 @@
 // FLASH_ATTN_EXT on the AI cores (plan.md, M2e design): the claim, the split of the rows over the tiles, and the
-// portable reference.
+// portable reference; for one token per call from n_kv 512, the split of the KV positions over the tiles and the merge
+// of their partial results (plan.md, M2e.3 round 2).
 
 #include "flagos-spacemit-attn.h"
 
@@ -165,31 +166,27 @@ void flash_attn_ref(const ggml_tensor * dst, int64_t ir0, int64_t ir1) {
 // the split (M2e.3 round 2) from this many positions, as ggml-cpu's for one token (ops.cpp:9115): 8 blocks of 64
 constexpr int64_t split_min_kv = 512;
 
-// test-only (plan.md M2e.3, round 2): FLAGOS_SPACEMIT_ATTN, comma-separated: split takes the one-token calls it can
-// as (a), paired adds the turns of the two tiles of a pair. 0 none, 1 split, 2 split with the turns; an unknown setting
-// is reported once and ignored. Read whenever spacemit_find_op looks at a node, so a benchmark can switch
+// how the calls the split takes run (plan.md M2e.3, round 2, adopted 2026-10-14): 2 the split with the turns of the two
+// tiles of a pair (the default; tg32 at depth 4096 +20%), 1 the split without the turns (the same outputs), 0 the
+// one-chunk kernels as before. test-only: FLAGOS_SPACEMIT_ATTN=split or one-chunk, for comparisons (paired names the
+// default), read whenever spacemit_find_op looks at a node, so a benchmark can switch; anything else is reported once
+// and ignored
 int split_setting_from_env() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN");
-    if (v == nullptr) {
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "paired") == 0) {
+        return 2;
+    }
+    if (std::strcmp(v, "split") == 0) {
+        return 1;
+    }
+    if (std::strcmp(v, "one-chunk") == 0) {
         return 0;
     }
-    bool split = false, paired = false;
-    for (const char * p = v; *p != '\0';) {
-        const char * comma = std::strchr(p, ',');
-        const size_t len   = comma != nullptr ? (size_t) (comma - p) : std::strlen(p);
-        if (len == 5 && std::strncmp(p, "split", 5) == 0) {
-            split = true;
-        } else if (len == 6 && std::strncmp(p, "paired", 6) == 0) {
-            paired = true;
-        } else if (len > 0) {
-            static std::atomic<bool> warned{ false };
-            if (!warned.exchange(true)) {
-                GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN=%s: unknown setting ignored\n", __func__, v);
-            }
-        }
-        p = comma != nullptr ? comma + 1 : p + len;
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN=%s: unknown setting ignored\n", __func__, v);
     }
-    return split ? (paired ? 2 : 1) : 0;
+    return 2;
 }
 
 // the shapes the split takes: one token and one stream, from split_min_kv positions, F16 K and V in llama.cpp's cache
