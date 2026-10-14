@@ -30,6 +30,22 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
 size_t tiled_scratch_bytes(int64_t DK, int64_t DV);
 void   forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scratch, size_t scratch_size);
 
+// M2e.3 round 2, candidate (a) (plan.md "M2e.3 design"): one-token attention with the KV positions split over the tiles
+// in blocks dealt round-robin by flagos-spacemit-attn.cpp, which also merges the tiles' partial results. Each tile
+// stages its blocks' whole cells (every KV head) in its TCM and keeps per query head a running maximum, sum and F32 V
+// sum. Needs one token and one stream, F16 K and V whose cells hold every KV head (llama.cpp's cache), no ALiBi and no
+// softcap, DK and DV as supported_shape. A tile calls split_begin, then for each of its blocks split_stage and, when
+// that returns true, split_compute, then split_end, all with the same tcm.
+// positions per block that fit tcm_size: a multiple of 8 up to 64, 0 when fewer than 8 fit
+int64_t split_block_positions(const ggml_tensor * dst, size_t tcm_size);
+void    split_begin(const ggml_tensor * dst, void * tcm, size_t tcm_size);
+// stages block b; false, with nothing copied, when the mask hides every position of it
+bool    split_stage(const ggml_tensor * dst, int64_t b, void * tcm, size_t tcm_size);
+void    split_compute(const ggml_tensor * dst, int64_t b, void * tcm, size_t tcm_size);
+// the tile's partial result per query head h at partial + h * (DV + 2): the maximum score, the sum of exp(score -
+// maximum), then DV floats, V summed with those weights; -inf, 0 and zeros when it saw no visible position
+void    split_end(const ggml_tensor * dst, void * tcm, size_t tcm_size, float * partial);
+
 }  // namespace spacemit_rvv_attn
 
 #endif  // GGML_FLAGOS_SPACEMIT_RVV

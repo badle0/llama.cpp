@@ -10,3 +10,14 @@
 bool spacemit_flash_attn_supported(const ggml_tensor * op);
 
 bool spacemit_kernel_flash_attn(const spacemit_tile & tile, ggml_tensor * dst);
+
+// M2e.3 round 2, candidate (a) (plan.md "M2e.3 design"; test-only until adopted): one-token calls from n_kv 512 with
+// the KV positions split over the tiles. Step 1 computes each tile's partial results into the workspace, the blocks of
+// positions dealt round-robin (with the turns, the two tiles of a pair take turns between staging and arithmetic);
+// step 2 merges them per query head and writes dst. spacemit_flash_attn_split tells spacemit_find_op which: 0 the
+// one-step op above, 1 the split, 2 the split with the turns
+int    spacemit_flash_attn_split(const ggml_tensor * op);
+size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node);
+bool   spacemit_kernel_flash_attn_split_partial(const spacemit_tile & tile, ggml_tensor * dst);
+bool   spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile & tile, ggml_tensor * dst);
+bool   spacemit_kernel_flash_attn_split_merge(const spacemit_tile & tile, ggml_tensor * dst);

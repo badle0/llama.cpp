@@ -961,6 +961,140 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
     __riscv_vse32_v_f32m4(dst, VKQ32_v, DV);
 }
 
+// flagos (M2e.3 round 2, the split over the tiles): rvv_pv_accumulate_f16_x1/x4 for V rows v_stride elements apart (the
+// rows of one KV head in staged cells), dst += sum over tk < n of prob[tk] * V row tk, in F32
+static inline void rvv_pv_accumulate_f16_x1_strided(float *          dst,
+                                                    const float *    prob,
+                                                    const _Float16 * v,
+                                                    int64_t          v_stride,
+                                                    int64_t          n,
+                                                    int64_t          dv) {
+    int64_t d_left = dv;
+    int64_t d_off  = 0;
+
+    while (d_left > 0) {
+        const size_t vl  = __riscv_vsetvl_e16m2(d_left);
+        vfloat32m4_t acc = __riscv_vle32_v_f32m4(dst + d_off, vl);
+
+        for (int64_t tk = 0; tk < n; ++tk) {
+            const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v + tk * v_stride + d_off, vl);
+            const vfloat32m4_t v32 = __riscv_vfwcvt_f_f_v_f32m4(v16, vl);
+            acc                    = __riscv_vfmacc_vf_f32m4(acc, prob[tk], v32, vl);
+        }
+
+        __riscv_vse32_v_f32m4(dst + d_off, acc, vl);
+        d_left -= vl;
+        d_off += vl;
+    }
+}
+
+static inline void rvv_pv_accumulate_f16_x4_strided(float *          dst0,
+                                                    float *          dst1,
+                                                    float *          dst2,
+                                                    float *          dst3,
+                                                    const float *    prob0,
+                                                    const float *    prob1,
+                                                    const float *    prob2,
+                                                    const float *    prob3,
+                                                    const _Float16 * v,
+                                                    int64_t          v_stride,
+                                                    int64_t          n,
+                                                    int64_t          dv) {
+    int64_t d_left = dv;
+    int64_t d_off  = 0;
+
+    while (d_left > 0) {
+        const size_t vl   = __riscv_vsetvl_e16m2(d_left);
+        vfloat32m4_t acc0 = __riscv_vle32_v_f32m4(dst0 + d_off, vl);
+        vfloat32m4_t acc1 = __riscv_vle32_v_f32m4(dst1 + d_off, vl);
+        vfloat32m4_t acc2 = __riscv_vle32_v_f32m4(dst2 + d_off, vl);
+        vfloat32m4_t acc3 = __riscv_vle32_v_f32m4(dst3 + d_off, vl);
+
+        for (int64_t tk = 0; tk < n; ++tk) {
+            const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v + tk * v_stride + d_off, vl);
+            const vfloat32m4_t v32 = __riscv_vfwcvt_f_f_v_f32m4(v16, vl);
+            acc0                   = __riscv_vfmacc_vf_f32m4(acc0, prob0[tk], v32, vl);
+            acc1                   = __riscv_vfmacc_vf_f32m4(acc1, prob1[tk], v32, vl);
+            acc2                   = __riscv_vfmacc_vf_f32m4(acc2, prob2[tk], v32, vl);
+            acc3                   = __riscv_vfmacc_vf_f32m4(acc3, prob3[tk], v32, vl);
+        }
+
+        __riscv_vse32_v_f32m4(dst0 + d_off, acc0, vl);
+        __riscv_vse32_v_f32m4(dst1 + d_off, acc1, vl);
+        __riscv_vse32_v_f32m4(dst2 + d_off, acc2, vl);
+        __riscv_vse32_v_f32m4(dst3 + d_off, acc3, vl);
+        d_left -= vl;
+        d_off += vl;
+    }
+}
+
+// flagos (M2e.3 round 2): whether any of n mask values (n <= 64, one register group) is not -inf
+static inline bool rvv_any_visible(const float * mask32, int64_t n) {
+    const size_t    vl      = __riscv_vsetvl_e32m2(n);
+    const vbool16_t visible = __riscv_vmfne_vf_f32m2_b16(__riscv_vle32_v_f32m2(mask32, vl), -INFINITY, vl);
+    return __riscv_vcpop_m_b16(visible, vl) > 0;
+}
+
+// flagos (M2e.3 round 2): where the split keeps its data in a tile's TCM. The staged cells of one block (K, then V),
+// the transposed K rows of one KV head (rows ggml_fa_tile_config::KV apart, as the score helpers read them), q in F16
+// for every query head, per query head the F32 V sum, the running maximum and the sum, the block's mask values and the
+// scores of up to 4 query heads; each region 64-byte aligned
+struct split_layout {
+    int64_t n_head = 0, n_head_kv = 0, DK = 0, DV = 0, n_kv = 0;
+    int64_t block  = 0;  // positions per block, a multiple of 8 up to 64; 0 when fewer than 8 fit
+    size_t  k_cell = 0, v_cell = 0;
+    size_t  off_v = 0, off_kt = 0, off_q = 0, off_acc = 0, off_max = 0, off_sum = 0, off_mask = 0, off_scores = 0;
+    size_t  total = 0;
+};
+
+static size_t align64(size_t n) {
+    return (n + 63) & ~(size_t) 63;
+}
+
+static split_layout split_layout_of(const ggml_tensor * dst, size_t tcm_size) {
+    constexpr int64_t   KV = ggml_fa_tile_config::KV;
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * k  = dst->src[1];
+    const ggml_tensor * v  = dst->src[2];
+
+    split_layout L;
+    L.n_head    = q->ne[2];
+    L.n_head_kv = k->ne[2];
+    L.DK        = k->ne[0];
+    L.DV        = v->ne[0];
+    L.n_kv      = k->ne[1];
+    L.k_cell    = k->nb[1];
+    L.v_cell    = v->nb[1];
+    const auto layout_for = [&](int64_t block) {
+        size_t off  = align64((size_t) block * L.k_cell);
+        L.off_v     = off;
+        off         = align64(off + (size_t) block * L.v_cell);
+        L.off_kt    = off;
+        off         = align64(off + (size_t) (L.DK * KV) * sizeof(_Float16));
+        L.off_q     = off;
+        off         = align64(off + (size_t) (L.n_head * L.DK) * sizeof(_Float16));
+        L.off_acc   = off;
+        off         = align64(off + (size_t) (L.n_head * L.DV) * sizeof(float));
+        L.off_max   = off;
+        off         = align64(off + (size_t) L.n_head * sizeof(float));
+        L.off_sum   = off;
+        off         = align64(off + (size_t) L.n_head * sizeof(float));
+        L.off_mask  = off;
+        off         = align64(off + (size_t) KV * sizeof(float));
+        L.off_scores = off;
+        return off + (size_t) (4 * KV) * sizeof(float);
+    };
+    for (int64_t block = KV; block >= 8; block -= 8) {
+        L.total = layout_for(block);
+        if (L.total <= tcm_size) {
+            L.block = block;
+            return L;
+        }
+    }
+    L.block = 0;
+    return L;
+}
+
 // flagos: the rows go through spacemit_ime::copy, M2b's copy of the same memcpy1d (1013-1113), which keeps it behind a
 // call because its asm does not declare the vector registers it overwrites
 void memcpy2d(void * dst, int64_t dst_stride, const void * src, int64_t src_stride, int64_t tile_rows, int64_t size) {
@@ -1505,6 +1639,142 @@ void forward_tiled(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * scr
         rvv_pack_scaled_f32_as_f32(dst_ptr, nb1 * ne1, VKQ32, DV * sizeof(float), tile_rows, DV, S);
 
         ir += tile_rows;
+    }
+}
+
+// flagos (M2e.3 round 2, candidate (a); plan.md "M2e.3 design"): the split of one-token attention over the tiles, a
+// tile's part; flagos-spacemit-attn.cpp deals the blocks and merges. The layout: split_layout above
+int64_t split_block_positions(const ggml_tensor * dst, size_t tcm_size) {
+    return split_layout_of(dst, tcm_size).block;
+}
+
+void split_begin(const ggml_tensor * dst, void * tcm, size_t tcm_size) {
+    const split_layout L = split_layout_of(dst, tcm_size);
+    GGML_ASSERT(L.block >= 8 && tcm != nullptr && (uintptr_t) tcm % alignof(float) == 0);
+    const ggml_tensor * q    = dst->src[0];
+    char *              base = (char *) tcm;
+
+    // q in F16, unscaled (the scores are scaled in F32), as forward_one_chunk's kernels and ggml-cpu round it
+    _Float16 * q16 = (_Float16 *) (base + L.off_q);
+    for (int64_t h = 0; h < L.n_head; ++h) {
+        const float *      pq = (const float *) ((const char *) q->data + h * q->nb[2]);
+        const vfloat16m2_t qh = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq, L.DK), L.DK);
+        __riscv_vse16_v_f16m2(q16 + h * L.DK, qh, L.DK);
+    }
+    rvv_zero_f32((float *) (base + L.off_acc), L.n_head * L.DV);
+    float * M = (float *) (base + L.off_max);
+    float * S = (float *) (base + L.off_sum);
+    for (int64_t h = 0; h < L.n_head; ++h) {
+        M[h] = -INFINITY;
+        S[h] = 0.0f;
+    }
+}
+
+bool split_stage(const ggml_tensor * dst, int64_t b, void * tcm, size_t tcm_size) {
+    const split_layout  L    = split_layout_of(dst, tcm_size);
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t       p0   = b * L.block;
+    const int64_t       np   = std::min(L.block, L.n_kv - p0);
+    char *              base = (char *) tcm;
+
+    float * mask32 = (float *) (base + L.off_mask);
+    if (mask != nullptr) {
+        rvv_pack_scaled_f16_as_f32(mask32, 0, (const ggml_fp16_t *) mask->data + p0, 0, 1, np, 1.0f);
+        if (!rvv_any_visible(mask32, np)) {
+            return false;
+        }
+    } else {
+        rvv_zero_f32(mask32, np);
+    }
+    // whole cells, every KV head: one contiguous range of K and one of V
+    spacemit_ime::copy(base, (const char *) k->data + p0 * (int64_t) L.k_cell, (size_t) np * L.k_cell);
+    spacemit_ime::copy(base + L.off_v, (const char *) v->data + p0 * (int64_t) L.v_cell, (size_t) np * L.v_cell);
+    return true;
+}
+
+void split_compute(const ggml_tensor * dst, int64_t b, void * tcm, size_t tcm_size) {
+    constexpr int64_t   KV    = ggml_fa_tile_config::KV;
+    const split_layout  L     = split_layout_of(dst, tcm_size);
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const int64_t       np    = std::min(L.block, L.n_kv - b * L.block);
+    const int64_t       rk2   = L.n_head / L.n_head_kv;
+    const float         scale = ggml_get_op_params_f32(dst, 0);  // the split runs without softcap
+    char *              base  = (char *) tcm;
+
+    _Float16 *       kt       = (_Float16 *) (base + L.off_kt);
+    const _Float16 * q16      = (const _Float16 *) (base + L.off_q);
+    float *          acc      = (float *) (base + L.off_acc);
+    float *          M        = (float *) (base + L.off_max);
+    float *          S        = (float *) (base + L.off_sum);
+    const float *    mask32   = (const float *) (base + L.off_mask);
+    float *          sc       = (float *) (base + L.off_scores);
+    const int64_t    v_stride = (int64_t) (L.v_cell / sizeof(_Float16));
+
+    for (int64_t hk = 0; hk < L.n_head_kv; ++hk) {
+        // this KV head's K rows, a cell apart in the staged block, transposed for the score helpers
+        rvv_transposed_s16_mn_to_nm((int8_t *) kt, KV * sizeof(_Float16), (int8_t *) (base + hk * k->nb[2]),
+                                    (int64_t) L.k_cell, np, L.DK);
+        const _Float16 * v_head = (const _Float16 *) (base + L.off_v + hk * v->nb[2]);
+
+        for (int64_t g = 0; g < rk2; g += 4) {
+            const int64_t nq = std::min<int64_t>(4, rk2 - g);
+            const int64_t h0 = hk * rk2 + g;
+            if (nq == 4) {
+                rvv_qk_dot_tile_f16_x4(sc, sc + KV, sc + 2 * KV, sc + 3 * KV, q16 + h0 * L.DK, q16 + (h0 + 1) * L.DK,
+                                       q16 + (h0 + 2) * L.DK, q16 + (h0 + 3) * L.DK, kt, L.DK, np);
+            } else {
+                for (int64_t i = 0; i < nq; ++i) {
+                    rvv_qk_dot_tile_f16_x1(sc + i * KV, q16 + (h0 + i) * L.DK, kt, L.DK, np);
+                }
+            }
+            for (int64_t i = 0; i < nq; ++i) {
+                float *       row = sc + i * KV;
+                const int64_t h   = h0 + i;
+                rvv_scale_f32(row, scale, np);
+                const float tile_max = rvv_add_max_inplace_f32(row, mask32, np);
+                if (tile_max == -INFINITY) {
+                    rvv_zero_f32(row, np);  // no visible position for this row: no weight
+                    continue;
+                }
+                if (tile_max > M[h]) {
+                    const float ms = expf(M[h] - tile_max);
+                    M[h]           = tile_max;
+                    S[h] *= ms;
+                    rvv_scale_f32(acc + h * L.DV, ms, L.DV);
+                }
+                S[h] += rvv_softmax_exp_inplace_f32(row, np, M[h]);
+            }
+            if (nq == 4) {
+                rvv_pv_accumulate_f16_x4_strided(acc + h0 * L.DV, acc + (h0 + 1) * L.DV, acc + (h0 + 2) * L.DV,
+                                                 acc + (h0 + 3) * L.DV, sc, sc + KV, sc + 2 * KV, sc + 3 * KV, v_head,
+                                                 v_stride, np, L.DV);
+            } else {
+                for (int64_t i = 0; i < nq; ++i) {
+                    rvv_pv_accumulate_f16_x1_strided(acc + (h0 + i) * L.DV, sc + i * KV, v_head, v_stride, np, L.DV);
+                }
+            }
+        }
+    }
+}
+
+void split_end(const ggml_tensor * dst, void * tcm, size_t tcm_size, float * partial) {
+    const split_layout L    = split_layout_of(dst, tcm_size);
+    const char *       base = (const char *) tcm;
+    const float *      acc  = (const float *) (base + L.off_acc);
+    const float *      M    = (const float *) (base + L.off_max);
+    const float *      S    = (const float *) (base + L.off_sum);
+    for (int64_t h = 0; h < L.n_head; ++h) {
+        float * p = partial + h * (L.DV + 2);
+        p[0]      = M[h];
+        p[1]      = S[h];
+        for (int64_t d = 0; d < L.DV;) {  // vector copies: scalar reads of TCM are slow (k3-hardware.md)
+            const size_t vl = __riscv_vsetvl_e32m4(L.DV - d);
+            __riscv_vse32_v_f32m4(p + 2 + d, __riscv_vle32_v_f32m4(acc + h * L.DV + d, vl), vl);
+            d += (int64_t) vl;
+        }
     }
 }
 
