@@ -13,7 +13,10 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -23,6 +26,45 @@ constexpr int64_t max_head_size = 128;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 // from this many tokens per head the tiled kernel runs (ggml-cpu's ggml_fa_tile_config::Q, as in ime.cpp)
 constexpr int64_t tiled_min_rows = 64;
+
+// test-only (plan.md M2e.3, round 1): FLAGOS_SPACEMIT_ATTN, comma-separated settings of the grouped one-chunk kernels
+// (spacemit_rvv_attn::one_chunk_test: stream, compute, cached, burst), read at every call so a benchmark can switch;
+// an unknown setting is reported once and ignored
+unsigned one_chunk_test_from_env() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN");
+    if (v == nullptr) {
+        return 0;
+    }
+    static const struct {
+        const char * name;
+        unsigned     flag;
+    } settings[] = {
+        { "stream", spacemit_rvv_attn::one_chunk_stream },
+        { "compute", spacemit_rvv_attn::one_chunk_compute },
+        { "cached", spacemit_rvv_attn::one_chunk_cached },
+        { "burst", spacemit_rvv_attn::one_chunk_burst },
+    };
+    unsigned flags = 0;
+    for (const char * p = v; *p != '\0';) {
+        const char * comma = std::strchr(p, ',');
+        const size_t len   = comma != nullptr ? (size_t) (comma - p) : std::strlen(p);
+        bool         known = len == 0;
+        for (const auto & setting : settings) {
+            if (std::strlen(setting.name) == len && std::strncmp(p, setting.name, len) == 0) {
+                flags |= setting.flag;
+                known = true;
+            }
+        }
+        if (!known) {
+            static std::atomic<bool> warned{ false };
+            if (!warned.exchange(true)) {
+                GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN=%s: unknown setting ignored\n", __func__, v);
+            }
+        }
+        p = comma != nullptr ? comma + 1 : p + len;
+    }
+    return flags;
+}
 #endif
 
 bool divides(int64_t d, int64_t n) {
@@ -212,7 +254,7 @@ bool spacemit_kernel_flash_attn(const spacemit_tile & tile, ggml_tensor * dst) {
             tile.tcm_size >= spacemit_rvv_attn::tiled_scratch_bytes(DK, DV)) {
             spacemit_rvv_attn::forward_tiled(dst, ir0, ir1, tile.tcm, tile.tcm_size);
         } else {
-            spacemit_rvv_attn::forward_one_chunk(dst, ir0, ir1, tile.tcm, tile.tcm_size);
+            spacemit_rvv_attn::forward_one_chunk(dst, ir0, ir1, tile.tcm, tile.tcm_size, one_chunk_test_from_env());
         }
         return true;
     }

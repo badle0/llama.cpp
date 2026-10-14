@@ -597,6 +597,51 @@ static inline bool rvv_last_column_visible(const float * tile, int64_t stride, i
     return __riscv_vcpop_m_b16(__riscv_vmfne_vf_f32m2_b16(last, -INFINITY, vl), vl) == vl;
 }
 
+// flagos (test-only, plan.md M2e.3 round 1, one_chunk_burst): stage 8 positions' K and V rows into the chunk's TCM
+// tiles at columns first..first+7, issuing the 8 K loads, then the 8 V loads, before their stores, so that several
+// reads from DRAM are in flight; the tiles end up as the grouped kernel's one-row staging leaves them
+static inline void rvv_stage_rows_x8(_Float16 *          k_tile_pack,
+                                     _Float16 *          v_tile_pack,
+                                     int64_t             first,
+                                     int64_t             k_tile_byte_stride,
+                                     const char * const * k_rows,
+                                     const char * const * v_rows,
+                                     int64_t             DK,
+                                     int64_t             DV) {
+    const vfloat16m2_t k0 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[0], DK);
+    const vfloat16m2_t k1 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[1], DK);
+    const vfloat16m2_t k2 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[2], DK);
+    const vfloat16m2_t k3 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[3], DK);
+    const vfloat16m2_t k4 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[4], DK);
+    const vfloat16m2_t k5 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[5], DK);
+    const vfloat16m2_t k6 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[6], DK);
+    const vfloat16m2_t k7 = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[7], DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 0, k_tile_byte_stride, k0, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 1, k_tile_byte_stride, k1, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 2, k_tile_byte_stride, k2, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 3, k_tile_byte_stride, k3, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 4, k_tile_byte_stride, k4, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 5, k_tile_byte_stride, k5, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 6, k_tile_byte_stride, k6, DK);
+    __riscv_vsse16_v_f16m2(k_tile_pack + first + 7, k_tile_byte_stride, k7, DK);
+    const vfloat16m2_t v0 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[0], DV);
+    const vfloat16m2_t v1 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[1], DV);
+    const vfloat16m2_t v2 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[2], DV);
+    const vfloat16m2_t v3 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[3], DV);
+    const vfloat16m2_t v4 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[4], DV);
+    const vfloat16m2_t v5 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[5], DV);
+    const vfloat16m2_t v6 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[6], DV);
+    const vfloat16m2_t v7 = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[7], DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 0) * DV, v0, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 1) * DV, v1, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 2) * DV, v2, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 3) * DV, v3, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 4) * DV, v4, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 5) * DV, v5, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 6) * DV, v6, DV);
+    __riscv_vse16_v_f16m2(v_tile_pack + (first + 7) * DV, v7, DV);
+}
+
 template <size_t QLEN>
 static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **            pq,
                                                                   const char *        k_data_row,
@@ -613,7 +658,8 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                                                                   int64_t             DV,
                                                                   int64_t             DK,
                                                                   void *              tcm_buffer,
-                                                                  size_t              tcm_buffer_size) {
+                                                                  size_t              tcm_buffer_size,
+                                                                  unsigned            test) {
     GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
     float S[QLEN] = { 0.0f };  // sum
     float M[QLEN];             // maximum KQ value
@@ -625,6 +671,14 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     _Float16 *   qv_buffer            = kq16_buffer + QLEN * DV;
     const size_t qkv_temp_buffer_size = (QLEN * DV + QLEN * DK) * sizeof(_Float16);
     char *       kv_tile_buffer       = (char *) (qv_buffer + QLEN * DK);
+
+    // flagos (test-only, plan.md M2e.3 round 1, one_chunk_cached): q and the chunk's scores, which the inner loops read
+    // one value at a time, on the stack (cached memory) instead of in TCM; the TCM layout stays as it is
+    alignas(64) _Float16 q_cached[QLEN * 128];
+    alignas(64) float    kq_cached[QLEN * 64];
+    if (test & one_chunk_cached) {
+        qv_buffer = q_cached;
+    }
 
     {
         vfloat16m2_t VKQ16_v = __riscv_vfmv_v_f_f16m2(0.0f, DV);
@@ -655,26 +709,71 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
         _Float16 * k_tile_pack    = reinterpret_cast<_Float16 *>(k_tile_addr);
         _Float16 * v_tile_pack    = reinterpret_cast<_Float16 *>(v_tile_addr);
         float *    mv_tile_pack   = reinterpret_cast<float *>(mv_tile_addr);
+        if (test & one_chunk_cached) {
+            GGML_ASSERT(ic_tile_step <= 64);
+            kq_tile_buffer = kq_cached;
+        }
 
         const int64_t k_tile_byte_stride = ic_tile_step * (int64_t) sizeof(_Float16);
 
         int64_t ic_step = 0;
-        for (int64_t ic = 0; ic < nek1; ++ic) {
-            const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
+        // flagos (test-only, plan.md M2e.3 round 1): one_chunk_burst and one_chunk_compute stage in their own way
+        // (staged_once: compute stages the first chunk only); the default stages one position at a time, as copied.
+        // Every way fills each chunk with the same positions, so the arithmetic sees the same chunks
+        bool staged_once = false;
+        for (int64_t ic = 0; ic < nek1;) {
+            int64_t next = ic + 1;
+            if (test & (one_chunk_burst | one_chunk_compute)) {
+                // the visible positions from ic on, at most 8 and no more than the chunk has room for
+                const char * k_rows[8];
+                const char * v_rows[8];
+                int          n = 0;
+                for (next = ic; next < nek1 && n < 8 && ic_step + n < ic_tile_step; ++next) {
+                    const float mv = mp ? slope * ((_Float16 *) mp)[next] : 0.0f;
+                    if (mv != -INFINITY) {
+                        k_rows[n]                 = k_data_row + next * nbk1;
+                        v_rows[n]                 = v_data_row + next * nbv1;
+                        mv_tile_pack[ic_step + n] = mv;
+                        n++;
+                    }
+                }
+                if (!((test & one_chunk_compute) && staged_once)) {
+                    if ((test & one_chunk_burst) && n == 8) {
+                        rvv_stage_rows_x8(k_tile_pack, v_tile_pack, ic_step, k_tile_byte_stride, k_rows, v_rows, DK,
+                                          DV);
+                    } else {
+                        for (int j = 0; j < n; ++j) {
+                            const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2((const _Float16 *) k_rows[j], DK);
+                            const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2((const _Float16 *) v_rows[j], DV);
+                            __riscv_vsse16_v_f16m2(k_tile_pack + ic_step + j, k_tile_byte_stride, k_data_v, DK);
+                            __riscv_vse16_v_f16m2(v_tile_pack + (ic_step + j) * DV, v_data_v, DV);
+                        }
+                    }
+                }
+                ic_step += n;
+                if (ic_step > 0 && (ic_step == ic_tile_step || next == nek1)) {
+                    staged_once = true;
+                }
+            } else {
+                const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
 
-            if (mv != -INFINITY) {
-                const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
-                const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
+                if (mv != -INFINITY) {
+                    const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
+                    const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
 
-                const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data, DK);
-                const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data, DV);
-                __riscv_vsse16_v_f16m2(k_tile_pack + ic_step, k_tile_byte_stride, k_data_v, DK);
-                __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV, v_data_v, DV);
-                mv_tile_pack[ic_step] = mv;
-                ic_step++;
+                    const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data, DK);
+                    const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data, DV);
+                    __riscv_vsse16_v_f16m2(k_tile_pack + ic_step, k_tile_byte_stride, k_data_v, DK);
+                    __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV, v_data_v, DV);
+                    mv_tile_pack[ic_step] = mv;
+                    ic_step++;
+                }
             }
 
-            if (ic_step > 0 && (ic_step == ic_tile_step || ic == (nek1 - 1))) {
+            const bool chunk_ready = ic_step > 0 && (ic_step == ic_tile_step || next == nek1);
+            if (chunk_ready && (test & one_chunk_stream)) {
+                ic_step = 0;  // flagos (test-only): stream skips the arithmetic
+            } else if (chunk_ready) {
                 if constexpr (QLEN == 4) {
                     const size_t qk_vl   = __riscv_vsetvl_e16m1(ic_step);
                     vfloat32m2_t qk_acc0 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
@@ -780,6 +879,7 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
 
                 ic_step = 0;
             }
+            ic = next;
         }
     } else {
         for (int64_t ic = 0; ic < nek1; ++ic) {
@@ -985,7 +1085,12 @@ size_t tiled_scratch_bytes(int64_t DK, int64_t DV) {
 }
 
 // flagos: the interface of flagos-spacemit-rvv-attn.h; no ggml_compute_params (its ith was unused here)
-void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * tcm_buffer, size_t tcm_buffer_size) {
+void forward_one_chunk(const ggml_tensor * dst,
+                       int64_t             ir0,
+                       int64_t             ir1,
+                       void *              tcm_buffer,
+                       size_t              tcm_buffer_size,
+                       unsigned            test) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1134,7 +1239,7 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
                 mp,                                                    //
                 sinks_buffer.data(),                                   //
                 dst_buffer.data(),                                     //
-                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size);
+                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size, test);
         } else if (group_rows && tcm_buffer != nullptr && 2 * KV_row_size < tcm_buffer_size && ir < (ir1 - 1) &&
                    mp_equal_2 && ik3_1 == ik3 && ik2_1 == ik2 && iv3_1 == iv3 && iv2_1 == iv2) {
             ir_step = 2;
@@ -1155,7 +1260,7 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
                 mp,                                                    //
                 sinks_buffer.data(),                                   //
                 dst_buffer.data(),                                     //
-                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size);
+                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size, test);
         } else {
             ir_step = 1;
             flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(                             //

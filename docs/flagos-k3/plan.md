@@ -803,7 +803,7 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 
 ### M2e.3 design: attention during generation at streaming speed
 
-**Status:** designed 2026-10-13, nothing implemented. Built on M2e's final state (`build.md` §7) and on what L1-L4 measured. The candidates are kernel changes inside the provider: the same op, inputs, outputs and math. None changes llama.cpp, the model or the KV cache. Inference-level options (a quantized KV cache, another cache layout, speculative decoding) are out of scope; (c), the cache on huge pages, is set aside (above).
+**Status:** designed 2026-10-13. Round 1 implemented 2026-10-14, to run on the K3: the switch, the four settings, an identity check and the benchmark rows (below). Built on M2e's final state (`build.md` §7) and on what L1-L4 measured. The candidates are kernel changes inside the provider: the same op, inputs, outputs and math. None changes llama.cpp, the model or the KV cache. Inference-level options (a quantized KV cache, another cache layout, speculative decoding) are out of scope; (c), the cache on huge pages, is set aside (above).
 
 **Where the time goes now (Qwen3-4B, depth 4096):**
 - A token takes 154 ms: attention 65.6 ms (36 calls of 1822 us at n_kv 4096), the 1-row matmuls about 88 ms. Attention is 43% of a token, and its share grows with context; at depth 1024 it is about 17%.
@@ -822,6 +822,13 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 - `cached`, candidate (e): q and the chunk's scores/probabilities in a stack array (2 KiB, L1-cached) instead of TCM, so the inner loops' scalar operands come from ordinary memory. The values and the order of operations are unchanged, so the outputs must be bit-identical.
 - `burst`, candidate (b): stage a chunk's K and V rows with several rows' loads in flight (load 8 rows into separate vector registers, then store them), instead of one row at a time between stores. Bit-identical too.
 - With `stream` and `compute` against the default, the round says whether the kernel is bound by staging, by arithmetic, or by both in turn: `stream` + `compute` close to the total means they never overlap.
+- Implementation (2026-10-14):
+  - `FLAGOS_SPACEMIT_ATTN` is read in `spacemit_kernel_flash_attn` at every call and passed as bits (`spacemit_rvv_attn::one_chunk_test`) through `forward_one_chunk` to the grouped kernel; the tiled and the 1-row kernels ignore it.
+  - In the grouped kernel the default stages one position at a time as before. `burst` and `compute` collect the same visible positions per chunk, at most 8 at a time and never past the chunk's room, so every chunk holds what it holds by default.
+  - `burst` stages 8 rows with `rvv_stage_rows_x8`: 8 K loads, their 8 stores, then the same for V. `compute` stages the first chunk only. `stream` skips the arithmetic, leaving the output at zero.
+  - `cached` points q and the scores at 2 KiB on the stack, the TCM layout unchanged.
+  - `flagos-check-spacemit` compares `cached`, `burst` and `cached,burst` byte for byte with the default on the four one-token cases (gating on the K3).
+  - `--bench-attn` (and `--bench`) times `stream`, `stream,burst`, `compute`, `cached`, `burst` and `cached,burst` at one token, n_kv 256, 1024, 4096 and the new 8192, every setting and the default taking turns twice, the faster turn of each.
 
 **Predictions (estimates):**
 - `stream` close to the total on the real layout (strided loads dominate); `compute` well under half of it.

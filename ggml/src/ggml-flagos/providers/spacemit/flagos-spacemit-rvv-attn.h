@@ -18,11 +18,27 @@ namespace spacemit_rvv_attn {
 // the head sizes the kernels handle: DK and DV in 1..128 (one register group at VLEN 1024)
 bool supported_shape(int64_t DK, int64_t DV);
 
+// test-only settings of the grouped one-chunk kernels (plan.md M2e.3, round 1: FLAGOS_SPACEMIT_ATTN), combinable.
+// stream and compute give wrong outputs: they time the staging of K and V alone and the arithmetic alone (compute
+// stages the first chunk and lets every later one reuse it). cached and burst keep the outputs bit for bit: q and the
+// chunk's scores in cached memory instead of TCM, 8 positions' rows loaded before any is stored
+enum one_chunk_test : unsigned {
+    one_chunk_stream  = 1u << 0,
+    one_chunk_compute = 1u << 1,
+    one_chunk_cached  = 1u << 2,
+    one_chunk_burst   = 1u << 3,
+};
+
 // rows [ir0, ir1) of dst = FLASH_ATTN_EXT(q, k, v, mask, sinks), a row being one query (token i1, head i2, stream i3)
 // in ggml-cpu's order, ir = (i3 * ne_q2 + i2) * ne_q1 + i1. With tcm (not null), and without ALiBi, rows that share
 // K, V and the mask row (with one token per call, the query heads of one KV head) go 4 or 2 at a time through it,
-// else one at a time
-void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void * tcm, size_t tcm_size);
+// else one at a time; test (one_chunk_test bits) acts on those grouped kernels only
+void forward_one_chunk(const ggml_tensor * dst,
+                       int64_t             ir0,
+                       int64_t             ir1,
+                       void *              tcm,
+                       size_t              tcm_size,
+                       unsigned            test = 0);
 
 // the same rows in tiles of up to 64 rows of one head (calls of 64 tokens or more), in scratch: float-aligned, at least
 // tiled_scratch_bytes(DK, DV) bytes (160 KiB at DK = DV = 128), e.g. the tile's TCM. Each row stops at its last
