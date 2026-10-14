@@ -576,7 +576,13 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
   - mean KLD 0.014712 ± 0.000669 (512-token batches) and 0.012409 ± 0.000565 (`-ub 1`), the first for 0.6B, 4-6x 4B's, with the same order (batches above `-ub 1`) as on 4B;
   - greedy text off the CPU's after 88 characters (4B: 143), coherent.
 
-  Where the error comes from is not measured. The IME path's own perplexity and KLD on 0.6B would tell whether it is the int8 activations both share.
+  The upstream IME path has the same error (measured the same day, `build-ime` with `-fa on` over the same 8 x 512 tokens against a fresh CPU base):
+  - its mean KLD is 0.014046 ± 0.000592, against the provider's 0.014712 ± 0.000669: the same within one standard error;
+  - its perplexity ratio (llama-perplexity's KLD mode) is 1.016377 ± 0.007407.
+
+  So 0.6B's larger gap belongs to the IME approach (int8 activations, shared by both), not to what the provider adds (requantized head, Q4_1 conversion, attention on the AI cores).
+- With 8 chunks the perplexity ratio on 0.6B carries ±0.74% at one standard error. The runner's 1% bound cannot tell +0.89% from +1.64%, and by the ratio the IME path itself would miss it. On 0.6B, KLD is the measure to judge accuracy by.
+- The CPU run behind that base gave PPL 14.3706, where the runner's identical CPU run gave 14.3795: CPU runs are not bit-reproducible here (0.06%; cause not checked), far below the noise that matters above.
 - Placement as on 4B: C5a, 2 graph splits per token; model 394.71 MiB, compute 298.75 MiB.
 
 Manual checks:
