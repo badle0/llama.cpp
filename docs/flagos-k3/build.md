@@ -126,12 +126,16 @@ B=build-flagos/bin; M=~/models/Qwen3-4B-Q4_0.gguf; KB=~/kld/qwen3-4b-cpu.bin; mk
 [ -f "$KB" ] || FLAGOS_SPACEMIT_DISABLE=1 $B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on \
   --kl-divergence-base "$KB" > ~/kld/base.log 2>&1
 ~/tcmtest/tcmrelease --apply
+# llama-perplexity runs n_batch / n_ctx = 4 sequences at once, each in its own cache stream: a 512-token ubatch holds
+# 128 tokens of each
 $B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on --kl-divergence-base "$KB" --kl-divergence \
   > ~/kld/m2c.log 2>&1; grep -E 'Mean +KLD|99.0% +KLD|Maximum KLD|Same top p' ~/kld/m2c.log
-# the same through the generation path: 1-token ubatches use the 1-row kernels and the GEMV path (about 10 minutes)
+# the same through the generation path (about 10 minutes): -b 512 runs one sequence, so every ubatch is one token (the
+# 1-row matmuls; from n_kv 512 the split over the tiles). With the default batch, -ub 1 puts a token of each of 2
+# sequences into every ubatch (2 streams), as in every -ub 1 run before 2026-10-14 (§7, "M2e.3 round 2")
 ~/tcmtest/tcmrelease --apply
-$B/llama-perplexity -m $M -f ~/ppl.txt -c 512 --chunks 8 -t 8 -fa on -ub 1 --kl-divergence-base "$KB" --kl-divergence \
-  > ~/kld/m2c-ub1.log 2>&1; grep -E 'Mean +KLD|99.0% +KLD|Maximum KLD|Same top p' ~/kld/m2c-ub1.log
+$B/llama-perplexity -m $M -f ~/ppl.txt -c 512 -b 512 --chunks 8 -t 8 -fa on -ub 1 --kl-divergence-base "$KB" \
+  --kl-divergence > ~/kld/m2c-ub1.log 2>&1; grep -E 'Mean +KLD|99.0% +KLD|Maximum KLD|Same top p' ~/kld/m2c-ub1.log
 ```
 
 Mac: same CMake options plus `-DGGML_METAL=OFF -DGGML_BLAS=OFF`; the provider compiles but finds no device (`flagos-check-spacemit` reports "device checks skipped").
@@ -609,6 +613,39 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - The model's differences are smaller than the benchmark's at long context: for effects of a few percent there, the model is the better judge.
 - Decision (by the rule fixed before measuring): nothing adopted. None reaches 5% less time at n_kv 4096, and the model moves by at most 1.4%. The settings and their switch were removed the same day; the benchmark keeps the one-token shape at n_kv 8192.
 
+**M2e.3 round 2: one-token attention split over the tiles, adopted, 2026-10-14** (`plan.md` "M2e.3 design"; measured at commit `e06cf90`, where the split sat behind `FLAGOS_SPACEMIT_ATTN=split[,paired]` and the default was the one-chunk kernels; `flagos-check-spacemit --expect-device --bench-attn`, both settings and the default taking turns twice, the faster turn of each; us per one-token call, Qwen3-4B's heads; in brackets against the one-chunk kernels):
+
+| n_kv | one-chunk kernels | `split` | `split,paired` |
+|---|---|---|---|
+| 256 (below the split's 512: the one-chunk kernels in all three) | 134 | 134 | 135 |
+| 1024 | 479 (8.8 GB/s) | 374 (-22.0%) | 385 (-19.6%) |
+| 4096 | 1743 (9.6 GB/s) | 1303 (-25.2%, 12.9 GB/s) | 1132 (-35.1%, 14.8 GB/s) |
+| 8192 | 3108 (10.8 GB/s) | 2366 (-23.9%) | 2116 (-31.9%, 15.9 GB/s) |
+
+| tg32, llama-bench (Qwen3-4B Q4_0, `-fa 1 -mmp 0`, two rounds taking turns) | depth 1024 | depth 4096 | ms per token at depth 4096 |
+|---|---|---|---|
+| one-chunk kernels | 9.57, 9.59 | 6.53, 6.50 | 153.5 |
+| `split` | 9.66, 9.58 (+0.4%) | 7.52, 7.51 (+15.3%) | 133.1 |
+| `split,paired` | 9.89, 9.86 (+3.1%) | 7.86, 7.79 (+20.1%) | 127.8 |
+
+| Mean KLD against the CPU at `-ub 1 -b 512` (one sequence, one token per ubatch) | one-chunk kernels | `split,paired` |
+|---|---|---|
+| Qwen3-4B, 8 chunks | 0.002050 ± 0.000155 (PPL ratio 1.006083) | 0.002001 ± 0.000138 (1.006909) |
+| Qwen3-0.6B, 32 chunks | 0.014032 ± 0.000381 (1.016157) | 0.013979 ± 0.000341 (1.016668) |
+
+- Correct: the check's one-token cases (8 per setting) within the bounds, max NMSE 2.3e-5, and all 16 outputs differ from the one-chunk kernels' (the split ran); test-backend-ops passes every case with each setting.
+- Speed: both settings pass the rule (at least 20% less at n_kv 4096, no shape slower), though below the predictions (-30 to -40% and -50 to -60%). At n_kv 4096 K and V are read at 12.9 and 14.8 GB/s, against 28 for the 1-row matmuls: either the new arithmetic (a K transpose per KV head, V summed in F32) costs more than round 1's `compute` measured, or 8 tiles copying at once do not reach 28 GB/s. Not separated.
+- In the model the gains are larger than the benchmark suggested at depth 4096 (estimated +12% and +18%). At depth 1024 `split` gains almost nothing, where the benchmark gave -22% at n_kv 1024. Likely cause, not measured: there the cache holds 1280 positions in 20 blocks, 17 of them with visible positions, so dealt round-robin tile 0 takes 3 blocks and every other tile 2. The turns recover part of it (+3.1%).
+- Accuracy: with the split the KLD is slightly lower on both models (V summed in F32) and the PPL ratio slightly higher, both well within one standard error.
+- The first KLD runs of round 2, with llama-perplexity's default batch, gave the one-chunk kernels' numbers to the last digit with both settings: the split had not run.
+  - llama-perplexity runs n_batch / n_ctx = 4 sequences at once, each in its own cache stream (`kv_unified` off). For several streams, llama.cpp builds ubatches with `split_equal` (`src/llama-batch.cpp:547`), which at `-ub 1` puts a token of each of 2 sequences into every ubatch. The split takes one stream only, so it did not run.
+  - Checked on the Mac with a CPU build and `LLAMA_BATCH_DEBUG=1`: for 2048 tokens at `-ub 1`, 1024 ubatches of 2 tokens in 2 streams. With `-b 512` (one sequence) or `-kvu` (one stream) every ubatch is one token. At the default `-ub 512` a ubatch holds 128 tokens of each of the 4 sequences.
+  - So every earlier `-ub 1` run (M2c.1, M2c.2, M2e.1, the runner's) gave the matmuls 2 rows (path C), not the 1-row path that generation uses. Attention was one token per stream there, the one-chunk kernels as recorded.
+  - On Qwen3-4B one-token ubatches give the one-chunk kernels' KLD and PPL ratio of the 2-token runs to the last digit (0.002050, 1.006083): the 1-row matmuls produce the same logits, so the recorded `-ub 1` values stand for generation's path. On 0.6B the CPU base moved with the batch (PPL 16.9033 with 4 sequences, 16.9058 with one), so those two runs cannot be compared.
+  - The runner's and the recipe's `-ub 1` runs take `-b 512` since. The rule's reference for 4B, M2e's 0.002050, is the same value measured with one-token ubatches in the same run.
+- Decision (by the rule fixed before measuring, `plan.md`): adopted. `split,paired` is 4.1% ahead of `split` at depth 4096, more than the rule's 2% margin, so the split with the turns is the default for the calls it takes: one token and one stream from n_kv 512, llama.cpp's cache layout, no ALiBi or softcap. `FLAGOS_SPACEMIT_ATTN=split` (without the turns, the same outputs) and `one-chunk` (the kernels before) stay for comparisons, and the benchmark adds a one-token shape at n_kv 512, where the split starts.
+- Not covered: several sequences generating at once (several streams, or several tokens per call) keep the one-chunk kernels, as ggml-cpu keeps its own split of the positions to one stream (`ggml-cpu/ops.cpp:9115`).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
@@ -622,7 +659,7 @@ Experiment switches of the provider (environment variables; test-only unless not
 | `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
 | `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
 | `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |
-| `FLAGOS_SPACEMIT_ATTN=split[,paired]` | one-token attention from n_kv 512 (llama.cpp's cache layout, no ALiBi or softcap), read whenever an op is looked up | M2e.3 round 2 (`plan.md`): the KV positions split over the tiles and the partial results merged in a second step; `paired`: the two tiles of a pair take turns between staging and arithmetic. Outputs change in rounding (V summed in F32) |
+| `FLAGOS_SPACEMIT_ATTN=split` or `one-chunk` | one-token attention from n_kv 512 (one stream, llama.cpp's cache layout, no ALiBi or softcap), read whenever an op is looked up | the default since 2026-10-14 (M2e.3 round 2, `plan.md`): the KV positions split over the tiles, the two tiles of a pair taking turns between staging and arithmetic, and the partial results merged in a second step (`paired` names it); `split`: the same without the turns (identical outputs); `one-chunk`: the one-chunk kernels as before round 2 (V summed in F16, so the outputs differ in rounding) |
 | `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
 | `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
 | `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and path A run; `flagos-check-spacemit` sets 393216 for its 1-row checks |
