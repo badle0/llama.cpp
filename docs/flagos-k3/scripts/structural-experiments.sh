@@ -33,7 +33,7 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=${REPO:-$(git -C "$HERE" rev-parse --show-toplevel)}
+REPO=${REPO:-$(cd "$HERE/../../.." && pwd)}
 BUILD_A=${BUILD_A:-$REPO/build-flagos}
 WT_B=${WT_B:-$REPO-no-c5}
 BUILD_B=${BUILD_B:-$WT_B/build-flagos}
@@ -85,6 +85,9 @@ mode_fa_bench() { case $1 in e1-on) echo on ;; *) echo auto ;; esac; }
 mode_fa() { case $1 in e1-on) echo "-fa on" ;; *) echo "" ;; esac; }
 
 has() { case " $EXPS " in *" $1 "*) return 0 ;; esac; return 1; }
+# the board's checkout belongs to another uid (copied from the Mac), so git refuses it ("dubious ownership"); as with
+# `git -c safe.directory=$PWD pull` there, every call allows the two checkouts for itself and changes no git settings
+g() { git -c safe.directory="$REPO" -c safe.directory="$WT_B" "$@"; }
 release() { if [ -x "$TCM_RELEASE" ]; then "$TCM_RELEASE" --apply > /dev/null 2>&1; fi; return 0; }
 
 # run <mode> <log> <tool> [args...]: the tool of the mode's build with the mode's environment, after a TCM release;
@@ -121,28 +124,28 @@ bench() {
 
 prepare() {
     local head c
-    head=$(git -C "$REPO" rev-parse HEAD) || exit 1
+    head=$(g -C "$REPO" rev-parse HEAD) || exit 1
     echo "== build B: $WT_B at $head, src/llama-context.cpp without C5a and C5b"
     if [ -n "$DRY" ]; then
         echo "   git worktree add/checkout $WT_B $head; reverse-apply $C5_COMMITS; cmake -S $WT_B -B $BUILD_B ..."
         return 0
     fi
     if [ -d "$WT_B" ]; then
-        git -C "$WT_B" checkout -q -f --detach "$head" || exit 1
+        g -C "$WT_B" checkout -q -f --detach "$head" || exit 1
     else
-        git -C "$REPO" worktree add -q --detach "$WT_B" "$head" || exit 1
+        g -C "$REPO" worktree add -q --detach "$WT_B" "$head" || exit 1
     fi
     for c in $C5_COMMITS; do
-        git -C "$WT_B" diff "$c^" "$c" -- src/llama-context.cpp | git -C "$WT_B" apply -R || {
+        g -C "$WT_B" diff "$c^" "$c" -- src/llama-context.cpp | g -C "$WT_B" apply -R || {
             echo "reverse-applying $c failed"
             exit 1
         }
     done
-    if git -C "$WT_B" diff --quiet "$UPSTREAM_BASE" -- src; then
+    if g -C "$WT_B" diff --quiet "$UPSTREAM_BASE" -- src; then
         echo "   src/ is upstream's ($UPSTREAM_BASE)"
     else
         echo "   WARNING: src/ differs from upstream $UPSTREAM_BASE beyond C5a and C5b:"
-        git -C "$WT_B" diff --stat "$UPSTREAM_BASE" -- src
+        g -C "$WT_B" diff --stat "$UPSTREAM_BASE" -- src
     fi
     mkdir -p "$BUILD_B"
     cmake -S "$WT_B" -B "$BUILD_B" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF \
@@ -283,8 +286,8 @@ run_all() {
         {
             echo "date: $(date -u +%Y-%m-%dT%H:%MZ)"
             echo "model: $M; EXPS: $EXPS; REPS: $REPS; DEPTH: $DEPTH; PPL_TEXT: $PPL_TEXT; CHUNKS: $CHUNKS"
-            echo "A: $BUILD_A at $(git -C "$REPO" rev-parse --short HEAD)"
-            echo "B: $BUILD_B at $(git -C "$WT_B" rev-parse --short HEAD), changed: $(git -C "$WT_B" diff --stat | tail -1)"
+            echo "A: $BUILD_A at $(g -C "$REPO" rev-parse --short HEAD)"
+            echo "B: $BUILD_B at $(g -C "$WT_B" rev-parse --short HEAD), changed: $(g -C "$WT_B" diff --stat | tail -1)"
         } > "$OUT/info.txt"
     fi
 

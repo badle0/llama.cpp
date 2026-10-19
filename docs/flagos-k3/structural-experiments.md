@@ -235,12 +235,15 @@ with the modes interleaved in each repetition: the board drifts between sessions
 ### How to run E1, E2, E2-hp, E2-neg and E3 (on the K3, inside tmux)
 
 ```bash
-git pull                                                           # the switches, checks and script
+git -c safe.directory=$PWD pull                                    # the switches, checks and script
 docs/flagos-k3/scripts/structural-experiments.sh prepare           # build B, then build A's tools and checks
 docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf 2>&1 | tee ~/sx-run.log
 docs/flagos-k3/scripts/structural-experiments.sh summary ~/sx/Qwen3-4B-Q4_0     # the tables again
 ```
 
+- The board's checkout belongs to uid 501 (copied from the Mac; its `.git` belongs to root), so git refuses it
+  ("dubious ownership") unless a command allows it, as `git -c safe.directory=$PWD` does; the script passes the same
+  exception on every git call and changes no git settings.
 - `prepare` makes build B: a worktree of the repository's HEAD at `../llama.cpp-flagos-no-c5` whose
   `src/llama-context.cpp` has C5a and C5b reverse-applied (it then equals upstream's; the script checks that `src/`
   matches `ba360ef`), configured as `build-flagos/` is and built with `llama-completion`, `llama-bench` and
@@ -263,7 +266,7 @@ docs/flagos-k3/scripts/structural-experiments.sh summary ~/sx/Qwen3-4B-Q4_0     
 ### E4 (manual; not yet tried)
 
 ```bash
-git -C ~/llama.cpp-flagos worktree add --detach ~/llama.cpp-stock ba360ef        # upstream's tree, no FlagOS lines
+git -c safe.directory=$HOME/llama.cpp-flagos -C ~/llama.cpp-flagos worktree add --detach ~/llama.cpp-stock ba360ef  # upstream's tree
 cmake -S ~/llama.cpp-stock -B ~/llama.cpp-stock/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_BACKEND_DL=ON \
   -DBUILD_SHARED_LIBS=ON && cmake --build ~/llama.cpp-stock/build --target llama-bench llama-completion
 cmake -S . -B build-flagos-dl -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON \
@@ -308,7 +311,9 @@ on threads (`FLAGOS_SPACEMIT_TEST_THREADS=1`); the layer with the KV cache in ou
 in a CPU buffer (5.40e-04); per step identical in 4/4 layer cases and 8/8 split cases; `test-backend-ops` with one launch
 per step: `MUL_MAT` 3/3, `FLASH_ATTN_EXT` 1324/1324, `ROPE_SET_ROWS` 24/24, `RMS_NORM_MUL_ADD` 30/30;
 `llama-completion --list-devices` lists the device with the IGPU warning. The script: `bash -n`, a dry run of every
-command, and its summary on sample logs (bash 3.2). Not yet on the K3.
+command, and its summary on sample logs (bash 3.2); `prepare`'s git steps (worktree, C5a and C5b reverse-applied,
+`src/` equal to `ba360ef`, and a second run on the existing worktree) under `GIT_TEST_ASSUME_DIFFERENT_OWNER=1`, git's
+own simulation of the board's ownership check, with `cmake` stubbed. Not yet on the K3.
 
 ## 6. Results
 
@@ -318,3 +323,5 @@ To be filled from the board run (`summary` output), with the date and commit.
 
 - 2026-10-19: requirements, questions and findings collected from the deck, the AMD comparison, upstream `master`, the
   Ascend backend and the board's memory map; E1-E3 switches, checks and runner written and verified on the Mac.
+- 2026-10-19: the first `git pull` on the board stopped at git's dubious-ownership check, which the board has had since
+  2026-10-08 (handled with `git -c safe.directory=$PWD`); the runner now passes the same exception to every git call.
