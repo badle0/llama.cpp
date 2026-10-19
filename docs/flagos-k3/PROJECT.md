@@ -9,6 +9,7 @@ Loaded at every Claude Code session. Details live in sibling files; read them wh
 - `docs/flagos-k3/device-type.md` — GPU vs IGPU vs ACCEL: what the type controls in llama.cpp, what "right behavior" means (R1–R6), predictions and experiments X0–X6
 - `docs/flagos-k3/code-tour.md` — reading guide to the provider's code, stop by stop, each compared with the AMD provider, with links to the lines
 - `docs/flagos-k3/upstream-changes.md` — every change this fork makes to upstream llama.cpp/ggml or to the mentor's FlagOS code, with commit, lines, reason and status
+- `docs/flagos-k3/structural-experiments.md` — the mentor's structural requirements (FlagOS plugin ABI, kernel package, minimal upstream change), questions Q1–Q10, findings F1–F13 (ACCEL/IGPU/GPU upstream, Ascend, the K3's memory map), and experiments E1–E6 with their switches (`FLAGOS_SPACEMIT_TEST_DEVICE_TYPE`, `FLAGOS_SPACEMIT_TEST_LAUNCH`) and runner `scripts/structural-experiments.sh`
 
 ## 1. Task
 
