@@ -21,6 +21,7 @@ provider, checks in `flagos-check-spacemit`, and `scripts/structural-experiments
 | R9 | Settled earlier: device type ACCEL (D3, mentor, 2026-10-08); C5a and C5b approved for the fork (2026-10-14); the copied kernels may be changed (2026-10-08); the mentor's design §14.1: in-tree code is "reference, not boundary" | `PROJECT.md` §2, §7 |
 | R10 | The AMD provider is a reference, not a template: it is still being developed | user, 2026-10-19 |
 | R11 | Design review of ggml-flagos focused on kernel fusion and on the shim between Common and the providers | `PROJECT.md` §1, `upstream-review.md` |
+| R12 | The measure of the framework's cost: "框架开销约 1%" (about 1%), defined as the time per token the device waits idle. AMD 890M, Qwen3.5-4B Q4_K_M generation: ggml-flagos 45.3 ms per token (kernels 44.7 ms, framework idle 0.6 ms, 1.2%) against the native HIP backend's 41.2 ms; the GEMVs (82% of generation) at about 1.0x native; the remaining gap is kernels (GDN 1.7x slower, SSM_CONV 1.18x), with 98-99% of native expected once they are fixed (90-92% today) | deck, page 9 (its text, extracted 2026-10-19) |
 
 ## 2. Questions for the mentor
 
@@ -29,13 +30,17 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
 
 **Q1. Does a K3 plugin need Tier-2 graph capture?**
 - Problem: today a split's steps run in one spine-runtime launch, a barrier between steps; a token takes 2 splits and
-  about 1,060 steps (1 ms of barriers at 0.94 µs each, `build.md` §7). A plugin with Tier-1 alone gets one `launch` per
-  kernel: launch 11.2-11.5 µs against a barrier's 0.89-0.94 µs, about 12 ms of a token's 88.5 ms (tg128 about -12%;
-  estimate).
+  about 1,060 steps (1 ms of barriers at 0.94 µs each, `build.md` §7), about 1.1% of a token's 88.5 ms: near the deck's
+  1.2% for AMD (R12). A plugin with Tier-1 alone gets one `launch` per kernel on a stream the ABI treats as ordered. On
+  spine-runtime nothing orders launches (F14): the plugin must order them itself, by waiting for each launch on the host
+  (11.2-11.5 µs per launch against a barrier's 0.89-0.94 µs: about 12 ms per token, tg128 about -12%; estimate) or,
+  if the board's spine-runtime has it, by making each launch's tiles wait inside the cores for the previous launch
+  (`Context::join`; cost unknown).
 - Options: (a) the K3 plugin implements Tier-2 capture: record the launches, replay them as one spine-runtime launch with
   a barrier between kernels, which is today's executor; (b) a "launch list" call added to Tier-1; (c) accept the cost.
-- Recommendation: (a). AMD's provider already depends on replay (hipGraph).
-- Answered by: E3.
+- Recommendation: (a), unless E3b shows ordered launches cost about as little as the barriers. AMD's provider already
+  depends on replay (hipGraph).
+- Answered by: E3a, E3b (E3c splits today's overhead the deck's way).
 
 **Q2. How does a plugin keep weights in a vendor layout?** (`PROJECT.md` question 2, D4)
 - Problem: the IME kernels need weights repacked (Q4_0 interleaved 32 rows x 256; Q4_1 with an integer zero point,
@@ -214,18 +219,31 @@ core already builds as a loadable backend (`ggml_add_backend_library`; `GGML_BAC
 and stock ggml loads one from `GGML_BACKEND_PATH` (`ggml-backend-reg.cpp:597`), so the ggml-side lines may not be needed
 (E4). The provider has no link dependency on the CPU backend (its mentions of `ggml-cpu` are comments).
 
+**F14. spine-runtime does not order launches** (its documentation on GitHub, `spacemit-com/spine-runtime` `main`,
+read 2026-10-19; the board's 0.6.x header not yet checked). `Stream::launch` "launches a Tile-SPMD task and returns a
+`Future`"; `Future::sync` waits for it, `Future::sync_all` for a group; Futures are copyable shared handles. No ordering
+between launches on one stream is stated: "Kernels with read/write dependencies should establish an explicit execution
+order through `Future::sync()`, `Future::sync_all()`, or in-tile cooperation primitives"; "independent tasks can be
+submitted consecutively and then waited on together". Each core has one resident worker, and a tile waiting at a barrier,
+event, `join` or shared-buffer allocation is suspended so the worker can run other ready tiles, so tiles of queued
+launches may interleave. The API reference lists `Context::join`, "cooperatively waits for a Future from the same Stream".
+The ABI slide's Tier-1 assumes an ordered stream ("在 stream 上排序" for copies, `stream_synchronize`); on spine-runtime the
+plugin must provide that order. Today's executor needs none of it: one launch per split, barriers inside (`Context::sync`).
+
 ## 4. Experiments
 
 All on Qwen3-4B Q4_0 unless named, in one session, every mode against the reference (today's build, default flags)
 with the modes interleaved in each repetition: the board drifts between sessions.
 
-| ID | Answers | What changes | Prediction | Decision rule (proposed; confirm before the run) | Status |
+| ID | Answers | What changes | Prediction | Decision rule | Status |
 |---|---|---|---|---|---|
-| E2 | Q5 | Build B (upstream's `llama-context.cpp`), `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu` and `gpu`, `-ngl 99`; once with the default `-ngl` (placement only) | 2 splits per token; flash attention enabled under `-fa auto`; logits identical to the reference (KLD 0, same top p 100%; the same kernels run the same nodes); speed within 1-2%; GPU = IGPU; the default `-ngl` offloads every layer | "IGPU is viable with no llama.cpp change" if logits are identical at both batch settings, a token takes 2 splits, and pp128, tg128, tg32 at depths 0/1024/4096 and pp512 at depth 4096 are within 2% of the reference | ready |
+| E2 | Q5 | Build B (upstream's `llama-context.cpp`), `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu` and `gpu`, `-ngl 99`; once with the default `-ngl` (placement only) | 2 splits per token; flash attention enabled under `-fa auto`; logits identical to the reference (KLD 0, same top p 100%; the same kernels run the same nodes); speed within 1-2%; GPU = IGPU; the default `-ngl` offloads every layer | agreed (user, 2026-10-19): "IGPU is viable with no llama.cpp change" if logits are identical at both batch settings, a token takes 2 splits, and pp128, tg128, tg32 at depths 0/1024/4096 and pp512 at depth 4096 are within 2% of the reference | ready |
 | E2-hp | Q5 | E2's IGPU and the reference, each with and without `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`, depth runs | unknown; the 128 KiB block spacing suggests no 2.2x slowdown | KV cache on huge pages "hurts" if IGPU's tg32 at depth 4096 loses at least 2% more from huge pages than the reference does, "helps" if it gains at least 2% more | ready |
 | E2-neg | F8 | Build B as IGPU, and the reference: a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0 -fa on -c 512`), and a context shift (`-c 256 -n 400 --ignore-eos --context-shift`) | IGPU aborts in both ("pre-allocated tensor ... cannot run the operation": `SET_ROWS`, then `ROPE`); the reference runs both (the shift logs "context full, swapping") | confirms or refutes F8's two gaps | ready |
 | E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | ready |
-| E3 | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step instead of per split | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical | graph capture "needed" for the K3 if tg128 loses 5% or more; "not needed" at 2% or less; in between, report | ready |
+| E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | open (user, 2026-10-19: more investigation against the deck first). Proposed, anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b if possible, else E3a) keeps the framework's cost within about 2% of a token (tg128 within about 1% of the reference, which already carries about 1.1%); Tier-2 capture is needed if it costs 5% or more; in between, report | ready (runs in the full run) |
+| E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): Tier-1 on an ordered stream, as the ABI assumes | unknown: between the reference and E3a | as E3a | needs the board's `spert.hpp` (`join`, `sync_all`, Future copies); not implemented |
+| E3c | Q1, R12 | Test-only counters: per token, the time inside launches, the kernels' own time (tile 0) and the steps; the rest of a token is the AI cores waiting on llama.cpp, the CPU's split and sampling | today's cost the deck's way (device idle per token), split into inside and outside launches, for comparison with AMD's 0.6 ms of 45 ms | none: a measurement | proposed, not implemented |
 | E4 | Q5, F13 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | "no ggml lines needed" if it loads and matches E2 | manual (below) |
 | E6 | Q2 | GGUF's bytes in the buffer ggml sees plus a private repacked copy | about +2.35 GB, the same speed, exact read-back | evidence for option (e) | not implemented |
 | E5 | Q2 | the 1-row path reads GGUF's layout, interleaving 32 rows while copying into TCM | unknown; generation only | how much repacking buys | not implemented |
@@ -237,7 +255,8 @@ with the modes interleaved in each repetition: the board drifts between sessions
 ```bash
 git -c safe.directory=$PWD pull                                    # the switches, checks and script
 docs/flagos-k3/scripts/structural-experiments.sh prepare           # build B, then build A's tools and checks
-docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf 2>&1 | tee ~/sx-run.log
+# E2 first (its rule is agreed); E3a later with E3b, in one session, once E3's rule is settled
+EXPS="e2 e1 e2hp e2neg" docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf 2>&1 | tee ~/sx-run.log
 docs/flagos-k3/scripts/structural-experiments.sh summary ~/sx/Qwen3-4B-Q4_0     # the tables again
 ```
 
@@ -325,3 +344,12 @@ To be filled from the board run (`summary` output), with the date and commit.
   Ascend backend and the board's memory map; E1-E3 switches, checks and runner written and verified on the Mac.
 - 2026-10-19: the first `git pull` on the board stopped at git's dubious-ownership check, which the board has had since
   2026-10-08 (handled with `git -c safe.directory=$PWD`); the runner now passes the same exception to every git call.
+- 2026-10-19: `prepare` on the K3: builds A and B without errors; `flagos-check-spacemit` passes all checks with the AI
+  cores (the layer with the KV cache in our buffer: max NMSE 5.24e-04; one launch per step byte-identical in 4/4 layer
+  and 8/8 split cases). E2's rule agreed. E3's rule left open for a comparison with the deck: R12 (the deck's 1.2%) and
+  F14 (spine-runtime leaves launches unordered) split E3 into E3a (host waits, built), E3b (in-core ordering, needs the
+  board's header) and E3c (the deck's measure).
+- 2026-10-19: the first wiring run hung at the first `llama-completion`. Diagnosed from the code (to be confirmed by `ps`
+  showing state T): GNU `timeout` runs its command outside the terminal's foreground, and `llama-completion` sets the
+  terminal up at start (`console::init`, `tcsetattr` on stdin), which makes the kernel stop it (SIGTTOU). The runner now
+  uses `timeout --foreground` and gives every run `/dev/null` as input. E2 runs first; E3a waits for E3b.

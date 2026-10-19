@@ -52,8 +52,10 @@ C5_COMMITS="64e6cbd f1cf809"
 UPSTREAM_BASE=ba360ef
 TOOLS="llama-completion llama-bench llama-perplexity"
 PROMPT="The capital of France is"
+# --foreground: without it timeout runs the command outside the terminal's foreground, and llama-completion, which sets
+# the terminal up at start (console::init), is stopped by the kernel (SIGTTOU) and never ends
 TO=""
-if command -v timeout > /dev/null; then TO="timeout $TIMEOUT"; fi
+if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
 unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES \
     FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
@@ -102,8 +104,9 @@ run() {
         return 0
     fi
     release
+    # no terminal input: nothing may wait for it or set it up (as spacemit_check.py runs its tools)
     # shellcheck disable=SC2086 # $TO and $env are lists of words
-    $TO env $env "$bin" "$@" > "$log.out" 2> "$log.err"
+    $TO env $env "$bin" "$@" < /dev/null > "$log.out" 2> "$log.err"
     rc=$?
     echo "$rc" > "$log.rc"
     return "$rc"
