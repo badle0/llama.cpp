@@ -96,12 +96,25 @@ static std::vector<float> ramp(int64_t n, float scale, float offset) {
     return v;
 }
 
+// ACCEL, unless the test-only FLAGOS_SPACEMIT_TEST_DEVICE_TYPE names GPU or IGPU (structural-experiments.md E2)
+static enum ggml_backend_dev_type expected_device_type() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_DEVICE_TYPE");
+    if (v != nullptr && std::strcmp(v, "gpu") == 0) {
+        return GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
+    if (v != nullptr && std::strcmp(v, "igpu") == 0) {
+        return GGML_BACKEND_DEVICE_TYPE_IGPU;
+    }
+    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
+
 static int check_registry(ggml_backend_dev_t dev, size_t global_index) {
-    CHECK(ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL);
+    CHECK(ggml_backend_dev_type(dev) == expected_device_type());
     CHECK(ggml_backend_dev_description(dev) != nullptr);
 
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
+    CHECK(props.type == expected_device_type());
     CHECK(props.memory_total > 0);
     CHECK(props.memory_free > 0 && props.memory_free <= props.memory_total);
     CHECK(!props.caps.async && !props.caps.events && !props.caps.host_buffer);
@@ -115,7 +128,10 @@ static int check_registry(ggml_backend_dev_t dev, size_t global_index) {
     CHECK(info.profile.vector_bits == 1024);
     CHECK(info.profile.concurrency > 0);
 
-    std::printf("device   %s: %s, type ACCEL, memory %.1f / %.1f GiB free\n", props.name, props.description,
+    const char * type = props.type == GGML_BACKEND_DEVICE_TYPE_GPU  ? "GPU" :
+                        props.type == GGML_BACKEND_DEVICE_TYPE_IGPU ? "IGPU" :
+                                                                      "ACCEL";
+    std::printf("device   %s: %s, type %s, memory %.1f / %.1f GiB free\n", props.name, props.description, type,
                 props.memory_free / 1073741824.0, props.memory_total / 1073741824.0);
     std::printf("flagos   provider %s (id 0x%016llx), engine cpu, %u AI cores, VLEN %u, target %s, runtime %s\n",
                 info.provider.name, (unsigned long long) info.provider.id, info.profile.concurrency,
@@ -334,20 +350,28 @@ static int check_ops(ggml_backend_dev_t dev) {
     ggml_backend_free(backend);
 
     // a kernel failure inside the launch stops every tile and is reported (test-only switch). Repeated, in the
-    // first step and in a later one: on the AI cores a failure seen at the wrong barrier would hang a launch
+    // first step and in a later one: on the AI cores a failure seen at the wrong barrier would hang a launch. The step
+    // counts within a launch, so the launches are set here: one per split, and one per step (structural-experiments.md
+    // E3), where a failure in the first launch must fail the graph (a launch of one step has no step 1)
     constexpr int k_fail_runs = 100;
     int           fail_ok     = 0;
-    for (const char * fail_node : { "0", "1" }) {
-        set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", fail_node);
-        ggml_backend_t failing = ggml_backend_dev_init(dev, nullptr);
-        set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", nullptr);
-        REQUIRE(failing != nullptr);
-        for (int r = 0; r < k_fail_runs; r++) {
-            fail_ok += ggml_backend_graph_compute(failing, chain) == GGML_STATUS_FAILED;
+    for (const char * launch : { "per-split", "per-step" }) {
+        env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch);
+        for (const char * fail_node : { "0", "1" }) {
+            if (std::strcmp(launch, "per-step") == 0 && std::strcmp(fail_node, "1") == 0) {
+                continue;
+            }
+            set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", fail_node);
+            ggml_backend_t failing = ggml_backend_dev_init(dev, nullptr);
+            set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", nullptr);
+            REQUIRE(failing != nullptr);
+            for (int r = 0; r < k_fail_runs; r++) {
+                fail_ok += ggml_backend_graph_compute(failing, chain) == GGML_STATUS_FAILED;
+            }
+            ggml_backend_free(failing);
         }
-        ggml_backend_free(failing);
     }
-    CHECK(fail_ok == 2 * k_fail_runs);
+    CHECK(fail_ok == 3 * k_fail_runs);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -355,8 +379,8 @@ static int check_ops(ggml_backend_dev_t dev) {
                 "%lldx%lld ADD exact: checked\n",
                 (long long) n_big, (long long) n_rows, (long long) n);
     std::printf("backend  empty and view-only graphs succeed; unclaimed op returns FAILED; forced kernel failure in step 0 "
-                "and 1 returns FAILED %d/%d times: checked\n",
-                fail_ok, 2 * k_fail_runs);
+                "and 1 (and in step 0 with one launch per step) returns FAILED %d/%d times: checked\n",
+                fail_ok, 3 * k_fail_runs);
     return 0;
 }
 
@@ -1369,7 +1393,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     // the switch's value per setting (nullptr: the default) and its name in the reports
     const char * const split_settings[][2] = { { nullptr, "the default, with the turns" },
                                                { "split", "FLAGOS_SPACEMIT_ATTN=split, without the turns" } };
-    int                n_split = 0, n_split_differ = 0, n_turns_same = 0;
+    int                n_split = 0, n_split_differ = 0, n_turns_same = 0, n_launch_same = 0;
     double             e_split = 0.0, e_split_row = 0.0;
     for (const split_case & c : split_cases) {
         attn_run run;
@@ -1399,6 +1423,21 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
             g_failures++;
         }
         n_turns_same += same;
+        // structural-experiments.md E3: the default split with its two steps (the tiles' partial results, then their
+        // merge, passed through the workspace) in launches of their own, against both in one launch
+        std::vector<float> launched[2];
+        for (int l = 0; l < 2; l++) {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+            env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", l == 0 ? "per-split" : "per-step");
+            REQUIRE(run.dev_output(backend, launched[l]));
+        }
+        const bool same_launch =
+            std::memcmp(launched[0].data(), launched[1].data(), launched[0].size() * sizeof(float)) == 0;
+        if (!same_launch) {
+            std::fprintf(stderr, "FAIL: attention split, %s: one launch per step differs from one launch\n", c.what);
+            g_failures++;
+        }
+        n_launch_same += same_launch;
     }
 
     ggml_backend_free(backend);
@@ -1414,9 +1453,11 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     std::printf("attn     split over the tiles (the default; FLAGOS_SPACEMIT_ATTN=split without the turns) on %d "
                 "one-token cases: max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); %d/%d outputs differ from "
-                "the one-chunk kernels' (the split ran); with and without the turns identical in %d/%zu cases\n",
+                "the one-chunk kernels' (the split ran); with and without the turns identical in %d/%zu cases; one "
+                "launch per step (E3) identical in %d/%zu\n",
                 n_split, e_split, k_attn_max_nmse, e_split_row, k_attn_max_row_nmse, n_split_differ, n_split,
-                n_turns_same, sizeof(split_cases) / sizeof(split_cases[0]));
+                n_turns_same, sizeof(split_cases) / sizeof(split_cases[0]), n_launch_same,
+                sizeof(split_cases) / sizeof(split_cases[0]));
     return 0;
 }
 
@@ -1551,21 +1592,24 @@ static bool graph_finite(ggml_cgraph * g) {
 // provider's output. The batch's tokens go to scattered cells (3 + 5t), the positions before it fill the other cells in
 // order and the rest stay empty; every cell first holds random K and V (stale data in the empty ones), and the causal
 // mask lets a token see the cells of its own position and the earlier ones
+// kv_in_provider: the provider's KV cache in its own buffer, as llama.cpp places it for a GPU or IGPU device
+// (structural-experiments.md E2), instead of a CPU buffer, as for ACCEL; full_out: the provider's layer output
 static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, int64_t n_tokens,
-                         ggml_type down) {
+                         ggml_type down, bool kv_in_provider = false, std::vector<float> * full_out = nullptr) {
     ggml_init_params params = { ggml_tensor_overhead() * 128 + ggml_graph_overhead() * 2, nullptr, true };
     ggml_context *   ctx_h  = ggml_init(params);  // inputs and caches: CPU buffer
     ggml_context *   ctx_wd = ggml_init(params);  // weights for the provider: its buffer
     ggml_context *   ctx_wc = ggml_init(params);  // weights for the CPU: CPU buffer
     ggml_context *   ctx_gd = ggml_init(params);  // the provider's graph
     ggml_context *   ctx_gc = ggml_init(params);  // the CPU's graph
+    ggml_context *   ctx_kd = ggml_init(params);  // the provider's caches with kv_in_provider: its buffer
 
     ggml_tensor * x       = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, k_d, n_tokens);
     ggml_tensor * pos     = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n_tokens);
     ggml_tensor * kv_idx  = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I64, n_tokens);
     ggml_tensor * out_ids = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 1);
-    ggml_tensor * kc_d    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
-    ggml_tensor * vc_d    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    ggml_tensor * kc_d    = ggml_new_tensor_2d(kv_in_provider ? ctx_kd : ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+    ggml_tensor * vc_d    = ggml_new_tensor_2d(kv_in_provider ? ctx_kd : ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * kc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * vc_c    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
     ggml_tensor * mask    = ggml_new_tensor_4d(ctx_h, GGML_TYPE_F16, k_slots, n_tokens, 1, 1);
@@ -1575,10 +1619,15 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
     ggml_backend_buffer_t bh  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
     ggml_backend_buffer_t bwd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wd, ggml_backend_dev_buffer_type(dev));
     ggml_backend_buffer_t bwc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wc, ggml_backend_cpu_buffer_type());
-    if (bh == nullptr || bwd == nullptr || bwc == nullptr) {
+    ggml_backend_buffer_t bkd =
+        kv_in_provider ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_kd, ggml_backend_dev_buffer_type(dev)) : nullptr;
+    if (bh == nullptr || bwd == nullptr || bwc == nullptr || (kv_in_provider && bkd == nullptr)) {
         return -1.0;
     }
     ggml_backend_buffer_clear(bh, 0);
+    if (bkd != nullptr) {
+        ggml_backend_buffer_clear(bkd, 0);
+    }
     set_layer_weights(wd);
     copy_layer_weights(wd, wc);
 
@@ -1628,6 +1677,9 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
         std::vector<float> full(ggml_nelements(od.full)), out(ggml_nelements(od.out));
         ggml_backend_tensor_get(od.full, full.data(), 0, ggml_nbytes(od.full));
         ggml_backend_tensor_get(od.out, out.data(), 0, ggml_nbytes(od.out));
+        if (full_out != nullptr) {
+            *full_out = full;
+        }
         worst = nmse(full.data(), static_cast<const float *>(oc.full->data), (int64_t) full.size());
         if (std::memcmp(out.data(), full.data() + (n_tokens - 1) * k_d, k_d * sizeof(float)) != 0 || !graph_finite(gd)) {
             worst = -1.0;  // GET_ROWS is a copy; a non-finite intermediate is a failure
@@ -1641,10 +1693,10 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
         }
     }
 
-    for (ggml_backend_buffer_t b : { bh, bwd, bwc, bgd, bgc }) {
+    for (ggml_backend_buffer_t b : { bh, bwd, bwc, bgd, bgc, bkd }) {
         ggml_backend_buffer_free(b);
     }
-    for (ggml_context * c : { ctx_h, ctx_wd, ctx_wc, ctx_gd, ctx_gc }) {
+    for (ggml_context * c : { ctx_h, ctx_wd, ctx_wc, ctx_gd, ctx_gc, ctx_kd }) {
         ggml_free(c);
     }
     return worst;
@@ -1872,6 +1924,41 @@ static int check_layer(ggml_backend_dev_t dev) {
             worst = std::max(worst, e);
         }
     }
+    // structural-experiments.md E2: the KV cache in the provider's buffer, as llama.cpp places it for a GPU or IGPU
+    // device: the same kernels, so the same bound
+    double worst_kv = 0.0;
+    for (int64_t n_tokens : { 1, 7 }) {
+        const double e = layer_nmse(dev, backend, cpu, n_tokens, GGML_TYPE_Q4_0, true);
+        if (e < 0.0 || e > k_layer_max_nmse) {
+            std::fprintf(stderr, "FAIL: layer with %lld tokens, KV cache in the provider's buffer: %s %.3e\n",
+                         (long long) n_tokens, e < 0.0 ? "refused or failed" : "NMSE", e);
+            g_failures++;
+        }
+        worst_kv = std::max(worst_kv, e);
+    }
+    // E3: one launch per step (quantization and matmul, the norms, RoPE, the cache writes, attention, each launched on
+    // its own) gives the same outputs as one launch for the layer; set both ways, whatever the run's setting
+    int n_launch_same = 0, n_launch_cases = 0;
+    for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
+        for (int64_t n_tokens : { 1, 7 }) {
+            std::vector<float> out[2];
+            double             e[2];
+            for (int l = 0; l < 2; l++) {
+                env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", l == 0 ? "per-split" : "per-step");
+                e[l] = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[l]);
+            }
+            const bool same = e[0] >= 0.0 && e[1] >= 0.0 && out[0].size() == out[1].size() &&
+                              std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
+            if (!same) {
+                std::fprintf(stderr, "FAIL: layer with %lld tokens, down projection %s: one launch per step %s\n",
+                             (long long) n_tokens, ggml_type_name(down),
+                             e[0] < 0.0 || e[1] < 0.0 ? "refused or failed" : "differs from one per layer");
+                g_failures++;
+            }
+            n_launch_same += same;
+            n_launch_cases++;
+        }
+    }
     // the whole head rotated, and half of it (the rest copied)
     const double e_rope_full = rope_wide_nmse(dev, backend, cpu, 256);
     const double e_rope_half = rope_wide_nmse(dev, backend, cpu, 128);
@@ -1886,9 +1973,10 @@ static int check_layer(ggml_backend_dev_t dev) {
     ggml_backend_free(cpu);
     std::printf("layer    Qwen3-like layer with flash attention in one launch vs CPU (1 and 7 tokens after %d "
                 "positions, down projection Q4_0 and Q4_1, all rows; KV cache of %lld cells and mask in a CPU buffer, "
-                "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e%s\n",
-                k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope,
-                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e; KV cache in our buffer "
+                "(E2) max NMSE %.2e; one launch per step (E3) identical in %d/%d cases%s\n",
+                k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope, worst_kv, n_launch_same,
+                n_launch_cases, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
 

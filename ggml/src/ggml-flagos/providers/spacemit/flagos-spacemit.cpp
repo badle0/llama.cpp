@@ -12,6 +12,7 @@
 #include "../../../ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -241,6 +242,24 @@ bool spacemit_data_ready(const ggml_tensor * node) {
     return true;
 }
 
+// test-only: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step launches every step on its own, as a runtime without graph capture
+// launches each kernel (structural-experiments.md E3); per-split, the default, launches a split's steps together. Read
+// at every graph, so a benchmark can switch; anything else is reported once and ignored
+bool spacemit_launch_per_step() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_LAUNCH");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "per-split") == 0) {
+        return false;
+    }
+    if (std::strcmp(v, "per-step") == 0) {
+        return true;
+    }
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_TEST_LAUNCH=%s: unknown setting ignored\n", __func__, v);
+    }
+    return false;
+}
+
 // every node and the workspace are checked before the launch, so a graph either runs completely or fails with
 // nothing written
 ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -288,6 +307,18 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
 
     std::lock_guard<std::mutex> lock(dev->run_mutex);
+    if (spacemit_launch_per_step()) {
+        // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every tile
+        // before the next starts, as the barrier after a step does inside one launch
+        std::vector<spacemit_step> one(1);
+        for (const spacemit_step & step : ctx->steps) {
+            one[0] = step;
+            if (!ctx->executor->run(one, ctx->workspace, ctx->workspace_size)) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
     return ctx->executor->run(ctx->steps, ctx->workspace, ctx->workspace_size) ? GGML_STATUS_SUCCESS
                                                                                   : GGML_STATUS_FAILED;
 }
@@ -353,8 +384,24 @@ void spacemit_device_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
 #endif
 }
 
+// ACCEL (D3). test-only: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu or igpu reports that type instead, so llama.cpp gives the
+// device whole layers and their KV cache, without C5a and C5b (structural-experiments.md E2); read once, reported once
+// when it changes the type, anything else reported and ignored
 enum ggml_backend_dev_type spacemit_device_type(ggml_backend_dev_t) {
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    static const enum ggml_backend_dev_type type = [] {
+        const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_DEVICE_TYPE");
+        if (v == nullptr || *v == '\0' || std::strcmp(v, "accel") == 0) {
+            return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+        }
+        if (std::strcmp(v, "gpu") == 0 || std::strcmp(v, "igpu") == 0) {
+            GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: reporting %s instead of ACCEL\n", v,
+                          v[0] == 'g' ? "GPU" : "IGPU");
+            return v[0] == 'g' ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_IGPU;
+        }
+        GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: unknown setting ignored\n", v);
+        return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    }();
+    return type;
 }
 
 void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
