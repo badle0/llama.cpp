@@ -184,13 +184,18 @@ summary() {
         m=$(basename "$f" .err)
         m=${m#load-}
         rc=$(cat "${f%.err}.rc" 2> /dev/null)
-        splits=$(grep -oE 'graph splits = [0-9]+ \(with bs=[0-9]+\), [0-9]+ \(with bs=1\)' "$f" | tail -1 |
-            sed -E 's/graph splits = ([0-9]+) .*, ([0-9]+) .*/\1 \/ \2/')
+        # one number when both graphs take the same count (src/llama-context.cpp, "graph splits")
+        splits=$(grep -oE 'graph splits = [0-9]+( \(with bs=[0-9]+\), [0-9]+ \(with bs=1\))?' "$f" | tail -1 |
+            sed -E 's/graph splits = ([0-9]+) \(with bs=[0-9]+\), ([0-9]+) \(with bs=1\)/\1 \/ \2/; s/graph splits = ([0-9]+)$/\1 \/ \1/')
         fa=$(grep -oE 'Flash Attention (enabled|not supported, set to disabled)' "$f" | tail -1 | awk '{print $NF}')
         off=$(grep -oE 'offloaded [0-9]+/[0-9]+ layers' "$f" | tail -1 | awk '{print $2}')
-        type=ACCEL
-        if grep -q 'reporting IGPU instead of ACCEL' "$f"; then type=IGPU; fi
-        if grep -q 'reporting GPU instead of ACCEL' "$f"; then type=GPU; fi
+        # the type the mode's switch reports; its one warning cannot tell: under llama.cpp's automatic fit (no -ngl) it
+        # comes while the fit turns messages into debug ones. The offloaded layers and the KV cache show the effect
+        case $(mode_env "$m") in
+            *DEVICE_TYPE=igpu*) type=IGPU ;;
+            *DEVICE_TYPE=gpu*) type=GPU ;;
+            *) type=ACCEL ;;
+        esac
         kv=$(grep -oE '[A-Za-z0-9:_]+ KV buffer size = +[0-9.]+ MiB' "$f" | sed -E 's/ KV buffer size = +/ /' | sort -u |
             paste -sd, -)
         printf '   %-14s %-4s %-9s %-10s %-11s %-6s %s\n' "$m" "${rc:-?}" "${splits:--}" "${fa:-set}" "${off:--}" "$type" \

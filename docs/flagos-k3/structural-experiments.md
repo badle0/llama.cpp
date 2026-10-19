@@ -349,7 +349,14 @@ To be filled from the board run (`summary` output), with the date and commit.
   and 8/8 split cases). E2's rule agreed. E3's rule left open for a comparison with the deck: R12 (the deck's 1.2%) and
   F14 (spine-runtime leaves launches unordered) split E3 into E3a (host waits, built), E3b (in-core ordering, needs the
   board's header) and E3c (the deck's measure).
-- 2026-10-19: the first wiring run hung at the first `llama-completion`. Diagnosed from the code (to be confirmed by `ps`
-  showing state T): GNU `timeout` runs its command outside the terminal's foreground, and `llama-completion` sets the
+- 2026-10-19: the first wiring run hung at the first `llama-completion` (`ps`: state `Tl`, stopped, after 27 minutes).
+  The cause, from the code: GNU `timeout` runs its command outside the terminal's foreground, and `llama-completion` sets the
   terminal up at start (`console::init`, `tcsetattr` on stdin), which makes the kernel stop it (SIGTTOU). The runner now
   uses `timeout --foreground` and gives every run `/dev/null` as input. E2 runs first; E3a waits for E3b.
+- 2026-10-19: wiring check on the K3 (`REPS=1 DEPTH=0 PPL_TEXT= EXPS="e2"`: ref, e2-igpu, e2-gpu, e2-igpu-auto; no
+  depth runs, perplexity or repetitions): every run exit code 0; as IGPU and GPU all 37 layers and the KV cache
+  (5760 MiB at llama-completion's default context, the model's 40,960 tokens) are in the provider's buffer, also with
+  llama.cpp's automatic fit; ref keeps the KV cache in a CPU buffer; flash attention enabled under `-fa auto` in every
+  mode; the same text. pp128 / tg128 (one run each): ref 91.88 / 11.30, IGPU 92.15 / 11.28, GPU 92.06 / 11.29. The
+  summary misread two columns (the split count, printed as one number when both graphs take the same; and the type
+  under the automatic fit); fixed.
