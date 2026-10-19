@@ -247,18 +247,21 @@ EOF
             [ -f "$f" ] || continue
             m=$(basename "$f" .err)
             printf '   %-18s rc %-3s %s\n' "$m" "$(cat "${f%.err}.rc" 2> /dev/null)" "$(cat "${f%.err}.out" "$f" |
-                grep -oE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+|Mean PPL\(Q\) *: *[0-9.]+|Mean +KLD: *[0-9.]+|Maximum KLD: *[0-9.]+|Same top p: *[0-9.]+' |
+                grep -oE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+|Mean PPL\(Q\) *: *[0-9.]+|Mean +KLD: *-?[0-9.]+|Maximum KLD: *[0-9.]+|Same top p: *[0-9.]+' |
                 tr -s ' ' | paste -sd';' -)"
         done
     fi
     if compgen -G "$OUT/neg-*.err" > /dev/null; then
         echo
-        echo "== E2-neg (expected: the igpu runs abort with \"cannot run the operation\", the ref runs end with rc 0;"
-        echo "   the shift runs log \"context full, swapping\" before)"
+        echo "== E2-neg (expected: the igpu runs abort with \"cannot run the operation\", the ref runs end with rc 0; the"
+        echo "   shift runs have a 256-token context, so more tokens generated than that means the context was shifted)"
         for f in "$OUT"/neg-*.err; do
             m=$(basename "$f" .err)
-            printf '   %-16s rc %-4s swaps %-3s %s\n' "$m" "$(cat "${f%.err}.rc" 2> /dev/null)" \
-                "$(grep -c 'context full, swapping' "$f")" "$(grep -m1 -oE 'pre-allocated tensor.*|GGML_ASSERT.*' "$f" | cut -c1-110)"
+            # tokens generated: llama-completion's "eval time = ... / N runs"; its "context full" line is a debug one,
+            # shown only from -lv 5
+            gen=$(grep -oE 'eval time = +[0-9.]+ ms / +[0-9]+ runs' "$f" | tail -1 | grep -oE '[0-9]+ runs' | cut -d' ' -f1)
+            printf '   %-16s rc %-4s generated %-5s %s\n' "$m" "$(cat "${f%.err}.rc" 2> /dev/null)" "${gen:--}" \
+                "$(grep -m1 -oE 'pre-allocated tensor.*|GGML_ASSERT.*' "$f" | cut -c1-100)"
         done
     fi
     echo "logs: $OUT"
