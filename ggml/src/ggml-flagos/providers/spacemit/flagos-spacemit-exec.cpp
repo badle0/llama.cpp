@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 #    include <spert.hpp>
@@ -14,8 +16,6 @@
 #    endif
 #else
 #    include <condition_variable>
-#    include <cstring>
-#    include <mutex>
 #    include <thread>
 #endif
 
@@ -64,6 +64,16 @@ int64_t spacemit_test_fail_step() {
     return value != nullptr ? std::atoll(value) : -1;
 }
 
+// test-only (structural-experiments.md E3b-diag): each tile's core after its join, after taking its TCM, after the TCM
+// agreement and after its last step, and the TCM it took
+struct spacemit_tile_trace {
+    int          cpu[4][SPACEMIT_MAX_TILES] = {};
+    const void * tcm[SPACEMIT_MAX_TILES]    = {};
+};
+
+std::mutex              g_ordered_mutex;
+spacemit_ordered_counts g_ordered;
+
 struct spacemit_launch {
     const spacemit_step * steps          = nullptr;
     size_t                n_steps        = 0;
@@ -75,6 +85,7 @@ struct spacemit_launch {
     spacemit_pairs        pairs;
     spacemit_run_stats *  stats      = nullptr;  // test-only (E3c): where the tiles note their times, if anywhere
     size_t                stats_base = 0;        // the first step of this launch in stats
+    spacemit_tile_trace * trace      = nullptr;  // test-only (E3b-diag): where ordered launches note their cores
 
     spacemit_launch() { pairs.failed = &failed; }
 };
@@ -126,6 +137,14 @@ void spacemit_stats_end(const spacemit_launch & launch, spacemit_clock::time_poi
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 
+int spacemit_cpu_now() {
+#    if defined(__linux__)
+    return sched_getcpu();
+#    else
+    return -1;
+#    endif
+}
+
 // every tile reaches every barrier, also after a failure, when it only skips the remaining kernels: a tile that left
 // early would leave the others waiting at the next barrier forever. (Leaving when the flag is set after a barrier is
 // not enough: a faster tile may already have failed in the next step, so tiles would disagree.)
@@ -133,12 +152,19 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     const uint32_t                ith = ctx->program_id(0);
     const uint32_t                nth = ctx->grid_dim(0);
     const spert::SharedBufferView tcm = ctx->shared_buffer();
+    if (launch->trace != nullptr) {  // test-only (E3b-diag)
+        launch->trace->cpu[1][ith] = spacemit_cpu_now();
+        launch->trace->tcm[ith]    = tcm.data;
+    }
 
     // agree on one TCM size, the smallest any tile has, so every tile takes the same kernel path
     launch->tcm_sizes[ith] = tcm.data != nullptr ? tcm.size : 0;
     if (ctx->sync() != spert::Status::Ok) {
         launch->failed.store(true);  // spine-runtime's barrier itself failed: nothing can keep the tiles together
         return;
+    }
+    if (launch->trace != nullptr) {
+        launch->trace->cpu[2][ith] = spacemit_cpu_now();
     }
     size_t tcm_size = launch->tcm_sizes[0];
     for (uint32_t i = 1; i < nth; i++) {
@@ -167,16 +193,20 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     if (launch->stats != nullptr) {
         launch->stats->barrier_ns[ith] += barrier_ns;
     }
+    if (launch->trace != nullptr) {
+        launch->trace->cpu[3][ith] = spacemit_cpu_now();
+    }
 }
 
 // test-only (structural-experiments.md E3b): one launch per step, ordered inside the cores. spine-runtime does not
 // order the launches of a stream (dependent kernels wait for each other's Future), so every tile first joins its own
 // copy of the previous launch's Future, before it takes its core's TCM. A tile that waits is suspended and its core
 // may run another tile; two tiles of one launch on one core could deadlock at the TCM agreement or a pair wait, so
-// every tile notes its core and the host reports launches whose tiles shared one
+// every tile notes its cores and its TCM (E3b-diag), and the host counts what they show
 struct spacemit_ordered_launch : spacemit_launch {
-    std::vector<spert::Future> previous;                      // one copy per tile; none for a graph's first launch
-    int                        cpus[SPACEMIT_MAX_TILES] = {};  // the core each tile ran on (Linux; else 0)
+    std::vector<spert::Future> previous;  // one copy per tile; none for a graph's first launch
+    spacemit_tile_trace        tile_trace;
+    bool                       fence = false;  // E3b-diag: FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1, full fences around it
 };
 
 void spacemit_tile_main_ordered(spert::Context * ctx, spacemit_ordered_launch * launch) noexcept {
@@ -184,11 +214,55 @@ void spacemit_tile_main_ordered(spert::Context * ctx, spacemit_ordered_launch * 
     if (!launch->previous.empty() && ctx->join(launch->previous[ith]) != spert::Status::Ok) {
         launch->failed.store(true);  // the tile still reaches every barrier, skipping its kernel
     }
-#if defined(__linux__)
-    launch->cpus[ith] = sched_getcpu();
-#endif
+    if (launch->fence) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);  // after the join: the previous launch's writes
+    }
+    launch->tile_trace.cpu[0][ith] = spacemit_cpu_now();
     spacemit_tile_main(ctx, launch);
+    if (launch->fence) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);  // this launch's writes, before its Future completes
+    }
 }
+
+#    if defined(__linux__)
+// what the tiles of each ordered launch noted (spacemit_ordered_counts), added to the counts since the last take;
+// returns the launches with two tiles on one core
+size_t spacemit_count_ordered(const std::vector<std::unique_ptr<spacemit_ordered_launch>> & launches, uint32_t nth) {
+    spacemit_ordered_counts c;
+    for (const auto & launch : launches) {
+        const spacemit_tile_trace & t = launch->tile_trace;
+        bool                        shared = false, pair = false, elsewhere = false;
+        for (uint32_t a = 0; a < nth; a++) {
+            for (int p = 1; p < 4; p++) {
+                if (t.cpu[p][a] != t.cpu[p - 1][a]) {
+                    c.moved_tiles++;
+                    break;
+                }
+            }
+            for (uint32_t b = a + 1; b < nth; b++) {
+                bool same_core = false;
+                for (int p = 0; p < 4; p++) {
+                    same_core = same_core || t.cpu[p][a] == t.cpu[p][b];
+                }
+                shared    = shared || same_core;
+                pair      = pair || (same_core && b == (a ^ 1u));
+                elsewhere = elsewhere || (t.tcm[a] != nullptr && t.tcm[a] == t.tcm[b] && t.cpu[2][a] != t.cpu[2][b]);
+            }
+        }
+        c.launches++;
+        c.shared_core += shared;
+        c.pairs_on_one_core += pair;
+        c.tcm_elsewhere += elsewhere;
+    }
+    std::lock_guard<std::mutex> lock(g_ordered_mutex);
+    g_ordered.launches += c.launches;
+    g_ordered.shared_core += c.shared_core;
+    g_ordered.moved_tiles += c.moved_tiles;
+    g_ordered.tcm_elsewhere += c.tcm_elsewhere;
+    g_ordered.pairs_on_one_core += c.pairs_on_one_core;
+    return c.shared_core;
+}
+#    endif
 
 class spert_executor final : public spacemit_executor {
   public:
@@ -230,6 +304,8 @@ class spert_executor final : public spacemit_executor {
             return false;
         }
         const uint32_t nth = static_cast<uint32_t>(stream->core_count());
+        const char *   fence_value = std::getenv("FLAGOS_SPACEMIT_TEST_JOIN_FENCE");  // test-only (E3b-diag)
+        const bool     fence       = fence_value != nullptr && std::strcmp(fence_value, "0") != 0;
 
         std::vector<std::unique_ptr<spacemit_ordered_launch>> launches;
         std::vector<spert::Future>                             futures;
@@ -242,6 +318,8 @@ class spert_executor final : public spacemit_executor {
             launch->workspace      = workspace;
             launch->workspace_size = workspace_size;
             launch->fail_step      = fail_step;
+            launch->trace          = &launch->tile_trace;
+            launch->fence          = fence;
             if (!futures.empty()) {
                 launch->previous.assign(nth, futures.back());
             }
@@ -262,16 +340,7 @@ class spert_executor final : public spacemit_executor {
             ok = ok && !launch->failed.load();
         }
 #if defined(__linux__)
-        size_t shared = 0;
-        for (const auto & launch : launches) {
-            bool twice = false;
-            for (uint32_t a = 0; a < nth && !twice; a++) {
-                for (uint32_t b = a + 1; b < nth && !twice; b++) {
-                    twice = launch->cpus[a] == launch->cpus[b];
-                }
-            }
-            shared += twice;
-        }
+        const size_t             shared = spacemit_count_ordered(launches, nth);
         static std::atomic<bool> warned{ false };
         if (shared > 0 && !warned.exchange(true)) {
             GGML_LOG_WARN("FlagOS SpacemiT: ordered launches: %zu of %zu had two tiles on one core (reported once)\n",
@@ -465,6 +534,13 @@ class host_executor final : public spacemit_executor {
 #endif
 
 }  // namespace
+
+spacemit_ordered_counts spacemit_ordered_counts_take() {
+    std::lock_guard<std::mutex> lock(g_ordered_mutex);
+    const spacemit_ordered_counts c = g_ordered;
+    g_ordered                       = spacemit_ordered_counts{};
+    return c;
+}
 
 std::unique_ptr<spacemit_executor> spacemit_executor_create(spacemit_stream_policy policy, uint32_t n_cores) {
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)

@@ -10,8 +10,13 @@
 //                    order violations (a tile that found the previous launch unfinished after its join) and launches
 //                    with two tiles on one core
 //   joined+tcm       as joined, every tile then taking its shared buffer and passing one barrier, as E3b's tiles do;
-//                    also counts tiles left without TCM and launches whose tiles got the same TCM. Runs last: if it
-//                    hangs (no new line for a minute), stop it with Ctrl-C and run tcmrelease --apply
+//                    also counts tiles left without TCM and launches whose tiles got the same TCM
+//   joined+canary    E3b-diag: as joined+tcm, every tile writing a pattern of its own into its TCM before the barrier
+//                    and checking it after (did another tile use this TCM while this one waited?), then writing it again
+//                    and checking it four times with no suspension point in between (did another tile use it at the
+//                    same time?); also counts tiles that changed core between the join, taking TCM, the barrier and
+//                    the end, and launches whose two tiles on different cores held one TCM
+// The joined cases run last: if one hangs (no new line for a minute), stop it with Ctrl-C and run tcmrelease --apply
 // Build on the K3: g++ -O2 -std=c++17 -I$HOME/spine-runtime/include spert-launch-bench.cpp -L$HOME/spine-runtime/lib \
 //                      -lspert -o spert-launch-bench
 // Run (inside tmux, nothing else on the AI cores): ~/tcmtest/tcmrelease --apply
@@ -144,12 +149,16 @@ struct joined_arg {
     const std::atomic<uint32_t> * previous_done = nullptr;  // the previous launch's finished tiles
     std::atomic<uint32_t>         done{ 0 };
     uint32_t                      nth      = 0;
+    uint32_t                      id       = 0;  // the launch's number, in the canaries
     bool                          take_tcm = false;
-    int                           cpus[MAX_TILES]     = {};
+    bool                          canary   = false;
+    int                           cpus[4][MAX_TILES]  = {};  // after the join, after taking TCM, after the barrier, at the end
     const void *                  tcm[MAX_TILES]      = {};
     size_t                        tcm_size[MAX_TILES] = {};
     std::atomic<int> *            violations = nullptr;
     std::atomic<int> *            failed     = nullptr;
+    std::atomic<int> *            lost       = nullptr;  // canary written before the barrier, changed after it
+    std::atomic<int> *            torn       = nullptr;  // canary changed with no suspension point in between
 };
 
 void tile_joined(spert::Context * ctx, joined_arg * a) noexcept {
@@ -161,15 +170,44 @@ void tile_joined(spert::Context * ctx, joined_arg * a) noexcept {
             a->violations->fetch_add(1);
         }
     }
-    a->cpus[ith] = cpu_now();
+    a->cpus[0][ith] = cpu_now();
     if (a->take_tcm) {
         const spert::SharedBufferView buf = ctx->shared_buffer();
         a->tcm[ith]                       = buf.data;
         a->tcm_size[ith]                  = buf.data != nullptr ? buf.size : 0;
+        a->cpus[1][ith]                   = cpu_now();
+        // canaries: up to 1024 words of the tile's TCM, a pattern of its own, read back through scalar loads
+        volatile uint32_t * w     = static_cast<volatile uint32_t *>(buf.data);
+        const size_t        words = a->canary && w != nullptr ? std::min<size_t>(buf.size / 4, 1024) : 0;
+        const uint32_t      mine  = (a->id << 8) | ith;
+        for (size_t j = 0; j < words; j++) {
+            w[j] = mine ^ 0xa5a5a5a5u;
+        }
         if (ctx->sync() != spert::Status::Ok) {
             a->failed->fetch_add(1);
         }
+        a->cpus[2][ith] = cpu_now();
+        bool kept = true;  // across the barrier, where the tile may have been suspended
+        for (size_t j = 0; j < words; j++) {
+            kept = kept && w[j] == (mine ^ 0xa5a5a5a5u);
+        }
+        for (size_t j = 0; j < words; j++) {
+            w[j] = mine;
+        }
+        bool intact = true;  // four passes with no suspension point: only a tile running at the same time can change it
+        for (int pass = 0; pass < 4; pass++) {
+            for (size_t j = 0; j < words; j++) {
+                intact = intact && w[j] == mine;
+            }
+        }
+        if (words > 0 && !kept) {
+            a->lost->fetch_add(1);
+        }
+        if (words > 0 && !intact) {
+            a->torn->fetch_add(1);
+        }
     }
+    a->cpus[3][ith] = cpu_now();
     a->done.fetch_add(1);
 }
 
@@ -272,15 +310,18 @@ int main(int argc, char ** argv) {
                     "queued", nth, batch, n_launches, total / n_launches, calls / n_launches, failed, shared);
     }
 
-    for (const bool take_tcm : { false, true }) {
+    // joined: the tiles only join; +tcm: they also take their TCM and pass a barrier, as E3b's do; +canary: they also
+    // check their TCM (E3b-diag)
+    for (const int mode : { 0, 1, 2 }) {
+        const bool take_tcm = mode > 0, canary = mode == 2;
         if (take_tcm) {
-            std::printf("joined+tcm: running (a hang here: Ctrl-C, then tcmrelease --apply)\n");
+            std::printf("%s: running (a hang here: Ctrl-C, then tcmrelease --apply)\n", canary ? "joined+canary" : "joined+tcm");
         }
         for (const int batch : { 8, 64 }) {
             const int        rounds = std::max(1, reps / batch);
-            std::atomic<int> violations{ 0 }, failed{ 0 };
+            std::atomic<int> violations{ 0 }, failed{ 0 }, lost{ 0 }, torn{ 0 };
             double           total = 0.0, calls = 0.0;
-            int              shared = 0, no_tcm = 0, same_tcm = 0;
+            int              shared = 0, no_tcm = 0, same_tcm = 0, moved = 0, elsewhere = 0;
             for (int r = 0; r < rounds; r++) {
                 std::vector<std::unique_ptr<joined_arg>> args;
                 std::vector<spert::Future>               futures;
@@ -290,9 +331,13 @@ int main(int argc, char ** argv) {
                 for (int i = 0; i < batch; i++) {
                     auto a        = std::make_unique<joined_arg>();
                     a->nth        = nth;
+                    a->id         = static_cast<uint32_t>(r * batch + i);
                     a->take_tcm   = take_tcm;
+                    a->canary     = canary;
                     a->violations = &violations;
                     a->failed     = &failed;
+                    a->lost       = &lost;
+                    a->torn       = &torn;
                     if (!futures.empty()) {
                         a->previous.assign(nth, futures.back());
                         a->previous_done = &args.back()->done;
@@ -305,29 +350,53 @@ int main(int argc, char ** argv) {
                 const clk::time_point t2 = clk::now();
                 calls += us_between(t0, t1);
                 total += us_between(t0, t2);
+                // the points each tile noted: after the join and at the end; with TCM also after taking it and after
+                // the barrier
+                const std::vector<int> points = take_tcm ? std::vector<int>{ 0, 1, 2, 3 } : std::vector<int>{ 0, 3 };
                 for (const auto & a : args) {
-                    shared += shares_core(a->cpus, nth);
-                    note_cores(a->cpus, nth);
+                    bool twice = false;
+                    for (const int p : points) {
+                        twice = twice || shares_core(a->cpus[p], nth);
+                        note_cores(a->cpus[p], nth);
+                    }
+                    shared += twice;
+                    for (uint32_t x = 0; x < nth; x++) {
+                        for (size_t p = 1; p < points.size(); p++) {
+                            if (a->cpus[points[p]][x] != a->cpus[points[p - 1]][x]) {
+                                moved++;
+                                break;
+                            }
+                        }
+                    }
                     if (!take_tcm) {
                         continue;
                     }
-                    bool same = false;
+                    bool same = false, other_core = false;
                     for (uint32_t x = 0; x < nth; x++) {
                         no_tcm += a->tcm[x] == nullptr || a->tcm_size[x] == 0;
                         for (uint32_t y = x + 1; y < nth; y++) {
-                            same = same || (a->tcm[x] != nullptr && a->tcm[x] == a->tcm[y]);
+                            const bool one_tcm = a->tcm[x] != nullptr && a->tcm[x] == a->tcm[y];
+                            same               = same || one_tcm;
+                            other_core         = other_core || (one_tcm && a->cpus[2][x] != a->cpus[2][y]);
                         }
                     }
                     same_tcm += same;
+                    elsewhere += other_core;
                 }
             }
             const int n_launches = rounds * batch;
             std::printf("%-16s grid %u, %d at a time: %d launches: %.2f us per launch (the host's launch calls %.2f us "
-                        "each); failed %d; order violations %d; launches with two tiles on one core %d",
-                        take_tcm ? "joined+tcm" : "joined", nth, batch, n_launches, total / n_launches,
-                        calls / n_launches, failed.load(), violations.load(), shared);
+                        "each); failed %d; order violations %d; launches with two tiles on one core %d; tiles that "
+                        "changed core %d",
+                        mode == 0 ? "joined" : canary ? "joined+canary" : "joined+tcm", nth, batch, n_launches,
+                        total / n_launches, calls / n_launches, failed.load(), violations.load(), shared, moved);
             if (take_tcm) {
-                std::printf("; tiles without TCM %d; launches with two tiles on the same TCM %d", no_tcm, same_tcm);
+                std::printf("; tiles without TCM %d; launches with two tiles on the same TCM %d (on two cores %d)",
+                            no_tcm, same_tcm, elsewhere);
+            }
+            if (canary) {
+                std::printf("; tiles whose TCM changed across their barrier %d, with no suspension point %d", lost.load(),
+                            torn.load());
             }
             std::printf("\n");
         }

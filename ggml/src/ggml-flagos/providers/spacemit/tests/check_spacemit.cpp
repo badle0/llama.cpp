@@ -1,5 +1,6 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn]
+//                              [--e3b[=runs]]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -12,6 +13,8 @@
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default)
+//   --e3b[=runs]     only structural-experiments.md E3b-diag: why launches ordered in the cores differ (default 20 runs
+//                    per case and variant); a measurement, it fails nothing
 // Without a flag, a host without the device skips the device checks.
 
 #include "ggml-alloc.h"
@@ -19,6 +22,7 @@
 #include "ggml-cpu.h"
 #include "ggml-flagos.h"
 #include "ggml.h"
+#include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
 
 #include <algorithm>
 #include <chrono>
@@ -1993,6 +1997,137 @@ static int check_layer(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// eight 1-row matmuls of one weight on one input (sixteen steps: the activations quantized, then the matmul, each
+// time), their outputs one after another; false if the provider failed
+static bool matmuls_out(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_type type, std::vector<float> & out) {
+    mm_weight w;
+    if (!w.init(dev, k_ff, k_d, 21, type)) {
+        return false;
+    }
+    ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);  // the input: CPU buffer
+    ggml_context *   ctx_d  = ggml_init(params);  // the graph and the outputs: the provider's buffer
+    ggml_tensor *    x      = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, k_ff, 1);
+    ggml_cgraph *    g      = ggml_new_graph(ctx_d);
+    std::vector<ggml_tensor *> ys;
+    for (int i = 0; i < 8; i++) {
+        ys.push_back(ggml_mul_mat(ctx_d, w.w_dev, x));
+        ggml_build_forward_expand(g, ys.back());
+    }
+    ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+    bool                  ok = bh != nullptr && bd != nullptr;
+    if (ok) {
+        const std::vector<float> xv = random_values(k_ff, 22, 2.0f);
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ok = ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS;
+    }
+    out.clear();
+    for (ggml_tensor * y : ys) {
+        if (ok) {
+            std::vector<float> v(ggml_nelements(y));
+            ggml_backend_tensor_get(y, v.data(), 0, ggml_nbytes(y));
+            out.insert(out.end(), v.begin(), v.end());
+        }
+    }
+    ggml_backend_buffer_free(bh);
+    ggml_backend_buffer_free(bd);
+    ggml_free(ctx_h);
+    ggml_free(ctx_d);
+    return ok;
+}
+
+// structural-experiments.md E3b-diag (--e3b): why one launch per step ordered in the cores (E3b) gives other outputs
+// than one launch per graph. Each case runs once with one launch per graph (the reference) and `runs` times ordered in
+// the cores, in four variants: the 1-row matmuls' default strategy (paired: the two tiles of a pair take turns,
+// staging weights through TCM), staged (through TCM, no turns), direct (weights from DRAM, no turns), and paired with
+// full memory fences after every join and at every tile's end (FLAGOS_SPACEMIT_TEST_JOIN_FENCE). It prints, per case
+// and variant, the runs identical to the reference, differing (and their largest NMSE against it) and failed, and what
+// the ordered launches' tiles noted (spacemit_ordered_counts), in all runs and in the differing ones
+static int diagnose_e3b(ggml_backend_dev_t dev, int runs) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 8);
+
+    struct variant {
+        const char * name, * gemv, * fence;
+    };
+    const variant variants[] = { { "paired", "paired", "0" },
+                                 { "staged", "staged", "0" },
+                                 { "direct", "direct", "0" },
+                                 { "paired+fence", "paired", "1" } };
+    struct e3b_case {
+        const char * name;
+        bool         layer;  // else eight 1-row matmuls
+        ggml_type    type;   // the layer's down projection, or the matmuls' weight
+        int64_t      tokens;
+    };
+    const e3b_case cases[] = { { "layer, 1 token, down q4_0", true, GGML_TYPE_Q4_0, 1 },
+                               { "layer, 1 token, down q4_1", true, GGML_TYPE_Q4_1, 1 },
+                               { "layer, 7 tokens, down q4_0", true, GGML_TYPE_Q4_0, 7 },
+                               { "8 matmuls, 1 row, q4_0", false, GGML_TYPE_Q4_0, 1 },
+                               { "8 matmuls, 1 row, q4_1", false, GGML_TYPE_Q4_1, 1 } };
+    const auto     output  = [&](const e3b_case & c, std::vector<float> & out) {
+        return c.layer ? layer_nmse(dev, backend, cpu, c.tokens, c.type, false, &out) >= 0.0 :
+                              matmuls_out(dev, backend, c.type, out);
+    };
+    const auto add = [](spacemit_ordered_counts & a, const spacemit_ordered_counts & b) {
+        a.launches += b.launches;
+        a.shared_core += b.shared_core;
+        a.moved_tiles += b.moved_tiles;
+        a.tcm_elsewhere += b.tcm_elsewhere;
+        a.pairs_on_one_core += b.pairs_on_one_core;
+    };
+
+    for (const e3b_case & c : cases) {
+        for (const variant & v : variants) {
+            env_override       gemv("FLAGOS_SPACEMIT_GEMV", v.gemv);
+            env_override       fence("FLAGOS_SPACEMIT_TEST_JOIN_FENCE", v.fence);
+            std::vector<float> ref, out;
+            bool               ref_ok;
+            {
+                env_override launch("FLAGOS_SPACEMIT_TEST_LAUNCH", "per-split");
+                ref_ok = output(c, ref);
+            }
+            int                     same = 0, differ = 0, failed = 0;
+            double                  worst = 0.0;
+            spacemit_ordered_counts all, in_differing;
+            spacemit_ordered_counts_take();
+            for (int r = 0; r < runs; r++) {
+                bool ok;
+                {
+                    env_override launch("FLAGOS_SPACEMIT_TEST_LAUNCH", "per-step-join");
+                    ok = output(c, out);
+                }
+                const spacemit_ordered_counts k = spacemit_ordered_counts_take();
+                add(all, k);
+                if (!ok || !ref_ok || out.size() != ref.size()) {
+                    failed++;
+                } else if (std::memcmp(out.data(), ref.data(), out.size() * sizeof(float)) == 0) {
+                    same++;
+                } else {
+                    differ++;
+                    worst = std::max(worst, nmse(out.data(), ref.data(), (int64_t) out.size()));
+                    add(in_differing, k);
+                }
+            }
+            std::printf("e3b-diag %-27s %-13s %d runs: %d same, %d differ (max NMSE %.2e), %d failed; %llu launches: "
+                        "two tiles on one core in %llu (%llu in differing runs), tiles moved %llu (%llu), one TCM on two "
+                        "cores in %llu (%llu), a pair on one core in %llu (%llu)\n",
+                        c.name, v.name, runs, same, differ, worst, failed, (unsigned long long) all.launches,
+                        (unsigned long long) all.shared_core, (unsigned long long) in_differing.shared_core,
+                        (unsigned long long) all.moved_tiles, (unsigned long long) in_differing.moved_tiles,
+                        (unsigned long long) all.tcm_elsewhere, (unsigned long long) in_differing.tcm_elsewhere,
+                        (unsigned long long) all.pairs_on_one_core, (unsigned long long) in_differing.pairs_on_one_core);
+            std::fflush(stdout);
+        }
+    }
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    return 0;
+}
+
 static double time_us(const std::function<void()> & fn, int iterations) {
     for (int i = 0; i < iterations / 10 + 1; i++) {
         fn();
@@ -2281,8 +2416,11 @@ int main(int argc, char ** argv) {
     bool run_bench     = false;
     bool run_gemv      = false;
     bool run_attn      = false;
+    int  e3b_runs      = 0;
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--expect-device") == 0) {
+        if (std::strncmp(argv[i], "--e3b", 5) == 0 && (argv[i][5] == '\0' || argv[i][5] == '=')) {
+            e3b_runs = argv[i][5] == '=' ? std::max(1, std::atoi(argv[i] + 6)) : 20;
+        } else if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
         } else if (std::strcmp(argv[i], "--expect-none") == 0) {
             expect_none = true;
@@ -2296,7 +2434,8 @@ int main(int argc, char ** argv) {
             run_attn = true;
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn]\n",
+                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn] "
+                         "[--e3b[=runs]]\n",
                          argv[0]);
             return 2;
         }
@@ -2330,6 +2469,9 @@ int main(int argc, char ** argv) {
     }
     REQUIRE(!expect_none);
     CHECK(n_spacemit == 1);
+    if (e3b_runs > 0) {  // E3b-diag only
+        return diagnose_e3b(dev, e3b_runs);
+    }
 
     // without spine-runtime the provider runs on the host executor (simulated device)
     flagos_device_info info;

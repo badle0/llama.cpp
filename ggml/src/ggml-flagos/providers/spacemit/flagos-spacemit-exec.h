@@ -74,3 +74,15 @@ class spacemit_executor {
 
 // spine-runtime executor on the AI cores; without spine-runtime (non-riscv64 builds) a serial stand-in for tests
 std::unique_ptr<spacemit_executor> spacemit_executor_create(spacemit_stream_policy policy, uint32_t n_cores);
+
+// test-only (structural-experiments.md E3b-diag): what the launches ordered in the cores (FLAGOS_SPACEMIT_TEST_LAUNCH=
+// per-step-join) did since the last call. Each tile notes its core after its join, after taking its TCM, after the TCM
+// agreement and after its step, and which TCM it took. All zero without spine-runtime
+struct spacemit_ordered_counts {
+    uint64_t launches          = 0;
+    uint64_t shared_core       = 0;  // launches with two tiles on one core, at any of the points
+    uint64_t moved_tiles       = 0;  // tiles found on another core than at the point before
+    uint64_t tcm_elsewhere     = 0;  // launches where two tiles on different cores held the same TCM
+    uint64_t pairs_on_one_core = 0;  // launches where both tiles of a pair (2i, 2i+1) were on one core
+};
+spacemit_ordered_counts spacemit_ordered_counts_take();
