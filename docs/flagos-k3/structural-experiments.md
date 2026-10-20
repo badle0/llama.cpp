@@ -31,8 +31,9 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
 
 **Q1. Does a K3 plugin need Tier-2 graph capture?**
 - Problem: today a split's steps run in one spine-runtime launch, a barrier between steps; a token takes 2 splits and
-  about 1,060 steps (estimated, never counted): about 1 ms of barriers at 0.94 µs each (`build.md` §7), about 1.1% of a
-  token's 88.5 ms (an estimate; E3c would measure it), near the deck's 1.2% for AMD (R12). A plugin with the required
+  about 1,060 steps (estimated; E3c counted 1,086, §6 run 4): about 1 ms of barriers at 0.94 µs each (`build.md` §7;
+  E3c measured 0.6 ms), about 1.1% of a token's 88.5 ms (an estimate; E3c: the AI cores idle 1.3-1.8% of a token by the
+  deck's measure, the barriers 0.7% of it), near the deck's 1.2% for AMD (R12). A plugin with the required
   functions alone gets one `launch` per kernel on a stream, which we read the ABI as ordering (the deck states the
   order only for copies, F15). spine-runtime's documentation promises no order between launches (F14): the plugin must
   order them itself, by waiting for each launch on the host (11.2-11.5 µs per launch against a barrier's 0.89-0.94 µs:
@@ -299,11 +300,14 @@ per kernel) reach the deck's cost of about 1% (R12) and graph capture is an opti
 - The K3 does not. spine-runtime 0.6 promises no order between launches (its documentation, F14; dependent launches
   were never run unordered). One launch per kernel with the host waiting for each is correct and costs Qwen3-4B 11-14%
   of generation and 0-2% of prompt processing (E3a). The cost is per kernel: a one-node graph takes about 11 µs through
-  our whole path (`--bench`), E3a about 14 µs per step (with the estimated 1,060 steps), so a smaller model loses more
-  (Qwen3-0.6B a third or more, estimated) and a larger one less. Passing E3's 5% line needs a launch with its wait
-  under about 5 µs; spine-runtime's own share of the 11 µs was never timed alone. Launches queued and ordered inside the
-  cores are not reliably correct with our kernels (E3b: the 1-token layers differ from one launch in 5 of 5 runs and one
-  run failed; the size of the difference was not printed; mechanism unverified). For generation the roles swap: graph
+  our whole path (`--bench`), E3a 13.4 µs per step over the 1,086 steps E3c counted (run 3; 14.3-15.0 µs with E3c's
+  counters on, of which 11.7-12.3 µs is each launch's own overhead, run 4), so a smaller model loses more (Qwen3-0.6B a
+  third or more, estimated) and a larger one less. Passing E3's 5% line needs a launch with its wait under about 5 µs
+  (at 1,086 steps: 4.1 µs more than a barrier); spine-runtime alone takes 7.67 µs, 7.2 more than a barrier (E3d, run 4),
+  so no plugin passes it on Qwen3-4B with this runtime. Launches queued and ordered inside the cores are not reliably
+  correct with our kernels (E3b: the 1-token layers differ from one launch in 5 of 5 runs and one run failed; the size
+  of the difference was not printed; mechanism unverified, E3b-diag) and cost 7.27-295.6 µs per launch even with tiles
+  that do nothing (E3d). For generation the roles swap: graph
   capture is the K3's normal path, the required functions alone its slow fallback.
 - Point by point. A plugin with the required functions alone is complete (R3): holds (E3a, identical logits); fast: not
   for Qwen3-4B's generation on the K3 (E3a). Capture optional (R3, R5 ⑤): in the ABI yes, for that speed no; today's
@@ -318,8 +322,9 @@ per kernel) reach the deck's cost of about 1% (R12) and graph capture is an opti
   least (without capture, prompt processing loses 0-2%, E3a), not as an opt-in like AMD's. To ask the mentor: how the
   core waits when a plugin has no events, and whether the deck's 0.6 ms was measured with capture.
 - For M3 (our plan, not the deck): an AOT kernel run as a launch of its own (`plan.md` M3.1) would pay a host-waited
-  launch, about 14 µs in E3a (with the estimated 1,060 steps per token) against the 12 µs M3.2 assumes (about 1.7 ms
-  per token for the RMS norms, estimated, already over M3.2's 1% rule); AOT kernels called as steps inside the
+  launch, 13.4-15.0 µs per launch in a model run (E3a, E3c) against the 12 µs M3.2 assumes (for a token's 145 RMS
+  norms about 2 ms at the measured cost, 1.7 ms at M3.2's, estimates, either over M3.2's 1% rule); AOT kernels called
+  as steps inside the
   replayed launch (Q3) would not (neither is built).
 
 ## 4. Experiments
@@ -335,11 +340,12 @@ with the modes interleaved in each repetition: the board drifts between sessions
 | E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | done 2026-10-19 (§6): -24 to -95%; not repeated (user, 2026-10-20: M0's X3/X3b and run 1 cover it; out of the default `EXPS`) |
 | E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | agreed (user, 2026-10-20), anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b, as E3a fails) keeps tg128 within 1% of `ref` (whose framework cost is already about 1.1%); Tier-2 graph capture is required at a tg128 loss of 5% or more; in between, report the numbers | done 2026-10-20 (§6, run 3): tg128 -14.2%, about 14.6 ms per token; identical logits |
 | E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): one launch per kernel on an ordered stream, as we read the ABI (F15) | unknown: between the reference and E3a | as E3a | implemented 2026-10-20 (`FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join`, below); **fails its checks on the K3** (2026-10-20, 5 of 5 runs): the 1-token layer cases differ from one launch (once failed), while E3a passes everything and E3b passes the 8 split-attention and the 7-token layer cases; spine-runtime ran two tiles of one launch on one core. Not measured: a computation that is not reliably correct. Not fixed (user, 2026-10-20; Q1) |
-| E3c | Q1, R12 | Build A with `FLAGOS_SPACEMIT_TEST_STATS=<file>` (§5): per graph the steps and launches, the time in `graph_compute`, in the launches (host), every tile's time in every step's kernel and at the barriers; per token: outside `graph_compute` (llama.cpp, the CPU's split, sampling), host work in it, launch overhead, the barriers' own cost, imbalance, kernels. Modes `e3c` (today's launches) and `e3c-a` (E3a's) against `ref` | steps per token about 1,060 (estimated, never counted); the barriers' own cost about 1 ms per token (0.94 µs each); the counters cost tg128 under 1% (estimate: 3 clock reads per step and tile); idle (the deck's measure) unknown: the 1.1% counted the barriers only | none for a design decision: it replaces Q1's estimates (steps, 1.1%) with counts, gives R12's number, and from `e3c-a` E3a's cost per step and per launch inside a run (13.8 µs per step estimated against the benchmark's 11.5). If `e3c` loses more than 1% of tg128 against `ref`, its times are reported as disturbed | implemented 2026-10-20 (Mac: all checks pass with the switch, serial, threaded and per step; E3b is not counted); not run on the K3 |
-| E3d | Q1, F15 | `scripts/spert-launch-bench.cpp`: spine-runtime alone, no provider and no ggml, tiles that do nothing: one launch and its wait (grid 8 and 1); the same with each tile taking its TCM and one barrier (our per-launch setup); 20,000 barriers in one launch, with each tile's core at its start, middle and end; 8 and 64 launches queued, unordered; the same ordered by `Context::join`, checking the order and the cores; and again with each tile taking its TCM and a barrier (E3b's tiles) | launch and wait: unknown, below our whole path's 11.0-11.5 µs (`--bench`); barriers about 0.9 µs; the rest unknown | fixed before the run: (1) launch and wait (grid 8, median) at 5 µs or more: one launch per kernel with a host wait cannot pass E3's 5% line on Qwen3-4B on spine-runtime 0.6 whatever the plugin does (at about 1,060 steps; E3c counts them); below, our own per-launch path is the larger part. (2) joined, 64 at a time, at 1.7 µs or less per launch with no order violation and no shared core: in-core ordering would pass E3's 1% line with tiles that need no core of their own; reported to the user (E3b's decision is theirs) and the mentor. Any order violation: `Context::join` does not order launches, for SpacemiT. (3) barriers: any tile that changed core or shared one contradicts today's executor's assumption; stop and look before other runs. (4) joined with TCM: tiles without TCM or on the same TCM test E3b's likely mechanism (log); reported, no decision | written 2026-10-20 (Mac: compiles against a stand-in for `spert.hpp`); not run |
+| E3c | Q1, R12 | Build A with `FLAGOS_SPACEMIT_TEST_STATS=<file>` (§5): per graph the steps and launches, the time in `graph_compute`, in the launches (host), every tile's time in every step's kernel and at the barriers; per token: outside `graph_compute` (llama.cpp, the CPU's split, sampling), host work in it, launch overhead, the barriers' own cost, imbalance, kernels. Modes `e3c` (today's launches) and `e3c-a` (E3a's) against `ref` | steps per token about 1,060 (estimated, never counted); the barriers' own cost about 1 ms per token (0.94 µs each); the counters cost tg128 under 1% (estimate: 3 clock reads per step and tile); idle (the deck's measure) unknown: the 1.1% counted the barriers only | none for a design decision: it replaces Q1's estimates (steps, 1.1%) with counts, gives R12's number, and from `e3c-a` E3a's cost per step and per launch inside a run (13.8 µs per step estimated against the benchmark's 11.5). If `e3c` loses more than 1% of tg128 against `ref`, its times are reported as disturbed | done 2026-10-20 (§6 run 4): 1,086 steps per token (1,122 from n_kv 1024); idle 1.3-1.8% by the deck's measure; E3a 14.3-15.0 µs per step in a run; the counters cost tg128 0.5% |
+| E3d | Q1, F15 | `scripts/spert-launch-bench.cpp`: spine-runtime alone, no provider and no ggml, tiles that do nothing: one launch and its wait (grid 8 and 1); the same with each tile taking its TCM and one barrier (our per-launch setup); 20,000 barriers in one launch, with each tile's core at its start, middle and end; 8 and 64 launches queued, unordered; the same ordered by `Context::join`, checking the order and the cores; and again with each tile taking its TCM and a barrier (E3b's tiles); `joined+canary` added for E3b-diag (below) | launch and wait: unknown, below our whole path's 11.0-11.5 µs (`--bench`); barriers about 0.9 µs; the rest unknown | fixed before the run: (1) launch and wait (grid 8, median) at 5 µs or more: one launch per kernel with a host wait cannot pass E3's 5% line on Qwen3-4B on spine-runtime 0.6 whatever the plugin does (at about 1,060 steps; E3c counts them); below, our own per-launch path is the larger part. (2) joined, 64 at a time, at 1.7 µs or less per launch with no order violation and no shared core: in-core ordering would pass E3's 1% line with tiles that need no core of their own; reported to the user (E3b's decision is theirs) and the mentor. Any order violation: `Context::join` does not order launches, for SpacemiT. (3) barriers: any tile that changed core or shared one contradicts today's executor's assumption; stop and look before other runs. (4) joined with TCM: tiles without TCM or on the same TCM test E3b's likely mechanism (log); reported, no decision | done 2026-10-20 (§6 run 4): rule 1 triggers (7.67 µs), rule 2 fails (7.27-295.6 µs per launch), rule 3 holds, rule 4: no tile without TCM, tiles on a shared core got the same TCM |
 | E3a-0.6B | F15 | E3a (`e3`) on Qwen3-0.6B Q4_0, runner group `e3a` (E3a without E3b) | tg128 about -35 to -40% (estimate: E3a's 11.5-13.8 µs per step on 4B, about 820 steps for 0.6B's 28 layers against 4B's 36, on a token of about 17.9 ms); prompt processing a few %; logits identical | descriptive: replaces F15's estimate ("a third or more") | ready, not run |
 | E2-0.6B | Q5 | E2 (`e2`) on Qwen3-0.6B Q4_0 | as on 4B: identical logits, 2 splits per token, speeds within 2% (pp512 at depth 4096 possibly faster, as on 4B) | E2's | ready, not run |
-| R12-hw | `PROJECT.md` question 8, `plan.md` R12 | Build R (`EXPS=r12 ... prepare`): build A's configuration with `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` defined, which compiles upstream's active branch of the 1-row Q4_1 kernel (16-bit zero-point product, fp16 sums); the provider checks once, the zero-point probe (zero point 15 against 32 equal activations, 1 row and 4) | 1-row NMSE about 4.6 (the reference's emulation of a 16-bit product, `plan.md` M2c design), 4 rows unchanged (3e-7), so the check fails; random-data Q4_1 cases unknown | 1-row NMSE above the matmul bound (5e-4): upstream's branch wraps on the board, R12 becomes a tested finding for question 8; within it: the reading was wrong and R12 is withdrawn | ready, not run (the switch compiles only on riscv64, so the Mac cannot try it) |
+| R12-hw | `PROJECT.md` question 8, `plan.md` R12 | Build R (`EXPS=r12 ... prepare`): build A's configuration with `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` defined, which compiles upstream's active branch of the 1-row Q4_1 kernel (16-bit zero-point product, fp16 sums); the provider checks once, the zero-point probe (zero point 15 against 32 equal activations, 1 row and 4) | 1-row NMSE about 4.6 (the reference's emulation of a 16-bit product, `plan.md` M2c design), 4 rows unchanged (3e-7), so the check fails; random-data Q4_1 cases unknown | 1-row NMSE above the matmul bound (5e-4): upstream's branch wraps on the board, R12 becomes a tested finding for question 8; within it: the reading was wrong and R12 is withdrawn | done 2026-10-20 (§6 run 4): 1 row 4.62, 4 rows 3.0e-7: upstream's branch wraps on the board |
+| E3b-diag | the cause of E3b's differences (Q1; for SpacemiT) | Two parts, both test-only. (a) E3d's `joined+canary`: tiles that only join, take their TCM, pass a barrier and check a pattern of their own in their TCM, across the barrier and with no suspension point in between, noting their core at four points. (b) `flagos-check-spacemit --e3b[=runs]`: the 1-token layers (q4_0, q4_1), the 7-token layer and eight 1-row matmuls alone (q4_0, q4_1), each `runs` times ordered in the cores against one launch, in four variants: the default 1-row strategy (`paired`), `staged` (TCM, no pair turns), `direct` (weights from DRAM, no pair turns) and `paired` with full memory fences after every join and at every tile's end (`FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1`); per run, what the ordered launches' tiles noted: two tiles on one core, tiles that moved, one TCM held on two cores, both tiles of a pair on one core | unknown. Candidates: H1, two tiles use one TCM at the same time (truly at once on one core, or a tile that moved still using its first core's TCM); H2, both tiles of a pair on one core, the first spinning on the second until the 10 s limit (would explain the one failed run, not the differences); H3, a tile reading data the previous launch wrote before it is visible (memory order across `join`); H4, something in the 1-row path itself (pair turns or TCM staging) | fixed before the run. H1: (a) shows a canary changed with no suspension point, or one TCM on two cores, and (b)'s differing runs show tiles that moved or one TCM on two cores. H2: (b)'s failed runs, and only they, show a pair on one core. H3: `paired+fence` has no differing run where `paired` has many. H4: the 1-row matmuls alone differ, and `staged` or `direct` changes how often (pair turns or TCM staging). Differing runs with no shared core, moved tile or shared TCM rule co-location out. If none fits, the cause stays open and the next step is comparing every node's output | written 2026-10-20 (Mac: builds, the checks pass, `--e3b` runs E3b as host waits there, so all identical and the counts 0; E3d compiles against a stand-in); not run |
 | E4 | Q5, F13, R1 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | E2's rule; then "no upstream change needed at all" | done 2026-10-20 (§6, run 2): passes; pp512 at depth 4096 +4.0% |
 | E6 | Q2 | GGUF's bytes in the buffer ggml sees plus a private repacked copy | about +2.35 GB, the same speed, exact read-back | evidence for option (e) | not implemented |
 | E5 | Q2 | the 1-row path reads GGUF's layout, interleaving 32 rows while copying into TCM | unknown; generation only | how much repacking buys | not implemented |
@@ -404,6 +410,21 @@ EXPS="e2 e3a" docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen
 - Time (estimates): E3c about an hour (3 modes, 3 repetitions, depth runs); the 0.6B session about 40 minutes; build R
   a full build of the checks.
 
+### Run 5 (prepared 2026-10-20): E3b-diag (on the K3 once run 4's runs have ended, inside tmux)
+
+```bash
+# the commits (bundle or pull), then:
+cmake --build build-flagos --target flagos-check-spacemit 2>&1 | tail -1
+g++ -O2 -std=c++17 -I$HOME/spine-runtime/include docs/flagos-k3/scripts/spert-launch-bench.cpp \
+    -L$HOME/spine-runtime/lib -lspert -o ~/spert-launch-bench
+~/tcmtest/tcmrelease --apply && LD_LIBRARY_PATH=$HOME/spine-runtime/lib ~/spert-launch-bench 2>&1 | tee ~/sx-e3d-2.log
+~/tcmtest/tcmrelease --apply && ./build-flagos/bin/flagos-check-spacemit --expect-device --e3b 2>&1 | tee ~/sx-e3b-diag.log
+```
+
+- `--e3b` prints one `e3b-diag` line per case and variant (20 runs each by default, `--e3b=50` for more); it fails
+  nothing. A few minutes, longer if pair waits run into their 10 s limit (each such run takes 10 s).
+- The benchmark repeats run 4's cases and adds `joined+canary` at the end.
+
 ### E4: stock upstream llama.cpp with the provider as a run-time module (scripted 2026-10-20)
 
 **Why:** E2 showed that as an IGPU the K3 needs no llama.cpp change. What remains of the fork's footprint is the mentor's
@@ -454,6 +475,8 @@ Test-only; the defaults are unchanged.
 | `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join` | the executors' `run_ordered` (`flagos-spacemit-exec.h`, `flagos-spacemit-exec.cpp`) | E3b: every step its own spine-runtime launch, queued without host waits; each tile first joins its own copy of the previous launch's `Future` (`Context::join`), before it takes its core's TCM; the host waits once (`Future::sync_all`) and reports, once, launches whose tiles shared a core (`sched_getcpu`), where the TCM agreement or a pair wait could deadlock. Without spine-runtime (the Mac) the host waits for each launch, as E3a |
 | `FLAGOS_SPACEMIT_TEST_STATS=<file>` | `spacemit_stats_file` and `spacemit_backend_graph_compute` (`flagos-spacemit.cpp`), `spacemit_run_stats` (`flagos-spacemit-exec.h`), the executors' `run` | E3c: per kind of graph (launch mode, the first matmul's rows, the first attention's KV length class: below 1024, below 4096, above), the graphs, steps and launches, the time in `graph_compute`, in the launches (host), in the kernels (summed over the tiles, and per step the slowest tile) and at the barriers; one JSON line per kind appended to `<file>` when the process ends. Read once; the tiles read the clock only with the switch set and write their times into their own rows. E3b's launches are not counted |
 | `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (compile-time) | `gemm_kernel_i8i4_m1`, `flagos-spacemit-ime-kernels.cpp` | R12-hw: compiles upstream's active branch of the 1-row Q4_1 kernel instead of the exact one; only in build R, through `CMAKE_CXX_FLAGS` |
+| `FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1` | `run_ordered` and `spacemit_tile_main_ordered`, `flagos-spacemit-exec.cpp` | E3b-diag: with E3b, a full memory fence after every tile's join and at its end. E3b's launches also always note each tile's core after its join, after taking its TCM, after the TCM agreement and at its end, and its TCM; `spacemit_ordered_counts_take()` (`flagos-spacemit-exec.h`) returns what they showed |
+| `flagos-check-spacemit --e3b[=runs]` | `diagnose_e3b`, `tests/check_spacemit.cpp` | E3b-diag: only the E3b diagnosis (§4), nothing else checked |
 
 The kernels are the same in every mode: the switches change only what llama.cpp is told (E2) or how the steps are
 grouped into launches (E3).
@@ -664,6 +687,96 @@ Reading:
   counted. E3c counts it.
 - Correctness and placement do not change with the launch model (expected: the same steps in the same order).
 
+### Run 4 (K3, 2026-10-20): E3d, R12-hw and E3c (the Qwen3-0.6B runs still going)
+
+Commits up to `060c96d1f` (by `git bundle`, the board's name lookup failing). Every program ended without a runtime
+failure.
+
+E3d, spine-runtime 0.6 alone (8 cores, VLEN 1024, shared buffer 384 KiB, arch 0xa064), tiles that do (almost)
+nothing; medians over 20,000 launches per case, one session:
+
+| Case | Result |
+|---|---|
+| launch and wait, 8 tiles / 1 tile | 7.67 µs (p10 7.46, p90 7.96) / 4.50 µs |
+| launch, TCM and one barrier, and wait (our per-launch setup) | 8.79 µs |
+| barriers inside one launch (20,000 x 20 launches) | 0.435 µs each; no tile changed core (0 of 160), no launch with two tiles on one core (0 of 20) |
+| queued, unordered, 8 / 64 at a time | 5.86 / 5.36 µs per launch; the host's launch calls alone 5.49 / 5.28 µs; no shared core |
+| ordered by `join`, 8 / 64 at a time | 7.27 / 295.64 µs per launch; no order violation; two tiles on one core in 44 of 20,000 / 11,345 of 19,968 launches |
+| ordered by `join`, with TCM and a barrier, 8 / 64 at a time | 26.37 / 420.46 µs per launch; no order violation; two tiles on one core in 5,210 / 14,716 launches; no tile without TCM; two tiles on the same TCM in 5,210 / 14,716 launches |
+
+Tiles ran on cores 8-15 only. By the rules fixed in §4:
+- Rule 1 triggers: a launch and its wait cost 7.2 µs more than a barrier, so one launch per kernel with a host wait
+  stays under E3's 5% line on Qwen3-4B (88.5 ms per token) only below about 610 steps per token (estimated 1,060;
+  E3c counts them).
+- Rule 2 fails: in-core ordering by `join` costs 7.27 µs per launch at 8 in flight and 295.64 µs at 64, against the
+  1.7 µs it needed. It kept the order in all of about 80,000 launches.
+- Rule 3 holds: within one launch, no tile moved and none shared a core, in 20 launches of 20,000 barriers.
+- Rule 4: no tile was left without TCM, which contradicts the first half of E3b's likely mechanism in the log. Tiles
+  that shared a core got the same TCM, in every such launch. Two tiles on one core came only with `join`, and also
+  with tiles that do nothing: the runtime's doing, not our kernels'.
+- Also measured: a bare barrier costs 0.435 µs, half the 0.89-0.94 µs per node of the provider's `--bench` (which
+  includes a node's kernel and dispatch), so Q1's "about 1 ms of barriers per token" is likely about twice too high
+  (estimate; E3c measures the barriers' own cost in a run). The host's launch call alone costs 5.3-5.5 µs, so queuing
+  launches without waits still costs the host about that per launch.
+
+R12-hw (build R): the probe's 1-row result has NMSE 4.62, the 4-row one 3.0e-7, so the check fails as predicted; its
+random-data Q4_1 cases pass with upstream's branch. For this input every block's value is -30,480 and a 16-bit wrap
+turns the zero-point term 60,960 into -4,576, so the kernel computes 35,056: off by 65,536 = 2^16 in every block, an NMSE
+of (65,536 / 30,480)^2 = 4.62, the board's figure. By the rule: upstream's active branch of the 1-row Q4_1 kernel wraps
+on the K3 (in the provider's copy, its body unchanged); R12 is a tested finding for question 8. Build A passes the probe.
+How often real models produce such blocks is not measured.
+
+E3c (Qwen3-4B Q4_0, build A, `ref`, `e3c` and `e3c-a` interleaved, 3 repetitions, depth runs; logs in `~/sx/e3c`).
+Speed (t/s, change against `ref`):
+
+| Mode | pp128 | tg128 | tg32 depth 0 | tg32 depth 1024 | tg32 depth 4096 | pp512 depth 4096 |
+|---|---|---|---|---|---|---|
+| `ref` | 92.43 ± 0.25 | 11.25 ± 0.01 | 11.39 ± 0.02 | 9.87 ± 0.04 | 7.81 ± 0.02 | 34.59 ± 0.12 |
+| `e3c` (counters) | 92.01 (-0.4%) | 11.20 (-0.5%) | 11.27 (-1.1%) | 9.83 (-0.4%) | 7.79 (-0.3%) | 34.61 (+0.1%) |
+| `e3c-a` (counters, one launch per step) | 90.88 (-1.7%) | 9.54 (-15.3%) | 9.57 (-16.0%) | 8.43 (-14.6%) | 6.90 (-11.8%) | 34.51 (-0.2%) |
+
+One generated token with today's launches (`e3c`), µs, mean of the repetitions (the summary's columns: outside
+`graph_compute`; host work in it outside the launch; launch, the launch less the mean tile's kernels and barrier waits;
+the barriers' own cost; imbalance, each step's slowest tile less the mean tile, summed; kernels, the mean tile's; idle,
+the deck's measure, the token less the busy time):
+
+| Test | Token | Outside | Host | Launch | Barriers | Imbalance | Kernels | Idle | Steps |
+|---|---|---|---|---|---|---|---|---|---|
+| tg128 | 89,285 | 273 | 546 | 190 | 604 | 2,469 | 85,202 | 1,614 (1.81%) | 1,086 |
+| tg32 depth 0 | 88,768 | -264 | 643 | 203 | 587 | 2,479 | 85,120 | 1,169 (1.32%) | 1,086 |
+| tg32 depth 1024 | 101,758 | 369 | 548 | 190 | 620 | 3,711 | 96,321 | 1,726 (1.70%) | 1,122 |
+| tg32 depth 4096 | 128,356 | 390 | 547 | 193 | 623 | 3,508 | 123,095 | 1,753 (1.37%) | 1,122 |
+
+With one launch per step (`e3c-a`): idle 11.5-14.8% of a token, each launch's own overhead 11.73-12.25 µs; E3a's cost
+per step, `e3c-a` less `e3c` over `e3c`'s steps, 14.34 µs (tg128), 14.51, 14.97 and 14.84 µs (tg32 at depths 0, 1024,
+4096).
+
+Reading:
+- E3c's rule: the counters cost tg128 0.5% (tg32 at depth 0 1.1%, at the edge), so the times stand, with the counters'
+  own clock reads in them.
+- Steps: 1,086 per token below n_kv 1024 and 1,122 from it, 36 more: the split attention's merge step in each of the 36
+  layers (it runs from n_kv 512; inferred from the design, the numbers match). Q1's estimate was 1,060.
+- The framework's cost by the deck's measure, the AI cores idle per token: 1.2-1.8 ms, 1.3-1.8% of a token (with the
+  counters on). Of it: the barriers' own cost 0.59-0.62 ms (0.55 µs each with a clock read; E3d's bare barrier 0.435
+  µs), host work in `graph_compute` 0.55-0.64 ms, the one launch 0.19-0.20 ms (it also holds the clock reads the counters
+  do not attribute, so it overstates spine-runtime's share; inference), outside `graph_compute` 0.27-0.39 ms
+  (llama.cpp, the X100 cores' split, sampling). Depth 0's negative "outside" most likely comes from the run's first
+  1-row graph, which also creates the spine-runtime stream: it is in the counters' average and not in llama-bench's
+  timed tokens (inferred). The deck's AMD figure is 1.2% (their measurement on other hardware; whether the definitions
+  match is not known). Q1's estimate was 1.1%, the barriers alone at twice their cost.
+- Imbalance, the slowest tile's lead summed over the steps, is 2.5-3.7 ms per token (2.7-3.6%): more than the whole
+  idle time. It counts as busy by the deck's measure; it is in how the kernels split their work, not in the launch
+  model.
+- E3a in a model run: 14.3-15.0 µs per step with the counters on (run 3, without them: 13.4 µs over the counted 1,086
+  steps). Of it, each launch's own overhead 11.7-12.3 µs (E3d's runtime alone: 7.67 µs, 8.79 with TCM and a barrier),
+  host work about 1.2 µs more per launch, and the kernels about 1.4 µs slower per step when each step is a launch
+  (inference: each launch starting cold). Run 3's question, more steps or dearer launches: the count adds 2.5%; the
+  launches cost more in a run than in either benchmark.
+
+Build A's provider checks: rc=1, only from E3b's two 1-token layer cases (as since 2026-10-20); E3a identical in all
+cases, the KV cache in our buffer max NMSE 5.24e-04. Builds A and R compile with E3c's counters against the board's
+`spert.hpp`.
+
 ## 7. Log
 
 - 2026-10-19: requirements, questions and findings collected from the deck, the AMD comparison, upstream `master`, the
@@ -738,3 +851,15 @@ Reading:
   Qwen3-0.6B), R12-hw (`FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1`, build R in `prepare`). Predictions and rules fixed in
   §4 before any run. Mac: the checks pass with and without the counters (serial, threaded, per step); the runner's dry
   runs and its E3c table on fixture logs; E3d compiles against a stand-in for `spert.hpp`. Nothing run on the K3.
+- 2026-10-20: run 4 on the K3, first part (§6): E3d (rules 1 and 3 as predicted, rule 2 fails, rule 4: shared cores
+  get the same TCM, no tile without TCM) and R12-hw (upstream's branch wraps: NMSE 4.62, exactly a 2^16 error per
+  block). E3c's runs still going.
+- 2026-10-20: E3b-diag prepared (user: find E3b's cause): `joined+canary` in E3d, `flagos-check-spacemit --e3b`,
+  `FLAGOS_SPACEMIT_TEST_JOIN_FENCE`, and the ordered launches' per-tile cores and TCM counted per run; hypotheses
+  H1-H4 and what each would show fixed in §4 before any run. Mac: builds, the checks pass, `--e3b=3` runs (E3b as host
+  waits there, so identical and nothing counted); the K3-only code compiles against a stand-in for `spert.hpp`.
+  `plan.md` R12 and `PROJECT.md` question 8 still read "found by reading"; to update when run 4 is recorded in full.
+- 2026-10-20: run 4, E3c (§6): 1,086 steps per token (1,122 with the split attention), the AI cores idle 1.3-1.8% of
+  a token by the deck's measure (barriers 0.6 ms, host work 0.55 ms, the launch 0.2 ms, llama.cpp's side about 0.3 ms),
+  imbalance 2.5-3.7 ms, E3a 14.3-15.0 µs per step in a run (11.7-12.3 µs of it each launch's overhead). Q1, F15 and the
+  M3 note updated with the counts. The Qwen3-0.6B runs (E3a-0.6B, E2-0.6B) still going.
