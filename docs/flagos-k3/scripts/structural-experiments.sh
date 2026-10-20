@@ -13,7 +13,8 @@
 #                                                           M, this repository's provider built as such a module in
 #                                                           $BUILD_M; then a smoke check (the stock programs list the
 #                                                           device through GGML_BACKEND_PATH). Always: build A's tools
-#                                                           (today's build-flagos/) and its provider checks
+#                                                           (today's build-flagos/) and its provider checks, 5 times with
+#                                                           e3 (they compare E3a and E3b with one launch, byte for byte)
 #        structural-experiments.sh run <model.gguf> [out]   the runs of $EXPS, then the summary (logs in out; default
 #                                                           ~/sx/<model name>)
 #        structural-experiments.sh summary <out>            the summary again from the logs
@@ -35,7 +36,8 @@
 #   e2-igpu       B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
 #   e2-gpu        B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu, -ngl 99
 #   e2-igpu-auto  B  as e2-igpu with llama.cpp's default -ngl (its automatic fit); placement only
-#   e3            A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step
+#   e3            A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step        E3a: one launch per step, the host waiting for each
+#   e3b           A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join   E3b: ordered in the cores, the host waiting once
 #   ref-nohp      A  FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1    E2-hp, with e2-igpu-nohp (B, igpu, no huge pages)
 #   neg-{q8,shift}-{igpu,ref}  E2-neg: a Q8_0 KV cache and a context shift, as e2-igpu (B) and as ref (A)
 #   e4-igpu       S  GGML_BACKEND_PATH=<M's libggml-flagos.so>, FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
@@ -76,7 +78,7 @@ unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEM
 
 mode_build() {
     case $1 in
-        ref | ref-nohp | e3 | neg-*-ref) echo "$BUILD_A" ;;
+        ref | ref-nohp | e3 | e3b | neg-*-ref) echo "$BUILD_A" ;;
         e4-*) echo "$BUILD_S" ;;
         *) echo "$BUILD_B" ;;
     esac
@@ -88,6 +90,7 @@ mode_env() {
         e2-gpu) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu" ;;
         e2-igpu-nohp) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1" ;;
         e3) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step" ;;
+        e3b) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join" ;;
         # the stock programs know no "flagos" module by name; GGML_BACKEND_PATH loads one from any path
         e4-igpu) echo "GGML_BACKEND_PATH=$MODULE FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu" ;;
         *) echo "" ;;
@@ -239,12 +242,23 @@ prepare_a() {
     # shellcheck disable=SC2086
     cmake --build "$BUILD_A" --target $TOOLS flagos-check-spacemit > "$BUILD_A/sx-build.log" 2>&1
     echo "   build A: rc=$?; $(grep -cE 'error:|FAILED' "$BUILD_A/sx-build.log") error lines ($BUILD_A/sx-build.log)"
-    # the checks include E2's layer with the KV cache in the provider's buffer and E3's per-step comparisons
-    release
-    "$BUILD_A/bin/flagos-check-spacemit" --expect-device > "$BUILD_A/sx-check.out" 2> "$BUILD_A/sx-check.err"
-    echo "   flagos-check-spacemit: rc=$?: $(tail -1 "$BUILD_A/sx-check.out")"
-    grep -E "^layer|^attn     split" "$BUILD_A/sx-check.out" | grep -oE "KV cache in our buffer[^;]*|one launch per step[^;]*" |
-        sed 's/^/   /'
+    # the checks include E2's layer with the KV cache in the provider's buffer and E3's comparisons of one launch per
+    # step (E3a, E3b) with one per layer, byte for byte; with e3 they run 5 times, as a missing order shows only at times.
+    # A hang ends after 15 minutes
+    local n_check=1 i rc to=""
+    if has e3; then n_check=5; fi
+    if command -v timeout > /dev/null; then to="timeout --foreground 900"; fi
+    for i in $(seq "$n_check"); do
+        release
+        # shellcheck disable=SC2086
+        $to "$BUILD_A/bin/flagos-check-spacemit" --expect-device < /dev/null > "$BUILD_A/sx-check.out" \
+            2> "$BUILD_A/sx-check.err"
+        rc=$?
+        echo "   flagos-check-spacemit ($i/$n_check): rc=$rc: $(tail -1 "$BUILD_A/sx-check.out")"
+        grep -E "^layer|^attn     split" "$BUILD_A/sx-check.out" |
+            grep -oE "KV cache in our buffer[^;]*|one launch per step[^;]*" | sed 's/^/      /'
+        grep -E "FAIL|two tiles on one core|ordered launches" "$BUILD_A/sx-check.err" | head -5 | sed 's/^/      /'
+    done
 }
 
 prepare() {
@@ -373,7 +387,7 @@ run_all() {
         place+=" e1-auto e1-on" bench_modes+=" e1-auto e1-on" depth_modes+=" e1-auto e1-on" kld_modes+=" e1-auto e1-on"
     fi
     if has e3; then
-        place+=" e3" bench_modes+=" e3" depth_modes+=" e3" kld_modes+=" e3"
+        place+=" e3 e3b" bench_modes+=" e3 e3b" depth_modes+=" e3 e3b" kld_modes+=" e3 e3b"
     fi
     if has e2hp; then
         case " $depth_modes " in *" e2-igpu "*) ;; *) depth_modes+=" e2-igpu" ;; esac

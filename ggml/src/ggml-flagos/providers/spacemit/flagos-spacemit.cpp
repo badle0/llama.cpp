@@ -242,22 +242,31 @@ bool spacemit_data_ready(const ggml_tensor * node) {
     return true;
 }
 
-// test-only: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step launches every step on its own, as a runtime without graph capture
-// launches each kernel (structural-experiments.md E3); per-split, the default, launches a split's steps together. Read
+enum class spacemit_launch_kind {
+    per_split,      // the default: a split's steps in one launch, a barrier after each
+    per_step,       // E3a: every step its own launch, the host waiting for each
+    per_step_join,  // E3b: every step its own launch, ordered inside the cores, the host waiting once
+};
+
+// test-only: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step or per-step-join launches every step on its own, as a runtime
+// without graph capture launches each kernel (structural-experiments.md E3a, E3b); per-split names the default. Read
 // at every graph, so a benchmark can switch; anything else is reported once and ignored
-bool spacemit_launch_per_step() {
+spacemit_launch_kind spacemit_launch_mode() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_LAUNCH");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "per-split") == 0) {
-        return false;
+        return spacemit_launch_kind::per_split;
     }
     if (std::strcmp(v, "per-step") == 0) {
-        return true;
+        return spacemit_launch_kind::per_step;
+    }
+    if (std::strcmp(v, "per-step-join") == 0) {
+        return spacemit_launch_kind::per_step_join;
     }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_TEST_LAUNCH=%s: unknown setting ignored\n", __func__, v);
     }
-    return false;
+    return spacemit_launch_kind::per_split;
 }
 
 // every node and the workspace are checked before the launch, so a graph either runs completely or fails with
@@ -307,17 +316,25 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
 
     std::lock_guard<std::mutex> lock(dev->run_mutex);
-    if (spacemit_launch_per_step()) {
-        // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every tile
-        // before the next starts, as the barrier after a step does inside one launch
-        std::vector<spacemit_step> one(1);
-        for (const spacemit_step & step : ctx->steps) {
-            one[0] = step;
-            if (!ctx->executor->run(one, ctx->workspace, ctx->workspace_size)) {
-                return GGML_STATUS_FAILED;
+    switch (spacemit_launch_mode()) {
+        case spacemit_launch_kind::per_step:
+            {
+                // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every
+                // tile before the next starts, as the barrier after a step does inside one launch
+                std::vector<spacemit_step> one(1);
+                for (const spacemit_step & step : ctx->steps) {
+                    one[0] = step;
+                    if (!ctx->executor->run(one, ctx->workspace, ctx->workspace_size)) {
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+                return GGML_STATUS_SUCCESS;
             }
-        }
-        return GGML_STATUS_SUCCESS;
+        case spacemit_launch_kind::per_step_join:
+            return ctx->executor->run_ordered(ctx->steps, ctx->workspace, ctx->workspace_size) ? GGML_STATUS_SUCCESS
+                                                                                                : GGML_STATUS_FAILED;
+        case spacemit_launch_kind::per_split:
+            break;
     }
     return ctx->executor->run(ctx->steps, ctx->workspace, ctx->workspace_size) ? GGML_STATUS_SUCCESS
                                                                                   : GGML_STATUS_FAILED;

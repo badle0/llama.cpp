@@ -9,6 +9,9 @@
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 #    include <spert.hpp>
+#    if defined(__linux__)
+#        include <sched.h>
+#    endif
 #else
 #    include <condition_variable>
 #    include <cstring>
@@ -113,6 +116,27 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     }
 }
 
+// test-only (structural-experiments.md E3b): one launch per step, ordered inside the cores. spine-runtime does not
+// order the launches of a stream (dependent kernels wait for each other's Future), so every tile first joins its own
+// copy of the previous launch's Future, before it takes its core's TCM. A tile that waits is suspended and its core
+// may run another tile; two tiles of one launch on one core could deadlock at the TCM agreement or a pair wait, so
+// every tile notes its core and the host reports launches whose tiles shared one
+struct spacemit_ordered_launch : spacemit_launch {
+    std::vector<spert::Future> previous;                      // one copy per tile; none for a graph's first launch
+    int                        cpus[SPACEMIT_MAX_TILES] = {};  // the core each tile ran on (Linux; else 0)
+};
+
+void spacemit_tile_main_ordered(spert::Context * ctx, spacemit_ordered_launch * launch) noexcept {
+    const uint32_t ith = ctx->program_id(0);
+    if (!launch->previous.empty() && ctx->join(launch->previous[ith]) != spert::Status::Ok) {
+        launch->failed.store(true);  // the tile still reaches every barrier, skipping its kernel
+    }
+#if defined(__linux__)
+    launch->cpus[ith] = sched_getcpu();
+#endif
+    spacemit_tile_main(ctx, launch);
+}
+
 class spert_executor final : public spacemit_executor {
   public:
     spert_executor(spacemit_stream_policy policy, uint32_t n_cores, int64_t fail_step) :
@@ -120,22 +144,8 @@ class spert_executor final : public spacemit_executor {
 
     bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
         std::unique_ptr<spert::Stream> per_call_stream;
-        spert::Stream *                stream = nullptr;
-        if (policy == spacemit_stream_policy::per_call) {
-            per_call_stream = make_stream();
-            stream          = per_call_stream.get();
-        } else {
-            if (persistent_stream == nullptr) {
-                persistent_stream = make_stream();
-            }
-            stream = persistent_stream.get();
-        }
+        spert::Stream *                stream = stream_for_run(per_call_stream);
         if (stream == nullptr) {
-            return false;
-        }
-        if (static_cast<uint32_t>(stream->core_count()) > SPACEMIT_MAX_TILES) {
-            GGML_LOG_ERROR("FlagOS SpacemiT: %u AI cores, at most %u supported\n",
-                           static_cast<uint32_t>(stream->core_count()), SPACEMIT_MAX_TILES);
             return false;
         }
 
@@ -154,11 +164,91 @@ class spert_executor final : public spacemit_executor {
         return !launch.failed.load();
     }
 
+    // every step its own launch, queued without the host waiting, each ordered after the previous by its tiles; the
+    // host waits once, for all. Each launch's arguments stay alive until then
+    bool run_ordered(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
+        std::unique_ptr<spert::Stream> per_call_stream;
+        spert::Stream *                stream = stream_for_run(per_call_stream);
+        if (stream == nullptr) {
+            return false;
+        }
+        const uint32_t nth = static_cast<uint32_t>(stream->core_count());
+
+        std::vector<std::unique_ptr<spacemit_ordered_launch>> launches;
+        std::vector<spert::Future>                             futures;
+        launches.reserve(steps.size());
+        futures.reserve(steps.size());
+        for (const spacemit_step & step : steps) {
+            auto launch            = std::make_unique<spacemit_ordered_launch>();
+            launch->steps          = &step;
+            launch->n_steps        = 1;
+            launch->workspace      = workspace;
+            launch->workspace_size = workspace_size;
+            launch->fail_step      = fail_step;
+            if (!futures.empty()) {
+                launch->previous.assign(nth, futures.back());
+            }
+            futures.push_back(stream->launch(spert::Grid{ stream->core_count() }, spacemit_tile_main_ordered,
+                                             launch.get()));
+            launches.push_back(std::move(launch));
+        }
+        // a launch the stream could not admit has an invalid Future, which this reports as well
+        const spert::Status status = spert::Future::sync_all(futures);
+        if (status != spert::Status::Ok) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: %zu ordered launches: spine-runtime status %d\n", futures.size(),
+                           spert::status_code(status));
+            return false;
+        }
+
+        bool ok = true;
+        for (const auto & launch : launches) {
+            ok = ok && !launch->failed.load();
+        }
+#if defined(__linux__)
+        size_t shared = 0;
+        for (const auto & launch : launches) {
+            bool twice = false;
+            for (uint32_t a = 0; a < nth && !twice; a++) {
+                for (uint32_t b = a + 1; b < nth && !twice; b++) {
+                    twice = launch->cpus[a] == launch->cpus[b];
+                }
+            }
+            shared += twice;
+        }
+        static std::atomic<bool> warned{ false };
+        if (shared > 0 && !warned.exchange(true)) {
+            GGML_LOG_WARN("FlagOS SpacemiT: ordered launches: %zu of %zu had two tiles on one core (reported once)\n",
+                          shared, launches.size());
+        }
+#endif
+        return ok;
+    }
+
     const char * name() const override {
         return policy == spacemit_stream_policy::per_call ? "spine-runtime, stream per call" : "spine-runtime, persistent stream";
     }
 
   private:
+    // the stream for one run: the backend's, or one of its own (FLAGOS_SPACEMIT_STREAM=per-call) kept in per_call
+    spert::Stream * stream_for_run(std::unique_ptr<spert::Stream> & per_call) {
+        spert::Stream * stream = nullptr;
+        if (policy == spacemit_stream_policy::per_call) {
+            per_call = make_stream();
+            stream   = per_call.get();
+        } else {
+            if (persistent_stream == nullptr) {
+                persistent_stream = make_stream();
+            }
+            stream = persistent_stream.get();
+        }
+        if (stream != nullptr && static_cast<uint32_t>(stream->core_count()) > SPACEMIT_MAX_TILES) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: %u AI cores, at most %u supported\n",
+                           static_cast<uint32_t>(stream->core_count()), SPACEMIT_MAX_TILES);
+            return nullptr;
+        }
+        return stream;
+    }
+
     std::unique_ptr<spert::Stream> make_stream() const {
         auto stream = std::make_unique<spert::Stream>(n_cores);
         if (!stream->valid() || stream->core_count() == 0) {

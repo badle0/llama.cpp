@@ -26,6 +26,19 @@ class spacemit_executor {
     // false if any step or the runtime failed
     virtual bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) = 0;
 
+    // test-only (structural-experiments.md E3b): every step a launch of its own, ordered where the runtime can order
+    // them without the host; here, as a runtime without that would do, the host waits for each
+    virtual bool run_ordered(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) {
+        std::vector<spacemit_step> one(1);
+        for (const spacemit_step & step : steps) {
+            one[0] = step;
+            if (!run(one, workspace, workspace_size)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     virtual const char * name() const = 0;
 };
 
