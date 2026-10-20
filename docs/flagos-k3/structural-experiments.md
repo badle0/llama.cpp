@@ -244,11 +244,11 @@ with the modes interleaved in each repetition: the board drifts between sessions
 | E2 | Q5 | Build B (upstream's `llama-context.cpp`), `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu` and `gpu`, `-ngl 99`; once with the default `-ngl` (placement only) | 2 splits per token; flash attention enabled under `-fa auto`; logits identical to the reference (KLD 0, same top p 100%; the same kernels run the same nodes); speed within 1-2%; GPU = IGPU; the default `-ngl` offloads every layer | agreed (user, 2026-10-19): "IGPU is viable with no llama.cpp change" if logits are identical at both batch settings, a token takes 2 splits, and pp128, tg128, tg32 at depths 0/1024/4096 and pp512 at depth 4096 are within 2% of the reference | done 2026-10-19 (§6): passes; pp512 at depth 4096 +3.6% |
 | E2-hp | Q5 | E2's IGPU and the reference, each with and without `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`, depth runs | unknown; the 128 KiB block spacing suggests no 2.2x slowdown | KV cache on huge pages "hurts" if IGPU's tg32 at depth 4096 loses at least 2% more from huge pages than the reference does, "helps" if it gains at least 2% more | done 2026-10-19 (§6): neither in generation; mixed in prompt processing at depth |
 | E2-neg | F8 | Build B as IGPU, and the reference: a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0 -fa on -c 512`), and a context shift (`-c 256 -n 400 --ignore-eos --context-shift`) | IGPU aborts in both ("pre-allocated tensor ... cannot run the operation": `SET_ROWS`, then `ROPE`); the reference runs both (the shift logs "context full, swapping") | confirms or refutes F8's two gaps | done 2026-10-19 (§6): both confirmed |
-| E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | done 2026-10-19 (§6): -24 to -95% |
+| E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | done 2026-10-19 (§6): -24 to -95%; not repeated (user, 2026-10-20: M0's X3/X3b and run 1 cover it; out of the default `EXPS`) |
 | E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | open (user, 2026-10-19: more investigation against the deck first). Proposed, anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b if possible, else E3a) keeps the framework's cost within about 2% of a token (tg128 within about 1% of the reference, which already carries about 1.1%); Tier-2 capture is needed if it costs 5% or more; in between, report | ready (runs in the full run) |
 | E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): Tier-1 on an ordered stream, as the ABI assumes | unknown: between the reference and E3a | as E3a | needs the board's `spert.hpp` (`join`, `sync_all`, Future copies); not implemented |
 | E3c | Q1, R12 | Test-only counters: per token, the time inside launches, the kernels' own time (tile 0) and the steps; the rest of a token is the AI cores waiting on llama.cpp, the CPU's split and sampling | today's cost the deck's way (device idle per token), split into inside and outside launches, for comparison with AMD's 0.6 ms of 45 ms | none: a measurement | proposed, not implemented |
-| E4 | Q5, F13 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | "no ggml lines needed" if it loads and matches E2 | manual (below) |
+| E4 | Q5, F13, R1 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | E2's rule; then "no upstream change needed at all" | scripted 2026-10-20 (`EXPS=e4`, below); on the Mac the module builds and loads through `GGML_BACKEND_PATH` |
 | E6 | Q2 | GGUF's bytes in the buffer ggml sees plus a private repacked copy | about +2.35 GB, the same speed, exact read-back | evidence for option (e) | not implemented |
 | E5 | Q2 | the 1-row path reads GGUF's layout, interleaving 32 rows while copying into TCM | unknown; generation only | how much repacking buys | not implemented |
 | Q4 table | Q4 | on paper: our kernel choices as manifest entries (startup filter for device facts, `when` for per-token shapes, one generic variant per contract), each condition `when` cannot express marked | some inexpressible (ranges, equality, strides, layout) | input for Q4 | to do |
@@ -286,21 +286,44 @@ docs/flagos-k3/scripts/structural-experiments.sh summary ~/sx/Qwen3-4B-Q4_0     
 - Time with the defaults: about 2-3 hours (estimate: the depth runs process 4096 tokens before each test, and `e1-auto`
   runs attention on the X100 cores).
 
-### E4 (manual; not yet tried)
+### E4: stock upstream llama.cpp with the provider as a run-time module (scripted 2026-10-20)
+
+**Why:** E2 showed that as an IGPU the K3 needs no llama.cpp change. What remains of the fork's footprint is the mentor's
+ggml lines (F13): 5 CMake options, `ggml_add_backend(FLAGOS)`, and in `ggml-backend-reg.cpp` the compiled-in
+registration plus one line in the run-time loader's name list (`ggml_backend_load_best("flagos", ...)`). With
+`GGML_BACKEND_DL=ON`, ggml builds every backend as a separate module and loads them at start (`ggml_backend_load_all`:
+known names, then the one file `GGML_BACKEND_PATH` names); the compiled-in registration does not apply, and
+`GGML_BACKEND_PATH` loads a module without any name. So stock upstream should run the provider, built elsewhere, with no
+line changed. If it does at E2's speed, R1 is met with no upstream change at all; it is also the deck's model ("ggml
+backend 接口，llama.cpp 不用改").
+
+**Builds** (`EXPS=e4 ... prepare`):
+- S: a worktree of upstream `ba360ef` at `<repo>-stock`, built in `build-dl` with `-DGGML_BACKEND_DL=ON
+  -DBUILD_SHARED_LIBS=ON` and upstream's defaults otherwise (its SpacemiT CPU path stays off, as in A and B); the
+  programs pull in every backend module (the CPU's), as ggml makes them depend on `ggml`.
+- M: this repository built in `build-flagos-dl` the same way with the FlagOS options, target `ggml-flagos`: the module
+  `build-flagos-dl/bin/libggml-flagos.so` (modules go to the programs' directory, `ggml_add_backend_library`).
+- A: as before (the reference and the provider checks).
+- Smoke check: the `libggml-base` names (soname) of S and M and the module's needs, which must agree so that the dynamic
+  linker reuses the stock library (one ggml core in the process); then the stock `llama-completion --list-devices` with
+  `GGML_BACKEND_PATH` and `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu`, which must list `FlagOS:SpacemiT:0` and report IGPU.
+
+**Mode** `e4-igpu`: S's programs, `GGML_BACKEND_PATH=<M's module>`, `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu`, `-ngl 99`;
+the same measurements as E2 (placement, pp128/tg128, the depth runs, perplexity and KLD against `ref`, also at one token
+per ubatch). Rule: E2's.
 
 ```bash
-git -c safe.directory=$HOME/llama.cpp-flagos -C ~/llama.cpp-flagos worktree add --detach ~/llama.cpp-stock ba360ef  # upstream's tree
-cmake -S ~/llama.cpp-stock -B ~/llama.cpp-stock/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_BACKEND_DL=ON \
-  -DBUILD_SHARED_LIBS=ON && cmake --build ~/llama.cpp-stock/build --target llama-bench llama-completion
-cmake -S . -B build-flagos-dl -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON \
-  -DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON && \
-  cmake --build build-flagos-dl --target ggml-flagos
-GGML_BACKEND_PATH=$PWD/build-flagos-dl/bin/libggml-flagos.so FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu \
-  ~/llama.cpp-stock/build/bin/llama-bench -m ~/models/Qwen3-4B-Q4_0.gguf -t 8 -ngl 99 -p 128 -n 128 -ub 128 -mmp 0
+EXPS="e4" docs/flagos-k3/scripts/structural-experiments.sh prepare 2>&1 | tee ~/sx-prepare-e4.log
+EXPS="e4" docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf ~/sx/e4 2>&1 | tee ~/sx-e4.log
 ```
 
-Risks: the module's path and name in the build tree, and whether the stock binaries' `libggml-base.so` serves the module
-(both at `ba360ef`, so the ABI should match).
+`EXPS="e2 e4"` adds `e2-igpu` (build B) to tell effects of loading the provider as a module from effects of the device
+type. Expected cost: a full build of S, then about 1-1.5 hours of runs (estimate).
+
+**Mac, 2026-10-20** (`build-host-dl`, the simulated device, backends as modules): the module builds and links needing only
+`libggml-base` (`otool -L`; macOS refuses a module with unresolved symbols); this repository's own loader finds it by
+name; moved out of `bin`, it is no longer found, and `GGML_BACKEND_PATH` alone loads it, reporting IGPU under the
+switch. Not tried on the Mac: stock upstream's programs (the K3's smoke check does it).
 
 ## 5. Code for the experiments
 
@@ -377,7 +400,7 @@ Accuracy (KLD against `ref`'s logits, which llama-perplexity stores as 16-bit lo
 |---|---|---|---|---|
 | `ref`, 512-token batches | 9.7820 | (base) | | |
 | `e2-igpu` | 9.782019 | -0.000000 | 0.000053 | 100% |
-| `e2-gpu` | 9.782019 | -0.000000 | 0.000053 | 100% |
+| `e2-gpu` | 9.782019 | not read (the summary missed negative zeros then) | 0.000053 | 100% |
 | `ref`, one token per ubatch | 9.7566 | (base) | | |
 | `e2-igpu`, one token per ubatch | 9.756647 | 0.000000 | 0.000055 | 100% |
 | `e1-auto` | 9.767601 | 0.001285 | 0.072804 | 98.28% |
@@ -414,45 +437,6 @@ Reading:
 - **E2-neg:** F8's two gaps are real: a quantized KV cache and a context shift both abort as IGPU, and both run as
   ACCEL.
 
-**E2 in full** (from the run's `info.txt`, `bench.jsonl`, `load-*.err` and `kld-*.out`):
-- Started 2026-10-19 07:52 UTC. `ref`: build A, `~/llama.cpp-flagos/build-flagos`, its binaries built by `prepare` from
-  `0b201a6` (the repository was at `72d741f` when the run started; the commits between changed only the runner and this
-  file); its llama-bench reports `build_commit` "unknown" because git refuses the board's checkout when cmake asks for
-  the commit. `e2-igpu`, `e2-gpu`: build B, `~/llama.cpp-flagos-no-c5/build-flagos` at `0b201a6`, whose
-  `src/llama-context.cpp` has C5a and C5b removed (1 line restored, 21 removed).
-- llama-bench as it recorded itself: 8 threads, batch 2048, ubatch 128 in the pp128/tg128 run (its default 512 in the
-  depth runs), flash attention auto, K and V cache F16, devices auto; `-ngl 99` for the E2 modes (`ref`: -1, auto).
-- Memory (`llama-completion`, context 40,960 tokens), the same in every mode except the KV cache: model 2349.87 MiB in
-  the provider's buffer and 304.28 MiB mapped on the CPU (the token embeddings); KV cache 5760 MiB in a CPU buffer
-  (`ref`) or in the provider's (E2); compute buffers 301.75 MiB (provider) and 50.01 MiB (CPU); 2 graph splits; flash
-  attention enabled; E2 offloads 37 of 37 layers.
-
-Every repetition (t/s; repetitions 1, 2, 3):
-
-| Test | `ref` | `e2-igpu` | `e2-gpu` |
-|---|---|---|---|
-| pp128 | 92.292, 92.720, 92.313 | 91.930, 92.174, 92.166 | 92.151, 92.105, 92.129 |
-| tg128 | 11.258, 11.327, 11.270 | 11.268, 11.274, 11.277 | 11.292, 11.279, 11.231 |
-| tg32 depth 0 | 11.395, 11.362, 11.342 | 11.355, 11.403, 11.334 | 11.403, 11.420, 11.385 |
-| tg32 depth 1024 | 9.864, 9.806, 9.889 | 9.815, 9.852, 9.879 | 9.834, 9.829, 9.808 |
-| tg32 depth 4096 | 7.817, 7.853, 7.840 | 7.783, 7.836, 7.815 | 7.816, 7.835, 7.800 |
-| pp512 depth 4096 | 34.503, 34.748, 34.644 | 36.001, 35.782, 35.851 | 35.886, 35.969, 35.874 |
-
-Only pp512 at depth 4096 separates the modes: every E2 repetition is above every `ref` one. In the other tests the
-ranges overlap or touch; pp128's E2 values sit 0.3-0.4% below `ref`'s, whose second repetition (92.720) is its highest.
-
-Accuracy in full:
-
-| | `ref`'s perplexity | E2's perplexity | Mean KLD | Median | 99% | Max | Same top token |
-|---|---|---|---|---|---|---|---|
-| 512-token batches (`e2-igpu`, `e2-gpu` alike) | 9.7820 ± 0.70560 | 9.782019 ± 0.705601 | -0.000000 ± 0.000000 | 0.000000 | 0.000035 | 0.000053 | 100.000% |
-| one token per ubatch (`e2-igpu`) | 9.7566 ± 0.70302 | 9.756647 ± 0.703021 | 0.000000 ± 0.000000 | 0.000000 | 0.000039 | 0.000055 | 100.000% |
-
-llama-perplexity also prints "PPL(base)" 9.693236 (one token per ubatch: 9.670406) and a ratio of 1.009159 (1.008918).
-That base is recomputed from the stored file, which keeps each token's log-probability only within 16 nats of the most
-likely one and stores anything less likely at that floor (`tools/perplexity/perplexity.cpp:86`, `:213`), so it comes out
-optimistic. `ref`'s own perplexity, from its full logits, is the comparison: equal to E2's.
-
 ## 7. Log
 
 - 2026-10-19: requirements, questions and findings collected from the deck, the AMD comparison, upstream `master`, the
@@ -479,3 +463,7 @@ optimistic. `ref`'s own perplexity, from its full logits, is the comparison: equ
   depth 4096 3.6% faster, the rule's reading to confirm); E1 shows ACCEL needs C5a and C5b, C5b for prompt processing
   too; E2-neg confirms F8's two gaps. The summary now reads negative zeros in the KLD and reports the tokens the shift
   runs generated (llama.cpp's "context full" line is a debug message).
+- 2026-10-20: E4 scripted (no provider change): `prepare` builds S (upstream `ba360ef`, backends as modules) and M (the
+  provider as a module) and smoke-checks the stock programs loading it through `GGML_BACKEND_PATH`; mode `e4-igpu`. On
+  the Mac the module builds needing only `libggml-base` and loads through `GGML_BACKEND_PATH`. E1 leaves the default
+  `EXPS` (user: M0 and run 1 cover it); the default is now `e2 e2hp e2neg e4`.
