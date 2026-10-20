@@ -31,27 +31,33 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
 
 **Q1. Does a K3 plugin need Tier-2 graph capture?**
 - Problem: today a split's steps run in one spine-runtime launch, a barrier between steps; a token takes 2 splits and
-  about 1,060 steps (1 ms of barriers at 0.94 µs each, `build.md` §7), about 1.1% of a token's 88.5 ms: near the deck's
-  1.2% for AMD (R12). A plugin with Tier-1 alone gets one `launch` per kernel on a stream the ABI treats as ordered. On
-  spine-runtime nothing orders launches (F14): the plugin must order them itself, by waiting for each launch on the host
-  (11.2-11.5 µs per launch against a barrier's 0.89-0.94 µs: about 12 ms per token, tg128 about -12%; estimate) or,
-  if the board's spine-runtime has it, by making each launch's tiles wait inside the cores for the previous launch
-  (`Context::join`; cost unknown).
+  about 1,060 steps (estimated, never counted): about 1 ms of barriers at 0.94 µs each (`build.md` §7), about 1.1% of a
+  token's 88.5 ms (an estimate; E3c would measure it), near the deck's 1.2% for AMD (R12). A plugin with the required
+  functions alone gets one `launch` per kernel on a stream, which we read the ABI as ordering (the deck states the
+  order only for copies, F15). spine-runtime's documentation promises no order between launches (F14): the plugin must
+  order them itself, by waiting for each launch on the host (11.2-11.5 µs per launch against a barrier's 0.89-0.94 µs:
+  about 12 ms per token, tg128 about -12%; estimate) or, if the board's spine-runtime has it, by making each launch's
+  tiles wait inside the cores for the previous launch (`Context::join`; cost unknown).
 - Options: (a) the K3 plugin implements Tier-2 capture: record the launches, replay them as one spine-runtime launch with
   a barrier between kernels, which is today's executor; (b) a "launch list" call added to Tier-1; (c) accept the cost.
 - Recommendation: (a), unless E3b shows ordered launches cost about as little as the barriers. AMD's provider has
   replay (hipGraph) only as an opt-in experiment (F12).
-- Measured 2026-10-20 (§6 run 3, log): Tier-1 alone is either slow (E3a, the host waiting for each launch: tg128 -14%)
-  or not correct on spine-runtime 0.6 (E3b: with launches queued, the runtime ran two tiles of one launch on one core,
-  which our tiles cannot share). So for the K3 Tier-2 graph capture is required, and today's executor is its
+- Measured 2026-10-20 (§6 run 3, log; Qwen3-4B Q4_0): the required functions alone (one launch per kernel) are either
+  slow (E3a, the host waiting for each launch: tg128 -14%) or not reliably correct with our kernels on spine-runtime
+  0.6 (E3b: the 1-token layer cases differed from one launch in 5 of 5 runs; in the same runs the runtime put two tiles
+  of one launch on one core, which our tiles are not written for; that this causes the differences is not verified).
+  So by E3's agreed rule the K3 needs graph capture (for generation; the scope is in F15), and today's executor is its
   implementation: the captured launches replayed as one spine-runtime launch with a barrier between kernels, the
-  arguments that change per token (the KV length) updated in place (`end_update`), the plugin's Tier-1 `launch` kept as
-  a slow fallback (E3a). For the mentor: Tier-2 required for runtimes without ordered streams; kernels launched one at
-  a time must not assume a core of their own (FlagTree's in M3; ours assume it, which a capture keeps true); for
-  SpacemiT: ordered launches on a stream, or tile i kept on core i, would make a cheap Tier-1 possible.
-- Decided (user, 2026-10-20): E3b is not fixed. Fixing it needs tiles that never rely on owning a core: TCM taken and
-  returned within each step, and no pair turns (worth 3.5-5% of generation in the 1-row matmuls and about 4% at depth
-  4096 in the split attention) or two tile models side by side, for a launch model the K3 does not need. Today's
+  arguments that change per token (the KV length) updated in place (`end_update`), the plugin's plain `launch` kept as
+  a slow fallback (E3a). For the mentor: graph capture required on spine-runtime 0.6 (the one runtime tested); kernels
+  launched one at a time cannot count on a core of their own (E3b saw two tiles of one launch on one core; FlagTree's
+  kernels in M3 not tried; ours count on it, and today's one launch per split has shown no sign of breaking it, though
+  it is not counted there); for SpacemiT: ordered launches on a stream, or tile i kept on core i, might make one launch
+  per kernel cheap enough (the launch's own cost would then decide; not measured).
+- Decided (user, 2026-10-20): E3b is not fixed. If the shared core is the cause (unverified), fixing it needs tiles that
+  never rely on owning a core: TCM taken and returned within each step, and no pair turns (worth 3.5-5% of generation
+  in the 1-row matmuls and about 4% at depth 4096 in the split attention) or two tile models side by side, for a launch
+  model the K3 does not need. Today's
   executor stays the K3's graph capture; SpacemiT is asked for ordered launches on a stream, or tile i kept on core i.
   E3c is not needed for this decision (it would measure today's overhead the deck's way, R12). E3 against the deck: F15.
 - Where the barrier design comes from: ggml-cpu runs every node on every thread with a barrier after each node
@@ -113,11 +119,13 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   generation -30%).
 - Recommendation: decide after E2 (with E2-hp and E2-neg) and E1. If E2 matches today's speed with identical logits, (b)
   fits R1 and ggml's definitions best.
-- Measured 2026-10-19 (§6, run 1): as IGPU or GPU the K3 matches today's speed with identical logits and no llama.cpp
-  change; ACCEL without C5a and C5b loses 24-95% in generation and 8-52% in prompt processing. So (b), once the provider
-  fixes F8's two gaps (confirmed by E2-neg); (a) only if the K3 must keep accelerating next to a discrete GPU.
-- Measured 2026-10-20 (§6, run 2, E4): as IGPU the provider also runs from stock upstream llama.cpp, loaded at run time
-  as a module, with the same speed and identical logits: no upstream change at all.
+- Measured 2026-10-19 (§6, run 1; Qwen3-4B Q4_0 only): as IGPU or GPU the K3 matches today's speed with identical
+  logits and no llama.cpp change; ACCEL without C5a and C5b loses 24-95% in generation and 8-52% in prompt processing.
+  So (b), once the provider fixes F8's two gaps (confirmed by E2-neg); (a) only if the K3 must keep accelerating next to
+  a discrete GPU.
+- Measured 2026-10-20 (§6, run 2, E4; Qwen3-4B Q4_0 only): as IGPU the provider also runs from stock upstream
+  llama.cpp, loaded at run time as a module, with the same speed and identical logits: no upstream change at run time
+  (building the module still uses the mentor's CMake lines, §6 run 2).
 - Answered by: E1, E2, E2-hp, E2-neg, E4.
 
 **Q6. During the transition, do native RVV/IME kernels go in the package or in the plugin?** The deck says both: the
@@ -267,8 +275,9 @@ order through `Future::sync()`, `Future::sync_all()`, or in-tile cooperation pri
 submitted consecutively and then waited on together". Each core has one resident worker, and a tile waiting at a barrier,
 event, `join` or shared-buffer allocation is suspended so the worker can run other ready tiles, so tiles of queued
 launches may interleave. The API reference lists `Context::join`, "cooperatively waits for a Future from the same Stream".
-The ABI slide's Tier-1 assumes an ordered stream ("在 stream 上排序" for copies, `stream_synchronize`); on spine-runtime the
-plugin must provide that order. Today's executor needs none of it: one launch per split, barriers inside (`Context::sync`).
+The ABI slide states an order on a stream for copies ("在 stream 上排序") and has `stream_synchronize`; that it assumes
+ordered launches too is our reading (F15). On spine-runtime, by its documentation, the plugin must order dependent
+launches itself. Today's executor needs none of it: one launch per split, barriers inside (`Context::sync`).
 The board's header (`~/spine-runtime/include/spert.hpp`, read 2026-10-20) has what in-core ordering needs:
 `Stream::launch` returns a `Future` and copies the arguments into storage the launch owns (`:579-590`; the Future is
 invalid if the launch cannot be admitted); `Future` is a shared handle with `sync()` and `sync_all(const
@@ -278,29 +287,40 @@ the grid barrier `sync()` (`:453`); a stream sends its launches only to the work
 
 **F15. E3 against the deck** (2026-10-20). E3 contradicts neither the deck's split (one core for every chip; a runtime
 plugin and a kernel package from the vendor; the core choosing the kernels and their order) nor its ABI: both forms the
-K3 can use are built from the deck's functions. It contradicts an assumption beneath the deck's layering: that the
-vendor's runtime has a GPU-like stream, ordered and asynchronous, so that the required functions alone (one `launch` per
-kernel) reach the deck's cost of about 1% (R12) and graph capture is an optional extra.
-- AMD fits the assumption: one launch per kernel on one non-blocking HIP stream, the host queueing the next kernel while
-  the GPU runs the last; its replay is an opt-in experiment (F12). The deck does not say whether its 0.6 ms of idle per
-  token was measured with capture; the code's default is without.
-- The K3 does not: spine-runtime 0.6 leaves launches unordered (F14). One launch per kernel, the host waiting for each,
-  is correct and costs 11-14% of generation (E3a; about 12 times R12's 1.2%); launches queued and ordered inside the
-  cores are not correct with our kernels (E3b). The roles swap: graph capture is the K3's normal path, the required
-  functions alone its slow fallback.
+K3 can use are built from the deck's functions. It contradicts an assumption beneath the deck's layering (our reading:
+the ABI slide states the order only for copies, "在 stream 上排序", and the core's code is in no branch we have, F1): that
+the vendor's runtime has a GPU-like stream, ordered and asynchronous, so that the required functions alone (one `launch`
+per kernel) reach the deck's cost of about 1% (R12) and graph capture is an optional extra.
+- AMD fits the assumption as far as this tree's provider shows (the deck's `amd-rt` is not available, F1): by default
+  one launch per kernel on one non-blocking HIP stream with no wait between kernels (`flagos-amd.cpp:4896` on), so the
+  host queues the next kernel while the GPU runs the last (V2.0 p. 34: about 700 launches per token); its replay is an
+  opt-in experiment (F12). Whether the launch costs hide behind the kernels was not measured by us, and the deck does
+  not say whether its 0.6 ms of idle per token was measured with capture.
+- The K3 does not. spine-runtime 0.6 promises no order between launches (its documentation, F14; dependent launches
+  were never run unordered). One launch per kernel with the host waiting for each is correct and costs Qwen3-4B 11-14%
+  of generation and 0-2% of prompt processing (E3a). The cost is per kernel: a one-node graph takes about 11 µs through
+  our whole path (`--bench`), E3a about 14 µs per step (with the estimated 1,060 steps), so a smaller model loses more
+  (Qwen3-0.6B a third or more, estimated) and a larger one less. Passing E3's 5% line needs a launch with its wait
+  under about 5 µs; spine-runtime's own share of the 11 µs was never timed alone. Launches queued and ordered inside the
+  cores are not reliably correct with our kernels (E3b: the 1-token layers differ from one launch in 5 of 5 runs and one
+  run failed; the size of the difference was not printed; mechanism unverified). For generation the roles swap: graph
+  capture is the K3's normal path, the required functions alone its slow fallback.
 - Point by point. A plugin with the required functions alone is complete (R3): holds (E3a, identical logits); fast: not
-  on the K3. Capture optional (R3, R5 ⑤): in the ABI yes, for the K3's speed no; today's executor implements it (Q1). The
-  core decides and schedules (R5): holds; the order between kernels comes from the plugin's replay (barriers inside one
-  launch), which is runtime work. The core computes each kernel's grid (R5 ⑤): inside one replayed launch every kernel
-  runs on the same 8 tiles, so the plugin spreads each kernel's grid over them (Q3 (a)). The manifest (R4) describes a
-  kernel by `block_size`, `num_warps`, `contract` and `when`; nothing in it says a kernel needs a core per tile, its
-  core's TCM or a partner tile, the assumptions E3b broke: a gap rather than a contradiction, and moot while the native
-  kernels stay in the plugin (Q6).
-- For the core: its capture policy must treat a plugin's capture as the main path, for generation graphs at least
-  (without capture, prompt processing loses 0-2%, E3a), not as an opt-in like AMD's.
-- For M3 (our plan, not the deck): an AOT kernel run as a launch of its own (`plan.md` M3.1) pays a host-waited launch,
-  about 14 µs in E3a (with the estimated 1,060 steps per token) against the 12 µs M3.2 assumes (about 1.7 ms per token
-  for the RMS norms, already over M3.2's 1% rule); AOT kernels called as steps inside the replayed launch (Q3) would not.
+  for Qwen3-4B's generation on the K3 (E3a). Capture optional (R3, R5 ⑤): in the ABI yes, for that speed no; today's
+  executor implements it (Q1). The core decides and schedules (R5): holds; the order between kernels comes from the
+  plugin's replay (barriers inside one launch), which is runtime work. The core computes each kernel's grid (R5 ⑤):
+  inside one replayed launch every kernel runs on the same 8 tiles, so the plugin spreads each kernel's grid over them
+  (Q3 (a)). The manifest (R4) describes a kernel by `block_size`, `num_warps`, `contract` and `when`; nothing in it says
+  a kernel needs a core per tile, its core's TCM or a partner tile, the assumptions our tiles make and E3b's queued
+  launches did not keep (two tiles of one launch on one core): a gap rather than a contradiction, and moot while the
+  native kernels stay in the plugin (Q6).
+- For the core, on the K3: its capture policy must treat a plugin's capture as the main path, for generation graphs at
+  least (without capture, prompt processing loses 0-2%, E3a), not as an opt-in like AMD's. To ask the mentor: how the
+  core waits when a plugin has no events, and whether the deck's 0.6 ms was measured with capture.
+- For M3 (our plan, not the deck): an AOT kernel run as a launch of its own (`plan.md` M3.1) would pay a host-waited
+  launch, about 14 µs in E3a (with the estimated 1,060 steps per token) against the 12 µs M3.2 assumes (about 1.7 ms
+  per token for the RMS norms, estimated, already over M3.2's 1% rule); AOT kernels called as steps inside the
+  replayed launch (Q3) would not (neither is built).
 
 ## 4. Experiments
 
@@ -314,7 +334,7 @@ with the modes interleaved in each repetition: the board drifts between sessions
 | E2-neg | F8 | Build B as IGPU, and the reference: a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0 -fa on -c 512`), and a context shift (`-c 256 -n 400 --ignore-eos --context-shift`) | IGPU aborts in both ("pre-allocated tensor ... cannot run the operation": `SET_ROWS`, then `ROPE`); the reference runs both (the shift logs "context full, swapping") | confirms or refutes F8's two gaps | done 2026-10-19 (§6): both confirmed |
 | E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | done 2026-10-19 (§6): -24 to -95%; not repeated (user, 2026-10-20: M0's X3/X3b and run 1 cover it; out of the default `EXPS`) |
 | E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | agreed (user, 2026-10-20), anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b, as E3a fails) keeps tg128 within 1% of `ref` (whose framework cost is already about 1.1%); Tier-2 graph capture is required at a tg128 loss of 5% or more; in between, report the numbers | done 2026-10-20 (§6, run 3): tg128 -14.2%, about 14.6 ms per token; identical logits |
-| E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): Tier-1 on an ordered stream, as the ABI assumes | unknown: between the reference and E3a | as E3a | implemented 2026-10-20 (`FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join`, below); **fails its checks on the K3** (2026-10-20, 5 of 5 runs): the 1-token layer cases differ from one launch (once failed), while E3a passes everything and E3b passes the 8 split-attention and the 7-token layer cases; spine-runtime ran two tiles of one launch on one core. Not measured: a computation that is not reliably correct. Not fixed (user, 2026-10-20; Q1) |
+| E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): one launch per kernel on an ordered stream, as we read the ABI (F15) | unknown: between the reference and E3a | as E3a | implemented 2026-10-20 (`FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join`, below); **fails its checks on the K3** (2026-10-20, 5 of 5 runs): the 1-token layer cases differ from one launch (once failed), while E3a passes everything and E3b passes the 8 split-attention and the 7-token layer cases; spine-runtime ran two tiles of one launch on one core. Not measured: a computation that is not reliably correct. Not fixed (user, 2026-10-20; Q1) |
 | E3c | Q1, R12 | Test-only counters: per token, the time inside launches, the kernels' own time (tile 0) and the steps; the rest of a token is the AI cores waiting on llama.cpp, the CPU's split and sampling | today's cost the deck's way (device idle per token), split into inside and outside launches, for comparison with AMD's 0.6 ms of 45 ms | none: a measurement | proposed, not implemented; not needed for E3's decision (Q1), only for R12's number |
 | E4 | Q5, F13, R1 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | E2's rule; then "no upstream change needed at all" | done 2026-10-20 (§6, run 2): passes; pp512 at depth 4096 +4.0% |
 | E6 | Q2 | GGUF's bytes in the buffer ggml sees plus a private repacked copy | about +2.35 GB, the same speed, exact read-back | evidence for option (e) | not implemented |
@@ -488,8 +508,8 @@ Reading:
 - **E2, by the agreed rule:** logits identical at both batch settings (perplexity to six digits, the same top token
   every time, mean KLD 0); a token takes 2 splits; five of the six speeds within 0.4% of `ref`. pp512 at depth 4096 is
   3.6% faster as IGPU and 3.7% as GPU: outside "within 2%" only in the favorable direction, a pass if the rule means no
-  loss beyond 2% (the user's reading pending). GPU and IGPU are the same. So the K3 runs at today's speed and accuracy
-  as IGPU or GPU with no change to llama.cpp.
+  loss beyond 2% (the user's reading pending). GPU and IGPU are the same. So the K3 runs Qwen3-4B Q4_0 at today's speed
+  and accuracy as IGPU or GPU with no change to llama.cpp (other models not run).
 - **E1:** stock llama.cpp with an ACCEL device needs C5a and C5b. With `-fa auto` flash attention goes off and attention
   runs on the X100 cores (360 splits per graph): generation at depth 4096 falls to 5% of `ref`. With `-fa on` the norms
   are pinned to the CPU (288 splits): generation -24 to -30%, as predicted (-30%, X3b). The pinning hits prompt
@@ -574,7 +594,7 @@ The same text in both.
 
 Reading: E4 passes E2's rule as E2 did: identical logits at both batch settings, 2 splits per token, five speeds within
 0.3% of `ref` and pp512 at depth 4096 4.0% faster (E2: +3.6%), the KV cache on huge pages again. So with the provider
-reporting IGPU, the K3 runs llama.cpp at today's speed and with identical results with no change at all to upstream
+reporting IGPU, the K3 runs Qwen3-4B Q4_0 at today's speed and with identical results with no change at all to upstream
 llama.cpp or ggml: neither C5a and C5b nor the mentor's ggml lines are needed at run time. What this does not settle:
 - F8's two gaps hold here too (the KV cache is in the provider's buffer), so IGPU needs that provider fix before it can
   be the default.
@@ -600,9 +620,10 @@ Accuracy: perplexity 9.782019 against `ref`'s 9.7820, mean KLD -0.000000, maximu
 the same top token 100%: identical logits, as the checks showed (byte-identical outputs).
 
 Reading:
-- A Tier-1-only plugin that orders the kernels by waiting on the host costs the K3 11-14% of generation: about 14.6 ms
-  more per token at depths 0-1024 (15.7 ms at 4096), about 12 times today's estimated 1.1% (and the deck's 1.2% for
-  AMD). Prompt processing loses little (-1.7% at 128 tokens, nothing measurable at 512): the same steps carry more work.
+- A plugin with the required functions alone, ordering the kernels by waiting on the host, costs Qwen3-4B Q4_0 on the
+  K3 11-14% of generation: about 14.6 ms more per token at depths 0-1024 (15.7 ms at 4096), about 12 times today's
+  estimated 1.1% (and the deck's 1.2% for AMD). Prompt processing loses little (-1.7% at 128 tokens, nothing measurable
+  at 512), most likely because each step carries more work (not measured).
   By the proposed rule (Tier-2 needed at 5% or more), E3a fails clearly, so the question moves to E3b.
 - The cost per step is higher than predicted: 14.6 ms per token over the estimated 1,060 steps is about 13.8 µs per step,
   against about 11.5 µs from the launch and barrier benchmarks (predicted -12%, measured -14%). Either a launch costs
@@ -673,3 +694,9 @@ Reading:
 - 2026-10-20: decided by the user: E3b is not fixed, today's executor stays the K3's graph capture (Q1); the deck guides
   the macro design and is not a standard (R13). F15 sets E3 against the deck. Corrected: AMD's hipGraph replay is an
   opt-in experiment, not something AMD depends on (F12, Q1; `flagos-amd.cpp:366-373, 4808-4812`).
+- 2026-10-20: F15 and Q1 scoped (user: how certain is it?): what is measured, what is read in code and what is our
+  reading of the deck; E3a's cost is per kernel, so its percentage depends on the model and the phase; E3b "not
+  reliably correct" rather than "not correct" (its check prints no size for the difference).
+- 2026-10-20: rule (user, `PROJECT.md` §6): conclusions never assert untested findings. Applied to this file's
+  conclusions: Q1 (the step count and the 1.1% marked as estimates; the ABI's order as our reading; E3b's shared core
+  not shown to cause its differences), F14, F15, Q5 and runs 1-3 (scoped to Qwen3-4B Q4_0), the E3b row.
