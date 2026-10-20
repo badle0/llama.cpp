@@ -40,6 +40,14 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   a barrier between kernels, which is today's executor; (b) a "launch list" call added to Tier-1; (c) accept the cost.
 - Recommendation: (a), unless E3b shows ordered launches cost about as little as the barriers. AMD's provider already
   depends on replay (hipGraph).
+- Where the barrier design comes from: ggml-cpu runs every node on every thread with a barrier after each node
+  (`ggml/src/ggml-cpu/ggml-cpu.c:3088-3117`; the in-tree IME path runs inside that model); ggml-spacemit moved it onto
+  the AI cores as one spine-runtime launch per `graph_compute` with a grid barrier after every node (`plan.md:34`); D5
+  (M2a) took ggml-spacemit's model with nodes expanded into steps and no waits inside a step (the pair waits came later).
+  It gives: a barrier (about 0.9 µs) instead of a launch (about 11 µs) per step; the order between steps without the
+  runtime ordering launches (F14); one workspace for a multi-step op; per-launch setup (the TCM agreement) once per
+  split; one failure flag. It costs every step's wait for its slowest tile. In the deck's terms it is the K3's form of
+  Tier-2 "图录制 · 逐 token 重放", with the step list rebuilt each graph instead of captured once.
 - Answered by: E3a, E3b (E3c splits today's overhead the deck's way).
 
 **Q2. How does a plugin keep weights in a vendor layout?** (`PROJECT.md` question 2, D4)
@@ -102,6 +110,14 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
 architecture slide keeps them in the plugin (R7); the flow slide lists "HSACO / ELF / 厂商格式" (vendor format) as package
 binaries. Recommendation: the package (K3 ELF `.so` files with FlagTree's calling convention), so the core picks them like
 any variant and Triton versions replace them one by one.
+- Decided (user, 2026-10-20): the native kernels stay in the plugin for now (as R7 says), and the other experiments come
+  first. When the K3 gets a package, its directory is `share/ggml/flagos/spacemit/k3-a100/` (`<hw>/<target>` =
+  `spacemit/k3-a100`). How the package is built and shipped (FlagTree's CI cross-compiling on x86 or a build on the K3;
+  released apart from git) goes to the mentor (`PROJECT.md` question 6).
+- Package locations already in the tree: Denglin installs to `share/ggml/flagos/denglin` (`ggml-flagos/CMakeLists.txt:169`;
+  run-time override `FLAGOS_KERNEL_DIR`, `flagos-denglin.cpp:301-302`), AMD takes `FLAGOS_AMD_AOT_KERNEL_DIR` at build
+  time (a `manifest.json` required, `providers/amd/provider.cmake:18-22`) and installs to `share/ggml/flagos/amd`
+  (`CMakeLists.txt:172`); the deck's variable is `GGML_FLAGOS_KERNEL_DIR`.
 
 **Q7. How does a kernel report a failure?** Today `GET_ROWS` and `SET_ROWS` with a bad index make the graph return
 `GGML_STATUS_FAILED` instead of aborting; the deck shows only `SYNC_LAUNCH` and `TRACE_LAUNCH`. Options: (a) `launch`
@@ -554,3 +570,6 @@ llama.cpp or ggml: neither C5a and C5b nor the mentor's ggml lines are needed at
   all pass. So at run time the mentor's ggml lines are not needed; speed and logits next (run 2).
 - 2026-10-20: run 2 (E4) on the K3; results in §6: stock upstream with the provider module as IGPU passes E2's rule
   (identical logits, 2 splits, speeds within 0.3%, pp512 at depth 4096 +4.0%): no upstream change needed at run time.
+- 2026-10-20: decided by the user (Q6): native kernels stay in the plugin for now; the K3's package directory is
+  `spacemit/k3-a100`; how the package is built and shipped goes to the mentor. Q1 notes where the barrier design comes
+  from.
