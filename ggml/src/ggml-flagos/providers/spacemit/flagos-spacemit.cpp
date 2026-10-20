@@ -14,13 +14,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #if defined(__linux__)
@@ -62,6 +66,7 @@ struct spacemit_backend_context {
     std::vector<spacemit_step>         steps;
     void *                             workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                             workspace_size = 0;
+    spacemit_run_stats                 run_stats;  // test-only (E3c): the current graph's, with FLAGOS_SPACEMIT_TEST_STATS
 
     ~spacemit_backend_context() {
         if (workspace != nullptr) {
@@ -269,11 +274,97 @@ spacemit_launch_kind spacemit_launch_mode() {
     return spacemit_launch_kind::per_split;
 }
 
+// test-only (structural-experiments.md E3c): FLAGOS_SPACEMIT_TEST_STATS=<file> counts, per kind of graph (launch mode,
+// rows of its first matmul, KV length class of its first attention: 0 below 1024, 1024 below 4096, else 4096), the
+// graphs, steps and launches and the time spent in graph_compute, in the launches as the host waits for them, in the
+// kernels (summed over the tiles; per step the slowest tile, "busy") and at the barriers (summed over the tiles). When
+// the process ends it appends one JSON line per kind to <file>. Read once; one launch per step joined in the cores
+// (E3b) is not counted
+class spacemit_stats_file {
+  public:
+    // nullptr when the switch is not set
+    static spacemit_stats_file * get() {
+        static spacemit_stats_file file(std::getenv("FLAGOS_SPACEMIT_TEST_STATS"));
+        return file.path.empty() ? nullptr : &file;
+    }
+
+    void add(const char * launch, int64_t rows, int64_t n_kv, const spacemit_run_stats & run, double graph_us) {
+        double kernel_ns = 0.0, busy_ns = 0.0, barrier_ns = 0.0;
+        for (size_t s = 0; s < run.n_steps; s++) {
+            uint32_t slowest = 0;
+            for (uint32_t t = 0; t < run.n_tiles; t++) {
+                const uint32_t ns = run.kernel_ns[t * run.stride + s];
+                kernel_ns += ns;
+                slowest = std::max(slowest, ns);
+            }
+            busy_ns += slowest;
+        }
+        for (uint32_t t = 0; t < run.n_tiles; t++) {
+            barrier_ns += static_cast<double>(run.barrier_ns[t]);
+        }
+        const int64_t               kv_class = n_kv < 0 ? -1 : n_kv < 1024 ? 0 : n_kv < 4096 ? 1024 : 4096;
+        std::lock_guard<std::mutex> lock(mutex);
+        totals & k = kinds[std::make_tuple(std::string(launch), rows, kv_class)];
+        k.graphs++;
+        k.steps += run.n_steps;
+        k.launches += run.launches;
+        k.tiles = run.n_tiles;
+        k.graph_us += graph_us;
+        k.launch_us += run.launch_us;
+        k.kernel_us += kernel_ns / 1e3;
+        k.busy_us += busy_ns / 1e3;
+        k.barrier_us += barrier_ns / 1e3;
+    }
+
+    ~spacemit_stats_file() {
+        if (path.empty() || kinds.empty()) {
+            return;
+        }
+        FILE * f = std::fopen(path.c_str(), "a");
+        if (f == nullptr) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: cannot write the test statistics to %s\n", path.c_str());
+            return;
+        }
+        for (const auto & [key, k] : kinds) {
+            std::fprintf(f,
+                         "{\"launch\":\"%s\",\"rows\":%lld,\"kv\":%lld,\"graphs\":%llu,\"steps\":%llu,\"launches\":%llu,"
+                         "\"tiles\":%u,\"graph_us\":%.3f,\"launch_us\":%.3f,\"kernel_us\":%.3f,\"busy_us\":%.3f,"
+                         "\"barrier_us\":%.3f}\n",
+                         std::get<0>(key).c_str(), (long long) std::get<1>(key), (long long) std::get<2>(key),
+                         (unsigned long long) k.graphs, (unsigned long long) k.steps, (unsigned long long) k.launches,
+                         k.tiles, k.graph_us, k.launch_us, k.kernel_us, k.busy_us, k.barrier_us);
+        }
+        std::fclose(f);
+    }
+
+  private:
+    explicit spacemit_stats_file(const char * p) : path(p != nullptr ? p : "") {
+        if (!path.empty()) {
+            GGML_LOG_WARN("FlagOS SpacemiT: test statistics (FLAGOS_SPACEMIT_TEST_STATS) go to %s at exit\n", p);
+        }
+    }
+
+    struct totals {
+        uint64_t graphs = 0, steps = 0, launches = 0;
+        uint32_t tiles  = 0;
+        double   graph_us = 0.0, launch_us = 0.0, kernel_us = 0.0, busy_us = 0.0, barrier_us = 0.0;
+    };
+
+    std::string                                                     path;
+    std::mutex                                                      mutex;
+    std::map<std::tuple<std::string, int64_t, int64_t>, totals> kinds;
+};
+
 // every node and the workspace are checked before the launch, so a graph either runs completely or fails with
 // nothing written
 ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * ctx = static_cast<spacemit_backend_context *>(backend->context);
     auto * dev = static_cast<spacemit_device_context *>(backend->device->context);
+
+    spacemit_stats_file * const           stats = spacemit_stats_file::get();  // test-only (E3c)
+    const std::chrono::steady_clock::time_point start =
+        stats != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    int64_t rows = -1, n_kv = -1;  // E3c's kind of graph: its first matmul's rows, its first attention's KV length
 
     ctx->steps.clear();
     size_t workspace_size = 0;
@@ -283,6 +374,12 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         // left unselected (ggml_build_forward_select), whose inputs may never have been set
         if (ggml_op_is_empty(node->op) || ggml_is_empty(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+        if (stats != nullptr && rows < 0 && node->op == GGML_OP_MUL_MAT) {
+            rows = node->src[1]->ne[1];
+        }
+        if (stats != nullptr && n_kv < 0 && node->op == GGML_OP_FLASH_ATTN_EXT) {
+            n_kv = node->src[1]->ne[1];
         }
         const spacemit_op * op = spacemit_find_op(node, &dev->buffer_type);
         if (op == nullptr) {
@@ -316,28 +413,38 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
 
     std::lock_guard<std::mutex> lock(dev->run_mutex);
-    switch (spacemit_launch_mode()) {
+    const spacemit_launch_kind  mode    = spacemit_launch_mode();
+    const bool                  counted = stats != nullptr && mode != spacemit_launch_kind::per_step_join;
+    if (counted) {
+        ctx->run_stats.reset(ctx->steps.size());
+    }
+    ctx->executor->stats = counted ? &ctx->run_stats : nullptr;
+    bool ok              = true;
+    switch (mode) {
         case spacemit_launch_kind::per_step:
             {
                 // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every
                 // tile before the next starts, as the barrier after a step does inside one launch
                 std::vector<spacemit_step> one(1);
-                for (const spacemit_step & step : ctx->steps) {
-                    one[0] = step;
-                    if (!ctx->executor->run(one, ctx->workspace, ctx->workspace_size)) {
-                        return GGML_STATUS_FAILED;
-                    }
+                for (size_t i = 0; i < ctx->steps.size() && ok; i++) {
+                    one[0] = ctx->steps[i];
+                    ok     = ctx->executor->run(one, ctx->workspace, ctx->workspace_size);
                 }
-                return GGML_STATUS_SUCCESS;
+                break;
             }
         case spacemit_launch_kind::per_step_join:
-            return ctx->executor->run_ordered(ctx->steps, ctx->workspace, ctx->workspace_size) ? GGML_STATUS_SUCCESS
-                                                                                                : GGML_STATUS_FAILED;
+            ok = ctx->executor->run_ordered(ctx->steps, ctx->workspace, ctx->workspace_size);
+            break;
         case spacemit_launch_kind::per_split:
+            ok = ctx->executor->run(ctx->steps, ctx->workspace, ctx->workspace_size);
             break;
     }
-    return ctx->executor->run(ctx->steps, ctx->workspace, ctx->workspace_size) ? GGML_STATUS_SUCCESS
-                                                                                  : GGML_STATUS_FAILED;
+    ctx->executor->stats = nullptr;
+    if (ok && counted) {
+        stats->add(mode == spacemit_launch_kind::per_step ? "per-step" : "per-split", rows, n_kv, ctx->run_stats,
+                   std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+    }
+    return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 const ggml_backend_i g_backend_iface = {

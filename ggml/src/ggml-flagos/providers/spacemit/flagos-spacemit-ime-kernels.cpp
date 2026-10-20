@@ -24,7 +24,8 @@
 // quantize_a_nrow_i8_ref and one in repack_q6_k_to_q8_0_32_bl_ref; the last K blocks in gemm_kernel_i8i4_mrow_ref
 // (dropped unless their count was a multiple of 16, which it asserted); unaligned fp32 scales read and written with
 // memcpy in the references gemm_kernel_i8i4_mrow_ref, quantize_a_nrow_i8_ref and gemm_kernel_i8i8_mrow_ref; and in
-// gemm_kernel_i8i4_m1 the exact zero-point branch upstream disables with #if 0, instead of its 16-bit one. Everything
+// gemm_kernel_i8i4_m1 the exact zero-point branch upstream disables with #if 0, instead of its 16-bit one (upstream's
+// again with FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1 defined, a test-only build). Everything
 // below the copies (dispatch, unpack) is new. When upstream changes these functions, take the fix by hand (plan.md R11).
 //
 // The IME and RVV code is built only with GGML_FLAGOS_SPACEMIT_IME2 (riscv64, GCC >= 15); the scalar references
@@ -1938,9 +1939,11 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
             // || Element                                             || Element         ...
 
             //bias always be nullptr
-#if 1  // flagos: upstream #if 0. This exact branch sums each block in 32 bits (vwmul.vx); the #else branch it
+#if !defined(FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1)
+       // flagos: upstream #if 0. This exact branch sums each block in 32 bits (vwmul.vx); the #else branch it
        // replaces adds the products in fp16 and multiplies zero point and activation sum in 16 bits (vmul.vx at
-       // e16), which wraps above 32767 (plan.md, M2c design)
+       // e16), which wraps above 32767 (plan.md, M2c design). Test-only: defining FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1
+       // builds upstream's branch, to run the zero-point probe on it (structural-experiments.md, R12-hw)
             __asm__ volatile(
 
                 // t3 = k/32

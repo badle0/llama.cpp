@@ -2,8 +2,9 @@
 # Structural experiments on the K3 (docs/flagos-k3/structural-experiments.md): E2, the provider as an IGPU or GPU device
 # on stock llama.cpp; E1, ACCEL on stock llama.cpp (without C5a and C5b); E3, one launch per step; E2-hp, the KV cache
 # on huge pages; E2-neg, the two settings expected to fail with the KV cache in the provider's buffer; E4, stock upstream
-# llama.cpp loading the provider as a run-time module (no upstream change at all). Every mode runs against the reference
-# (today's build, defaults) in the same session, the modes interleaved in every repetition.
+# llama.cpp loading the provider as a run-time module (no upstream change at all); E3c, test-only counters of where a
+# token's time goes; R12-hw, upstream's branch of the 1-row Q4_1 kernel on the board (prepare only). Every mode runs
+# against the reference (today's build, defaults) in the same session, the modes interleaved in every repetition.
 #
 # Usage: structural-experiments.sh prepare                  the builds $EXPS needs. B (e1, e2, e2hp, e2neg): a worktree
 #                                                           of the repository's HEAD at $WT_B whose src/llama-context.cpp
@@ -14,19 +15,24 @@
 #                                                           $BUILD_M; then a smoke check (the stock programs list the
 #                                                           device through GGML_BACKEND_PATH). Always: build A's tools
 #                                                           (today's build-flagos/) and its provider checks, 5 times with
-#                                                           e3 (they compare E3a and E3b with one launch, byte for byte)
+#                                                           e3 (they compare E3a and E3b with one launch, byte for byte).
+#                                                           R (r12), after A: $BUILD_R12, configured as A with
+#                                                           FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1 defined (upstream's
+#                                                           branch of the 1-row Q4_1 kernel); its provider checks run
+#                                                           once, and their Q4_1 line shows the zero-point probe
 #        structural-experiments.sh run <model.gguf> [out]   the runs of $EXPS, then the summary (logs in out; default
 #                                                           ~/sx/<model name>)
 #        structural-experiments.sh summary <out>            the summary again from the logs
-# Env:   EXPS      experiments (default "e2 e2hp e2neg e4"; also e1 and e3); the reference always runs
+# Env:   EXPS      experiments (default "e2 e2hp e2neg e4"; also e1, e3, e3a (E3a alone, without E3b), e3c and r12);
+#                  the reference always runs
 #        REPS      llama-bench repetitions per mode (default 3; 0 skips llama-bench)
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 1)
 #        PPL_TEXT  perplexity text (default ~/ppl.txt; empty skips perplexity and KLD); CHUNKS (default 8)
 #        KLD_UB1   1: also the KLD with one token per ubatch (-ub 1 -b 512) for E2's IGPU (default 1; ~10 min a run)
 #        BUILD_A   today's build (default <repo>/build-flagos); WT_B (default <repo>-no-c5); BUILD_B (default
 #                  $WT_B/build-flagos); WT_S (default <repo>-stock); BUILD_S (default $WT_S/build-dl); BUILD_M (default
-#                  <repo>/build-flagos-dl); SPERT_DIR (default ~/spine-runtime); TCM_RELEASE (default
-#                  ~/tcmtest/tcmrelease)
+#                  <repo>/build-flagos-dl); BUILD_R12 (default <repo>/build-r12); SPERT_DIR (default ~/spine-runtime);
+#                  TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (build A: today's, with C5a and C5b; build B: upstream's llama-context.cpp; build S: stock upstream with backends
 # as run-time modules, the provider loaded from build M; -fa is llama.cpp's default, auto, unless named):
@@ -38,6 +44,8 @@
 #   e2-igpu-auto  B  as e2-igpu with llama.cpp's default -ngl (its automatic fit); placement only
 #   e3            A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step        E3a: one launch per step, the host waiting for each
 #   e3b           A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join   E3b: ordered in the cores, the host waiting once
+#   e3c           A  FLAGOS_SPACEMIT_TEST_STATS=<log>.stats       E3c: the counters, written when each run ends
+#   e3c-a         A  as e3c, with FLAGOS_SPACEMIT_TEST_LAUNCH=per-step: E3c on E3a, what a launch costs inside a run
 #   ref-nohp      A  FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1    E2-hp, with e2-igpu-nohp (B, igpu, no huge pages)
 #   neg-{q8,shift}-{igpu,ref}  E2-neg: a Q8_0 KV cache and a context shift, as e2-igpu (B) and as ref (A)
 #   e4-igpu       S  GGML_BACKEND_PATH=<M's libggml-flagos.so>, FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
@@ -51,6 +59,7 @@ BUILD_B=${BUILD_B:-$WT_B/build-flagos}
 WT_S=${WT_S:-$REPO-stock}
 BUILD_S=${BUILD_S:-$WT_S/build-dl}
 BUILD_M=${BUILD_M:-$REPO/build-flagos-dl}
+BUILD_R12=${BUILD_R12:-$REPO/build-r12}
 # where CMake writes a backend module (ggml/src/CMakeLists.txt, ggml_add_backend_library: the runtime output directory)
 MODULE=$BUILD_M/bin/libggml-flagos.so
 SPERT_DIR=${SPERT_DIR:-$HOME/spine-runtime}
@@ -74,11 +83,11 @@ TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
 unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES \
-    FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
+    FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
 
 mode_build() {
     case $1 in
-        ref | ref-nohp | e3 | e3b | neg-*-ref) echo "$BUILD_A" ;;
+        ref | ref-nohp | e3 | e3b | e3c | e3c-a | neg-*-ref) echo "$BUILD_A" ;;
         e4-*) echo "$BUILD_S" ;;
         *) echo "$BUILD_B" ;;
     esac
@@ -89,7 +98,7 @@ mode_env() {
         e2-igpu | e2-igpu-auto | neg-*-igpu) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu" ;;
         e2-gpu) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu" ;;
         e2-igpu-nohp) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1" ;;
-        e3) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step" ;;
+        e3 | e3c-a) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step" ;;
         e3b) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join" ;;
         # the stock programs know no "flagos" module by name; GGML_BACKEND_PATH loads one from any path
         e4-igpu) echo "GGML_BACKEND_PATH=$MODULE FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu" ;;
@@ -119,10 +128,13 @@ run() {
     shift 3
     bin=$(mode_build "$mode")/bin/$tool
     env=$(mode_env "$mode")
+    # E3c: every run writes its counters next to its log, when it ends
+    case $mode in e3c | e3c-a) env="${env:+$env }FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;; esac
     if [ -n "$DRY" ]; then
         echo "   [$mode] ${env:+$env }$bin $*"
         return 0
     fi
+    rm -f "$log.stats"
     release
     # no terminal input: nothing may wait for it or set it up (as spacemit_check.py runs its tools)
     # shellcheck disable=SC2086 # $TO and $env are lists of words
@@ -261,10 +273,40 @@ prepare_a() {
     done
 }
 
+# build R (R12-hw): build A's configuration with upstream's branch of the 1-row Q4_1 kernel compiled in. Its provider
+# checks include the zero-point probe (zero point 15 against 32 equal activations), which fails the run if the 1-row
+# result is wrong; with upstream's branch it shows whether the 16-bit product wraps on the board
+prepare_r12() {
+    echo "== build R: $BUILD_R12, the 1-row Q4_1 kernel with upstream's branch (FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1)"
+    if [ -n "$DRY" ]; then
+        echo "   cmake -S $REPO -B $BUILD_R12 ... -DCMAKE_CXX_FLAGS=-DFLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1;" \
+            "flagos-check-spacemit --expect-device"
+        return 0
+    fi
+    mkdir -p "$BUILD_R12"
+    cmake -S "$REPO" -B "$BUILD_R12" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF \
+        -DGGML_FLAGOS_AMD=OFF -DGGML_FLAGOS_SPACEMIT=ON -DFLAGOS_SPACEMIT_SPERT_DIR="$SPERT_DIR" \
+        -DCMAKE_CXX_FLAGS=-DFLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1 > "$BUILD_R12/sx-configure.log" 2>&1 ||
+        { echo "   configure failed: $BUILD_R12/sx-configure.log"; exit 1; }
+    cmake --build "$BUILD_R12" --target flagos-check-spacemit > "$BUILD_R12/sx-build.log" 2>&1
+    echo "   build R: rc=$?; $(grep -cE 'error:|FAILED' "$BUILD_R12/sx-build.log") error lines ($BUILD_R12/sx-build.log)"
+    local rc to=""
+    if command -v timeout > /dev/null; then to="timeout --foreground 900"; fi
+    release
+    # shellcheck disable=SC2086
+    $to "$BUILD_R12/bin/flagos-check-spacemit" --expect-device < /dev/null > "$BUILD_R12/sx-check.out" \
+        2> "$BUILD_R12/sx-check.err"
+    rc=$?
+    echo "   flagos-check-spacemit, upstream's branch: rc=$rc: $(tail -1 "$BUILD_R12/sx-check.out")"
+    grep -E "^matmul   Q4_1" "$BUILD_R12/sx-check.out" | grep -oE "zero point 15[^;]*" | sed 's/^/      /'
+    grep -E "FAIL" "$BUILD_R12/sx-check.err" | head -8 | sed 's/^/      /'
+}
+
 prepare() {
     if has e1 || has e2 || has e2hp || has e2neg; then prepare_b; fi
     if has e4; then prepare_sm; fi
     prepare_a
+    if has r12; then prepare_r12; fi
 }
 
 summary() {
@@ -333,6 +375,58 @@ for m in modes:
     print("   " + f"{m:14}" + "".join(cells))
 EOF
     fi
+    if compgen -G "$OUT/bench-e3c*.stats" > /dev/null; then
+        echo
+        echo "== E3c: one generated token, us, mean over the repetitions. busy: each step's slowest tile, summed; idle (the"
+        echo "   deck's measure, R12): the token less busy = outside (llama.cpp, the CPU split, sampling) + host (graph_compute"
+        echo "   outside the launches) + launch (the launches less the mean tile's kernels and barrier waits) + barriers (their"
+        echo "   own cost); imbal.: busy less the mean tile's kernels"
+        python3 -I - "$OUT" << 'EOF'
+import glob, json, os, re, statistics, sys
+res = {}
+for sf in sorted(glob.glob(os.path.join(sys.argv[1], "bench-*.stats"))):
+    stem = sf[: -len(".stats")]
+    m = re.match(r"bench-(.+)-(std|tg|pp)-\d+$", os.path.basename(stem))
+    if not m:
+        continue
+    kinds = [json.loads(line) for line in open(sf) if line.startswith("{")]
+    try:
+        rows = [json.loads(line) for line in open(stem + ".out") if line.startswith("{")]
+    except OSError:
+        rows = []
+    for r in rows:
+        if not r.get("n_gen") or not r.get("avg_ts"):
+            continue
+        d = r.get("n_depth") or 0
+        kv = 0 if d < 1024 else 1024 if d < 4096 else 4096  # the counters' KV classes (flagos-spacemit.cpp)
+        k = next((x for x in kinds if x["rows"] == 1 and x["kv"] == kv and x["graphs"] > 0), None)
+        if k is None:
+            continue
+        g, t = k["graphs"], max(k["tiles"], 1)
+        token = 1e6 / r["avg_ts"]
+        graph, launch = k["graph_us"] / g, k["launch_us"] / g
+        kern, bar, busy = k["kernel_us"] / t / g, k["barrier_us"] / t / g, k["busy_us"] / g
+        test = f"tg{r['n_gen']}@{d}" if r["n_gen"] == 32 else f"tg{r['n_gen']}" + (f"@{d}" if d else "")
+        res.setdefault((m.group(1), test), []).append({
+            "token": token, "outside": token - graph, "host": graph - launch, "launch": launch - kern - bar,
+            "barriers": kern + bar - busy, "imbal.": busy - kern, "kernels": kern, "idle": token - busy,
+            "steps": k["steps"] / g, "launches": k["launches"] / g})
+cols = ["token", "outside", "host", "launch", "barriers", "imbal.", "kernels", "idle", "steps", "launches"]
+print("   " + f"{'mode':7}{'test':11}" + "".join(f"{c:>10}" for c in cols) + f"{'idle %':>8}{'launch/each':>12}")
+order = {"tg128": 0, "tg32@0": 1, "tg32@1024": 2, "tg32@4096": 3}
+mean = {}
+for key in sorted(res, key=lambda k: (order.get(k[1], 9), k[1], k[0])):
+    v = mean[key] = {c: statistics.mean(x[c] for x in res[key]) for c in cols}
+    each = v["launch"] / v["launches"] if v["launches"] else 0.0
+    cells = "".join(f"{v[c]:10.1f}" if c in ("steps", "launches") else f"{v[c]:10.0f}" for c in cols)
+    print("   " + f"{key[0]:7}{key[1]:11}" + cells + f"{100 * v['idle'] / v['token']:8.2f}{each:12.2f}")
+for (mode, test), v in mean.items():
+    one = mean.get(("e3c", test))
+    if mode == "e3c-a" and one and one["steps"]:
+        print(f"   {test}: E3a's cost per step (e3c-a less e3c, over e3c's {one['steps']:.0f} steps): "
+              f"{(v['token'] - one['token']) / one['steps']:.2f} us")
+EOF
+    fi
     if compgen -G "$OUT/ppl-*.err" > /dev/null || compgen -G "$OUT/kld-*.err" > /dev/null; then
         echo
         echo "== perplexity, and KLD against the reference's logits (identical logits: KLD 0, same top p 100%)"
@@ -388,6 +482,12 @@ run_all() {
     fi
     if has e3; then
         place+=" e3 e3b" bench_modes+=" e3 e3b" depth_modes+=" e3 e3b" kld_modes+=" e3 e3b"
+    elif has e3a; then
+        place+=" e3" bench_modes+=" e3" depth_modes+=" e3" kld_modes+=" e3"
+    fi
+    # the counters change no output (the checks compare them byte for byte), so no KLD
+    if has e3c; then
+        bench_modes+=" e3c e3c-a" depth_modes+=" e3c e3c-a"
     fi
     if has e2hp; then
         case " $depth_modes " in *" e2-igpu "*) ;; *) depth_modes+=" e2-igpu" ;; esac
@@ -434,7 +534,7 @@ run_all() {
         done
     fi
 
-    if [ -n "$PPL_TEXT" ] && { [ -n "$DRY" ] || [ -f "$PPL_TEXT" ]; }; then
+    if [ -n "$PPL_TEXT" ] && [ -n "$kld_modes$kld1_modes" ] && { [ -n "$DRY" ] || [ -f "$PPL_TEXT" ]; }; then
         echo "== perplexity and KLD against the reference"
         base=$OUT/kld-base-ref.bin
         rm -f "$base"

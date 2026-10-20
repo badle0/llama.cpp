@@ -73,6 +73,8 @@ struct spacemit_launch {
     std::atomic<bool>     failed{ false };
     size_t                tcm_sizes[SPACEMIT_MAX_TILES] = {};  // each tile's TCM, so all can agree on one size
     spacemit_pairs        pairs;
+    spacemit_run_stats *  stats      = nullptr;  // test-only (E3c): where the tiles note their times, if anywhere
+    size_t                stats_base = 0;        // the first step of this launch in stats
 
     spacemit_launch() { pairs.failed = &failed; }
 };
@@ -80,6 +82,46 @@ struct spacemit_launch {
 bool spacemit_run_step(const spacemit_launch & launch, size_t i, const spacemit_tile & tile) {
     const bool ok = launch.steps[i].kernel(tile, launch.steps[i].node);
     return ok && !(static_cast<int64_t>(i) == launch.fail_step && tile.ith == 0);
+}
+
+// test-only (structural-experiments.md E3c): the tiles read the clock only when their launch keeps statistics. A tile
+// writes its kernel times into its own row of stats->kernel_ns and its barrier time once, at the end of the launch, so
+// the tiles do not share cache lines step by step
+using spacemit_clock = std::chrono::steady_clock;
+
+spacemit_clock::time_point spacemit_stats_now(const spacemit_launch & launch) {
+    return launch.stats != nullptr ? spacemit_clock::now() : spacemit_clock::time_point{};
+}
+
+uint64_t spacemit_ns(spacemit_clock::duration d) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+}
+
+// tile ith spent t0 to t1 in step i's kernel
+void spacemit_stats_kernel(const spacemit_launch & launch, size_t i, uint32_t ith, spacemit_clock::time_point t0,
+                           spacemit_clock::time_point t1) {
+    spacemit_run_stats * stats = launch.stats;
+    stats->kernel_ns[ith * stats->stride + launch.stats_base + i] = static_cast<uint32_t>(spacemit_ns(t1 - t0));
+}
+
+// before a launch of nth tiles: its steps follow those of the graph's earlier launches
+void spacemit_stats_begin(spacemit_launch & launch, spacemit_run_stats * stats, uint32_t nth) {
+    launch.stats = stats;
+    if (stats == nullptr) {
+        return;
+    }
+    GGML_ASSERT(stats->n_steps + launch.n_steps <= stats->stride && nth <= SPACEMIT_MAX_TILES);
+    stats->n_tiles    = nth;
+    launch.stats_base = stats->n_steps;
+    stats->n_steps += launch.n_steps;
+}
+
+// after the host's wait for the launch, which it started at t
+void spacemit_stats_end(const spacemit_launch & launch, spacemit_clock::time_point t) {
+    if (launch.stats != nullptr) {
+        launch.stats->launches++;
+        launch.stats->launch_us += std::chrono::duration<double, std::micro>(spacemit_clock::now() - t).count();
+    }
 }
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
@@ -105,14 +147,25 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     const spacemit_tile tile = { ith, nth, tcm_size != 0 ? tcm.data : nullptr, tcm_size, launch->workspace,
                                  launch->workspace_size, &launch->pairs };
 
+    uint64_t barrier_ns = 0;  // test-only (E3c)
     for (size_t i = 0; i < launch->n_steps; i++) {
+        const spacemit_clock::time_point t0 = spacemit_stats_now(*launch);
         if (!launch->failed.load() && !spacemit_run_step(*launch, i, tile)) {
             launch->failed.store(true);
         }
-        if (ctx->sync() != spert::Status::Ok) {
+        const spacemit_clock::time_point t1     = spacemit_stats_now(*launch);
+        const spert::Status              status = ctx->sync();
+        if (launch->stats != nullptr) {
+            spacemit_stats_kernel(*launch, i, ith, t0, t1);
+            barrier_ns += spacemit_ns(spacemit_clock::now() - t1);
+        }
+        if (status != spert::Status::Ok) {
             launch->failed.store(true);
             return;
         }
+    }
+    if (launch->stats != nullptr) {
+        launch->stats->barrier_ns[ith] += barrier_ns;
     }
 }
 
@@ -155,8 +208,12 @@ class spert_executor final : public spacemit_executor {
         launch.workspace      = workspace;
         launch.workspace_size = workspace_size;
         launch.fail_step      = fail_step;
-        const spert::Future future = stream->launch(spert::Grid{ stream->core_count() }, spacemit_tile_main, &launch);
-        const spert::Status status = future.sync();
+        spacemit_stats_begin(launch, stats, static_cast<uint32_t>(stream->core_count()));
+        const spacemit_clock::time_point t      = spacemit_stats_now(launch);
+        const spert::Future              future = stream->launch(spert::Grid{ stream->core_count() }, spacemit_tile_main,
+                                                                 &launch);
+        const spert::Status              status = future.sync();
+        spacemit_stats_end(launch, t);
         if (status != spert::Status::Ok) {
             GGML_LOG_ERROR("FlagOS SpacemiT: spine-runtime launch failed with status %d\n", spert::status_code(status));
             return false;
@@ -333,6 +390,8 @@ class host_executor final : public spacemit_executor {
         launch.steps     = steps.data();
         launch.n_steps   = steps.size();
         launch.fail_step = fail_step;
+        spacemit_stats_begin(launch, stats, n_tiles);
+        const spacemit_clock::time_point start = spacemit_stats_now(launch);
         if (threaded) {
             host_barrier             barrier(n_tiles);
             std::vector<std::thread> threads;
@@ -340,32 +399,48 @@ class host_executor final : public spacemit_executor {
                 threads.emplace_back([&, ith] {
                     const spacemit_tile tile = { ith,       n_tiles,        tcm_of(ith), tcm_size,
                                                  workspace, workspace_size, &launch.pairs };
+                    uint64_t            barrier_ns = 0;
                     for (size_t i = 0; i < launch.n_steps; i++) {
+                        const spacemit_clock::time_point t0 = spacemit_stats_now(launch);
                         if (!launch.failed.load() && !spacemit_run_step(launch, i, tile)) {
                             launch.failed.store(true);
                         }
+                        const spacemit_clock::time_point t1 = spacemit_stats_now(launch);
                         barrier.wait();
+                        if (launch.stats != nullptr) {
+                            spacemit_stats_kernel(launch, i, ith, t0, t1);
+                            barrier_ns += spacemit_ns(spacemit_clock::now() - t1);
+                        }
+                    }
+                    if (launch.stats != nullptr) {
+                        launch.stats->barrier_ns[ith] += barrier_ns;
                     }
                 });
             }
             for (std::thread & t : threads) {
                 t.join();
             }
+            spacemit_stats_end(launch, start);
             return !launch.failed.load();
         }
 
         launch.pairs.concurrent = false;
         for (size_t i = 0; i < steps.size() && !launch.failed.load(); i++) {
             for (uint32_t ith = 0; ith < n_tiles; ith++) {
+                const spacemit_clock::time_point t0 = spacemit_stats_now(launch);
                 if (!spacemit_run_step(launch, i,
                                        { ith, n_tiles, tcm_of(ith), tcm_size, workspace, workspace_size, &launch.pairs })) {
                     launch.failed.store(true);
+                }
+                if (launch.stats != nullptr) {
+                    spacemit_stats_kernel(launch, i, ith, t0, spacemit_clock::now());
                 }
             }
             if (!spacemit_pairs_balanced(launch.pairs, n_tiles)) {
                 launch.failed.store(true);
             }
         }
+        spacemit_stats_end(launch, start);
         return !launch.failed.load();
     }
 

@@ -2,13 +2,40 @@
 
 #include "flagos-spacemit-ops.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <vector>
 
 struct spacemit_step {
     spacemit_kernel_fn kernel;
     ggml_tensor *      node;
+};
+
+// test-only (structural-experiments.md E3c): what one graph's runs spent, step by step and tile by tile. The executor
+// fills it during run() when it has one; the runs of a graph append their steps one after another
+struct spacemit_run_stats {
+    size_t                stride    = 0;  // steps one tile's row of kernel_ns holds (the graph's steps)
+    size_t                n_steps   = 0;  // steps recorded so far
+    uint32_t              n_tiles   = 0;  // tiles of the runs
+    uint64_t              launches  = 0;
+    double                launch_us = 0;  // host: from each launch to the end of the wait for it, summed
+    std::vector<uint32_t> kernel_ns;      // [tile * stride + step]: the tile's time in the step's kernel
+    uint64_t              barrier_ns[SPACEMIT_MAX_TILES] = {};  // per tile: at the barriers after its steps, summed
+
+    // before a graph of graph_steps steps
+    void reset(size_t graph_steps) {
+        stride   = graph_steps;
+        n_steps  = 0;
+        n_tiles  = 0;
+        launches = 0;
+        launch_us = 0;
+        if (kernel_ns.size() < SPACEMIT_MAX_TILES * stride) {
+            kernel_ns.resize(SPACEMIT_MAX_TILES * stride);
+        }
+        std::fill(std::begin(barrier_ns), std::end(barrier_ns), 0);
+    }
 };
 
 // persistent: one spine-runtime stream (core grant) per backend, kept until the backend is freed
@@ -40,6 +67,9 @@ class spacemit_executor {
     }
 
     virtual const char * name() const = 0;
+
+    // test-only (E3c): set by graph_compute around the runs of a graph it counts; run() fills it, run_ordered() not
+    spacemit_run_stats * stats = nullptr;
 };
 
 // spine-runtime executor on the AI cores; without spine-runtime (non-riscv64 builds) a serial stand-in for tests
