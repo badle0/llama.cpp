@@ -270,7 +270,7 @@ with the modes interleaved in each repetition: the board drifts between sessions
 | E2-hp | Q5 | E2's IGPU and the reference, each with and without `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`, depth runs | unknown; the 128 KiB block spacing suggests no 2.2x slowdown | KV cache on huge pages "hurts" if IGPU's tg32 at depth 4096 loses at least 2% more from huge pages than the reference does, "helps" if it gains at least 2% more | done 2026-10-19 (§6): neither in generation; mixed in prompt processing at depth |
 | E2-neg | F8 | Build B as IGPU, and the reference: a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0 -fa on -c 512`), and a context shift (`-c 256 -n 400 --ignore-eos --context-shift`) | IGPU aborts in both ("pre-allocated tensor ... cannot run the operation": `SET_ROWS`, then `ROPE`); the reference runs both (the shift logs "context full, swapping") | confirms or refutes F8's two gaps | done 2026-10-19 (§6): both confirmed |
 | E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | done 2026-10-19 (§6): -24 to -95%; not repeated (user, 2026-10-20: M0's X3/X3b and run 1 cover it; out of the default `EXPS`) |
-| E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | open (user, 2026-10-19: more investigation against the deck first). Proposed, anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b if possible, else E3a) keeps the framework's cost within about 2% of a token (tg128 within about 1% of the reference, which already carries about 1.1%); Tier-2 capture is needed if it costs 5% or more; in between, report | ready (runs in the full run) |
+| E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | open (user, 2026-10-19: more investigation against the deck first). Proposed, anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b if possible, else E3a) keeps the framework's cost within about 2% of a token (tg128 within about 1% of the reference, which already carries about 1.1%); Tier-2 capture is needed if it costs 5% or more; in between, report | done 2026-10-20 (§6, run 3): tg128 -14.2%, about 14.6 ms per token; identical logits |
 | E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): Tier-1 on an ordered stream, as the ABI assumes | unknown: between the reference and E3a | as E3a | feasible (2026-10-20: the board's `spert.hpp` has `Context::join`, `Future::sync_all`, copyable Futures; F14); design: each tile joins its own copy of the previous launch's Future before taking its TCM, every launch's arguments live until `sync_all`, a launch not admitted waits for those in flight and is retried once; not implemented |
 | E3c | Q1, R12 | Test-only counters: per token, the time inside launches, the kernels' own time (tile 0) and the steps; the rest of a token is the AI cores waiting on llama.cpp, the CPU's split and sampling | today's cost the deck's way (device idle per token), split into inside and outside launches, for comparison with AMD's 0.6 ms of 45 ms | none: a measurement | proposed, not implemented |
 | E4 | Q5, F13, R1 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | E2's rule; then "no upstream change needed at all" | done 2026-10-20 (§6, run 2): passes; pp512 at depth 4096 +4.0% |
@@ -539,6 +539,33 @@ llama.cpp or ggml: neither C5a and C5b nor the mentor's ggml lines are needed at
   it), it must match the host's ggml version (`ba360ef` here), and stock programs find it only through
   `GGML_BACKEND_PATH`; finding it by name needs the one loader line (`ggml_backend_load_best("flagos", ...)`).
 
+### Run 3: E3a (K3, 2026-10-20)
+
+Qwen3-4B Q4_0, build A for both modes (provider code as `0b201a6`): `ref`, and `e3` with
+`FLAGOS_SPACEMIT_TEST_LAUNCH=per-step` (one spine-runtime launch per step, the host waiting for each). `EXPS="e3"`, 3
+repetitions, depth runs, perplexity on 8 x 512 tokens; logs in `~/sx/e3a`. Every run ended with exit code 0. Placement
+the same in both (2 / 2 splits, flash attention enabled, ACCEL, KV cache in a CPU buffer); the same text.
+
+| Mode | pp128 | tg128 | tg32 depth 0 | tg32 depth 1024 | tg32 depth 4096 | pp512 depth 4096 |
+|---|---|---|---|---|---|---|
+| `ref` | 92.47 ± 0.32 | 11.31 ± 0.01 | 11.41 ± 0.04 | 9.87 ± 0.03 | 7.85 ± 0.00 | 34.54 ± 0.05 |
+| `e3` (E3a) | 90.93 ± 0.09 (-1.7%) | 9.71 ± 0.01 (-14.2%) | 9.78 ± 0.02 (-14.3%) | 8.62 ± 0.01 (-12.7%) | 6.99 ± 0.01 (-11.0%) | 34.47 ± 0.05 (-0.2%) |
+| extra time | 23 ms per 128-token batch | 14.6 ms per token | 14.6 ms per token | 14.7 ms per token | 15.7 ms per token | about 30 ms per 512-token batch (within the noise) |
+
+Accuracy: perplexity 9.782019 against `ref`'s 9.7820, mean KLD -0.000000, maximum 0.000053 (the base file's rounding),
+the same top token 100%: identical logits, as the checks showed (byte-identical outputs).
+
+Reading:
+- A Tier-1-only plugin that orders the kernels by waiting on the host costs the K3 11-14% of generation: about 14.6 ms
+  more per token at depths 0-1024 (15.7 ms at 4096), about 12 times today's estimated 1.1% (and the deck's 1.2% for
+  AMD). Prompt processing loses little (-1.7% at 128 tokens, nothing measurable at 512): the same steps carry more work.
+  By the proposed rule (Tier-2 needed at 5% or more), E3a fails clearly, so the question moves to E3b.
+- The cost per step is higher than predicted: 14.6 ms per token over the estimated 1,060 steps is about 13.8 µs per step,
+  against about 11.5 µs from the launch and barrier benchmarks (predicted -12%, measured -14%). Either a launch costs
+  more inside a model run than in the benchmark, or a token has more steps than estimated; the step count was never
+  counted. E3c counts it.
+- Correctness and placement do not change with the launch model (expected: the same steps in the same order).
+
 ## 7. Log
 
 - 2026-10-19: requirements, questions and findings collected from the deck, the AMD comparison, upstream `master`, the
@@ -579,3 +606,5 @@ llama.cpp or ggml: neither C5a and C5b nor the mentor's ggml lines are needed at
 - 2026-10-20: decided by the user (Q6): native kernels stay in the plugin for now; the K3's package directory is
   `spacemit/k3-a100`; how the package is built and shipped goes to the mentor. Q1 notes where the barrier design comes
   from.
+- 2026-10-20: run 3 (E3a) on the K3; results in §6: one launch per step with host waits costs tg128 14.2% (about 14.6 ms
+  per token, about 13.8 µs per step if a token has 1,060 steps), prompt processing 0-2%, logits identical.
