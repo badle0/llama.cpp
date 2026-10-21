@@ -15,7 +15,8 @@
 #                                                           $BUILD_M; then a smoke check (the stock programs list the
 #                                                           device through GGML_BACKEND_PATH). Always: build A's tools
 #                                                           (today's build-flagos/) and its provider checks, 5 times with
-#                                                           e3 (they compare E3a and E3b with one launch, byte for byte).
+#                                                           e3 (they compare E3a with one launch, byte for byte; E3b only
+#                                                           flagos-check-spacemit --e3b, since 2026-10-21).
 #                                                           R (r12), after A: $BUILD_R12, configured as A with
 #                                                           FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1 defined (upstream's
 #                                                           branch of the 1-row Q4_1 kernel); its provider checks run
@@ -254,9 +255,9 @@ prepare_a() {
     # shellcheck disable=SC2086
     cmake --build "$BUILD_A" --target $TOOLS flagos-check-spacemit > "$BUILD_A/sx-build.log" 2>&1
     echo "   build A: rc=$?; $(grep -cE 'error:|FAILED' "$BUILD_A/sx-build.log") error lines ($BUILD_A/sx-build.log)"
-    # the checks include E2's layer with the KV cache in the provider's buffer and E3's comparisons of one launch per
-    # step (E3a, E3b) with one per layer, byte for byte; with e3 they run 5 times, as a missing order shows only at times.
-    # A hang ends after 15 minutes
+    # the checks include E2's layer with the KV cache in the provider's buffer and E3a's comparisons of one launch per
+    # step with one per layer, byte for byte (E3b's left them 2026-10-21: flagos-check-spacemit --e3b); with e3 they run
+    # 5 times. A hang ends after 15 minutes
     local n_check=1 i rc to=""
     if has e3; then n_check=5; fi
     if command -v timeout > /dev/null; then to="timeout --foreground 900"; fi

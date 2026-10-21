@@ -518,6 +518,11 @@ Checks in `flagos-check-spacemit` (`tests/check_spacemit.cpp`):
   byte against one launch, on its 8 one-token cases;
 - the forced-failure test sets its launch mode: per split (failure in step 0 and step 1) and per step (step 0).
 
+During the experiments these comparisons and the forced-failure test also ran E3b's launches (ordered in the cores); its
+two 1-token layer cases differed at every run from 2026-10-20 (F16) and kept the checks' rc at 1. Since 2026-10-21 (user
+decision: one launch per split is settled) the default checks no longer run them; `flagos-check-spacemit --e3b` compares
+E3b on demand, for instance after a new spine-runtime release.
+
 `scripts/structural-experiments.sh`: `prepare`, `run`, `summary` (§4). `scripts/spert-launch-bench.cpp`: E3d, built
 and run by hand (its header, and run 4 in §4).
 

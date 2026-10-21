@@ -355,12 +355,12 @@ static int check_ops(ggml_backend_dev_t dev) {
 
     // a kernel failure inside the launch stops every tile and is reported (test-only switch). Repeated, in the
     // first step and in a later one: on the AI cores a failure seen at the wrong barrier would hang a launch. The step
-    // counts within a launch, so the launches are set here: one per split, and one per step, with the host waiting
-    // and ordered in the cores (structural-experiments.md E3a, E3b), where a failure in a step's launch must fail the
-    // graph (a launch of one step has no step 1)
+    // counts within a launch, so the launches are set here: one per split, and one per step with the host waiting
+    // (structural-experiments.md E3a), where a failure in a step's launch must fail the graph (a launch of one step has
+    // no step 1)
     constexpr int k_fail_runs = 100;
     int           fail_ok     = 0;
-    for (const char * launch : { "per-split", "per-step", "per-step-join" }) {
+    for (const char * launch : { "per-split", "per-step" }) {
         env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch);
         for (const char * fail_node : { "0", "1" }) {
             if (std::strcmp(launch, "per-split") != 0 && std::strcmp(fail_node, "1") == 0) {
@@ -376,7 +376,7 @@ static int check_ops(ggml_backend_dev_t dev) {
             ggml_backend_free(failing);
         }
     }
-    CHECK(fail_ok == 4 * k_fail_runs);
+    CHECK(fail_ok == 3 * k_fail_runs);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -384,9 +384,8 @@ static int check_ops(ggml_backend_dev_t dev) {
                 "%lldx%lld ADD exact: checked\n",
                 (long long) n_big, (long long) n_rows, (long long) n);
     std::printf("backend  empty and view-only graphs succeed; unclaimed op returns FAILED; forced kernel failure in step 0 "
-                "and 1 (and in step 0 with one launch per step, also ordered in the cores) returns FAILED %d/%d times: "
-                "checked\n",
-                fail_ok, 4 * k_fail_runs);
+                "and 1 (and in step 0 with one launch per step) returns FAILED %d/%d times: checked\n",
+                fail_ok, 3 * k_fail_runs);
     return 0;
 }
 
@@ -1399,7 +1398,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     // the switch's value per setting (nullptr: the default) and its name in the reports
     const char * const split_settings[][2] = { { nullptr, "the default, with the turns" },
                                                { "split", "FLAGOS_SPACEMIT_ATTN=split, without the turns" } };
-    int                n_split = 0, n_split_differ = 0, n_turns_same = 0, n_launch_same = 0, n_join_same = 0;
+    int                n_split = 0, n_split_differ = 0, n_turns_same = 0, n_launch_same = 0;
     double             e_split = 0.0, e_split_row = 0.0;
     for (const split_case & c : split_cases) {
         attn_run run;
@@ -1429,26 +1428,24 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
             g_failures++;
         }
         n_turns_same += same;
-        // structural-experiments.md E3a, E3b: the default split with its two steps (the tiles' partial results, then
-        // their merge, passed through the workspace) in launches of their own, the host waiting for each and ordered
-        // in the cores, against both in one launch
-        const char * const launch_settings[] = { "per-split", "per-step", "per-step-join" };
-        std::vector<float> launched[3];
-        for (int l = 0; l < 3; l++) {
+        // structural-experiments.md E3a: the default split with its two steps (the tiles' partial results, then their
+        // merge, passed through the workspace) in launches of their own, the host waiting for each, against both in
+        // one launch
+        const char * const launch_settings[] = { "per-split", "per-step" };
+        std::vector<float> launched[2];
+        for (int l = 0; l < 2; l++) {
             env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
             env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch_settings[l]);
             REQUIRE(run.dev_output(backend, launched[l]));
         }
-        for (int l = 1; l < 3; l++) {
-            const bool same_launch =
-                std::memcmp(launched[0].data(), launched[l].data(), launched[0].size() * sizeof(float)) == 0;
-            if (!same_launch) {
-                std::fprintf(stderr, "FAIL: attention split, %s: FLAGOS_SPACEMIT_TEST_LAUNCH=%s differs from one launch\n",
-                             c.what, launch_settings[l]);
-                g_failures++;
-            }
-            (l == 1 ? n_launch_same : n_join_same) += same_launch;
+        const bool same_launch =
+            std::memcmp(launched[0].data(), launched[1].data(), launched[0].size() * sizeof(float)) == 0;
+        if (!same_launch) {
+            std::fprintf(stderr, "FAIL: attention split, %s: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step differs from one launch\n",
+                         c.what);
+            g_failures++;
         }
+        n_launch_same += same_launch;
     }
 
     ggml_backend_free(backend);
@@ -1465,10 +1462,10 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     std::printf("attn     split over the tiles (the default; FLAGOS_SPACEMIT_ATTN=split without the turns) on %d "
                 "one-token cases: max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); %d/%d outputs differ from "
                 "the one-chunk kernels' (the split ran); with and without the turns identical in %d/%zu cases; one "
-                "launch per step identical in %d/%zu (E3a), %d/%zu ordered in the cores (E3b)\n",
+                "launch per step identical in %d/%zu (E3a)\n",
                 n_split, e_split, k_attn_max_nmse, e_split_row, k_attn_max_row_nmse, n_split_differ, n_split,
                 n_turns_same, sizeof(split_cases) / sizeof(split_cases[0]), n_launch_same,
-                sizeof(split_cases) / sizeof(split_cases[0]), n_join_same, sizeof(split_cases) / sizeof(split_cases[0]));
+                sizeof(split_cases) / sizeof(split_cases[0]));
     return 0;
 }
 
@@ -1962,30 +1959,29 @@ static int check_layer(ggml_backend_dev_t dev) {
         }
         worst_kv = std::max(worst_kv, e);
     }
-    // E3a, E3b: one launch per step (quantization and matmul, the norms, RoPE, the cache writes, attention, each launched
-    // on its own), the host waiting for each and ordered in the cores, gives the same outputs as one launch for the
-    // layer; every setting given here, whatever the run's
-    const char * const launch_settings[] = { "per-split", "per-step", "per-step-join" };
-    int                n_launch_same = 0, n_join_same = 0, n_launch_cases = 0;
+    // E3a: one launch per step (quantization and matmul, the norms, RoPE, the cache writes, attention, each launched on
+    // its own), the host waiting for each, gives the same outputs as one launch for the layer; both settings given here,
+    // whatever the run's. Launches ordered in the cores (E3b) differ on spine-runtime 0.6 (structural-experiments.md
+    // F16), so they are compared only by --e3b
+    const char * const launch_settings[] = { "per-split", "per-step" };
+    int                n_launch_same = 0, n_launch_cases = 0;
     for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
         for (int64_t n_tokens : { 1, 7 }) {
-            std::vector<float> out[3];
-            double             e[3];
-            for (int l = 0; l < 3; l++) {
+            std::vector<float> out[2];
+            double             e[2];
+            for (int l = 0; l < 2; l++) {
                 env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch_settings[l]);
                 e[l] = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[l]);
             }
-            for (int l = 1; l < 3; l++) {
-                const bool same = e[0] >= 0.0 && e[l] >= 0.0 && out[0].size() == out[l].size() &&
-                                  std::memcmp(out[0].data(), out[l].data(), out[0].size() * sizeof(float)) == 0;
-                if (!same) {
-                    std::fprintf(stderr, "FAIL: layer with %lld tokens, down projection %s: FLAGOS_SPACEMIT_TEST_LAUNCH=%s %s\n",
-                                 (long long) n_tokens, ggml_type_name(down), launch_settings[l],
-                                 e[0] < 0.0 || e[l] < 0.0 ? "refused or failed" : "differs from one launch per layer");
-                    g_failures++;
-                }
-                (l == 1 ? n_launch_same : n_join_same) += same;
+            const bool same = e[0] >= 0.0 && e[1] >= 0.0 && out[0].size() == out[1].size() &&
+                              std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
+            if (!same) {
+                std::fprintf(stderr, "FAIL: layer with %lld tokens, down projection %s: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step %s\n",
+                             (long long) n_tokens, ggml_type_name(down),
+                             e[0] < 0.0 || e[1] < 0.0 ? "refused or failed" : "differs from one launch per layer");
+                g_failures++;
             }
+            n_launch_same += same;
             n_launch_cases++;
         }
     }
@@ -2042,12 +2038,11 @@ static int check_layer(ggml_backend_dev_t dev) {
     std::printf("layer    Qwen3-like layer with flash attention in one launch vs CPU (1 and 7 tokens after %d "
                 "positions, down projection Q4_0 and Q4_1, all rows; KV cache of %lld cells and mask in a CPU buffer, "
                 "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e; KV cache in our buffer "
-                "(E2) max NMSE %.2e; one launch per step identical in %d/%d cases (E3a), %d/%d ordered in the cores "
-                "(E3b); one quantization for Q/K/V and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d "
-                "cases, 3 steps fewer in %d/%d%s\n",
+                "(E2) max NMSE %.2e; one launch per step identical in %d/%d cases (E3a); one quantization for Q/K/V "
+                "and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d cases, 3 steps fewer in %d/%d%s\n",
                 k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope, worst_kv, n_launch_same,
-                n_launch_cases, n_join_same, n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer,
-                n_shared_cases, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer, n_shared_cases,
+                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
 

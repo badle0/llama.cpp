@@ -302,6 +302,10 @@ and 3 steps fewer per layer (`spacemit_steps_take`, a test-only count of launche
 identical in 4/4 cases and 3 steps fewer in 4/4, serial and on threads with the TCM stand-in; `test-backend-ops` with
 `shared`: `MUL_MAT` 3/3, `ROPE` 165/165, `RMS_NORM_MUL_ADD` 30/30, `ROPE_SET_ROWS` 24/24, `FLASH_ATTN_EXT` 1324/1324. The
 spine-runtime executor's changed code compiles against a stub of `spert.hpp`; the K3's `prepare` builds it for real.
+On the K3, 2026-10-21 (`fusion-experiments.sh prepare`): build A without errors; `shared` identical in 4/4 cases and 3
+steps fewer in 4/4; the layer's max NMSE 5.24e-04 as in run 4; the checks' rc 1 only from E3b's two 1-token layer cases
+(launches ordered by `join`), as since 2026-10-20 (`structural-experiments.md` F16). The default checks no longer run
+E3b's launches since the same day (user decision; `structural-experiments.md` §5), so their rc is 0 when all pass.
 
 Predictions (estimates, fixed before the run; Qwen3-4B Q4_0):
 
