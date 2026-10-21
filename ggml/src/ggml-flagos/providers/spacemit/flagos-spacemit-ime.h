@@ -10,3 +10,7 @@
 size_t spacemit_mul_mat_workspace(const ggml_tensor * node);
 bool   spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node);
 bool   spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node);
+
+// whether MUL_MAT b quantizes the same activations as MUL_MAT a into the same layout, so that b can multiply what a's
+// quantize step wrote (FLAGOS_SPACEMIT_QUANTIZE=shared, spacemit_backend_graph_compute)
+bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b);

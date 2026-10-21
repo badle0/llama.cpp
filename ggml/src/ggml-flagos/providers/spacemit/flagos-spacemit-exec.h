@@ -11,10 +11,12 @@
 struct spacemit_step {
     spacemit_kernel_fn kernel;
     ggml_tensor *      node;
+    size_t             workspace_offset = 0;  // where the step's part of the shared workspace starts
 };
 
-// test-only (structural-experiments.md E3c): what one graph's runs spent, step by step and tile by tile. The executor
-// fills it during run() when it has one; the runs of a graph append their steps one after another
+// test-only (structural-experiments.md E3c, fusion-and-splitting.md §7): what one graph's runs spent, step by step and
+// tile by tile. The executor fills it during run() when it has one; the runs of a graph append their steps one after
+// another
 struct spacemit_run_stats {
     size_t                stride    = 0;  // steps one tile's row of kernel_ns holds (the graph's steps)
     size_t                n_steps   = 0;  // steps recorded so far
@@ -22,6 +24,7 @@ struct spacemit_run_stats {
     uint64_t              launches  = 0;
     double                launch_us = 0;  // host: from each launch to the end of the wait for it, summed
     std::vector<uint32_t> kernel_ns;      // [tile * stride + step]: the tile's time in the step's kernel
+    std::vector<uint32_t> step_barrier_ns;  // [tile * stride + step]: the tile's time at the barrier after the step
     uint64_t              barrier_ns[SPACEMIT_MAX_TILES] = {};  // per tile: at the barriers after its steps, summed
 
     // before a graph of graph_steps steps
@@ -33,6 +36,7 @@ struct spacemit_run_stats {
         launch_us = 0;
         if (kernel_ns.size() < SPACEMIT_MAX_TILES * stride) {
             kernel_ns.resize(SPACEMIT_MAX_TILES * stride);
+            step_barrier_ns.resize(SPACEMIT_MAX_TILES * stride);
         }
         std::fill(std::begin(barrier_ns), std::end(barrier_ns), 0);
     }
@@ -86,3 +90,7 @@ struct spacemit_ordered_counts {
     uint64_t pairs_on_one_core = 0;  // launches where both tiles of a pair (2i, 2i+1) were on one core
 };
 spacemit_ordered_counts spacemit_ordered_counts_take();
+
+// test-only: the steps the executors have launched since the last call (flagos-check-spacemit counts the quantize steps
+// that FLAGOS_SPACEMIT_QUANTIZE=shared leaves out)
+uint64_t spacemit_steps_take();

@@ -243,6 +243,17 @@ size_t spacemit_mul_mat_workspace(const ggml_tensor * node) {
     return GGML_PAD((size_t) (d.m * d.a_row_bytes), 64);
 }
 
+// the quantize step writes only what its activations and its layout's quantizers give (the 32x32 layouts share theirs)
+bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b) {
+    const ggml_tensor * xa = a->src[1];
+    const ggml_tensor * xb = b->src[1];
+    const mm_dims       da = mm_dims_of(a);
+    const mm_dims       db = mm_dims_of(b);
+    return xa->data == xb->data && xa->type == xb->type && ggml_are_same_shape(xa, xb) && ggml_are_same_stride(xa, xb) &&
+           da.f->k_block == db.f->k_block && da.f->act_row_bytes == db.f->act_row_bytes &&
+           da.f->quantize_row == db.f->quantize_row && da.f->quantize_4rows == db.f->quantize_4rows;
+}
+
 // step 1: quantize the activations into the workspace. One row: the tiles split its K blocks. Several rows: the tiles
 // split blocks of 4 rows; full blocks are stored interleaved for the 4-row kernel, the last partial block row by row.
 bool spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node) {

@@ -1499,6 +1499,15 @@ static layer_weights new_layer_weights(ggml_context * ctx, ggml_type down) {
     w.wg        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
     w.wu        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
     w.wd        = ggml_new_tensor_2d(ctx, down, k_ff, k_d);
+    // named as llama.cpp names a layer's weights, which the op counters read (FLAGOS_SPACEMIT_TEST_OP_STATS)
+    const std::pair<ggml_tensor *, const char *> names[] = {
+        { w.attn_norm, "attn_norm" }, { w.q_norm, "attn_q_norm" }, { w.k_norm, "attn_k_norm" }, { w.ffn_norm, "ffn_norm" },
+        { w.wq, "attn_q" },           { w.wk, "attn_k" },          { w.wv, "attn_v" },          { w.wo, "attn_output" },
+        { w.wg, "ffn_gate" },         { w.wu, "ffn_up" },          { w.wd, "ffn_down" },
+    };
+    for (const auto & [t, name] : names) {
+        ggml_format_name(t, "blk.0.%s.weight", name);
+    }
     return w;
 }
 
@@ -1626,6 +1635,12 @@ static double layer_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_ba
     ggml_tensor * mask    = ggml_new_tensor_4d(ctx_h, GGML_TYPE_F16, k_slots, n_tokens, 1, 1);
     const layer_weights wd = new_layer_weights(ctx_wd, down);
     const layer_weights wc = new_layer_weights(ctx_wc, down);
+    for (ggml_tensor * c : { kc_d, kc_c }) {
+        ggml_set_name(c, "cache_k_l0");
+    }
+    for (ggml_tensor * c : { vc_d, vc_c }) {
+        ggml_set_name(c, "cache_v_l0");
+    }
 
     ggml_backend_buffer_t bh  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
     ggml_backend_buffer_t bwd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wd, ggml_backend_dev_buffer_type(dev));
@@ -1974,6 +1989,44 @@ static int check_layer(ggml_backend_dev_t dev) {
             n_launch_cases++;
         }
     }
+    // fusion-and-splitting.md §5, candidate 6: with FLAGOS_SPACEMIT_QUANTIZE=shared, Q, V and K, and gate and up, multiply
+    // one quantization of their input: 3 steps fewer per layer, and the same bytes, in one launch and in one launch per
+    // step (where the quantized activations outlast the launches between)
+    int n_shared_same = 0, n_shared_fewer = 0, n_shared_cases = 0;
+    for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
+        for (int64_t n_tokens : { 1, 7 }) {
+            const char * const settings[3][2] = { { "separate", "per-split" }, { "shared", "per-split" },
+                                                  { "shared", "per-step" } };
+            std::vector<float> out[3];
+            double             e[3];
+            uint64_t           steps[3];
+            for (int s = 0; s < 3; s++) {
+                env_override quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", settings[s][0]);
+                env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", settings[s][1]);
+                spacemit_steps_take();
+                e[s]     = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[s]);
+                steps[s] = spacemit_steps_take();
+            }
+            bool same = e[0] >= 0.0;
+            for (int s = 1; s < 3; s++) {
+                same = same && e[s] >= 0.0 && out[s].size() == out[0].size() &&
+                       std::memcmp(out[0].data(), out[s].data(), out[0].size() * sizeof(float)) == 0;
+            }
+            const bool fewer = steps[1] + 3 == steps[0] && steps[2] == steps[1];
+            if (!same || !fewer) {
+                std::fprintf(stderr,
+                             "FAIL: layer with %lld tokens, down projection %s: FLAGOS_SPACEMIT_QUANTIZE=shared %s; "
+                             "steps separate %llu, shared %llu, shared one launch per step %llu\n",
+                             (long long) n_tokens, ggml_type_name(down),
+                             !same ? "refused, failed or differs from separate" : "has not 3 steps fewer",
+                             (unsigned long long) steps[0], (unsigned long long) steps[1], (unsigned long long) steps[2]);
+                g_failures++;
+            }
+            n_shared_same += same;
+            n_shared_fewer += fewer;
+            n_shared_cases++;
+        }
+    }
     // the whole head rotated, and half of it (the rest copied)
     const double e_rope_full = rope_wide_nmse(dev, backend, cpu, 256);
     const double e_rope_half = rope_wide_nmse(dev, backend, cpu, 128);
@@ -1990,10 +2043,11 @@ static int check_layer(ggml_backend_dev_t dev) {
                 "positions, down projection Q4_0 and Q4_1, all rows; KV cache of %lld cells and mask in a CPU buffer, "
                 "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e; KV cache in our buffer "
                 "(E2) max NMSE %.2e; one launch per step identical in %d/%d cases (E3a), %d/%d ordered in the cores "
-                "(E3b)%s\n",
+                "(E3b); one quantization for Q/K/V and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d "
+                "cases, 3 steps fewer in %d/%d%s\n",
                 k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope, worst_kv, n_launch_same,
-                n_launch_cases, n_join_same, n_launch_cases,
-                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                n_launch_cases, n_join_same, n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer,
+                n_shared_cases, std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
 
