@@ -14,3 +14,7 @@ bool   spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node);
 // whether MUL_MAT b quantizes the same activations as MUL_MAT a into the same layout, so that b can multiply what a's
 // quantize step wrote (FLAGOS_SPACEMIT_QUANTIZE=shared, spacemit_backend_graph_compute)
 bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b);
+
+// test-only: the multiply steps that took path A and path C since the last call, one count per step; the 1-row path is
+// not counted (flagos-check-spacemit checks that FLAGOS_SPACEMIT_MM=rows switches the path)
+void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_c);

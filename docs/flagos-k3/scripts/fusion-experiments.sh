@@ -4,6 +4,8 @@
 # the same session, the modes interleaved in every repetition. Experiments:
 #   base the baseline: only ref and ops, where every op's time per token or batch is measured on the defaults (§7.1)
 #   q6   one quantization for Q, K and V and one for gate and up (§5, #6): FLAGOS_SPACEMIT_QUANTIZE=shared
+#   mm   path A for every batch that gives each tile 4 rows (§7.3, not fusion): FLAGOS_SPACEMIT_MM=rows; adds prompts
+#        of 32, 64 and 96 tokens (one batch each)
 #
 # Usage: fusion-experiments.sh prepare                  build A's tools and its provider checks, run once (they compare
 #                                                       every candidate with the defaults, byte for byte)
@@ -14,7 +16,8 @@
 #        REPS      llama-bench repetitions per mode (default 5; 0 skips llama-bench)
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 0)
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
-#        KLD_UB1   1: the logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run)
+#        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
+#                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ
 #        BUILD_A   the build (default <repo>/build-flagos); TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
@@ -23,6 +26,8 @@
 #   ops      FLAGOS_SPACEMIT_TEST_OP_STATS and FLAGOS_SPACEMIT_TEST_STATS: the op counters and E3c's, on the defaults
 #   q6       FLAGOS_SPACEMIT_QUANTIZE=shared
 #   q6-ops   q6 with the op counters
+#   mm       FLAGOS_SPACEMIT_MM=rows
+#   mm-ops   mm with the op counters
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -43,12 +48,13 @@ PROMPT="The capital of France is"
 TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
-unset FLAGOS_SPACEMIT_TEST_OP_STATS FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_TEST_LAUNCH \
-    FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
+unset FLAGOS_SPACEMIT_TEST_OP_STATS FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_MM \
+    FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
 
 mode_env() {
     case $1 in
         q6 | q6-ops) echo "FLAGOS_SPACEMIT_QUANTIZE=shared" ;;
+        mm | mm-ops) echo "FLAGOS_SPACEMIT_MM=rows" ;;
         *) echo "" ;;
     esac
 }
@@ -171,7 +177,7 @@ kv_class = lambda n: 0 if n < 1024 else 1024 if n < 4096 else 4096  # E3c's KV c
 res = {}
 for sf in sorted(glob.glob(os.path.join(sys.argv[1], "bench-*.stats"))):
     stem = sf[: -len(".stats")]
-    m = re.match(r"bench-(.+)-(std|pp512|tg|pp)-\d+$", os.path.basename(stem))
+    m = re.match(r"bench-(.+)-(std|pp512|ppsmall|tg|pp)-\d+$", os.path.basename(stem))
     if not m:
         continue
     kinds = [json.loads(line) for line in open(sf) if line.startswith("{")]
@@ -239,7 +245,7 @@ EOF
 }
 
 run_all() {
-    local modes kld_modes m i base
+    local modes kld_modes kld_sets m i s base args
     M=${1:?usage: fusion-experiments.sh run <model.gguf> [out]}
     OUT=${2:-$HOME/fx/$(basename "$M" .gguf)}
     [ -n "$DRY" ] || [ -f "$M" ] || { echo "model not found: $M"; exit 1; }
@@ -247,8 +253,13 @@ run_all() {
     [ -n "$DRY" ] || mkdir -p "$OUT"
     rm -f "$OUT/bench.jsonl"
 
-    modes="ref ops" kld_modes=""
-    if has q6; then modes+=" q6 q6-ops" kld_modes+=" q6"; fi
+    # the logits check's settings: q6's at 512-token batches and one token per ubatch, mm's at 128 and 64 rows
+    modes="ref ops" kld_modes="" kld_sets=""
+    if has q6; then
+        modes+=" q6 q6-ops" kld_modes+=" q6" kld_sets+=" batch"
+        if [ "$KLD_UB1" = 1 ]; then kld_sets+=" ub1"; fi
+    fi
+    if has mm; then modes+=" mm mm-ops" kld_modes+=" mm" kld_sets+=" ub128 ub64"; fi
     if [ -z "$DRY" ]; then
         {
             echo "date: $(date -u +%Y-%m-%dT%H:%MZ)"
@@ -269,6 +280,9 @@ run_all() {
             for m in $modes; do
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
+                if has mm; then
+                    bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
+                fi
                 if [ "$DEPTH" = 1 ]; then
                     bench "$m" "tg-$i" -p 0 -n 32 -d 0,1024,4096
                     bench "$m" "pp-$i" -p 512 -n 0 -d 4096
@@ -279,28 +293,28 @@ run_all() {
 
     if [ -n "$PPL_TEXT" ] && [ -n "$kld_modes" ] && { [ -n "$DRY" ] || [ -f "$PPL_TEXT" ]; }; then
         echo "== logits against the reference"
-        base=$OUT/kld-base-ref.bin
-        rm -f "$base"
-        run ref "$OUT/ppl-ref" llama-perplexity -m "$M" -f "$PPL_TEXT" -c 512 --chunks "$CHUNKS" -t 8 \
-            --kl-divergence-base "$base"
-        echo "   ppl ref (writes the base logits): rc=$?"
-        for m in $kld_modes; do
-            run "$m" "$OUT/kld-$m" llama-perplexity -m "$M" -f "$PPL_TEXT" -c 512 --chunks "$CHUNKS" -t 8 \
-                --kl-divergence-base "$base" --kl-divergence
-            echo "   kld $m: rc=$?"
-        done
-        if [ "$KLD_UB1" = 1 ]; then
-            # one sequence, so every ubatch is one token: the 1-row matmuls (build.md §7, M2e.3 round 2)
-            run ref "$OUT/ppl-ref-ub1" llama-perplexity -m "$M" -f "$PPL_TEXT" -c 512 -b 512 -ub 1 --chunks "$CHUNKS" \
-                -t 8 --kl-divergence-base "$base.ub1"
-            echo "   ppl ref -ub 1 (writes the base logits): rc=$?"
+        for s in $kld_sets; do
+            case $s in
+                batch) args="" ;;
+                # one sequence, so every ubatch is one token: the 1-row matmuls (build.md §7, M2e.3 round 2)
+                ub1) args="-b 512 -ub 1" ;;
+                ub128) args="-ub 128" ;;
+                ub64) args="-ub 64" ;;
+            esac
+            base=$OUT/kld-base-ref-$s.bin
+            rm -f "$base"
+            # shellcheck disable=SC2086 # $args is a list of words
+            run ref "$OUT/ppl-ref-$s" llama-perplexity -m "$M" -f "$PPL_TEXT" -c 512 --chunks "$CHUNKS" -t 8 $args \
+                --kl-divergence-base "$base"
+            echo "   ppl ref $s (writes the base logits): rc=$?"
             for m in $kld_modes; do
-                run "$m" "$OUT/kld-$m-ub1" llama-perplexity -m "$M" -f "$PPL_TEXT" -c 512 -b 512 -ub 1 \
-                    --chunks "$CHUNKS" -t 8 --kl-divergence-base "$base.ub1" --kl-divergence
-                echo "   kld $m -ub 1: rc=$?"
+                # shellcheck disable=SC2086
+                run "$m" "$OUT/kld-$m-$s" llama-perplexity -m "$M" -f "$PPL_TEXT" -c 512 --chunks "$CHUNKS" -t 8 $args \
+                    --kl-divergence-base "$base" --kl-divergence
+                echo "   kld $m $s: rc=$?"
             done
-        fi
-        rm -f "$base" "$base.ub1"
+            rm -f "$base"
+        done
     fi
 
     if [ -z "$DRY" ]; then
@@ -312,5 +326,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,25p' "$0"; exit 1 ;;
+    *) sed -n '2,30p' "$0"; exit 1 ;;
 esac

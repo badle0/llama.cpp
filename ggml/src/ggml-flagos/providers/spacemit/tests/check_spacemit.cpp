@@ -1,6 +1,6 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
-// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn]
-//                              [--e3b[=runs]]
+// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
+//                              [--bench | --bench-gemv | --bench-attn | --bench-mm] [--e3b[=runs]]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -8,11 +8,13 @@
 //                    the IME
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
 //                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-8192, 128 tokens at n_kv 128
-//                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the 1-row strategies of
-//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes
+//                    and 4096, 512 at n_kv 512 and 4608) against the CPU, the 1-row strategies of
+//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes, and path A against the split (--bench-mm)
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default)
+//   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 16-512 rows on path A
+//                    (FLAGOS_SPACEMIT_MM=rows) against the default split
 //   --e3b[=runs]     only structural-experiments.md E3b-diag: why launches ordered in the cores differ (default 20 runs
 //                    per case and variant); a measurement, it fails nothing
 // Without a flag, a host without the device skips the device checks.
@@ -23,6 +25,7 @@
 #include "ggml-flagos.h"
 #include "ggml.h"
 #include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
+#include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
 
 #include <algorithm>
 #include <chrono>
@@ -1093,6 +1096,79 @@ static int check_gemv_strategies(ggml_backend_dev_t dev, bool host) {
                 "direct:32/128/512, direct:32@6) at 6 shapes with TCM%s: %d/%d identical to direct (copy-only control "
                 "differs); direct vs CPU max NMSE %.2e (bound %.0e)%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs, worst, k_mul_mat_max_nmse,
+                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+    return 0;
+}
+
+// fusion-and-splitting.md §7.3: FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows) against the default
+// split, which sends each case below to path C: the same bytes, as both run the 4-row kernel on the same groups of 4 rows
+// and blocks of 32 columns. The paths taken are counted (spacemit_mm_paths_take), so a case that does not switch fails.
+// Path A needs TCM: as check_gemv_strategies, a stand-in on a host without the AI cores, there also with tiles on threads
+static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
+    env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
+    std::vector<ggml_backend_t> backends;
+    for (const char * threads : { (const char *) nullptr, "1" }) {
+        if (threads != nullptr && !host) {
+            break;
+        }
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");
+        env_override on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
+        backends.push_back(ggml_backend_dev_init(dev, nullptr));
+        REQUIRE(backends.back() != nullptr);
+    }
+
+    struct mm_case { ggml_type type; int64_t k, n, m; };
+    const mm_case cases[] = {
+        { GGML_TYPE_Q4_0, 512, 4096, 32 },   // the fewest rows that give each of 8 tiles 4
+        { GGML_TYPE_Q4_0, 512, 1024, 37 },   // a last group of 1 row
+        { GGML_TYPE_Q4_0, 256, 8320, 128 },  // more than 64 times wider than the rows, as gate and up at 128 rows
+        { GGML_TYPE_Q4_1, 512, 1024, 66 },
+        { GGML_TYPE_Q8_0, 512, 1024, 64 },
+        { GGML_TYPE_Q6_K, 512, 1024, 33 },
+    };
+    int n_same = 0, n_runs = 0;
+    for (const mm_case & c : cases) {
+        mm_weight w;
+        REQUIRE(w.init(dev, c.k, c.n, (uint32_t) (c.k + c.n + c.m), c.type, c.type == GGML_TYPE_Q6_K));
+        mm_run run;
+        REQUIRE(run.init(dev, w, c.m, 12));
+        for (ggml_backend_t backend : backends) {
+            std::vector<float> out[2];
+            uint64_t           path_a[2] = {}, path_c[2] = {};
+            bool               ok        = true;
+            for (int s = 0; s < 2; s++) {
+                set_env("FLAGOS_SPACEMIT_MM", s == 0 ? nullptr : "rows");
+                spacemit_mm_paths_take(path_a[s], path_c[s]);
+                ok = ok && ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
+                spacemit_mm_paths_take(path_a[s], path_c[s]);
+                out[s].resize(ggml_nelements(run.y));
+                ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
+            }
+            set_env("FLAGOS_SPACEMIT_MM", nullptr);
+            const bool switched = path_a[0] == 0 && path_c[0] == 1 && path_a[1] == 1 && path_c[1] == 0;
+            const bool same     = ok && std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
+            if (!same || !switched) {
+                std::fprintf(stderr,
+                             "FAIL: %s matmul k=%lld n=%lld rows=%lld: FLAGOS_SPACEMIT_MM=rows %s (paths A/C: split %llu/%llu, "
+                             "rows %llu/%llu)%s\n",
+                             ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) c.m,
+                             !ok ? "failed" : !same ? "differs from split" : "did not switch from path C to path A",
+                             (unsigned long long) path_a[0], (unsigned long long) path_c[0],
+                             (unsigned long long) path_a[1], (unsigned long long) path_c[1],
+                             backend != backends[0] ? " (tiles on threads)" : "");
+                g_failures++;
+            }
+            n_same += same && switched;
+            n_runs++;
+        }
+    }
+
+    for (ggml_backend_t backend : backends) {
+        ggml_backend_free(backend);
+    }
+    std::printf("mm       FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows) against the default split (path C "
+                "for these): Q4_0, Q4_1, Q8_0 and Q6_K at 32-128 rows with TCM%s: %d/%d identical, path switched%s\n",
+                host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
 }
@@ -2287,6 +2363,80 @@ static int bench_gemv(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// fusion-and-splitting.md §7.3: the matmuls of a Qwen3-4B batch on path A (FLAGOS_SPACEMIT_MM=rows) against the default
+// split, at the row counts of short prompts and of llama-bench's batches: each shape alone with the path the split
+// takes, and per batch the shapes weighted by how often a batch runs them (36 q and attention outputs, 72 k and v, 72
+// gate and up, 32 + 4 down; the head runs on one row). As in bench_gemv every run reads its weights from DRAM: it takes
+// the next of enough copies of the weight (32 MB together)
+static int bench_mm(ggml_backend_dev_t dev) {
+    env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
+    ggml_backend_t backend = nullptr;
+    {
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM (check_mm_paths)
+        backend = ggml_backend_dev_init(dev, nullptr);
+    }
+    REQUIRE(backend != nullptr);
+    struct mm_shape { const char * what; ggml_type type; int64_t k, n; int per_batch; };
+    const mm_shape shapes[] = {
+        { "q", GGML_TYPE_Q4_0, 2560, 4096, 36 },        { "k, v", GGML_TYPE_Q4_0, 2560, 1024, 72 },
+        { "attn out", GGML_TYPE_Q4_0, 4096, 2560, 36 }, { "gate, up", GGML_TYPE_Q4_0, 2560, 9728, 72 },
+        { "down", GGML_TYPE_Q4_0, 9728, 2560, 32 },     { "down Q4_1", GGML_TYPE_Q4_1, 9728, 2560, 4 },
+    };
+    const std::vector<int64_t> rows = { 16, 32, 48, 64, 96, 128, 160, 256, 512 };
+    std::vector<double>        batch_split(rows.size(), 0.0), batch_rows(rows.size(), 0.0);
+    for (const mm_shape & s : shapes) {
+        const double               bytes  = (double) s.n * ime_row_bytes(s.type, s.k);
+        const size_t               copies = (size_t) std::min(32.0, std::ceil(32e6 / bytes));
+        const std::vector<uint8_t> q      = quantize_weights(s.type, s.k, s.n, 1);
+        std::vector<std::unique_ptr<mm_weight>> ws;
+        for (size_t c = 0; c < copies; c++) {
+            ws.push_back(std::make_unique<mm_weight>());
+            REQUIRE(ws.back()->init_with(dev, s.type, s.k, s.n, q));
+        }
+        for (size_t r = 0; r < rows.size(); r++) {
+            const int64_t                        m = rows[r];
+            std::vector<std::unique_ptr<mm_run>> runs;
+            for (size_t c = 0; c < copies; c++) {
+                runs.push_back(std::make_unique<mm_run>());
+                REQUIRE(runs.back()->init(dev, *ws[c], m, 1));
+                CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
+            }
+            const int    iters = m <= 64 ? 10 : m <= 160 ? 5 : 3;
+            double       t[2]  = {};
+            const char * path[2];
+            for (int k = 0; k < 2; k++) {
+                set_env("FLAGOS_SPACEMIT_MM", k == 0 ? nullptr : "rows");
+                bool     ok   = true;
+                size_t   next = 0;
+                uint64_t path_a, path_c;
+                spacemit_mm_paths_take(path_a, path_c);
+                t[k] = time_us(
+                    [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
+                    iters);
+                spacemit_mm_paths_take(path_a, path_c);
+                path[k] = path_c == 0 ? "A" : path_a == 0 ? "C" : "A and C";
+                CHECK(ok);
+            }
+            set_env("FLAGOS_SPACEMIT_MM", nullptr);
+            const double flop = 2.0 * s.k * s.n * m;
+            std::printf("bench    mm %-9s %s %5lldx%-5lld rows %3lld: split (path %s) %8.0f us %6.1f GFLOP/s, rows (path %s) "
+                        "%8.0f us %6.1f GFLOP/s (%+.1f%%)\n",
+                        s.what, ggml_type_name(s.type), (long long) s.k, (long long) s.n, (long long) m, path[0], t[0],
+                        flop / t[0] / 1e3, path[1], t[1], flop / t[1] / 1e3, 100.0 * (t[1] / t[0] - 1.0));
+            batch_split[r] += t[0] * s.per_batch;
+            batch_rows[r] += t[1] * s.per_batch;
+        }
+    }
+    for (size_t r = 0; r < rows.size(); r++) {
+        std::printf("bench    mm per Qwen3-4B batch of %3lld rows (its matmuls but the head): split %8.1f ms, rows %8.1f ms "
+                    "(%+.1f%%)\n",
+                    (long long) rows[r], batch_split[r] / 1e3, batch_rows[r] / 1e3,
+                    100.0 * (batch_rows[r] / batch_split[r] - 1.0));
+    }
+    ggml_backend_free(backend);
+    return 0;
+}
+
 // flash attention at Qwen3-4B's heads (32 query, 8 KV of 128; attn_run): a token at n_kv 256, 512, 1024, 4096 and
 // 8192, every cell valid, and prompt batches, causal: 128 tokens at n_kv 128 and 4096, 512 at n_kv 512 and 4608 (depth
 // 0 and 4096); the provider against the CPU backend (8 threads) on the same graph. As in the model, where each layer
@@ -2423,9 +2573,10 @@ static int bench(ggml_backend_dev_t dev) {
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
 
-    // Q4_0 matmul at Qwen3-4B's FFN shapes, and Q4_1 at its ffn_down shape (its first 4 layers): 1 row (GEMV), small
-    // batches (path C), 128 rows (path A). Q6_K (run as Q8_0, against the CPU's Q6_K) at its output head, whose 1 row
-    // is a generated token's: up to 16 rows and fewer iterations, as the head holds 15x an FFN matrix's weights
+    // Q4_0 matmul at Qwen3-4B's FFN shapes, and Q4_1 at its ffn_down shape (its first 4 layers): 1 row (the 1-row path),
+    // small batches (path C), 128 rows (path A for the down projection; the split keeps gate and up on path C there,
+    // fusion-and-splitting.md §7.3, bench_mm). Q6_K (run as Q8_0, against the CPU's Q6_K) at its output head, whose 1
+    // row is a generated token's: up to 16 rows and fewer iterations, as the head holds 15x an FFN matrix's weights
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu8    = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu8 != nullptr);
@@ -2455,7 +2606,7 @@ static int bench(ggml_backend_dev_t dev) {
     }
     ggml_backend_free(backend);
     ggml_backend_free(cpu8);
-    return bench_attn(dev) != 0 ? 1 : bench_gemv(dev);
+    return bench_attn(dev) != 0 || bench_gemv(dev) != 0 ? 1 : bench_mm(dev);
 }
 
 int main(int argc, char ** argv) {
@@ -2465,6 +2616,7 @@ int main(int argc, char ** argv) {
     bool run_bench     = false;
     bool run_gemv      = false;
     bool run_attn      = false;
+    bool run_mm        = false;
     int  e3b_runs      = 0;
     for (int i = 1; i < argc; i++) {
         if (std::strncmp(argv[i], "--e3b", 5) == 0 && (argv[i][5] == '\0' || argv[i][5] == '=')) {
@@ -2481,10 +2633,12 @@ int main(int argc, char ** argv) {
             run_gemv = true;
         } else if (std::strcmp(argv[i], "--bench-attn") == 0) {
             run_attn = true;
+        } else if (std::strcmp(argv[i], "--bench-mm") == 0) {
+            run_mm = true;
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-gemv | --bench-attn] "
-                         "[--e3b[=runs]]\n",
+                         "usage: %s [--expect-device | --expect-none] [--full] "
+                         "[--bench | --bench-gemv | --bench-attn | --bench-mm] [--e3b[=runs]]\n",
                          argv[0]);
             return 2;
         }
@@ -2527,11 +2681,13 @@ int main(int argc, char ** argv) {
     const bool         host = flagos_registry_get_device_info(global_index, &info) && info.profile.runtime != nullptr &&
                       std::strcmp(info.profile.runtime, "none") == 0;
     if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
-        check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_rows(dev) != 0 ||
-        check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
+        check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
+        check_rows(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
         return 1;
     }
-    if (run_bench ? bench(dev) != 0 : (run_gemv && bench_gemv(dev) != 0) || (run_attn && bench_attn(dev) != 0)) {
+    if (run_bench ? bench(dev) != 0 :
+                    (run_gemv && bench_gemv(dev) != 0) || (run_attn && bench_attn(dev) != 0) ||
+                        (run_mm && bench_mm(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

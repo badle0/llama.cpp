@@ -7,6 +7,7 @@
 #include "../../../ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -86,6 +87,27 @@ int64_t div_up(int64_t a, int64_t b) {
 bool use_reference() {
     return spacemit_use_reference() || !spacemit_ime::have_ime();
 }
+
+// test-only until adopted (fusion-and-splitting.md §7.3): FLAGOS_SPACEMIT_MM=rows takes path A for every call that gives
+// each tile at least one group of 4 rows; split (the default) keeps ime.cpp's choice, which takes path C below 113 rows,
+// and for matrices more than 64 times wider than the rows. The same bytes either way. Read at every call with 4 rows for
+// every tile, so a benchmark can switch; anything else is reported once and ignored
+bool mm_rows_from_env() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_MM");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "split") == 0) {
+        return false;
+    }
+    if (std::strcmp(v, "rows") == 0) {
+        return true;
+    }
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MM=%s: unknown setting ignored\n", __func__, v);
+    }
+    return false;
+}
+
+std::atomic<uint64_t> g_path_a{ 0 }, g_path_c{ 0 };  // test-only (spacemit_mm_paths_take)
 
 // rows [0, rows) of a block: 4 rows per kernel call while 4 remain, then 1
 void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, int64_t cols, const mm_dims & d,
@@ -243,6 +265,11 @@ size_t spacemit_mul_mat_workspace(const ggml_tensor * node) {
     return GGML_PAD((size_t) (d.m * d.a_row_bytes), 64);
 }
 
+void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_c) {
+    path_a = g_path_a.exchange(0);
+    path_c = g_path_c.exchange(0);
+}
+
 // the quantize step writes only what its activations and its layout's quantizers give (the 32x32 layouts share theirs)
 bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b) {
     const ggml_tensor * xa = a->src[1];
@@ -317,8 +344,12 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     }
 
     // path A (batches with 4 rows for every tile): each tile stages 4 quantized rows in TCM and streams all weights
-    // past them
-    if (n_stride == d.n && tcm != nullptr && (size_t) (row_align * d.a_row_bytes) <= tile.tcm_size) {
+    // past them. With FLAGOS_SPACEMIT_MM=rows whenever every tile gets 4 rows
+    const bool rows = d.m >= row_align * nth && mm_rows_from_env();
+    if ((n_stride == d.n || rows) && tcm != nullptr && (size_t) (row_align * d.a_row_bytes) <= tile.tcm_size) {
+        if (ith == 0) {
+            g_path_a.fetch_add(1, std::memory_order_relaxed);
+        }
         for (int64_t m0 = ith * row_align; m0 < d.m; m0 += row_align * nth) {
             const int64_t rows = std::min(d.m - m0, row_align);
             spacemit_ime::copy(tcm, qa + m0 * d.a_row_bytes, rows * d.a_row_bytes);
@@ -332,6 +363,9 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
 
     // path C: (rows, columns) tasks straight from DRAM. ime.cpp's path B (weight slabs staged in TCM, core pairs
     // staggered by a pair barrier) would go here; it is deferred (plan.md, M2b design).
+    if (ith == 0) {
+        g_path_c.fetch_add(1, std::memory_order_relaxed);
+    }
     const int64_t tasks_m = div_up(d.m, m_stride);
     const int64_t tasks   = tasks_m * div_up(d.n, n_stride);
     const int64_t per     = div_up(tasks, nth);

@@ -114,8 +114,9 @@ Other measured points: the output head takes 16.6 ms per token on the AI cores (
 attention is 43% of a token at depth 4096 (M2e.3); attention was about 70% of pp512 at depth 4096 (M2e.1, before the
 tiled kernel became a third faster in M2e's L3 and L4); the AI cores stream weights at up to about 28 GB/s (M2e.3).
 
-**Not measured:** time per op kind (how much of the 85.2 ms the norms, ropes, quantize steps, cache writes and each
-matmul role take). This is the main gap; the op counters of §7.1 measure it.
+**Measured 2026-10-21** (§7.1, the baseline; until then the main gap): time per op kind. Per tg128 token the matmuls'
+multiply steps take 83.46 ms, attention 1.44 ms and everything else 3.26 ms; the matmuls hold 2.0 of the 2.44 ms of
+imbalance, all of it from the pair turns' tail.
 
 Reading (inference): fusion cannot reduce the weight traffic, since every weight is read once per token. In
 generation these angles can only win back the per-step costs (barriers, imbalance, launch, host work) and the small ops'
@@ -280,6 +281,73 @@ cost; E3c's budget of a generated token with the op counters' totals against E3c
 (tg128 at n_kv 256, tg32 at n_kv 1280 and 4352, pp128, pp512, pp512 at n_kv 4608). The same run on Qwen3-0.6B is
 optional: its token takes about 18 ms, so a step's fixed cost weighs about 4 times more there.
 
+**Baseline results (K3, 2026-10-21; build `eb7a53962`; Qwen3-4B Q4_0, `EXPS=base DEPTH=1 REPS=3`; 25 of 25 runs rc 0;
+logs `~/fx/base` on the board).** Valid by the rules fixed before the run: the counters cost tg128 -0.83% and pp512
++0.06% (tg32 at depth 0 -1.38%, outside the rule; E3c's own counters cost 1.1% there); in every generation test the op
+counters' kernels, busy and barriers lie within 0.5% of E3c's from the same runs (tg128: -0.02%, -0.02%, +0.00%); tg128's
+budget is run 4's (kernels 85.2 ms, imbalance 2.45 ms, 1,086 steps); every step is named.
+
+| Group | tg128, per token | pp128, per batch | pp512, per batch |
+|---|---|---|---|
+| matmul multiply steps | 83.46 ms (94.7%) | 1,187 ms (85.6%) | 3,964 ms (74.0%) |
+| attention | 1.44 ms (1.6%) | 62 ms (4.5%) | 666 ms (12.4%) |
+| quantize steps | 1.04 ms (1.2%) | 39 ms (2.8%) | 167 ms (3.1%) |
+| `RMS_NORM` | 0.43 ms (0.5%) | 29 ms (2.1%) | 197 ms (3.7%) |
+| `ROPE` | 0.59 ms (0.7%) | 22 ms (1.6%) | 90 ms (1.7%) |
+| `MUL` | 0.40 ms (0.5%) | 11 ms (0.8%) | 84 ms (1.6%) |
+| `ADD` | 0.32 ms (0.4%) | 9 ms (0.7%) | 70 ms (1.3%) |
+| `GLU` (SwiGLU) | 0.30 ms (0.3%) | 25 ms (1.8%) | 111 ms (2.1%) |
+| `SET_ROWS` | 0.19 ms (0.2%) | 3 ms (0.2%) | 12 ms (0.2%) |
+| all (wall) | 88.16 ms | 1,387 ms | 5,360 ms |
+
+At depth (tg32) attention takes 14.26 ms per token at n_kv 1280 (14.1%) and 40.83 ms at n_kv 4352 (32.1%); the other
+groups stay as at depth 0, RoPE 6-9% dearer.
+
+Against the predictions: the matmuls (82-85 ms), the one-row norms' slowest tile (tile 0, 100%) and pp512's attention
+(0.67 s) as predicted, and the matmuls hold 2.0 of the 2.44 ms of imbalance (predicted at least 1.5). Missed: the rest of
+a generated token is 3.26 ms, about twice the upper estimate (the quantize steps 1.04 ms against 0.25-0.5; `MUL`, `ADD`,
+`SET_ROWS` and `GLU` 1.2 ms against 0.3-0.5); attention at depth 0 1.44 ms (2-3 predicted); pp512's elementwise and
+quantize steps 0.73 s (0.3-0.6); pp128's matmuls 1.19 s (1.0-1.1).
+
+Findings (measured unless marked):
+- The 1-row matmuls' imbalance is the pair turns' tail: in all 9 matmul roles the slowest tile was an odd one in 100% of
+  the steps, as the code predicts (the odd tile does its last multiply after the last pair wait,
+  `flagos-spacemit-ime.cpp:216-236`). 2.0 ms per token, the largest overhead after the weights. Since the late tile is the
+  same one every time, removing barriers (#8) cannot help it; the turns themselves would have to change.
+- A small step costs 2.5-4.5 µs of wall time in generation. Its kernel takes 1.7-1.9 µs on every tile even with almost
+  no work: the idle tiles 5-7 of a K-2560 quantize step 1.67 µs, `MUL attn_k_norm` (128 floats of its own row per tile)
+  1.85 µs. `--bench`'s chain of tiny `ADD`s needs about 0.45 µs per kernel. Cause not isolated. Hypothesis: each step's
+  tensor metadata and inputs have left the caches while the matmuls streamed their weights. Test: the `--bench` chain
+  with a weight stream between its `ADD`s, or touching the next step's tensors during the barrier.
+- RoPE: Q's 9.7 µs per step and K's 5.2 µs fit 3.7 µs of trig plus 1.5 µs per row of scalar rotation (inferred from the
+  two points), about 0.27 ms of each per token.
+- At 128 rows the gate and up projections take path C (`flagos-spacemit-ime.cpp:299-306` splits columns when n/m > 64):
+  9.56 ms per layer, against 6.63 ms for the down projection of the same size on path A (667 against 962 GFLOP/s), so
+  about 205 ms of pp128's 1.39 s. If path A ran them, pp128 would gain about 17% (estimate). pp512 takes path A everywhere.
+- In pp512 the head-row norms are latency-bound: `RMS_NORM attn_q_norm` (16,384 rows of 128) takes 98 ms per batch, 3.6
+  times what its bytes need at the `ADD`'s rate; the Q chain (norm, mul, RoPE) takes 199 ms.
+- At n_kv 1280 the split attention's partial step leaves tile 0 the slowest in 80% of the steps (3 of the 17 visible
+  blocks against 2): 1.28 ms of imbalance per token.
+
+Ceilings from the fixed names (upper bounds: a fused kernel still does the steps' work):
+
+| Candidate | tg128, per token | pp512, per batch |
+|---|---|---|
+| #5 gate and up in one step with SwiGLU | 0.65 ms (0.74%); with the down quantize 0.84 ms (0.96%) | 126 ms (2.3%); 174 ms (3.2%) |
+| #2 residual add + norm + mul | 0.62 ms (0.70%) | 113 ms (2.1%) |
+| #10 RoPE's sin/cos | 0.54 ms (0.61%), the trig about half | 89 ms (1.7%) |
+| #6 one quantization for Q/K/V and gate/up | 0.40 ms (0.45%) | 46 ms (0.86%) |
+| #3, #4 the Q and K chains | 0.87 ms (0.99%), of which the steps' fixed costs about 0.5-0.6 | 137 ms (2.6%) |
+| #9 residual add in the matmul's epilogue | 0.32 ms (0.36%), overlapping #2 | 70 ms (1.3%) |
+| #8 barriers by data dependency | 0.14 ms (0.16%) | 0.3 ms |
+
+Not fusion, but larger: the pair turns' tail 2.0 ms per token (2.3%); pp128's path C about 205 ms per batch (14.8%); the
+split attention's imbalance 1.1-1.3 ms per token at depth.
+
+Gaps: pp512 at depth 4096 has no table: with `-r 1` each process runs that graph once, and the counters leave each kind's
+first graph out (to fix: keep it apart instead of dropping it). The board's timebase is not read yet. "Structures" in the
+tables counts processes, because the hash holds kernel addresses, which differ from one process to the next.
+
 ### 7.2 Rank 1, candidate #6: one quantization for Q/K/V and for gate/up (prepared 2026-10-21; user request)
 
 What it does. `FLAGOS_SPACEMIT_QUANTIZE=shared` (test-only until adopted; read at every graph; `separate` is the default)
@@ -344,7 +412,69 @@ docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx/q6 > ~/fx-q6-summary.t
 - The summary: the texts; llama-bench per mode against `ref`, and the counters' cost; E3c's budget of a generated token
   for `ops` and `q6-ops`; the `ops` table per kind of graph; `q6-ops` against `ops` name by name; the logits.
 
-### 7.3 Still proposed
+### 7.3 Path A for small prompt batches (not fusion; prepared 2026-10-21; user request, from the baseline)
+
+The baseline found gate and up at 128 rows on path C, 9.56 ms per layer, against 6.63 ms for the down projection of the
+same size on path A (§7.1). The split copied from the in-tree IME path (`flagos-spacemit-ime.cpp:299-306`) takes path A
+only when there are at least as many blocks of 16 rows as tiles and the matrix is at most 64 times wider than the rows:
+so every batch below 113 rows, and gate and up up to 149 rows, run on path C. That covers llama-bench's pp128 at
+`-ub 128`, every prompt of fewer than 113 tokens, and a prompt's last partial batch.
+
+What it does. `FLAGOS_SPACEMIT_MM=rows` (test-only until adopted; read at every call that gives each tile 4 rows;
+`split` is the default) takes path A whenever each tile gets at least one group of 4 rows, 32 rows or more on 8 tiles,
+whatever the shape. The same bytes by construction: both paths run the 4-row kernel on the same groups of 4 rows and
+blocks of 32 columns. Path A keeps the 4 rows in TCM and streams the weights past them; path C reads both from the
+caches and DRAM. Alternatives not taken: a new threshold in place of 64 (it would guess the rule before measuring it);
+path A for every batch of several rows (below 32 rows some tiles would have none).
+
+Checks (`flagos-check-spacemit`, `check_mm_paths`): `rows` against `split` byte for byte for Q4_0, Q4_1, Q8_0 and Q6_K at
+32 to 128 rows, including a last group of 1 row and a matrix 65 times wider than its 128 rows, with the paths taken
+counted (`spacemit_mm_paths_take`), so a case that does not switch fails. On the Mac, 2026-10-21: 12 of 12 identical
+with the path switched, serial and on threads with the TCM stand-in; `test-backend-ops -o MUL_MAT` with `rows` 3/3.
+
+Measurement:
+- `flagos-check-spacemit --expect-device --bench-mm`: Qwen3-4B's 6 matmul shapes at 16 to 512 rows under both settings,
+  each run reading its weights from DRAM, with the path each setting took, and per batch the shapes weighted as a batch
+  runs them. 16 rows (path C both ways) and 160 to 512 rows (path A both ways) are controls.
+- `EXPS=mm` in `fusion-experiments.sh`: modes `ref`, `ops`, `mm`, `mm-ops`; pp128 with tg128 (`-ub 128`), pp512, and
+  prompts of 32, 64 and 96 tokens (one batch each); the logits at batches of 128 and of 64 rows, where the paths differ.
+
+Predictions (estimates, fixed before the run; Qwen3-4B Q4_0):
+
+| What | Prediction |
+|---|---|
+| outputs | identical: KLD 0 and the same top token at `-ub 128` and `-ub 64`; the same greedy text |
+| bench, gate and up at 128 rows | 9.6 ms on path C, 6.6-7.5 ms on path A: down's rate if K 2560's shorter rows cost nothing, up to 15% below it if they do |
+| bench, every shape at 64 and 96 rows | path A 15-35% faster |
+| bench, every shape at 32 rows | between 20% faster and 20% slower: each tile streams all the weights for its one group of 4 rows |
+| bench controls | 16 rows and 160-512 rows within 3% |
+| pp128 (`-ub 128`) | +12-17% (92.1 t/s to 103-108): the 70 gate and up steps 2.0-2.9 ms faster each |
+| pp64, pp96 | +15-30% |
+| pp32 | -10% to +20% |
+| pp512, tg128 | unchanged within 0.5% (path A and the 1-row path already) |
+
+Rules (proposed 2026-10-21; the user fixes them before the run):
+- Valid if the outputs are identical and the bench's controls stay within 3%.
+- Adopt a new split, path A whenever every tile gets 4 rows, if the bench finds path A faster or within 3% at every shape
+  from 32 rows, and llama-bench finds pp32, pp64, pp96 and pp128 no slower than `ref` beyond the larger spread and pp128
+  at least 5% faster. If path A loses somewhere, adopt it only from the measured crossover (per shape if needed).
+
+How to run (on the K3, inside tmux, after a bundle of the commit):
+
+```bash
+cd /root/llama.cpp-flagos && git -c safe.directory=$PWD pull --ff-only ~/sx-fx3.bundle feature/flagos-spacemit
+docs/flagos-k3/scripts/fusion-experiments.sh prepare 2>&1 | tee ~/fx-prepare2.log
+~/tcmtest/tcmrelease --apply && build-flagos/bin/flagos-check-spacemit --expect-device --bench-mm > ~/fx-bench-mm.log 2>&1
+grep -E "^bench    mm" ~/fx-bench-mm.log
+EXPS=mm REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf ~/fx/mm > ~/fx-mm.log 2>&1
+```
+
+- `prepare` builds and runs the checks: rc 0 expected (E3b left them), its `mm` line "12/12" on the Mac becomes "6/6" on
+  the K3 (no threaded host executor there).
+- The bench takes about a minute (estimate); the run about 20 minutes (4 modes, 3 repetitions, 4 logits runs).
+- Then on the Mac: `scp -r k3:/root/fx/mm ~/fx-mm && scp k3:/root/fx-bench-mm.log ~/`.
+
+### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
   each alone; decides whether §6's parallel use of the X100 cores could add bandwidth at all.
@@ -360,3 +490,8 @@ docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx/q6 > ~/fx-q6-summary.t
 - 2026-10-21: the baseline run prepared (§7.1, `EXPS=base`; user: run it first, as the foundation for the candidates);
   the runner's `ops` modes also write E3c's counters, and its summary prints E3c's budget of a generated token and the
   op counters' totals against E3c's.
+- 2026-10-21: the baseline run on the K3 (§7.1): valid; every op's time per token and per batch; the ceilings from the
+  fixed names; three larger levers that are not fusion (the pair turns' tail, pp128's path C, the split attention's
+  imbalance at depth) and an unexplained fixed cost of a small step.
+- 2026-10-21: path A for small prompt batches prepared (§7.3; user request): `FLAGOS_SPACEMIT_MM=rows`, its check,
+  `flagos-check-spacemit --bench-mm` and `EXPS=mm`; checked on the Mac, not yet run on the K3.
