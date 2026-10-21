@@ -20,7 +20,7 @@ Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edi
 - Commit: `f1cf809` (2026-10-09), on its own.
 - What: for batches under 32 tokens (and with full offload), llama.cpp pins every `norm` and `l_last` node to its layer's device. Under ACCEL's default device selection, a layer not on a GPU has the CPU as its device, so each norm was pinned to the CPU although the provider runs the ops around it. The change returns before pinning when the layer's device is the CPU and an ACCEL backend supports the node.
 - Why: whole layers on the AI cores (M2d). Without it ACCEL generates 30-39% slower (Qwen3-4B / 0.6B, X3b, `device-type.md` §5).
-- Status: approved by the user 2026-10-09; the mentor to confirm (`PROJECT.md` question 9).
+- Status: approved by the user 2026-10-09 and by the mentor 2026-10-14 (`PROJECT.md` question 9).
 - Known issue: its comment says "every layer's device is the CPU", true only without a GPU. The code checks the layer's device type, so it is right. C5a's comment had the same overstatement and was corrected (U2); this one is not yet (comment only).
 
 ### U2. A fused op that an ACCEL backend runs for a CPU layer is no mismatch (C5a)
@@ -29,7 +29,7 @@ Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edi
 - Commit: `64e6cbd` (2026-10-13), on its own, with the buffer-type check.
 - What: under `-fa auto`, llama.cpp turns a fused op (flash attention) off when the device the scheduler gave it differs from its layer's device. With ACCEL the layer is on the CPU and the op on the ACCEL device, so flash attention was turned off. The change treats that case as no mismatch when the ACCEL device supports the layer's buffer type (the KV cache's), that is, reads those tensors in place.
 - Why: flash attention on the provider under default flags (M2e.1): 2 graph splits per token instead of 74. Without it `-fa auto` would need M2e.2 (the graph without flash attention on the provider), or every run `-fa on`.
-- Status: decided by the user 2026-10-12, as a commit of its own; the mentor to confirm (question 9).
+- Status: decided by the user 2026-10-12, as a commit of its own; approved by the mentor 2026-10-14 (question 9).
 
 ### U3. Build option `GGML_FLAGOS_SPACEMIT`
 

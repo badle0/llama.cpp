@@ -668,7 +668,7 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
   - Mean KLD 0.014773 ± 0.000741 (512-token batches) and 0.012145 ± 0.000541 (`-ub 1 -b 512`, the first with one-token ubatches on 0.6B, so not comparable with M2e's 0.012409).
   - Greedy text leaves the CPU's after 88 characters, as before; `llama-completion` 56.87 t/s against 28.52.
 - Two findings of the benchmark, the same in the check run before it:
-  - At n_kv 512 every tile has one block, and the default is slower than the one-chunk kernels: 262 against 252 us (+3.9%; 260 against 253 in the run before). The split without the turns takes 210 (-20%). That breaks round 2's "no one-token shape slower"; it costs about 2% of a token, at depths 256-511 only. The remedy, no turns when no tile has more than one block, awaits the user's decision (`plan.md`).
+  - At n_kv 512 every tile has one block, and the default is slower than the one-chunk kernels: 262 against 252 us (+3.9%; 260 against 253 in the run before). The split without the turns takes 210 (-20%). That breaks round 2's "no one-token shape slower"; it costs about 2% of a token, at depths 256-511 only. Left as it is (user decision 2026-10-14); the remedy would be no turns when no tile has more than one block (`plan.md`).
   - The split without the turns varies between runs where the turns do not. At n_kv 4096 it took 1303, 1093 and 1172 us in three runs; the turns 1132, 1108 and 1109; the one-chunk kernels 1743, 1753 and 1771. So at depth the turns are the robust choice.
 
 Manual checks:
