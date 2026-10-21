@@ -6,6 +6,8 @@
 #   q6   one quantization for Q, K and V and one for gate and up (§5, #6): FLAGOS_SPACEMIT_QUANTIZE=shared
 #   mm   path A for every batch that gives each tile 4 rows (§7.3, not fusion): FLAGOS_SPACEMIT_MM=rows; adds prompts
 #        of 32, 64 and 96 tokens (one batch each)
+#   pb   path B where the split gives no path A, as ime.cpp (§7.3, not fusion): FLAGOS_SPACEMIT_MM=spacemit; adds
+#        prompts of 2-129 tokens (one batch each; with mm these replace mm's three)
 #
 # Usage: fusion-experiments.sh prepare                  build A's tools and its provider checks, run once (they compare
 #                                                       every candidate with the defaults, byte for byte)
@@ -17,7 +19,8 @@
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 0)
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
 #        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
-#                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ
+#                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ, pb's with 64
+#                  and 16 rows
 #        BUILD_A   the build (default <repo>/build-flagos); TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
@@ -28,6 +31,8 @@
 #   q6-ops   q6 with the op counters
 #   mm       FLAGOS_SPACEMIT_MM=rows
 #   mm-ops   mm with the op counters
+#   pb       FLAGOS_SPACEMIT_MM=spacemit
+#   pb-ops   pb with the op counters
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -55,6 +60,7 @@ mode_env() {
     case $1 in
         q6 | q6-ops) echo "FLAGOS_SPACEMIT_QUANTIZE=shared" ;;
         mm | mm-ops) echo "FLAGOS_SPACEMIT_MM=rows" ;;
+        pb | pb-ops) echo "FLAGOS_SPACEMIT_MM=spacemit" ;;
         *) echo "" ;;
     esac
 }
@@ -146,18 +152,21 @@ for line in open(sys.argv[1]):
     tests += [test] if test not in tests else []
     rows.setdefault((m, test), []).append(r["avg_ts"])
 mean = lambda m, t: statistics.mean(rows[(m, t)]) if rows.get((m, t)) else None
-print("   " + f"{'mode':10}" + "".join(f"{t:>22}" for t in tests))
-for m in modes:
-    cells = []
+def cell(m, t):
+    v, ref = rows.get((m, t)), mean("ref", t)
+    if not v:
+        return f"{'-':>22}"
+    avg, sd = statistics.mean(v), (statistics.stdev(v) if len(v) > 1 else 0.0)
+    change = f" {100 * (avg / ref - 1):+.2f}%" if ref and m != "ref" else ""
+    return f"{f'{avg:.2f}+-{sd:.2f}{change}':>22}"
+if len(tests) <= 6:  # a row per mode
+    print("   " + f"{'mode':10}" + "".join(f"{t:>22}" for t in tests))
+    for m in modes:
+        print("   " + f"{m:10}" + "".join(cell(m, t) for t in tests))
+else:  # a row per test
+    print("   " + f"{'test':10}" + "".join(f"{m:>22}" for m in modes))
     for t in tests:
-        v, ref = rows.get((m, t)), mean("ref", t)
-        if not v:
-            cells.append(f"{'-':>22}")
-            continue
-        avg, sd = statistics.mean(v), (statistics.stdev(v) if len(v) > 1 else 0.0)
-        change = f" {100 * (avg / ref - 1):+.2f}%" if ref and m != "ref" else ""
-        cells.append(f"{f'{avg:.2f}+-{sd:.2f}{change}':>22}")
-    print("   " + f"{m:10}" + "".join(cells))
+        print("   " + f"{t:10}" + "".join(cell(m, t) for m in modes))
 for m in modes:
     if m.endswith("ops"):
         base = "ref" if m == "ops" else m[: -len("-ops")]
@@ -177,7 +186,7 @@ kv_class = lambda n: 0 if n < 1024 else 1024 if n < 4096 else 4096  # E3c's KV c
 res = {}
 for sf in sorted(glob.glob(os.path.join(sys.argv[1], "bench-*.stats"))):
     stem = sf[: -len(".stats")]
-    m = re.match(r"bench-(.+)-(std|pp512|ppsmall|tg|pp)-\d+$", os.path.basename(stem))
+    m = re.match(r"bench-(.+)-(std|pp512|ppsmall|ppodd|tg|pp)-\d+$", os.path.basename(stem))
     if not m:
         continue
     kinds = [json.loads(line) for line in open(sf) if line.startswith("{")]
@@ -253,13 +262,16 @@ run_all() {
     [ -n "$DRY" ] || mkdir -p "$OUT"
     rm -f "$OUT/bench.jsonl"
 
-    # the logits check's settings: q6's at 512-token batches and one token per ubatch, mm's at 128 and 64 rows
+    # the logits check's settings: q6's at 512-token batches and one token per ubatch, mm's at 128 and 64 rows, pb's at
+    # 64 and 16 rows (each set once)
     modes="ref ops" kld_modes="" kld_sets=""
     if has q6; then
         modes+=" q6 q6-ops" kld_modes+=" q6" kld_sets+=" batch"
         if [ "$KLD_UB1" = 1 ]; then kld_sets+=" ub1"; fi
     fi
     if has mm; then modes+=" mm mm-ops" kld_modes+=" mm" kld_sets+=" ub128 ub64"; fi
+    if has pb; then modes+=" pb pb-ops" kld_modes+=" pb" kld_sets+=" ub64 ub16"; fi
+    kld_sets=$(printf '%s\n' $kld_sets | awk '!seen[$0]++' | tr '\n' ' ')
     if [ -z "$DRY" ]; then
         {
             echo "date: $(date -u +%Y-%m-%dT%H:%MZ)"
@@ -280,7 +292,9 @@ run_all() {
             for m in $modes; do
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
-                if has mm; then
+                if has pb; then
+                    bench "$m" "ppodd-$i" -p 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129 -n 0
+                elif has mm; then
                     bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
                 fi
                 if [ "$DEPTH" = 1 ]; then
@@ -300,6 +314,7 @@ run_all() {
                 ub1) args="-b 512 -ub 1" ;;
                 ub128) args="-ub 128" ;;
                 ub64) args="-ub 64" ;;
+                ub16) args="-ub 16" ;;
             esac
             base=$OUT/kld-base-ref-$s.bin
             rm -f "$base"
@@ -326,5 +341,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,30p' "$0"; exit 1 ;;
+    *) sed -n '2,35p' "$0"; exit 1 ;;
 esac

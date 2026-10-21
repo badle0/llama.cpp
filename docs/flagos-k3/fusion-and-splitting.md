@@ -116,7 +116,7 @@ tiled kernel became a third faster in M2e's L3 and L4); the AI cores stream weig
 
 **Measured 2026-10-21** (§7.1, the baseline; until then the main gap): time per op kind. Per tg128 token the matmuls'
 multiply steps take 83.46 ms, attention 1.44 ms and everything else 3.26 ms; the matmuls hold 2.0 of the 2.44 ms of
-imbalance, all of it from the pair turns' tail.
+imbalance: the pair turns' tail about 0.6 ms of it, a spread between pairs about 1.4 ms (§7.1).
 
 Reading (inference): fusion cannot reduce the weight traffic, since every weight is read once per token. In
 generation these angles can only win back the per-step costs (barriers, imbalance, launch, host work) and the small ops'
@@ -310,10 +310,17 @@ a generated token is 3.26 ms, about twice the upper estimate (the quantize steps
 quantize steps 0.73 s (0.3-0.6); pp128's matmuls 1.19 s (1.0-1.1).
 
 Findings (measured unless marked):
-- The 1-row matmuls' imbalance is the pair turns' tail: in all 9 matmul roles the slowest tile was an odd one in 100% of
-  the steps, as the code predicts (the odd tile does its last multiply after the last pair wait,
-  `flagos-spacemit-ime.cpp:216-236`). 2.0 ms per token, the largest overhead after the weights. Since the late tile is the
-  same one every time, removing barriers (#8) cannot help it; the turns themselves would have to change.
+- The 1-row matmuls hold 2.0 ms of imbalance per token, the largest overhead after the weights, and in all 9 matmul roles
+  the slowest tile was an odd one in 100% of the steps. The pair turns explain which tile: after a pair's last
+  handshake the even tile has nothing left and the odd one still multiplies its last slab
+  (`flagos-spacemit-ime.cpp:225-256`, the order of the in-tree `ggml-cpu/spacemit/ime.cpp:447-485`, a two-tile barrier
+  per pair). They do not explain all of the time (corrected 2026-10-21, from the tiles' kernel times): the odd tiles'
+  lag per matmul grows with the row length as one slab's multiply should, 3.2-3.3 µs at K 2560, 5.2 at 4096, 12.2 at
+  9728 (18.1 for Q4_1), which leaves the even tiles idle about 0.6 ms per token. The other 1.4 ms is a spread between
+  pairs (some pairs finish later; cause not isolated, most likely uneven memory speed), which also lands on an odd tile
+  and moves between them (for Q, tiles 1, 3, 5 and 7 were the slowest in 18, 27, 22 and 33% of the steps). So letting a
+  pair's tiles finish together would remove about 0.6 ms; the spread varies from step to step, so steps that do not
+  depend on each other could let it average out without a barrier between them (#8: only V and K, gate and up).
 - A small step costs 2.5-4.5 µs of wall time in generation. Its kernel takes 1.7-1.9 µs on every tile even with almost
   no work: the idle tiles 5-7 of a K-2560 quantize step 1.67 µs, `MUL attn_k_norm` (128 floats of its own row per tile)
   1.85 µs. `--bench`'s chain of tiny `ADD`s needs about 0.45 µs per kernel. Cause not isolated. Hypothesis: each step's
@@ -339,10 +346,11 @@ Ceilings from the fixed names (upper bounds: a fused kernel still does the steps
 | #6 one quantization for Q/K/V and gate/up | 0.40 ms (0.45%) | 46 ms (0.86%) |
 | #3, #4 the Q and K chains | 0.87 ms (0.99%), of which the steps' fixed costs about 0.5-0.6 | 137 ms (2.6%) |
 | #9 residual add in the matmul's epilogue | 0.32 ms (0.36%), overlapping #2 | 70 ms (1.3%) |
-| #8 barriers by data dependency | 0.14 ms (0.16%) | 0.3 ms |
+| #8 barriers by data dependency | 0.14 ms (0.16%), and part of the spread between pairs where two independent matmuls follow each other | 0.3 ms |
 
-Not fusion, but larger: the pair turns' tail 2.0 ms per token (2.3%); pp128's path C about 205 ms per batch (14.8%); the
-split attention's imbalance 1.1-1.3 ms per token at depth.
+Not fusion, but larger: the matmuls' imbalance 2.0 ms per token (2.3%: the pair turns' tail about 0.6 ms, a spread
+between pairs about 1.4 ms); pp128's path C about 205 ms per batch (14.8%); the split attention's imbalance 1.1-1.3 ms
+per token at depth.
 
 Gaps: pp512 at depth 4096 has no table: with `-r 1` each process runs that graph once, and the counters leave each kind's
 first graph out (to fix: keep it apart instead of dropping it). The board's timebase is not read yet. "Structures" in the
@@ -412,7 +420,7 @@ docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx/q6 > ~/fx-q6-summary.t
 - The summary: the texts; llama-bench per mode against `ref`, and the counters' cost; E3c's budget of a generated token
   for `ops` and `q6-ops`; the `ops` table per kind of graph; `q6-ops` against `ops` name by name; the logits.
 
-### 7.3 Path A for small prompt batches (not fusion; prepared 2026-10-21; user request, from the baseline)
+### 7.3 Path A for small prompt batches (not fusion; prepared and measured 2026-10-21; user request, from the baseline)
 
 The baseline found gate and up at 128 rows on path C, 9.56 ms per layer, against 6.63 ms for the down projection of the
 same size on path A (§7.1). The split copied from the in-tree IME path (`flagos-spacemit-ime.cpp:299-306`) takes path A
@@ -472,7 +480,284 @@ EXPS=mm REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-4
 - `prepare` builds and runs the checks: rc 0 expected (E3b left them), its `mm` line "12/12" on the Mac becomes "6/6" on
   the K3 (no threaded host executor there).
 - The bench takes about a minute (estimate); the run about 20 minutes (4 modes, 3 repetitions, 4 logits runs).
-- Then on the Mac: `scp -r k3:/root/fx/mm ~/fx-mm && scp k3:/root/fx-bench-mm.log ~/`.
+- Then on the Mac: `scp -r k3:/root/fx/mm ~/fx-mm && scp k3:/root/fx-bench-mm.log ~/`. To rebuild the summary there,
+  give the run's experiments: `EXPS=mm docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx-mm` (without `EXPS`
+  the script assumes `q6` and leaves out the `mm-ops` against `ops` tables).
+
+**Bench results (K3, 2026-10-21, `--bench-mm`; the q lines and the 16-row k and v line added from the log the same
+day).** Valid: the controls stay within 3% (16 rows, path C both ways: -2.8 to +0.9%, k and v the -2.8; where the
+split already takes path A, 128-512 rows: -2.4 to +0.8%, k and v and once down at -1.5 to -2.4%). Where the paths
+differ, path A is faster at every shape and row count:
+
+| Rows | q | k, v | attention output | gate, up | down | down Q4_1 | per batch, matmuls but the head |
+|---|---|---|---|---|---|---|---|
+| 32 | -33.2% | -25.0% | -36.2% | -33.5% | -34.7% | -35.4% | 398 -> 264 ms (-33.6%) |
+| 48 | -16.8% | -47.6% | -49.9% | -16.3% | -53.8% | -53.3% | 803 -> 512 ms (-36.3%) |
+| 64 | -19.6% | -21.6% | -26.2% | -34.0% | -26.1% | -24.7% | 745 -> 527 ms (-29.2%) |
+| 96 | -58.8% | -57.3% | -60.5% | -31.2% | -62.2% | -62.5% | 1,598 -> 790 ms (-50.6%) |
+| 128 | path A both | path A both | path A both | -26.3% (9.72 -> 7.17 ms) | path A both | path A both | 1,248 -> 1,063 ms (-14.8%) |
+
+- Rates: path A reaches 870-920 GFLOP/s for Q4_0 (k and v 770-820, Q4_1 610) wherever every tile gets the same
+  number of 4-row groups, 620-710 at 48 rows (12 groups for 8 tiles: four tiles take two; Q4_1 460). Path C reaches
+  550-710 at 32 and 64 rows (Q4_1 390-460) and only 320-370 at 48 and 96 rows (Q4_1 215-230), except where it splits
+  only columns (below): gate and up at both, q at 48 rows, 570-630.
+- Path C's dips come from its task split (read in code, `flagos-spacemit-ime.cpp:337-343` and the task loop after it):
+  for matrices at most 64 times wider than the rows it cuts blocks of 16 rows and column chunks aiming at 8 tasks; at 48
+  rows that gives 9 tasks (3 x 3) and at 96 rows 12 tasks of two sizes, so the busiest tile does twice its share; at 32
+  and 64 rows exactly 8. A matrix more than 64 times wider than the rows has only its columns split, into 8 balanced
+  tasks: gate and up up to 149 rows, q up to 63, the attention output and down up to 39; so q at 48 rows gains only
+  17%, as gate and up do. So today a 96-row batch's matmuls take longer than a 128-row batch's (1,598 against 1,248 ms).
+- Against the predictions: gate and up at 128 rows 7.17 ms (6.6-7.5 predicted); 64 rows 22-34% faster (15-35); 96 rows
+  31-63% (15-35, beyond); 32 rows 25-36% faster (between 20% faster and 20% slower predicted, beyond).
+- The bench part of the adoption rule is met; the llama-bench and logits parts wait for `EXPS=mm`. Estimates from these
+  numbers (the other ops at 32-96 rows scaled from the baseline's 128-row batch): pp128 about +15% (gate and up 2.56 ms
+  faster in each of 70 steps, 179 ms of 1.39 s); pp32 about +40%, pp64 about +35%, pp96 about +85%, the last because
+  path C's split makes today's pp96 slower per token than pp128.
+
+**How SpacemiT's code handles small batches (read 2026-10-21: ggml-spacemit `ime.cpp` @ `4e782bc`, lines 372-548; the
+in-tree `ggml-cpu/spacemit/ime.cpp:395-500`).** Both use the same split rule and the same path A, 4-row groups dealt
+round-robin. But where path A does not apply and TCM holds a 32-column slab, both take path B, not path C: slabs dealt
+round-robin to the cores, each core multiplying all of the batch's rows against its slab, the two cores of a pair taking
+turns. Splitting by columns keeps path B balanced at any row count; path C is only their fallback without TCM.
+ggml-spacemit's rewrite of path B (`has_pair` for an odd core count; both cores of a pair stepping through the same
+slab bases) makes it safe, not more balanced. So the collapse of path C at 33-112 rows is the provider's own: M2b
+deferred path B and runs path C in its place. Path A's rounding is the same in SpacemiT's code, but they take path A only
+from 113 rows, where it stays at 82-100% balance by group count (modelled from the code; the worst, 82.5%, at 129 rows:
+33 groups in 5 rounds; corrected 2026-10-21 from 85-100%). Real prompts are rarely a multiple of 32 rows
+(a prompt under 512 tokens is one batch of that many rows; a longer one ends with a partial batch), so path A from 32
+rows would bring its 56-94% balance into 33-102 rows. Open: which serves 33-112 rows best, path A with a balanced split,
+or path B for several rows (the provider's 1-row path is path B for one row); estimates for both below.
+
+**`EXPS=mm` results (K3, 2026-10-21; build `90cf54f5f`, Qwen3-4B Q4_0, 3 runs per mode, the modes interleaved; all 42
+runs rc 0).** Valid by the rules: the same greedy text; at `-ub 128` and `-ub 64` mean KLD 0.000000, maximum 0.000055
+and the same top token 100%, the floor that the base file's 16-bit log-probabilities leave for identical logits
+(`tools/perplexity/perplexity.cpp:79-93`; the same values for identical logits in `structural-experiments.md`, runs 1
+and 4); the bench's controls within 3%. The counters cost at most 0.9% (tg128), as in the baseline.
+
+| t/s, mean ± sd of 3 | pp32 | pp64 | pp96 | pp128 (`-ub 128`) | pp512 | tg128 |
+|---|---|---|---|---|---|---|
+| `ref` (`split`) | 71.55 ± 0.20 | 79.46 ± 0.03 | 57.05 ± 0.03 | 92.06 ± 0.11 | 94.93 ± 0.05 | 11.27 ± 0.01 |
+| `mm` (`rows`) | 101.47 ± 0.44 | 108.74 ± 0.66 | 107.84 ± 0.15 | 106.20 ± 0.17 | 95.27 ± 0.66 | 11.29 ± 0.01 |
+| change | +41.8% | +36.9% | +89.0% | +15.4% | +0.4% | +0.1% |
+| predicted before the bench | -10 to +20% | +15-30% | +15-30% | +12-17% | within 0.5% | within 0.5% |
+| estimated from the bench | about +40% | about +35% | about +85% | about +15% | | |
+
+- The predictions fixed before the bench hold for pp128, pp512 and tg128 and fall short for pp32, pp64 and pp96: they
+  expected every tile streaming all the weights for its group to cost path A at 32 rows, and missed path C's split at
+  96 rows. The estimates from the bench, made before llama-bench ran, are within 4 points of every result.
+- Op counters per batch (`mm-ops` against `ops`): 32 rows 447 -> 315 ms (-29.6%), 64 rows 803 -> 589 (-26.6%), 96
+  rows 1,680 -> 888 (-47.2%), 128 rows 1,391 -> 1,203 (-13.5%); where no path changes, 512 rows +0.4% (the runs'
+  spread) and a generated token 88.27 -> 88.28 ms. At 128 rows only gate and up move (9.58 -> 6.89 ms per step, 94 ms
+  each per batch); the matmuls that already took path A move by less than 0.2%. At 96 rows 509 of the 792 ms saved
+  are path C's imbalance (512 -> 3 ms per batch), the rest path A's rate; at 32 and 64 rows path C was balanced
+  (imbalance 9.5 and 8.1 ms per batch, with `rows` 1.8 and 2.9) and the gain is mostly rate. The other ops together
+  move by -0.5 to +0.1 ms per batch.
+- With `rows`, prompts of 32-128 tokens run at 101-109 t/s, above pp512's 95 (whose matmuls already take path A;
+  attention takes 0.67 s of its 5.4). Today a 96-token prompt runs at 57 t/s against 92 for 128 tokens; with `rows`,
+  108 and 106.
+- By the rule proposed above, the conditions for adoption are met at every row count measured. But those are path A's
+  best case: 32, 64, 96 and 128 rows give every tile the same number of groups (48 rows, only in the bench, gives four
+  tiles two). Not adopted (below).
+
+**What the measured row counts leave out (a model; estimates, not measured).** Path A deals the 4-row groups
+round-robin (`flagos-spacemit-ime.cpp:353`), so a batch that is not a multiple of 32 rows ends with a round in which
+some tiles wait: at 36 rows tile 0 multiplies a second group while the other seven wait. Path C splits only the
+columns of a matrix more than 64 times wider than the rows, into 8 balanced tasks (above): below 40 rows that is every
+shape but k and v. A model fitted to the bench (path C: the busiest tile's rows x columns at the per-tile rate the
+bench measured for that kind of task; path A: one group's time per round, as the 48-row bench's second round took)
+gives the five measured row counts within 5%, and llama-bench's `split` at pp32-pp128 within 2% and `rows`' gains
+within 5 points. What the bench cannot give is the cost of a round with few tiles. At 32 rows each tile reads all of
+gate's 14.0 MB in 1.73 ms, 65 GB/s of loads together against the 28 GB/s DRAM ceiling, so most of path A's reads must
+hit a cache shared by tiles that read the same weights at the same time (inference from the times and the loop,
+`:353-359`). A last round of 1-3 tiles has little to share: the optimistic case prices its groups as with 8 tiles, the
+pessimistic one at 3.1 GB/s per tile (one load in flight; `plan.md`, "1-row matmul bandwidth", an estimate; 3.0 GB/s
+measured per tile with all 8 streaming). A partial group (1-3 rows, the 1-row kernel row by row, `:112-120`) is priced
+as a full one. Per batch, the matmuls but the head, against today (llama-bench t/s in brackets, from the same model):
+
+| Rows | Today | `rows`, optimistic | `rows`, pessimistic | Balanced split (not built) |
+|---|---|---|---|---|
+| 33-39 | 448-519 ms | +2 to +18% (pp33 -13%, pp36 -7%) | +78 to +106% (pp33 -48%, pp36 -44%) | -22 to -33% (pp36 +31%) |
+| 40-44 | 728-756 ms | -27 to -30% (pp40 +32%) | +22 to +27% (pp40 -20%) | -51 to -52% |
+| 45-64 | 644-785 ms | -18 to -33% (pp48 +41%) | the same | -28 to -49% |
+| 65-76 | 1,289-1,353 ms | -38 to -41% (pp65 +55%) | -8 to -12% (pp65 +8%) | -52 to -54% |
+| 77-96 | 1,359-1,652 ms | -42 to -52% | the same | -51 to -56% |
+| 97-108 | 1,839-1,904 ms | -43 to -44% (pp100 +66%) | -21 to -24% (pp100 +25%) | -52 to -53% |
+| 109-128 | 1,220-1,927 ms | -13 to -45% | the same | -18 to -52% |
+| 129-140 | 1,454-1,518 ms (pessimistic 1,650-1,714) | -9 to -13% (pp129 +9%) | 0 to +4% (pp129 -4%) | -21 to -24% |
+| 141-149 | 1,524-1,571 ms | -13 to -16% | the same | -20 to -23% |
+
+- So `rows` as tested is predicted to make prompts of 33-39 tokens slower than today even if a round of few tiles
+  costs nothing extra (path C is balanced there for every shape but k and v), and prompts of 33-44 tokens much slower
+  if it does; faster everywhere else. Today's default has the same last rounds wherever it already takes path A, from
+  113 rows: 129-140, 161-172, ... rows, every batch whose groups leave 1-3 over (a 512-row batch leaves none).
+- The balanced split (not built): after the full rounds, the leftover groups multiplied by all 8 tiles, each on an
+  eighth of the columns in whole 32-column blocks: the same kernel calls on the same groups and blocks, so the same
+  bytes. Modelled as the full rounds plus the larger of the weights read once at 24 GB/s and the leftover work spread
+  over 8 tiles: 18-56% faster than today at every row count from 33 to 149.
+
+**SpacemiT's rule in full has never run in the provider (history read 2026-10-21 in git and `plan.md`).** The split,
+path A and path C came from ime.cpp with M2b (commit `6671c59`, 2026-10-09) and have not changed since. Path B was
+deferred (`plan.md`, M2b design): tg128 and perplexity do not use it; the in-tree version deadlocks when a pair's slab
+counts differ; it needs a wait inside a step; its gain over path C was unmeasured; it was to follow if the M2b bench
+found path C clearly slow at 4-64 rows. M2d called it not needed (pp128 83.0 against the IME path's 79.5, a whole-model
+comparison). Path B came for 1 row only, by measurement: weight slabs staged in TCM (`507cb52`, 2026-10-11; 10% less
+per token than the direct reads M2b had copied from ggml-spacemit) and the pair turns (`b8187d2`, 5% less again), which
+brought the first wait inside a step (`spacemit_pair_wait`) and handle pairs with unequal slab counts. So at 2-112 rows
+(gate and up 2-149) the provider has always run path C where both SpacemiT versions run path B, and no test has
+compared the two: `scripts/ime-gemv-bench.cpp` times the IME path at 1 row only, and the IME path's whole-model runs
+differ in every other op as well. Two of the four reasons no longer hold (the wait inside a step, unequal slab counts),
+and the bench above meets the trigger (path C at 32-112 rows 320-710 GFLOP/s against path A's 870-920). Read in their
+path B besides: when the batch's quantized activations fit in TCM next to a slab they are copied there too
+(`ggml-cpu/spacemit/ime.cpp:438-441`), so both operands come from TCM: at Qwen3-4B's shapes up to 119 rows at K 2560,
+68 for the attention output, 19 for down (18 for Q4_1). Its 32-column slabs are dealt round-robin, 4, 10, 16 and 38 per
+tile at Qwen3-4B's widths, so it is balanced at any row count.
+
+A model of their rule (estimates): path B per tile as the activation copy plus slabs x (slab copy + multiply) plus the
+pair waits, since in the turn schedule each tile copies its own slabs (`flagos-spacemit-ime.cpp:239-257`); calibrated on
+the baseline's 1-row `paired` kernel times (0.265 us per KB of slab, about three quarters of it copying) and on path A's
+per-call time; copies at 0.10-0.20 us per KB, multiplies with the activations outside TCM at 1.0-1.4 times. Per batch,
+against today: 16-31 rows -11 to -24% (pessimistic -10 to +2%), 32-112 rows -21 to -55% (-10 to -48%), 113-149 rows,
+where only gate and up change, -16 to -18% (0 to -16%); the same paths at 1 row and from 150 rows. Against `rows`
+slower at the multiples of 32 that favour path A (32 rows +14%, 64 +8%, 96 +5%, 128 +2%; pessimistic +22 to +34%),
+faster at the others; against the balanced split -9 to +15%. Below 16 rows both paths are bound by reading the weights
+(at least 70 ms per batch at the 1-row path's rate, 86 ms at the kernels' own loads), and the model does not apply.
+
+**Next, as proposed before the odd-length run (item 1 ran the same day; results below).**
+1. No code change, one session: llama-bench at prompts of 16, 32, 33, 36, 37, 40, 44, 48, 64, 65, 96, 100, 128 and 129
+   tokens under `split` and `rows`, and the IME path (SpacemiT's rule end to end) at the same prompts. Ours separates
+   the two cases (pp36 -7% or -44%; pp40 +32% or -20%) and tests today's last rounds (pp129 against pp128 under
+   `split`: -8% optimistic, -18% pessimistic). The IME path's curve shows whether path B leaves out our steps
+   (predicted: no dip at 40-48 or 96 rows, pp33-pp40 within 7% of pp32) and whether its path A has the same last round
+   (predicted: pp129 at least 4% below pp128).
+2. Then test-only settings, each checked byte for byte like `rows`: path B for several rows, SpacemiT's rule
+   (`FLAGOS_SPACEMIT_MM=spacemit`: the 1-row `paired` code extended to the batch's rows, activations in TCM where they
+   fit), first by the estimate, since it is SpacemiT's own design and also covers 2-31 rows; the balanced split
+   (`balanced`) if path B falls short. The bench at every row count from 2 to 160 under all settings, then llama-bench
+   at the prompts of 1. Adopt a setting if it is within 3% of the fastest at every row count and llama-bench agrees;
+   whether path A should keep the multiples of 32 where it wins is a later question, settled by measurement.
+
+**Odd prompt lengths (K3, 2026-10-21; build `90cf54f5f`, Qwen3-4B Q4_0, llama-bench `-r 3 -n 0`, every prompt one
+batch; ours with `-fa auto`, the IME path `build-ime` with `-fa 1`).** t/s, standard deviations at most 0.8:
+
+| Prompt | `split` | `rows` | IME path | `rows` against `split` (predicted: optimistic / pessimistic) | IME against `split` | IME against `rows` |
+|---|---|---|---|---|---|---|
+| 16 | 69.71 | 70.24 | 86.65 | +0.8% (the same path) | +24.3% | +23.4% |
+| 32 | 71.23 | 101.20 | 85.88 | +42.1% (+39%) | +20.6% | -15.1% |
+| 33 | 63.53 | 67.32 | 81.15 | +6.0% (-13% / -48%) | +27.7% | +20.5% |
+| 36 | 65.64 | 64.94 | 83.93 | -1.1% (-7% / -44%) | +27.9% | +29.2% |
+| 37 | 64.21 | 66.11 | 80.74 | +3.0% (-5% / -43%) | +25.7% | +22.1% |
+| 40 | 49.45 | 70.66 | 86.28 | +42.9% (+32% / -20%) | +74.5% | +22.1% |
+| 44 | 51.94 | 75.84 | 85.23 | +46.0% (+37% / -17%) | +64.1% | +12.4% |
+| 48 | 54.77 | 80.56 | 88.09 | +47.1% (+41%) | +60.8% | +9.3% |
+| 64 | 79.60 | 108.69 | 90.74 | +36.5% (+33%) | +14.0% | -16.5% |
+| 65 | 48.63 | 84.91 | 87.57 | +74.6% (+55% / +8%) | +80.1% | +3.1% |
+| 96 | 57.25 | 108.15 | 87.08 | +88.9% (+91%) | +52.1% | -19.5% |
+| 100 | 53.17 | 88.77 | 85.41 | +67.0% (+66% / +25%) | +60.6% | -3.8% |
+| 128 | 92.35 | 106.53 | 79.49 | +15.4% (+20%) | -13.9% | -25.4% |
+| 129 | 85.97 | 93.42 | 74.04 | +8.7% (+9% / -4%) | -13.9% | -20.7% |
+
+- Our two settings reproduce `EXPS=mm` within 0.5% at 32, 64, 96 and 128 tokens; the model of `split` is within 5% at
+  13 of the 14 lengths (pp16 +7%).
+- `rows` is never more than 1.1% slower than `split` (pp36) and 3-89% faster at 12 of the 14 lengths. The pessimistic
+  case is refuted wherever it differed. The optimistic case holds from 40 tokens (the gains within -5 to +20 points of
+  it) but not at 33-37 tokens: predicted 5-13% slower, measured -1.1 to +6.0%. The predicted loss at 33-39 tokens did
+  not appear.
+- What a round of path A costs, from the differences of `rows`' times per prompt: one more round with a full group on
+  one tile adds 238-239 ms per batch (32 -> 36 tokens, 96 -> 100), with a 1-row group 174-179 ms (32 -> 33, 64 -> 65,
+  128 -> 129); both include the other ops' growth, about 1.5 ms per row (op counters at 32 rows). A round in which all 8
+  tiles work costs about 243 ms (the multiply steps of the 32-row matmuls with `rows`). So a round costs about the same
+  whether one tile works in it or eight. A tile alone reads its weights about as fast as eight do together (gate's 14
+  MB in about 1.7 ms), so each tile's 4-row kernel sets path A's pace, not DRAM (inference), and the pessimistic case's
+  3.1 GB/s does not apply to that kernel.
+- Under `split`, pp129 is 6.9% below pp128 (predicted -8% optimistic, -18% pessimistic), and so is the IME path's
+  (-6.9%): the same last round of the same path A in both.
+- The IME path, SpacemiT's rule end to end: no dip at 40-48 or 96 tokens, pp33-pp40 within 6% of pp32, pp129 6.9%
+  below pp128; the three predictions hold. From 16 to 100 tokens it runs at 80.7-90.7 t/s, faster than our `split` at
+  every length (by 14-80%) and than `rows` at every length below 100 that is not a multiple of 32 (by 3-29%); `rows`
+  wins at 32, 64, 96 and 128 tokens (the IME path 15-25% slower), at 100 and at 129.
+- How much of that is path B (inference, not isolated): below 64 tokens the IME path's attention is the same code as
+  ours (the one-chunk kernels; M2e.3's L1, 2026-10-13), and from 64 its tiled kernel is slower than ours (L3). If its
+  other ops cost at least what ours do (op counters: attention and the other ops 47 ms of a 32-row batch, 63 of a
+  64-row one, 104 of a 96-row one), its matmuls take at most 326, 642 and 999 ms against our path C's 400, 740 and
+  1,577 (multiply and quantize steps, `ops`) and our path A's 268, 527 and 784 (`mm-ops`). Path B's matmuls then take
+  at least 19%, 13% and 37% less time than path C's there, and more than path A's at those multiples of 32 unless the
+  IME path's other ops are slower than ours. At 36 tokens the same bound, with our other ops scaled from 32 rows, puts
+  path B at least 24% below both of our settings.
+- Our attention costs less at 64 rows (22.9 ms per batch, the tiled kernel) than at 32 (27.6 ms, the one-chunk
+  kernels), which most likely is why a 64-token prompt takes `rows` less time than a 48-token one (589 against 596 ms;
+  48 rows were not counted).
+
+**Next (proposed; waits for the user).** Path B for several rows (`FLAGOS_SPACEMIT_MM=spacemit`, item 2 above), now
+first: the IME path puts it ahead of both our settings at 16-48 tokens. Predicted for the port, to fix before its run:
+from 16 to 48 tokens at least the IME path's t/s (80.7-88.1), since below 64 tokens our attention is the same code and
+our other ops are assumed no slower; below `rows` at 32, 64 and 96 tokens. Then a rule per row count from the
+measurements: path A where its last round is full (the multiples of 32), path B elsewhere, or the balanced split for
+path A's last round. Meanwhile `rows` is never more than 1.1% slower than today in this run and could become the
+default before path B (the user's choice).
+
+**Path B for several rows (prepared 2026-10-21; the user's decision after the review of its deferral, `plan.md` M2b
+design).** `FLAGOS_SPACEMIT_MM=spacemit` (test-only until adopted; read at every call with several rows) takes path B
+where the split gives no path A and TCM holds a 32-column slab, which is SpacemiT's rule (`gemm_slabs`,
+`flagos-spacemit-ime.cpp`). It is upstream's schedule (`ggml-cpu/spacemit/ime.cpp:435-494`): slabs dealt round-robin,
+copied into TCM and multiplied there for all the batch's rows; the batch's quantized activations in TCM too when they
+fit next to a slab (`:438-441`), otherwise read from the workspace; the two tiles of a pair taking turns as the 1-row
+`paired` code does, whose waits (`spacemit_pair_wait`) it uses. The same bytes as paths A and C: `gemm_rows` over rows 0
+to m for each block of 32 columns, the same kernel calls on the same groups of 4 rows. `split` stays the default with
+path C, which also remains the path without TCM; `rows` and the 1-row path are unchanged.
+
+Checks (`flagos-check-spacemit`, `check_mm_paths`, now all three settings): 13 cases at 2-128 rows in Q4_0, Q4_1, Q8_0
+and Q6_K, among them a pair with uneven slab counts (13 slabs), tiles without a slab (3 slabs) and activations that do
+not fit in TCM (K 9728, Q4_0 and Q4_1); each setting's paths counted; the output filled with NaN before every run (the
+earlier check read back whatever the previous run had left in place) and split's required finite. On the Mac,
+2026-10-21: 26/26 identical with the expected paths, with the tiles in turn and on threads (the TCM stand-in); two
+mutations caught (skipping each tile's last slab: 26/26 fail; the slab over the activations: 22/26 fail, the 4 others
+being the cases whose activations stay in the workspace); ThreadSanitizer over the whole check program: 0 reports;
+`test-backend-ops -o MUL_MAT` 3/3 under each setting, in turn and on threads.
+
+Measurement:
+- `flagos-check-spacemit --expect-device --bench-mm`: Qwen3-4B's 6 matmul shapes at 25 row counts from 2 to 512 under
+  `split`, `rows` and `spacemit`, each with the path it took, and per batch. Controls: where the settings take the
+  same path (`rows` below 32 rows; all three from 150 rows, path A).
+- `EXPS="mm pb"` in `fusion-experiments.sh`: modes `ref`, `ops`, `mm`, `mm-ops`, `pb`, `pb-ops`; pp128 with tg128
+  (`-ub 128`), pp512, and prompts of 2, 4, 8, 16, 32, 33, 36, 37, 40, 44, 48, 64, 65, 96, 100, 128 and 129 tokens (one
+  batch each); the logits at batches of 128, 64 and 16 rows.
+
+Predictions (estimates, fixed before any K3 run; Qwen3-4B Q4_0; from the model and the IME path's totals above):
+
+| What | Prediction |
+|---|---|
+| outputs | identical: KLD at the floor, the same top token at `-ub 128`, `-ub 64` and `-ub 16`; the same greedy text |
+| bench, path B against path C | faster at every shape from 16 rows; per batch 10-55% faster at 16-149 rows (model), at least 13-37% at 32-96 rows (IME bound) |
+| bench, path B against path A (`rows`) | slower at 32, 64 and 96 rows; faster at 33-44 rows |
+| bench controls | within 3% |
+| pp16-pp48 | at least the IME path's 81-88 t/s (today 49-71) |
+| pp32, pp64, pp96 | below `rows` (101, 109, 108 t/s) |
+| pp65, pp100 | within 10% of `rows` |
+| pp2-pp8 | -5% to +20% against `split` (bound by reading the weights; the model does not apply) |
+| pp512, tg128 | unchanged within 0.5% (path A and the 1-row path) |
+
+Rules (proposed 2026-10-21; the user fixes them before the run):
+- Valid if the outputs are identical and the bench's controls stay within 3%.
+- Adopt path B in place of path C (`spacemit` as the default) if llama-bench finds every tested length no slower than
+  `split` beyond the larger spread, and the lengths where `split` runs path C (16-100 tokens) at least 5% faster.
+- Path A against path B at 32-112 rows (whether the default should take path A where its rounds come out even): a
+  separate decision, from the same data.
+
+How to run (on the K3, inside tmux, after a bundle of the commit):
+
+```bash
+cd /root/llama.cpp-flagos && git -c safe.directory=$PWD pull --ff-only ~/sx-fx4.bundle feature/flagos-spacemit
+docs/flagos-k3/scripts/fusion-experiments.sh prepare 2>&1 | tee ~/fx-prepare4.log
+~/tcmtest/tcmrelease --apply && build-flagos/bin/flagos-check-spacemit --expect-device --bench-mm > ~/fx-bench-pb.log 2>&1
+grep -E "^bench    mm per" ~/fx-bench-pb.log
+EXPS="mm pb" REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf ~/fx/pb > ~/fx-pb.log 2>&1
+```
+
+- `prepare`: rc 0 expected; its `mm` line "26/26" on the Mac becomes "13/13" on the K3 (no threaded host executor).
+- The bench takes a few minutes (estimate); the run about 40 minutes (6 modes, 3 repetitions, 9 logits runs).
+- Then on the Mac: `scp -r k3:/root/fx/pb ~/fx-pb && scp k3:/root/fx-bench-pb.log ~/`, and
+  `EXPS="mm pb" docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx-pb` (with many prompt lengths the llama-bench
+  table has a row per test).
 
 ### 7.4 Still proposed
 
@@ -495,3 +780,23 @@ EXPS=mm REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-4
   imbalance at depth) and an unexplained fixed cost of a small step.
 - 2026-10-21: path A for small prompt batches prepared (§7.3; user request): `FLAGOS_SPACEMIT_MM=rows`, its check,
   `flagos-check-spacemit --bench-mm` and `EXPS=mm`; checked on the Mac, not yet run on the K3.
+- 2026-10-21: path A for small prompt batches run on the K3 (§7.3): valid, outputs identical; pp32 +41.8%, pp64
+  +36.9%, pp96 +89.0%, pp128 +15.4%, pp512 and tg128 unchanged. The proposed rule is met at the row counts measured,
+  which are path A's best case; a model fitted to the bench predicts `rows` slower than today at 33-39 rows (33-44 if a
+  round of few tiles reads slowly) and a balanced split 18-56% faster at every row count from 33 to 149. Not adopted;
+  proposed next: llama-bench at odd prompt lengths (no code change), then the balanced split.
+- 2026-10-21: the split rule's history checked (§7.3; user question): the provider has never run SpacemiT's rule at
+  2-149 rows. Path B was deferred at M2b and adopted for 1 row only (2026-10-11), and no test has compared it with path
+  C at several rows. Read besides: their path B puts the batch's activations in TCM when they fit. Modelled: their rule
+  10-55% faster than today at 16-149 rows (estimates), slower than `rows` at the multiples of 32 that favour path A.
+  Proposed next, reordered: the odd-length llama-bench with the IME path added, then path B for several rows before the
+  balanced split.
+- 2026-10-21: the odd-length run on the K3 (§7.3): `rows` never more than 1.1% slower than `split` (pp36) and 3-89%
+  faster at 12 of 14 lengths; the predicted loss at 33-39 tokens did not appear. A round of path A costs about the same
+  with one tile as with eight (234-239 ms per batch for a full group, 174-179 for a 1-row group). The IME path (SpacemiT's
+  rule) has no dips, beats `split` at 16-100 tokens and `rows` at the lengths that are not multiples of 32 below 100, and
+  loses to `rows` at the multiples of 32. Proposed next: path B for several rows.
+- 2026-10-21: path B for several rows prepared (§7.3; the user's decision after the review): `FLAGOS_SPACEMIT_MM=spacemit`
+  (`gemm_slabs`), `check_mm_paths` over all three settings (13 cases, NaN-filled outputs), `--bench-mm` at 25 row
+  counts, `EXPS=pb`; on the Mac 26/26 identical with the expected paths, two mutations caught, ThreadSanitizer clean; not
+  yet run on the K3.

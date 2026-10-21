@@ -687,7 +687,10 @@ Experiment switches of the provider (environment variables; test-only unless not
 | `FLAGOS_SPACEMIT_ATTN=split` or `one-chunk` | one-token attention from n_kv 512 (one stream, llama.cpp's cache layout, no ALiBi or softcap), read whenever an op is looked up | the default since 2026-10-14 (M2e.3 round 2, `plan.md`): the KV positions split over the tiles, the two tiles of a pair taking turns between staging and arithmetic, and the partial results merged in a second step (`paired` names it); `split`: the same without the turns (identical outputs); `one-chunk`: the one-chunk kernels as before round 2 (V summed in F16, so the outputs differ in rounding) |
 | `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
 | `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
-| `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and path A run; `flagos-check-spacemit` sets 393216 for its 1-row checks |
+| `FLAGOS_SPACEMIT_MM=rows` or `spacemit` | matmuls of several rows, read at every call (`fusion-and-splitting.md` §7.3) | `split` (the default): ime.cpp's choice of path A, path C where ime.cpp takes path B; `rows`: path A whenever every tile gets 4 rows; `spacemit`: path B where `split` takes path C and TCM holds a 32-column slab (SpacemiT's rule). The same bytes in all three |
+| `FLAGOS_SPACEMIT_QUANTIZE=shared` | matmuls (`fusion-and-splitting.md` §7.2) | one quantization of the activations for Q, K and V and one for gate and up |
+| `FLAGOS_SPACEMIT_TEST_OP_STATS=<file>` | every graph (`fusion-and-splitting.md` §7.1) | per-op counters, written to the file when the process ends |
+| `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and paths A and B run; `flagos-check-spacemit` sets 393216 for its 1-row and path checks |
 | `FLAGOS_SPACEMIT_TEST_THREADS=1` | host executor (Mac) | the tiles of each launch on threads, so pair waits wait (with the TCM stand-in: everything as on the AI cores) |
 | `FLAGOS_SPACEMIT_TEST_FAIL_NODE=<n>` | tests | tile 0 reports a failure at step n |
 

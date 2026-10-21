@@ -5,7 +5,8 @@
 // quantized MUL_MAT on the IME, weights in an IME layout (flagos-spacemit-weights.h: Q4_0 32x256, Q4_1 32x32, Q8_0 and
 // Q6_K in q8_0 32x32): step 1 quantizes the activations into the workspace, step 2 multiplies. Ported from
 // ggml-spacemit's forward_mul_mat (ime.cpp @ 4e782bc) without its in-kernel barriers, except that 1-row matmuls keep
-// the in-tree path B's waits between the two tiles of a pair (spacemit_pair_wait).
+// the in-tree path B's waits between the two tiles of a pair (spacemit_pair_wait), and so does path B for several rows
+// (test-only, FLAGOS_SPACEMIT_MM=spacemit).
 
 size_t spacemit_mul_mat_workspace(const ggml_tensor * node);
 bool   spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node);
@@ -15,6 +16,7 @@ bool   spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node);
 // quantize step wrote (FLAGOS_SPACEMIT_QUANTIZE=shared, spacemit_backend_graph_compute)
 bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b);
 
-// test-only: the multiply steps that took path A and path C since the last call, one count per step; the 1-row path is
-// not counted (flagos-check-spacemit checks that FLAGOS_SPACEMIT_MM=rows switches the path)
-void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_c);
+// test-only: the multiply steps that took path A, path B (several rows) and path C since the last call, one count per
+// step; the 1-row path is not counted (flagos-check-spacemit checks that FLAGOS_SPACEMIT_MM=rows and spacemit switch
+// the path)
+void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_b, uint64_t & path_c);
