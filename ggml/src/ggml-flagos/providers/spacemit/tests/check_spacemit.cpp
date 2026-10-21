@@ -15,7 +15,8 @@
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under FLAGOS_SPACEMIT_MM=rows
-//                    (path A) and spacemit (path B) against the default split
+//                    (path A), spacemit (path B) and fit (path B where TCM holds the activations) against the default
+//                    split
 //   --e3b[=runs]     only structural-experiments.md E3b-diag: why launches ordered in the cores differ (default 20 runs
 //                    per case and variant); a measurement, it fails nothing
 // Without a flag, a host without the device skips the device checks.
@@ -1101,13 +1102,21 @@ static int check_gemv_strategies(ggml_backend_dev_t dev, bool host) {
     return 0;
 }
 
-// fusion-and-splitting.md §7.3: FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows) and spacemit (path B
-// where the split gives no path A, as ime.cpp) against the default split, which sends each case below to path C: the
-// same bytes, as all three run the same kernels on the same groups of 4 rows and blocks of 32 columns. The paths
-// taken are counted (spacemit_mm_paths_take), so a case that does not switch fails; the output is filled with NaN
-// before every run, so columns a path skips show, and split's must come out finite. Paths A and B need TCM: as
-// check_gemv_strategies, a stand-in on a host without the AI cores, there also with tiles on threads, where path B's
-// pair waits wait
+static double ime_row_bytes(ggml_type type, int64_t k);
+
+// bytes of one quantized activation row in the provider's layout for a weight type: the Q4_0 32x256 layout's 290 per
+// 256 values, the 32x32 layouts' 38 per 32 (flagos-spacemit-ime-kernels.h)
+static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
+    return type == GGML_TYPE_Q4_0 ? k / 256 * 290 : k / 32 * 38;
+}
+
+// fusion-and-splitting.md §7.3: FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B
+// where the split gives no path A, as ime.cpp) and fit (path B where TCM holds the activations next to a slab, else
+// path A from 32 rows, else path C) against the default split: the same bytes, as all four run the same kernels on the
+// same groups of 4 rows and blocks of 32 columns. The paths taken are counted (spacemit_mm_paths_take) and compared
+// with what the rules give, worked out here again; the output is filled with NaN before every run, so columns a path
+// skips show, and split's must come out finite. Paths A and B need TCM: as check_gemv_strategies, a stand-in of the
+// K3's 384 KiB on a host without the AI cores, there also with tiles on threads, where path B's pair waits wait
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
     std::vector<ggml_backend_t> backends;
@@ -1137,8 +1146,12 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         { GGML_TYPE_Q4_1, 9728, 256, 19 },  // the same in Q4_1
         { GGML_TYPE_Q8_0, 512, 1024, 3 },
         { GGML_TYPE_Q6_K, 512, 1024, 16 },
+        // fit's other paths
+        { GGML_TYPE_Q4_0, 9728, 512, 33 },  // the activations do not fit, every tile gets 4 rows: path A
+        { GGML_TYPE_Q4_0, 512, 1024, 113 },  // the split gives path A, the activations fit: path B
     };
-    const char * const settings[] = { nullptr, "rows", "spacemit" };
+    const char * const settings[] = { nullptr, "rows", "spacemit", "fit" };
+    const char * const names[]    = { "split", "rows", "spacemit", "fit" };
     int                n_same = 0, n_runs = 0;
     for (const mm_case & c : cases) {
         mm_weight w;
@@ -1146,11 +1159,22 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         mm_run run;
         REQUIRE(run.init(dev, w, c.m, 12));
         const std::vector<float> nan(ggml_nelements(run.y), NAN);
+        // the path each setting must take with 8 tiles and 384 KiB of TCM (spacemit_mul_mat_gemm): split path A where
+        // ime.cpp's split gives every tile all columns, else path C; rows path A also from 32 rows; spacemit path B
+        // in place of path C; fit path B where TCM holds the activations next to a 32-column slab, else path A from
+        // 32 rows, else path C
+        const int64_t m_stride = c.n / c.m > 64 ? c.m : 16;
+        const bool    split_a  = (c.n * ((c.m + m_stride - 1) / m_stride) + 7) / 8 >= c.n;
+        const bool    fit_b    = (int64_t) GGML_PAD(c.m * ime_act_row_bytes(c.type, c.k), 64) +
+                                  32 * (int64_t) ime_row_bytes(c.type, c.k) <=
+                              393216;
+        const char    expect[4] = { split_a ? 'A' : 'C', split_a || c.m >= 32 ? 'A' : 'C', split_a ? 'A' : 'B',
+                                    fit_b ? 'B' : c.m >= 32 ? 'A' : 'C' };
         for (ggml_backend_t backend : backends) {
-            std::vector<float> out[3];
-            uint64_t           path_a[3] = {}, path_b[3] = {}, path_c[3] = {};
+            std::vector<float> out[4];
+            uint64_t           path_a[4] = {}, path_b[4] = {}, path_c[4] = {};
             bool               ok        = true;
-            for (int s = 0; s < 3; s++) {
+            for (int s = 0; s < 4; s++) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[s]);
                 ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
                 spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s]);
@@ -1160,30 +1184,31 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
             }
             set_env("FLAGOS_SPACEMIT_MM", nullptr);
-            // split takes path C, rows path A from 32 rows (8 tiles of 4), spacemit path B
-            const auto took = [&](int s, int a, int b, int c) {
-                return path_a[s] == (uint64_t) a && path_b[s] == (uint64_t) b && path_c[s] == (uint64_t) c;
-            };
-            const bool rows_a   = c.m >= 32;
-            const bool switched = took(0, 0, 0, 1) && took(1, rows_a, 0, !rows_a) && took(2, 0, 1, 0);
-            const bool finite   = std::all_of(out[0].begin(), out[0].end(), [](float v) { return std::isfinite(v); });
-            const size_t bytes  = out[0].size() * sizeof(float);
-            const bool same_rows     = std::memcmp(out[0].data(), out[1].data(), bytes) == 0;
-            const bool same_spacemit = std::memcmp(out[0].data(), out[2].data(), bytes) == 0;
-            const bool same          = ok && finite && same_rows && same_spacemit;
-            if (!same || !switched) {
-                const char * what = !ok            ? "a run failed" :
-                                    !finite        ? "split's output is not finite" :
-                                    !same_rows     ? "FLAGOS_SPACEMIT_MM=rows differs from split" :
-                                    !same_spacemit ? "FLAGOS_SPACEMIT_MM=spacemit differs from split" :
-                                                     "a setting did not take its path";
-                std::string paths;
-                for (int s = 0; s < 3; s++) {
-                    paths += s == 0 ? "split " : s == 1 ? ", rows " : ", spacemit ";
-                    paths += std::to_string(path_a[s]) + "/" + std::to_string(path_b[s]) + "/" + std::to_string(path_c[s]);
+            bool        switched = true;
+            int         differs  = 0;  // the first setting whose output differs from split's
+            std::string paths;
+            for (int s = 0; s < 4; s++) {
+                const char p = expect[s];
+                switched     = switched && path_a[s] == (uint64_t) (p == 'A') && path_b[s] == (uint64_t) (p == 'B') &&
+                           path_c[s] == (uint64_t) (p == 'C');
+                if (s > 0 && differs == 0 &&
+                    std::memcmp(out[0].data(), out[s].data(), out[0].size() * sizeof(float)) != 0) {
+                    differs = s;
                 }
-                std::fprintf(stderr, "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C: %s)%s\n",
-                             ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) c.m, what,
+                paths += std::string(s == 0 ? "" : ", ") + names[s] + " " + std::to_string(path_a[s]) + "/" +
+                         std::to_string(path_b[s]) + "/" + std::to_string(path_c[s]) + " (" + p + ")";
+            }
+            const bool finite = std::all_of(out[0].begin(), out[0].end(), [](float v) { return std::isfinite(v); });
+            const bool same   = ok && finite && differs == 0;
+            if (!same || !switched) {
+                const std::string what = !ok           ? std::string("a run failed") :
+                                         !finite       ? std::string("split's output is not finite") :
+                                         differs != 0  ? std::string("FLAGOS_SPACEMIT_MM=") + names[differs] +
+                                                            " differs from split" :
+                                                         std::string("a setting did not take its path");
+                std::fprintf(stderr,
+                             "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C taken, expected: %s)%s\n",
+                             ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) c.m, what.c_str(),
                              paths.c_str(), backend != backends[0] ? " (tiles on threads)" : "");
                 g_failures++;
             }
@@ -1195,9 +1220,10 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
     }
-    std::printf("mm       FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows) and spacemit (path B where "
-                "the split gives no path A) against the default split (path C for these): Q4_0, Q4_1, Q8_0 and Q6_K at "
-                "2-128 rows with TCM%s: %d/%d identical, paths as expected%s\n",
+    std::printf("mm       FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B where the "
+                "split gives no path A) and fit (path B where TCM holds the activations, else A or C) against the "
+                "default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, paths as "
+                "expected%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
@@ -2394,11 +2420,12 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 }
 
 // fusion-and-splitting.md §7.3: the matmuls of a Qwen3-4B batch under FLAGOS_SPACEMIT_MM=rows (path A whenever every
-// tile gets 4 rows) and spacemit (path B where the split gives no path A) against the default split, at the row counts
-// of short prompts, of a prompt's last batch and of llama-bench's batches: each shape alone with the path each setting
-// took, and per batch the shapes weighted by how often a batch runs them (36 q and attention outputs, 72 k and v, 72
-// gate and up, 32 + 4 down; the head runs on one row). As in bench_gemv every run reads its weights from DRAM: it takes
-// the next of enough copies of the weight (32 MB together)
+// tile gets 4 rows), spacemit (path B where the split gives no path A) and fit (path B where TCM holds the activations,
+// else A or C) against the default split, at the row counts of short prompts, of a prompt's last batch and of
+// llama-bench's batches: each shape alone with the path each setting took, and per batch the shapes weighted by how
+// often a batch runs them (36 q and attention outputs, 72 k and v, 72 gate and up, 32 + 4 down; the head runs on one
+// row). As in bench_gemv every run reads its weights from DRAM: it takes the next of enough copies of the weight (32 MB
+// together)
 static int bench_mm(ggml_backend_dev_t dev) {
     env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
     ggml_backend_t backend = nullptr;
@@ -2415,8 +2442,9 @@ static int bench_mm(ggml_backend_dev_t dev) {
     };
     const std::vector<int64_t> rows = { 2,  4,  8,  16, 17,  24,  31,  32,  33,  36,  40,  44, 48,
                                         64, 65, 96, 100, 112, 113, 128, 129, 149, 160, 256, 512 };
-    const char * const settings[] = { "split", "rows", "spacemit" };
-    std::vector<double> batch[3];
+    const char * const  settings[] = { "split", "rows", "spacemit", "fit" };
+    constexpr int       n_set      = 4;
+    std::vector<double> batch[n_set];
     for (std::vector<double> & b : batch) {
         b.assign(rows.size(), 0.0);
     }
@@ -2437,10 +2465,10 @@ static int bench_mm(ggml_backend_dev_t dev) {
                 REQUIRE(runs.back()->init(dev, *ws[c], m, 1));
                 CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
             }
-            const int   iters = m <= 64 ? 10 : m <= 160 ? 5 : 3;
-            double      t[3]  = {};
-            std::string path[3];
-            for (int k = 0; k < 3; k++) {
+            const int   iters    = m <= 64 ? 10 : m <= 160 ? 5 : 3;
+            double      t[n_set] = {};
+            std::string path[n_set];
+            for (int k = 0; k < n_set; k++) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[k]);
                 bool     ok   = true;
                 size_t   next = 0;
@@ -2460,23 +2488,35 @@ static int bench_mm(ggml_backend_dev_t dev) {
             }
             set_env("FLAGOS_SPACEMIT_MM", nullptr);
             const double flop = 2.0 * s.k * s.n * m;
-            std::printf("bench    mm %-9s %s %5lldx%-5lld rows %3lld: split (path %s) %8.0f us %6.1f GFLOP/s, rows (path %s) "
-                        "%8.0f us %6.1f GFLOP/s (%+.1f%%), spacemit (path %s) %8.0f us %6.1f GFLOP/s (%+.1f%%)\n",
-                        s.what, ggml_type_name(s.type), (long long) s.k, (long long) s.n, (long long) m,
-                        path[0].c_str(), t[0], flop / t[0] / 1e3, path[1].c_str(), t[1], flop / t[1] / 1e3,
-                        100.0 * (t[1] / t[0] - 1.0), path[2].c_str(), t[2], flop / t[2] / 1e3,
-                        100.0 * (t[2] / t[0] - 1.0));
-            for (int k = 0; k < 3; k++) {
+            std::string  line;
+            for (int k = 0; k < n_set; k++) {
+                char cell[128];
+                std::snprintf(cell, sizeof(cell), "%s%s (path %s) %8.0f us %6.1f GFLOP/s", k == 0 ? "" : ", ",
+                              settings[k], path[k].c_str(), t[k], flop / t[k] / 1e3);
+                line += cell;
+                if (k > 0) {
+                    std::snprintf(cell, sizeof(cell), " (%+.1f%%)", 100.0 * (t[k] / t[0] - 1.0));
+                    line += cell;
+                }
                 batch[k][r] += t[k] * s.per_batch;
             }
+            std::printf("bench    mm %-9s %s %5lldx%-5lld rows %3lld: %s\n", s.what, ggml_type_name(s.type),
+                        (long long) s.k, (long long) s.n, (long long) m, line.c_str());
         }
     }
     for (size_t r = 0; r < rows.size(); r++) {
-        std::printf("bench    mm per Qwen3-4B batch of %3lld rows (its matmuls but the head): split %8.1f ms, rows %8.1f ms "
-                    "(%+.1f%%), spacemit %8.1f ms (%+.1f%%)\n",
-                    (long long) rows[r], batch[0][r] / 1e3, batch[1][r] / 1e3,
-                    100.0 * (batch[1][r] / batch[0][r] - 1.0), batch[2][r] / 1e3,
-                    100.0 * (batch[2][r] / batch[0][r] - 1.0));
+        std::string line;
+        for (int k = 0; k < n_set; k++) {
+            char cell[96];
+            std::snprintf(cell, sizeof(cell), "%s%s %8.1f ms", k == 0 ? "" : ", ", settings[k], batch[k][r] / 1e3);
+            line += cell;
+            if (k > 0) {
+                std::snprintf(cell, sizeof(cell), " (%+.1f%%)", 100.0 * (batch[k][r] / batch[0][r] - 1.0));
+                line += cell;
+            }
+        }
+        std::printf("bench    mm per Qwen3-4B batch of %3lld rows (its matmuls but the head): %s\n",
+                    (long long) rows[r], line.c_str());
     }
     ggml_backend_free(backend);
     return 0;

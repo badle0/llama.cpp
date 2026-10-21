@@ -8,6 +8,8 @@
 #        of 32, 64 and 96 tokens (one batch each)
 #   pb   path B where the split gives no path A, as ime.cpp (§7.3, not fusion): FLAGOS_SPACEMIT_MM=spacemit; adds
 #        prompts of 2-129 tokens (one batch each; with mm these replace mm's three)
+#   fit  path B where TCM holds the activations next to a slab, else path A from 32 rows, else path C (§7.3):
+#        FLAGOS_SPACEMIT_MM=fit; the same prompts as pb
 #
 # Usage: fusion-experiments.sh prepare                  build A's tools and its provider checks, run once (they compare
 #                                                       every candidate with the defaults, byte for byte)
@@ -20,7 +22,7 @@
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
 #        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
 #                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ, pb's with 64
-#                  and 16 rows
+#                  and 16 rows, fit's with 128, 64 and 16
 #        BUILD_A   the build (default <repo>/build-flagos); TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
@@ -33,6 +35,8 @@
 #   mm-ops   mm with the op counters
 #   pb       FLAGOS_SPACEMIT_MM=spacemit
 #   pb-ops   pb with the op counters
+#   fit      FLAGOS_SPACEMIT_MM=fit
+#   fit-ops  fit with the op counters
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -61,6 +65,7 @@ mode_env() {
         q6 | q6-ops) echo "FLAGOS_SPACEMIT_QUANTIZE=shared" ;;
         mm | mm-ops) echo "FLAGOS_SPACEMIT_MM=rows" ;;
         pb | pb-ops) echo "FLAGOS_SPACEMIT_MM=spacemit" ;;
+        fit | fit-ops) echo "FLAGOS_SPACEMIT_MM=fit" ;;
         *) echo "" ;;
     esac
 }
@@ -263,7 +268,7 @@ run_all() {
     rm -f "$OUT/bench.jsonl"
 
     # the logits check's settings: q6's at 512-token batches and one token per ubatch, mm's at 128 and 64 rows, pb's at
-    # 64 and 16 rows (each set once)
+    # 64 and 16 rows, fit's at all three (each set once)
     modes="ref ops" kld_modes="" kld_sets=""
     if has q6; then
         modes+=" q6 q6-ops" kld_modes+=" q6" kld_sets+=" batch"
@@ -271,6 +276,7 @@ run_all() {
     fi
     if has mm; then modes+=" mm mm-ops" kld_modes+=" mm" kld_sets+=" ub128 ub64"; fi
     if has pb; then modes+=" pb pb-ops" kld_modes+=" pb" kld_sets+=" ub64 ub16"; fi
+    if has fit; then modes+=" fit fit-ops" kld_modes+=" fit" kld_sets+=" ub128 ub64 ub16"; fi
     kld_sets=$(printf '%s\n' $kld_sets | awk '!seen[$0]++' | tr '\n' ' ')
     if [ -z "$DRY" ]; then
         {
@@ -292,7 +298,7 @@ run_all() {
             for m in $modes; do
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
-                if has pb; then
+                if has pb || has fit; then
                     bench "$m" "ppodd-$i" -p 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129 -n 0
                 elif has mm; then
                     bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
@@ -341,5 +347,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,35p' "$0"; exit 1 ;;
+    *) sed -n '2,39p' "$0"; exit 1 ;;
 esac

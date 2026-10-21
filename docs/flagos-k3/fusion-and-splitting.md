@@ -759,6 +759,156 @@ EXPS="mm pb" REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qw
   `EXPS="mm pb" docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx-pb` (with many prompt lengths the llama-bench
   table has a row per test).
 
+**Bench results (K3, 2026-10-21, build `17413e6`, `--bench-mm`; per batch, the matmuls but the head, ms; the lines per
+shape are in the log, not yet read).** `prepare`: rc 0, all checks passed. Valid: the controls stay within 3% (160-512
+rows, path A in all three settings: -0.2 to +1.0%; below 32 rows `rows` takes `split`'s path C: -1.0 to 0.0%).
+
+| Rows | `split` | `rows` | `spacemit` | fastest, against `split` |
+|---|---|---|---|---|
+| 2 | 95.7 | 95.5 | 83.2 | path B, -13% |
+| 4 | 96.4 | 95.4 | 79.9 | path B, -17% |
+| 8 | 119.2 | 119.0 | 98.0 | path B, -18% |
+| 16 | 204.5 | 203.2 | 153.9 | path B, -25% |
+| 17 | 237.1 | 235.6 | 172.5 | path B, -27% |
+| 24 | 299.1 | 299.1 | 249.4 | path B, -17% |
+| 31 | 447.4 | 447.2 | 356.4 | path B, -20% |
+| 32 | 399.6 | 262.7 | 318.2 | path A, -34% |
+| 33 | 470.0 | 437.4 | 346.9 | path B, -26% |
+| 36 | 489.1 | 497.7 | 355.4 | path B, -27% |
+| 40 | 754.4 | 501.3 | 390.5 | path B, -48% |
+| 44 | 780.6 | 505.8 | 425.9 | path B, -45% |
+| 48 | 801.7 | 510.9 | 459.3 | path B, -43% |
+| 64 | 748.7 | 525.7 | 590.9 | path A, -30% |
+| 65 | 1,287.7 | 700.0 | 619.6 | path B, -52% |
+| 96 | 1,599.2 | 791.1 | 926.1 | path A, -51% |
+| 100 | 1,792.2 | 1,022.4 | 964.1 | path B, -46% |
+| 112 | 1,827.4 | 1,036.2 | 1,069.6 | path A, -43% |
+| 113 | 1,178.4 | 1,042.3 | 928.0 | path B, -21% |
+| 128 | 1,245.0 | 1,052.4 | 1,374.5 | path A, -15% |
+| 129 | 1,354.0 | 1,230.8 | 1,496.8 | path A, -9% |
+| 149 | 1,486.8 | 1,293.8 | 1,643.3 | path A, -13% |
+| 160, 256, 512 | 1,312.9, 2,102.3, 4,186.5 | +0.1, +0.0, +1.0% | -0.2, +0.2, +1.0% | the same path A |
+
+- Against the predictions: path B is faster than path C at every row count from 2 to 113 (13-52% per batch; predicted
+  10-55% at 16-149 rows and at least 13-37% at 32-96, which holds up to 113). At 128, 129 and 149 rows it is 10.4-10.5%
+  slower, beyond the pessimistic case (0 to -16%): there only gate and up differ, and their activations (2,900 bytes a
+  row) no longer fit in TCM next to a slab, which they do up to 119 rows; at 113 rows path B is still 21% faster. Path
+  B against path A as predicted: slower at 32, 64 and 96 rows (+21%, +12%, +17%), faster at 33-44 (-16% to -29%);
+  besides, faster at 48, 65, 100 and 113 rows, about level at 112 (+3%), slower from 128 (+22% to +31%).
+- So by the bench, path B wins where path A's rounds do not come out even and the activations fit in TCM; path A wins
+  at the multiples of 32 and where path B's activations would come from the workspace; `split` is never the fastest.
+  SpacemiT's rule as built makes a batch of 120-149 rows slower than today (gate and up), so `spacemit` alone likely
+  fails the adoption rule at pp128 and pp129 (a prediction; the llama-bench run tests it). The IME path's drop at 128
+  tokens (79.5 t/s against 85-87 at 96-100) fits the same mechanism: from 120 rows it runs gate and up on path B with
+  the activations outside TCM (inference).
+- Next, from the lines per shape: whether down (activations outside TCM from 20 rows) also loses on path B; then a rule
+  per call, path A where its rounds come out even or path B's activations do not fit, path B otherwise, designed with
+  the llama-bench results.
+
+**`EXPS="mm pb"` results (K3, 2026-10-21; build `17413e6`, Qwen3-4B Q4_0, 3 runs per mode, the modes interleaved;
+all 66 runs rc 0).** Valid by the rules: the same greedy text in all three; at `-ub 128`, `-ub 64` and `-ub 16` mean KLD
+0.000000, maximum 0.000055 and the same top token 100% for both `rows` and `spacemit` (the floor of identical logits);
+the same perplexity, 9.7573, at every batch size; the counters cost at most 1% (pp2 and pp4 up to 3%, within their
+spread). `split` reproduces the odd-length run within 0.5%.
+
+| t/s, mean of 3 | `split` | `rows` | `spacemit` | `spacemit` against `split` | IME path (the odd-length run) |
+|---|---|---|---|---|---|
+| pp2 | 18.23 | 18.56 | 20.45 | +12.2% | |
+| pp4 | 37.31 | 36.67 | 41.35 | +10.8% | |
+| pp8 | 58.35 | 58.57 | 68.02 | +16.6% | |
+| pp16 | 69.47 | 69.74 | 87.48 | +25.9% | 86.65 |
+| pp32 | 71.41 | 101.45 | 86.81 | +21.6% | 85.88 |
+| pp33 | 63.54 | 67.26 | 82.12 | +29.3% | 81.15 |
+| pp36 | 65.89 | 64.77 | 86.68 | +31.6% | 83.93 |
+| pp37 | 64.21 | 66.09 | 83.72 | +30.4% | 80.74 |
+| pp40 | 49.39 | 70.64 | 87.69 | +77.5% | 86.28 |
+| pp44 | 51.96 | 75.78 | 88.26 | +69.9% | 85.23 |
+| pp48 | 54.83 | 80.39 | 88.86 | +62.1% | 88.09 |
+| pp64 | 79.62 | 108.39 | 98.31 | +23.5% | 90.74 |
+| pp65 | 48.68 | 84.93 | 94.98 | +95.1% | 87.57 |
+| pp96 | 57.33 | 107.93 | 94.11 | +64.1% | 87.08 |
+| pp100 | 53.22 | 88.76 | 93.66 | +76.0% | 85.41 |
+| pp128 | 92.05 | 106.36 | 84.36 | -8.4% | 79.49 |
+| pp129 | 86.04 | 93.33 | 78.86 | -8.3% | 74.04 |
+| pp512 | 95.00 | 94.89 | 95.11 | +0.1% | |
+| tg128 | 11.24 | 11.23 | 11.22 | -0.2% | |
+
+- Against the predictions fixed before the run: pp16-pp48 at least the IME path's (82.1-88.9 against 80.7-88.1:
+  holds, by 1-4%); below `rows` at 32, 64 and 96 tokens (holds); within 10% of `rows` at 65 and 100 (holds at 100,
+  +5.5%; at 65 `spacemit` is 11.8% faster); pp2-pp8 -5% to +20% against `split` (holds, +11% to +17%); pp512 and tg128
+  within 0.5% (hold). As the bench predicted, `spacemit` is 8% slower than `split` at 128 and 129 tokens. With
+  SpacemiT's rule the provider runs 1-10% faster than the IME path at every length measured in both runs (two sessions
+  the same day; `split` moved less than 0.5% between them).
+- By the rule proposed above, `spacemit` is not adopted: pp128 and pp129 are slower than `split`. At 16-100 tokens it is
+  22-95% faster.
+- Per shape (the op counters of the same runs, microseconds per multiply step) path B wins where its activations fit in
+  TCM next to a slab, even at the multiples of 32 for gate and up (32 rows: 1,609 against path A's 1,682 and path C's
+  2,572), and loses where they do not: down from 32 rows (40 rows: path B 3,841, path A 3,196), the attention output at
+  96 and 100 rows (path B 3,806, path A 2,117 at 96), gate and up at 128 and 129 (path B 11,375, path A 6,892 at 128).
+  Where the activations fit, path A beats path B only for k and v at 32, 64 and 96 rows and for q and the attention
+  output at 32 (by 2-22%), mostly the batch's small matrices.
+- A rule per call from these numbers (an estimate composed of the measured steps, not run): path B where its activations
+  fit in TCM next to a slab, else path A where every tile gets 4 rows, else path C. Its matmuls per batch come within 0-3%
+  of the fastest path for each shape at every row count measured, never slower than `rows` or `spacemit`, and below both
+  at sizes like 64 and 96 rows (against `rows` -6% and -8%). With the other ops as measured (the same in all three
+  settings, within 1 ms), predicted t/s: pp16 87.5, pp32 101.7, pp36 88.8, pp40 91.9, pp48 96.9, pp64 114.9, pp65 103.9,
+  pp96 115.5, pp100 105.7, pp128 106.5, pp129 93.6 (`split` 69.5-92.1). Open before building it: down at 20-31 rows,
+  where its activations no longer fit and path A does not apply (path C or path B from the workspace; the bench's lines
+  per shape at 24 and 31 rows decide).
+- Settled by the bench's lines per shape (the same K3 session and build): down at 24 and 31 rows, its activations
+  outside TCM and no path A, takes 2,190 and 3,094 us on path C against 2,588 and 3,737 on path B (Q4_1: 3,135 and
+  4,464 against 3,391 and 4,855), so the rule's last branch is path C. Elsewhere the lines agree with the op counters,
+  e.g. gate and up at 113 rows on path B 5,360 us against path A's 6,940.
+
+**The rule per call as a fourth setting (prepared 2026-10-21; user decision).** `FLAGOS_SPACEMIT_MM=fit` (test-only
+until adopted) takes path B where TCM holds the batch's activations next to a 32-column slab (the test `gemm_slabs`
+itself uses, `slabs_hold_activations`), otherwise path A where every tile gets 4 rows, otherwise path C. At Qwen3-4B's
+shapes: path B up to 119 rows for q, k, v, gate and up, up to 68 for the attention output, up to 19 for down (Q4_1:
+18); path A beyond those from 32 rows; path C only for down at 20-31 rows. The 1-row path is unchanged; the same bytes
+as the other three settings.
+
+Checks (`check_mm_paths`, now four settings and 15 cases; the path each setting must take is worked out in the test
+from the rules, so a case may expect any path): the two new cases are K 9728 at 33 rows (fit takes path A) and 113
+rows, where the split gives path A (fit takes path B). On the Mac, 2026-10-21: 30/30 identical with the expected paths,
+tiles in turn and on threads; three mutations of the rule caught (path B whatever the activations: the three cases
+where they do not fit fail; no path A: the 33-row case; the split's path A first: the 113-row case);
+`test-backend-ops -o MUL_MAT` 3/3 under `fit`, in turn and on threads; ThreadSanitizer over the whole check program: 0
+reports.
+
+Measurement: `--bench-mm` with a fourth column; `EXPS="mm fit"`: modes `ref`, `ops`, `mm`, `mm-ops`, `fit`, `fit-ops`;
+pp128 with tg128 (`-ub 128`), pp512, the prompts of 2-129 tokens; the logits at batches of 128, 64 and 16 rows.
+
+Predictions (estimates fixed before the run, from the steps measured per shape in the `EXPS="mm pb"` run):
+
+| What | Prediction |
+|---|---|
+| outputs | identical: KLD at the floor and the same top token at `-ub 128`, `-ub 64` and `-ub 16`; the same text |
+| bench, per batch | within 3% of the fastest of `split`, `rows` and `spacemit` at every row count; below all three at 64 and 96 rows |
+| llama-bench t/s (each within 3%) | pp16 87.5, pp32 101.7, pp36 88.8, pp40 91.9, pp48 96.9, pp64 114.9, pp65 103.9, pp96 115.5, pp100 105.7, pp128 106.5, pp129 93.6 |
+| pp2, pp4, pp8 | as `spacemit` (20.5, 41.4, 68.0) within 3% |
+| pp512, tg128 | unchanged within 0.5% |
+
+Rules (proposed 2026-10-21; the user fixes them before the run):
+- Valid if the outputs are identical and the bench's controls stay within 3% (from 160 rows all four take path A).
+- Adopt `fit` as the default if llama-bench finds every tested length no more than 1% slower than either `split` or
+  `rows`, and the lengths where `split` runs path C (2-100 tokens) at least 5% faster than `split`.
+
+How to run (on the K3, inside tmux, after a bundle of the commit):
+
+```bash
+cd /root/llama.cpp-flagos && git -c safe.directory=$PWD pull --ff-only ~/sx-fx5.bundle feature/flagos-spacemit
+docs/flagos-k3/scripts/fusion-experiments.sh prepare 2>&1 | tee ~/fx-prepare5.log
+~/tcmtest/tcmrelease --apply && build-flagos/bin/flagos-check-spacemit --expect-device --bench-mm > ~/fx-bench-fit.log 2>&1
+grep -E "^bench    mm per" ~/fx-bench-fit.log
+EXPS="mm fit" REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf ~/fx/fit > ~/fx-fit.log 2>&1
+```
+
+- `prepare`: rc 0 expected; its `mm` line "30/30" on the Mac becomes "15/15" on the K3.
+- The bench takes a few minutes more than before (a fourth setting); the run about 40 minutes (6 modes, 3
+  repetitions, 9 logits runs). Progress from a second window: `grep -c 'rc=' ~/fx-fit.log` (66 runs in all).
+- Then on the Mac: `scp -rq k3:/root/fx/fit ~/fx-fit && scp -q k3:/root/fx-fit.log k3:/root/fx-bench-fit.log ~/`, and
+  `EXPS="mm fit" docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx-fit`.
+
 ### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
@@ -800,3 +950,13 @@ EXPS="mm pb" REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qw
   (`gemm_slabs`), `check_mm_paths` over all three settings (13 cases, NaN-filled outputs), `--bench-mm` at 25 row
   counts, `EXPS=pb`; on the Mac 26/26 identical with the expected paths, two mutations caught, ThreadSanitizer clean; not
   yet run on the K3.
+- 2026-10-21: path B's bench on the K3 (§7.3, build `17413e6`): valid; path B 13-52% faster than path C per batch at
+  2-113 rows, but 10% slower at 128-149 rows, where gate and up's activations no longer fit in TCM; path A still fastest
+  at the multiples of 32 and from 128 rows. The llama-bench run (`EXPS="mm pb"`) in progress.
+- 2026-10-21: `EXPS="mm pb"` on the K3 (§7.3): valid, outputs identical; `spacemit` 11-95% faster than `split` from 2 to
+  100 tokens and ahead of the IME path at every length, but 8% slower at 128 and 129 tokens, so not adopted by the
+  proposed rule. Per shape, path B wins where its activations fit in TCM and loses where they do not; a rule per call
+  on that (path B where they fit, else path A, else path C) is estimated at 0-3% from the fastest path for each shape.
+- 2026-10-21: that rule prepared as `FLAGOS_SPACEMIT_MM=fit` (§7.3; user decision), with predictions and proposed
+  rules: `check_mm_paths` over four settings and 15 cases, 30/30 on the Mac, three mutations of the rule caught;
+  `--bench-mm` with a fourth column; `EXPS=fit`. Not yet run on the K3.

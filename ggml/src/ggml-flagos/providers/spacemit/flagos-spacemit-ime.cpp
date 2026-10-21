@@ -91,10 +91,11 @@ bool use_reference() {
 // test-only until adopted (fusion-and-splitting.md §7.3), FLAGOS_SPACEMIT_MM: split (the default) keeps ime.cpp's
 // choice of path A and takes path C where ime.cpp takes path B: below 113 rows, and for matrices more than 64 times
 // wider than the rows; rows takes path A for every call that gives each tile at least one group of 4 rows; spacemit
-// takes path B there instead of path C whenever TCM holds a 32-column slab, as ime.cpp and ggml-spacemit do. The same
-// bytes in all three. Read at every call with several rows, so a benchmark can switch; anything else is reported once
-// and ignored
-enum class mm_setting { split, rows, spacemit };
+// takes path B there instead of path C whenever TCM holds a 32-column slab, as ime.cpp and ggml-spacemit do; fit takes
+// path B where TCM holds the batch's activations next to a slab, otherwise path A where every tile gets 4 rows,
+// otherwise path C (from the steps measured per shape under the other three). The same bytes in all four. Read at
+// every call with several rows, so a benchmark can switch; anything else is reported once and ignored
+enum class mm_setting { split, rows, spacemit, fit };
 
 mm_setting mm_setting_from_env() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_MM");
@@ -106,6 +107,9 @@ mm_setting mm_setting_from_env() {
     }
     if (std::strcmp(v, "spacemit") == 0) {
         return mm_setting::spacemit;
+    }
+    if (std::strcmp(v, "fit") == 0) {
+        return mm_setting::fit;
     }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
@@ -265,7 +269,12 @@ bool gemv(const gemv_strategy & s, const spacemit_tile & tile, const uint8_t * w
     return true;
 }
 
-// path B for several rows (FLAGOS_SPACEMIT_MM=spacemit, test-only): the in-tree path B
+// whether gemm_slabs' TCM holds the batch's quantized activations next to a 32-column slab (ime.cpp:438)
+bool slabs_hold_activations(const mm_dims & d, size_t tcm_size) {
+    return GGML_PAD(d.m * d.a_row_bytes, 64) + nb_cols * d.b_row_bytes <= (int64_t) tcm_size;
+}
+
+// path B for several rows (FLAGOS_SPACEMIT_MM=spacemit and fit, test-only): the in-tree path B
 // (ggml-cpu/spacemit/ime.cpp:435-494; ggml-spacemit's ime.cpp @ 4e782bc likewise). 32-column weight slabs, dealt
 // round-robin to the tiles, are copied into TCM and multiplied there for all the batch's rows. The batch's quantized
 // activations go into TCM too when they fit next to a slab (ime.cpp:438-441); otherwise the kernels read them from the
@@ -280,7 +289,7 @@ bool gemm_slabs(const spacemit_tile & tile, const uint8_t * qa, const uint8_t * 
     const int64_t   nth   = tile.nth;
     uint8_t *       tcm   = static_cast<uint8_t *>(tile.tcm);
     const int64_t   a_off = GGML_PAD(d.m * d.a_row_bytes, 64);
-    const bool      a_tcm = a_off + nb_cols * d.b_row_bytes <= (int64_t) tile.tcm_size;
+    const bool      a_tcm = slabs_hold_activations(d, tile.tcm_size);
     const uint8_t * acts  = a_tcm ? tcm : qa;
     uint8_t *       buf   = a_tcm ? tcm + a_off : tcm;
 
@@ -421,10 +430,14 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     }
 
     // path A (batches with 4 rows for every tile): each tile stages 4 quantized rows in TCM and streams all weights
-    // past them. With FLAGOS_SPACEMIT_MM=rows whenever every tile gets 4 rows
+    // past them. With FLAGOS_SPACEMIT_MM=rows whenever every tile gets 4 rows; with fit then too, unless path B holds
+    // the activations in TCM
     const mm_setting setting = mm_setting_from_env();
-    const bool       rows_a  = d.m >= row_align * nth && setting == mm_setting::rows;
-    if ((n_stride == d.n || rows_a) && tcm != nullptr && (size_t) (row_align * d.a_row_bytes) <= tile.tcm_size) {
+    const bool       fit     = setting == mm_setting::fit;
+    const bool       fit_b   = fit && tcm != nullptr && slabs_hold_activations(d, tile.tcm_size);
+    const bool       rows_a  = d.m >= row_align * nth && (setting == mm_setting::rows || (fit && !fit_b));
+    if (!fit_b && (n_stride == d.n || rows_a) && tcm != nullptr &&
+        (size_t) (row_align * d.a_row_bytes) <= tile.tcm_size) {
         if (ith == 0) {
             g_path_a.fetch_add(1, std::memory_order_relaxed);
         }
@@ -440,8 +453,9 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     }
 
     // path B with FLAGOS_SPACEMIT_MM=spacemit (test-only), where ime.cpp takes it: TCM holds a 32-column slab
-    // (gemm_slabs)
-    if (setting == mm_setting::spacemit && tcm != nullptr && nb_cols * d.b_row_bytes <= (int64_t) tile.tcm_size) {
+    // (gemm_slabs); with fit where TCM holds the activations next to it
+    if ((setting == mm_setting::spacemit || fit_b) && tcm != nullptr &&
+        nb_cols * d.b_row_bytes <= (int64_t) tile.tcm_size) {
         if (ith == 0) {
             g_path_b.fetch_add(1, std::memory_order_relaxed);
         }
