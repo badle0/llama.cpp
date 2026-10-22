@@ -1310,20 +1310,22 @@ Measurement:
    `fit,staged` stays faster than `fit` on path B, and `fit,mixed`'s worst and mean excess over the faster of the
    two; per layout a summary; the rows where none takes path B are the grid's controls.
 2. `--bench-mm` with a sixth column (Qwen3-4B's shapes, as before).
-3. `EXPS="mm fit-mixed"` on Qwen3-0.6B (5 runs per mode) and Qwen3-4B (3): the rule; `fit` and `fit,staged` from the
-   session before. The logits also at batches of 8 rows (the turns' side).
-4. `EXPS="mm fit fit-staged fit-mixed"` on a third model of another family, 5 runs per mode: whether the switch picks
-   the faster schedule on a model the rule was not derived from. Proposed: Llama-3.2-1B-Instruct Q4_0 (rows of 2,048
-   and 8,192 values; k and v 512 columns, 2 slabs per tile; gate and up 8,192, 32). Its other ops are not checked on
-   the provider: what it does not claim runs on the X100 cores, slower but correct.
-5. Optional: a Q8_0 model (Qwen3-0.6B requantized from its Q4_0 with `llama-quantize --allow-requantize`) with the
-   same experiments, for the Q8_0 threshold end to end.
+3. `EXPS="mm fit-mixed"` on Qwen3-0.6B (5 runs per mode) and Qwen3-4B (3), both Q4_0: the rule; `fit` and
+   `fit,staged` from the session before. The logits also at batches of 8 rows (the turns' side).
+4. `EXPS="mm fit fit-staged fit-mixed"` on Qwen3-0.6B in Q8_0 (5 runs per mode): the Q8_0 threshold (29 rows) end to
+   end, all three schedules in one session, as no Q8_0 run came before. Qwen's own Q8_0 file if it can be had,
+   otherwise the Q4_0 model requantized to Q8_0 (`llama-quantize --allow-requantize`: Q4_0's values rounded to Q8_0,
+   the same kernels and bytes per row as a true Q8_0, which is all this run measures).
+
+Qwen3 only (user decision, 2026-10-22): no model of another family for now. Whether the switch picks the faster
+schedule on shapes the rule was not derived from rests on the grid (all three schedules in one session, three layouts,
+1-38 slabs per tile) and the Q8_0 run.
 
 Predictions (estimates fixed before the run):
 
 | What | Prediction |
 |---|---|
-| outputs | identical on every model: KLD at the floor and the same top token at `-ub 128`, 64, 16 and 8; the same text |
+| outputs | identical in every run: KLD at the floor and the same top token at `-ub 128`, 64, 16 and 8; the same text |
 | the K3's checks | 21/21 identical, paths and turns as expected |
 | grid, Q4_0 and Q4_1, 4 or more slabs per tile | `fit,staged` faster from 10-16 rows at rows of 1,024 and 4,096 values, from 16 or never at 9,728 (path B ends at 19 rows there); `fit,mixed` within 4% of the faster schedule at every row count, its worst at 16 rows of 9,728 values |
 | grid, Q8_0 | the crossover later, at 16-32 rows (the byte rule's 29); `fit,mixed` within 4% at 4 or more slabs per tile |
@@ -1332,38 +1334,170 @@ Predictions (estimates fixed before the run):
 | `--bench-mm`, per batch | `fit,mixed` within 1% of `fit` at 2-8 rows and of `fit,staged` from 16 |
 | llama-bench, Qwen3-4B | pp2-pp8 at `fit`'s values of the session before (20.8, 40.9, 68.3 t/s; those lengths drift 2-5% between sessions), from pp16 at `fit,staged`'s within 1%: at least 10% over `split` at 2-100 tokens; from pp128 as `split` and `rows` (path A) |
 | llama-bench, Qwen3-0.6B | pp2-pp8 at `fit`'s (0.5-3.1% over `split`), from pp16 at `fit,staged`'s (12-134% over `split`, pp32 within 1% of `rows`) |
-| llama-bench, the third model | `fit,mixed` within 1% of the faster of `fit` and `fit,staged` at every length |
-| pp512, tg128 | unchanged within 0.5% on every model |
+| llama-bench, Qwen3-0.6B Q8_0 | `fit` and `fit,staged` cross between 16 and 32 tokens (the byte rule's 29); `fit,mixed` within 1% of the faster of the two at every length, but possibly pp16 (the turns there; up to the gap if Q8_0 crosses below 16 rows) |
+| pp512, tg128 | unchanged within 0.5% in every run |
 
 Rules (proposed 2026-10-22; the user fixes them before the run):
-- Valid if the outputs are identical on every model, the K3's checks pass, and the benches' controls stay within 3%.
+- Valid if the outputs are identical in every run, the K3's checks pass, and the benches' controls stay within 3%.
 - Adopt `fit,mixed` as the default (the unset setting; `split`, `rows`, `spacemit`, `fit` and `fit,staged` stay for
-  comparisons), after the acceptance runs on both Qwen3 models, if on every model run (1) no tested length is more
-  than 1% slower than `split` or `rows`; (2) every length from 16 to 100 tokens is at least 5% faster than `split`
-  (part 2 from 16 tokens, to be confirmed by the user: from 2 tokens no setting passes on 0.6B); (3) on the third model
-  no length is more than 1% slower than the faster of `fit` and `fit,staged`; and if the grid finds `fit,mixed` within
-  4% of the faster schedule at every row count with 4 or more slabs per tile. A miss at 1-2 slabs per tile is reported
-  and the rule refined (the switch could also take the slabs per tile), without blocking adoption: such matrices are a
-  few percent of a layer's matmul time (Llama-3.2-1B's k and v: about 4%).
+  comparisons), after the acceptance runs on both Qwen3 models, if in every run (the two Q4_0 models and the Q8_0 one)
+  (1) no tested length is more than 1% slower than `split` or `rows`, and (2) every length from 16 to 100 tokens is at
+  least 5% faster than `split` (part 2 from 16 tokens: confirmed by the user on 2026-10-22 as a trial, to go back to 2
+  tokens if needed; from 2 tokens no setting passes on 0.6B); and if the grid finds `fit,mixed` within 4% of the
+  faster schedule at every row count with 4 or more slabs per tile. In the Q8_0 run `fit,mixed` is also held to the
+  faster of `fit` and `fit,staged`: more than 1% behind it at some length means the Q8_0 threshold is off, and it is
+  refined from that run's counters (without blocking adoption if (1) and (2) hold). A miss at 1-2 slabs per tile in
+  the grid is reported and the rule refined (the switch could also take the slabs per tile), without blocking
+  adoption: no Qwen3 matrix has so few (the narrowest, 1,024 columns, have 4 slabs per tile).
 
-How to run (on the K3, inside tmux, after a bundle of the commit; the third model copied to `~/models` first):
+How to run (on the K3, inside tmux, after a bundle of the commit):
 
 ```bash
 cd /root/llama.cpp-flagos && git -c safe.directory=$PWD pull --ff-only ~/sx-fx7.bundle feature/flagos-spacemit
 docs/flagos-k3/scripts/fusion-experiments.sh prepare 2>&1 | tee ~/fx-prepare7.log
 ~/tcmtest/tcmrelease --apply && build-flagos/bin/flagos-check-spacemit --expect-device --bench-mm --bench-grid > ~/fx-bench-mixed.log 2>&1
 grep -E "^bench    (mm per|grid [^ ]+:)" ~/fx-bench-mixed.log
-EXPS="mm fit fit-staged fit-mixed" REPS=5 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Llama-3.2-1B-Instruct-Q4_0.gguf ~/fx/mx-llama1b > ~/fx-mx-llama1b.log 2>&1
 EXPS="mm fit-mixed" REPS=5 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-0.6B-Q4_0.gguf ~/fx/mx06 > ~/fx-mx06.log 2>&1
 EXPS="mm fit-mixed" REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf ~/fx/mx4b > ~/fx-mx4b.log 2>&1
+# Qwen3-0.6B in Q8_0: Qwen's file copied to ~/models if it can be had, otherwise requantized here from the Q4_0
+[ -f ~/models/Qwen3-0.6B-Q8_0.gguf ] || { cmake --build build-flagos --target llama-quantize > ~/fx-quantize.log 2>&1 && build-flagos/bin/llama-quantize --allow-requantize ~/models/Qwen3-0.6B-Q4_0.gguf ~/models/Qwen3-0.6B-Q8_0.gguf Q8_0 >> ~/fx-quantize.log 2>&1; }
+EXPS="mm fit fit-staged fit-mixed" REPS=5 docs/flagos-k3/scripts/fusion-experiments.sh run ~/models/Qwen3-0.6B-Q8_0.gguf ~/fx/mx06q8 > ~/fx-mx06q8.log 2>&1
 ```
 
 - `prepare`: rc 0 expected; its paths check "21/21 identical, paths and turns as expected".
-- Runs: 225 on the third model, 135 on 0.6B, 87 on 4B; progress: `grep -c 'rc=' <log>`; a run is finished when its
-  log's last line is `logs: <out>`. The third model first: it carries the new information, and its other ops have
-  not run on the provider before (a non-zero `rc` there is worth a look before the rest).
+- The Q8_0 file: unsloth's on ModelScope, the source of the Q4_0 models (build.md §7), 639,447,744 bytes; on the
+  board `cd ~/models && wget -c -q --show-progress
+  https://modelscope.cn/models/unsloth/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q8_0.gguf`, or with `curl -L -C - -o`
+  on the Mac and `scp` to `k3:/root/models/`. Hugging Face did not connect from the Mac (2026-10-22).
+- Runs: 135 on 0.6B, 87 on 4B, 225 on 0.6B in Q8_0; progress: `grep -c 'rc=' <log>`; a run is finished when its
+  log's last line is `logs: <out>`.
 - Then on the Mac: `scp -q k3:/root/fx-bench-mixed.log k3:/root/fx-prepare7.log ~/` and, per run,
   `scp -rq k3:/root/fx/<out> ~/fx-<out> && scp -q k3:/root/fx-<out>.log ~/`.
+
+**The grid on the K3 (2026-10-22, build `cdfd29e`; `~/fx-bench-mixed.log`).** `prepare`: rc 0, its paths check 21/21
+identical with the expected paths and turns; the Q8_0 file in place (639,447,744 bytes). One run of `--bench-mm
+--bench-grid`:
+- `--bench-mm` (Qwen3-4B's matmuls but the head): `fit,mixed` within 1.0% of `fit` at 2-8 rows (-1.0, +0.5 and
+  +0.1%), within 0.4% of `fit,staged` from 16 to 256 rows but at 17 (-1.4%), +1.0% at 512 rows, where all six run
+  path A. The five other settings within 1.8% of the last session's bench at every row count, but `spacemit` at 512
+  rows (-2.7%). As predicted: the switch runs the schedule it should.
+- The grid's controls (rows off path B, the same code in all three) within 1.0% for Q4_0 and 1.1% for Q4_1; for Q8_0
+  3.9% at one row (9,728 x 3,072 at 8 rows, path C) and 3.0% at two, all at 9,728 values per row, Q8_0's only rows
+  off path B. By the validity rule (3%) the Q8_0 grid is not valid, the Q4 grids are. On path B, `fit,mixed` and the
+  setting that runs its schedule differ by 0.2% (median), 1.1% (95th percentile), 2.5% at most.
+- The row count from which `fit,staged` stays faster than `fit` (the crossover), by layout, row length and columns
+  (slabs per tile in brackets):
+
+| | 256 (1) | 512 (2) | 1,024 (4) | 3,072 (12) | 9,728 (38) |
+|---|---|---|---|---|---|
+| Q4_0, rows of 1,024 values | 2 | 2 | 10 | 10 | 2 |
+| Q4_0, 4,096 | 6 | 10 | 14 | 14 | 10 |
+| Q4_0, 9,728 (path B to 16 of the grid's rows) | 6 | 10 | 14 | never | 14 |
+| Q4_1, 1,024 | 2 | 2 | 6 | 10 | 2 |
+| Q4_1, 4,096 | 2 | 6 | 10 | 10 | 6 |
+| Q4_1, 9,728 (to 16 rows) | 2 | 6 | 10 | 10 | 16 |
+| Q8_0, 1,024 | 2 | 10 | 14 | 14 | 10 |
+| Q8_0, 4,096 | 6 | 14 | 24 | 28 | 20 |
+| Q8_0, 9,728 (to 4 rows; the turns faster at 2 and 4) | never | never | never | never | never |
+
+  Against the predictions: at 4 or more slabs per tile 10 of the 18 Q4 crossovers lie in the predicted range (10-16
+  rows; 16 or never at 9,728 values), the other 8 earlier, down to 2 rows at 1,024 x 9,728 in both layouts; Q8_0's at
+  4,096 values in the predicted 16-32 (20-28), at 1,024 values earlier (10-14). At 1-2 slabs per tile earlier than at
+  4, as predicted. `fit,mixed` against the faster of the two at 4 or more slabs per tile: worst +6.7% (Q4_0, 1,024 x
+  1,024 at 14 rows), +10.6% (Q4_1, 9,728 x 1,024 at 14 rows) and +10.2% (Q8_0, 1,024 x 1,024 at 28 rows), each at the
+  last row count before its threshold (predicted: within 4%); at 1-2 slabs per tile +35.0%, +40.8% and +46.2%. On
+  average at 4 or more slabs per tile (from the two schedules' times): `fit,mixed` +1.0% over the faster, `fit` +3.9%,
+  `fit,staged` +3.7%.
+- Path B at 6, 10 and 14 rows is slower than at 8, 12 and 16 in 270 of the grid's 330 such pairs (both schedules;
+  median +5.3%; Q4_0 4,096 x 1,024 with the turns 156 us at 6 rows, 143 at 8). The kernels take 4 rows while 4 remain,
+  then one at a time (`q4_0_gemm`, flagos-spacemit-ime-kernels.cpp:2917-2936, as upstream's `gemm_kernel_i8i4_hp`,
+  ime2_kernels.cpp:5611), so 6 rows take three kernel calls per slab and 8 rows two; that a call costs about as much
+  with 1 row as with 4 is an inference (not isolated; at 2 against 4 rows, where the copies dominate, the difference
+  disappears: -2.5% in the median). Paths A and C and the IME path call the kernels alike, and the quantize step
+  splits the rows the same way (full groups of 4 interleaved for the 4-row kernel, the rest row by row,
+  flagos-spacemit-ime.cpp:408-439).
+
+Reading, from `gemm_slabs` (the in-tree protocol, ime.cpp:446-490) and the grid; the costs were not timed apart. With
+the turns a pair takes about R(c + p) + max(c, p) + (R + 1)w, with c a slab's copy, p its multiply and w a wait, the
+odd tile ending one step after the even one; without them each tile takes R(c' + p), c' a copy slowed by the
+partner's at the same time. The turns pay when R(c' - c) > max(c, p) + (R + 1)w: the slabs per tile and how much a
+pair's copies slow each other decide, not whether the activations' bytes reach a slab's, so the byte rule asked the
+wrong question. The grid fits that reading: at 1 slab per tile, where the tail falls on the only slab, the turns lead
+by 7.9% at most and only at 2-4 rows, and are behind from 6 rows in every shape; at 4 slabs per tile, where neither
+schedule nears the DRAM ceiling (15-24 GB/s with the turns at 2 rows, 15-18 without), they lead by up to 40%; at 38
+slabs per tile both read the weights at 23-30 GB/s at 2-4 rows, near the 28 GB/s ceiling, where keeping copies apart
+gains little, and at rows of 1,024 values (the shortest copies, against 39 waits) `fit,staged` leads from 2 rows for
+Q4_0 and Q4_1; longer rows cross later (Q4_0 at 4-12 slabs per tile: 10 rows at 1,024 values, 14 at 4,096; Q8_0: 14
+and 24-28), as a wait does not shrink with the copy; and the remainder rows lengthen p at 6, 10 and 14 rows, which
+jags the crossover. The test that would settle the mechanism: path B's copies, multiplies and waits timed apart per
+tile.
+
+Verdict by the rules (part 2 from 16 tokens, the user's trial): the grid's clause fails on the valid Q4 grids (6.7%
+and 10.6% against 4% allowed), so `fit,mixed` is not adopted, whatever the model runs would show; the switch itself
+works (the bench). The three model sessions were not run: their prompts (2, 4, 8, 16, 32 tokens and up) hold no length
+from 9 to 15 or from 17 to 31, where the thresholds act, so `fit,mixed` would have run `fit`'s code up to pp8 (on Q8_0
+up to pp16) and `fit,staged`'s from the next length, which says nothing about the threshold beyond the grid: a gap in
+this run's preparation. The earlier "crossover between 8 and 16 rows" was those lengths' resolution: the grid puts it
+near 10 rows at rows of 1,024 values, Qwen3-0.6B's (an estimate for the model from the nearest shapes).
+
+No rule of the byte form passes the clause: the best of "the turns from r slabs per tile while m * a < f * slab", f
+linear in log2 of the row length, fitted to the grid's own rows, still misses by 6.5% at 4 or more slabs per tile
+(then by 12.3% at 1-2), or at best by 10.2% over all shapes: the crossover moves with the slabs per tile, the row
+length, the layout and the remainder rows together. Options (proposed 2026-10-22; the user's choice):
+1. Measure per weight shape: at load or at a shape's first graph, both schedules timed for each distinct weight
+   shape at 1-32 rows (in the grid `fit,staged` leads in every shape from 28 rows), the faster used per row count;
+   general by construction, outputs unchanged (the same bytes), noise only near a crossover, where the two are close;
+   costs load time (seconds for Qwen3-4B, an estimate) and more code than the others.
+2. A table from the grid (per layout, by row length, slabs per tile and rows): small and deterministic; right at the
+   grid's shapes, unverified between them (a grid of other shapes, e.g. Qwen3's rows of 2,560 values, would test it).
+3. `fit,mixed` as it is, the grid's clause amended after the grid (recorded as such): +1.0% on average against the
+   faster schedule, up to 6.7-10.6% just below its thresholds and 35-46% at 1-2 slabs per tile (no Qwen3 matrix has
+   so few).
+Independent of these: the last 2-3 rows of a batch through the 4-row kernel (padded to 4) on every path, predicted to
+remove the excess at 6, 10 and 14 rows (median 5% there; an estimate). For Q4_0 the outputs of those rows change: its
+4-row quantizer takes one scale per 32 values for all four rows (the maximum over the four, quantize_a_4row_i8_hp,
+flagos-spacemit-ime-kernels.cpp:1492-1540; reference 507-560), where the 1-row quantizer takes each row's own, so
+those rows would be quantized like every full group already is, a question for the logits check. For Q4_1 and Q8_0
+the 4-row quantizer keeps a scale per row (quantize_a_nrow_i8_ref, 674-697), so outputs stay identical if the 4-row
+and 1-row kernels give the same values per row (a check on the K3 decides: the IME kernels run only there). Not
+small: the activations need room for whole groups (the workspace, the TCM checks of path B and `fit`, the copy into
+TCM), and the padding rows' outputs a scratch buffer.
+
+The user's direction (2026-10-22): a generally good rule rather than the best in every case, so option 1 is dropped.
+Proposed for that: `fit,mixed` and no turns when a tile has one slab (the tail then falls on the only slab): on the
+grid the 1-slab cases go from +11.9% on average (worst +45.7%) to +0.3% (worst +7.9%), nothing else changes (4 or
+more slabs per tile: +1.0% on average, worst +10.7%; 2: +4.3%, worst +22.6%; from the two schedules' times). The
+grid's clause would then be replaced, after the grid, by accepting these misses (to be recorded as such), and the
+model runs would decide by parts 1 and 2 with prompt lengths near the thresholds added.
+
+**`fit,staged` chosen (user, 2026-10-22), and its check on Q8_0.** The user set small batches aside (both parts of
+the rule from 16 tokens, a decision made after the data) and chose `fit,staged` on the recorded runs: on Qwen3-0.6B
+and Qwen3-4B (Q4_0) the fastest setting measured from 16 tokens or level with the fastest (0.6B pp32: -0.5% against
+`rows`), 12-134% (0.6B) and 29-121% (4B) faster than `split` at 16-100 tokens, pp512 and tg128 unchanged, outputs
+identical; its losses at 2-8 tokens (against `fit` up to -8.0%, against `split` -4.5% on 0.6B at pp2) are the small
+batches set aside. `fit,mixed` and the one-slab condition are not pursued. No Q8_0 model has run end to end, so before
+the default changes, one session on Qwen3-0.6B in Q8_0 (unsloth's file, 639,447,744 bytes) with `split` (the
+reference), `fit` and `fit,staged`: `EXPS="fit fit-staged" REPS=5` (132 runs: the text 3, the logits at `-ub` 128, 64
+and 16 9, llama-bench 120: pp128 and tg128, pp512, pp2-pp129 at 17 lengths and pp160-pp320, 5 times per mode, with
+and without the counters).
+
+Predictions (estimates fixed before the run, from the grid's Q8_0 shapes with rows of 1,024 values, those of 0.6B's
+q, k, v, gate and up; its o and down have 2,048 and 3,072 values, not in the grid):
+
+| What | Prediction |
+|---|---|
+| outputs | identical: the same text, KLD at the floor, the same top token at `-ub` 128, 64 and 16 |
+| pp2-pp8 | `fit,staged` slower than `fit` (the grid: the turns 6-15% faster at 2-8 rows on these shapes) |
+| pp16 | `fit,staged` within 3% of `fit` (the grid: level at 16 rows of 1,024 values, the turns 8-9% faster at 4,096) |
+| pp32-pp129 | `fit,staged` 4-9% faster than `fit` (the grid: 7-11% at 32 rows of 1,024 values; Q4_0 0.6B: 6.5-9.2%) |
+| pp160-pp320 | `fit,staged` 2-5% faster than `fit` (Q4_0 0.6B: 4.1-4.6%) |
+| against `split` | faster from pp16, by an amount nothing measured predicts for Q8_0 (Q4_0 0.6B: 12-134% at 16-100 tokens) |
+| pp512, tg128 | unchanged within 0.5% |
+
+Criterion (fixed before the run): the choice holds on Q8_0 if from 16 tokens no tested length is more than 1% slower
+than `split` and every length from 16 to 100 tokens is at least 5% faster than `split` (the rule's two parts from 16
+tokens; `rows` is not in this run). Against `fit` the run reports, with no bar. If the criterion fails, the default
+change waits and the Q8_0 case is examined first.
 
 ### 7.4 Still proposed
 
@@ -1449,4 +1583,15 @@ EXPS="mm fit-mixed" REPS=3 docs/flagos-k3/scripts/fusion-experiments.sh run ~/mo
   batch's activations take fewer bytes than a slab (16 rows for Q4_0 and Q4_1, 29 for Q8_0, no model constant);
   `check_mm_paths` over six settings and 21 cases, 42/42 on the Mac, five mutations caught, ThreadSanitizer clean;
   `--bench-grid`, a bench on shapes rather than a model (three layouts, 1-38 slabs per tile, 2-48 rows);
-  `EXPS=fit-mixed`; a third model of another family proposed. Not yet run on the K3.
+  `EXPS=fit-mixed` on both Qwen3 models, and all three schedules on Qwen3-0.6B in Q8_0 (Qwen3 only, user decision).
+  Not yet run on the K3.
+- 2026-10-22: the grid and the bench on the K3 (§7.3, build `cdfd29e`): `fit,mixed` switches as built, but the
+  crossover moves with the slabs per tile, the row length and the layout (2-16 rows for Q4_0 and Q4_1, 10-28 for
+  Q8_0), so the threshold misses by up to 6.7% (Q4_0) and 10.6% (Q4_1) at 4 or more slabs per tile, 4% allowed: not
+  adopted, and no rule of its form passes even fitted to the grid. The model sessions not run (no prompt length near
+  the thresholds). Also found: 6-, 10- and 14-row batches slower than 8, 12 and 16 (the kernels' remainder rows).
+  Part 2 of the rule from 16 tokens (user, as a trial). Next: how to switch, the user's choice.
+- 2026-10-22: `fit,staged` chosen by the user on the recorded runs (small batches set aside: both parts of the rule
+  from 16 tokens, a decision after the data); `fit,mixed` and the one-slab condition not pursued. Next: its check on
+  Qwen3-0.6B in Q8_0 against `split` and `fit` (§7.3, predictions and criterion fixed before the run), then the
+  default change and the acceptance runs on both models.

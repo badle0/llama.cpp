@@ -159,6 +159,7 @@ mkdir -p ~/models && cd ~/models
 MS=https://modelscope.cn/models/unsloth          # ModelScope: fast from the board; Qwen's own GGUF repos have no Q4_0
 wget -c -q --show-progress $MS/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q4_0.gguf   # 382156480 bytes
 wget -c -q --show-progress $MS/Qwen3-4B-GGUF/resolve/master/Qwen3-4B-Q4_0.gguf       # 2375773472 bytes
+wget -c -q --show-progress $MS/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q8_0.gguf   # 639447744 bytes (fusion-and-splitting.md §7.3)
 ```
 List a repo's files: `wget -qO- "https://modelscope.cn/api/v1/models/unsloth/Qwen3-4B-GGUF/repo/files?Revision=master&Recursive=true"`. The 4B file matches SpacemiT's table (2.21 GiB); their 0.6B file was about 6 MiB smaller, so compare 0.6B numbers to their table loosely.
 SpacemiT's doc benchmarks Qwen3-0.6B Q4_0 and qwen35 2B Q4_1 (`docs/build-riscv64-spacemit.md`); A100 IME supports Q2_K–Q6_K, Q4_0/1, Q5_0/1, Q8_0.
