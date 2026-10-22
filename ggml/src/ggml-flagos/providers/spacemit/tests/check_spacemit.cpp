@@ -15,8 +15,8 @@
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under FLAGOS_SPACEMIT_MM=rows
-//                    (path A), spacemit (path B) and fit (path B where TCM holds the activations) against the default
-//                    split
+//                    (path A), spacemit (path B), fit (path B where TCM holds the activations) and fit,staged (fit
+//                    without path B's turns) against the default split
 //   --e3b[=runs]     only structural-experiments.md E3b-diag: why launches ordered in the cores differ (default 20 runs
 //                    per case and variant); a measurement, it fails nothing
 // Without a flag, a host without the device skips the device checks.
@@ -1111,12 +1111,13 @@ static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
 }
 
 // fusion-and-splitting.md §7.3: FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B
-// where the split gives no path A, as ime.cpp) and fit (path B where TCM holds the activations next to a slab, else
-// path A from 32 rows, else path C) against the default split: the same bytes, as all four run the same kernels on the
-// same groups of 4 rows and blocks of 32 columns. The paths taken are counted (spacemit_mm_paths_take) and compared
-// with what the rules give, worked out here again; the output is filled with NaN before every run, so columns a path
-// skips show, and split's must come out finite. Paths A and B need TCM: as check_gemv_strategies, a stand-in of the
-// K3's 384 KiB on a host without the AI cores, there also with tiles on threads, where path B's pair waits wait
+// where the split gives no path A, as ime.cpp), fit (path B where TCM holds the activations next to a slab, else
+// path A from 32 rows, else path C) and fit,staged (fit's paths, path B without the pair turns) against the default
+// split: the same bytes, as all five run the same kernels on the same groups of 4 rows and blocks of 32 columns. The
+// paths taken are counted (spacemit_mm_paths_take) and compared with what the rules give, worked out here again, and
+// only fit,staged's path B steps may run without the turns; the output is filled with NaN before every run, so columns
+// a path skips show, and split's must come out finite. Paths A and B need TCM: as check_gemv_strategies, a stand-in of
+// the K3's 384 KiB on a host without the AI cores, there also with tiles on threads, where path B's pair waits wait
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
     std::vector<ggml_backend_t> backends;
@@ -1150,8 +1151,10 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         { GGML_TYPE_Q4_0, 9728, 512, 33 },  // the activations do not fit, every tile gets 4 rows: path A
         { GGML_TYPE_Q4_0, 512, 1024, 113 },  // the split gives path A, the activations fit: path B
     };
-    const char * const settings[] = { nullptr, "rows", "spacemit", "fit" };
-    const char * const names[]    = { "split", "rows", "spacemit", "fit" };
+    constexpr int      n_set           = 5;
+    const char * const settings[n_set] = { nullptr, "rows", "spacemit", "fit", "fit,staged" };
+    const char * const names[n_set]    = { "split", "rows", "spacemit", "fit", "fit,staged" };
+    constexpr int      staged          = 4;  // the setting whose path B runs without the turns
     int                n_same = 0, n_runs = 0;
     for (const mm_case & c : cases) {
         mm_weight w;
@@ -1161,25 +1164,26 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         const std::vector<float> nan(ggml_nelements(run.y), NAN);
         // the path each setting must take with 8 tiles and 384 KiB of TCM (spacemit_mul_mat_gemm): split path A where
         // ime.cpp's split gives every tile all columns, else path C; rows path A also from 32 rows; spacemit path B
-        // in place of path C; fit path B where TCM holds the activations next to a 32-column slab, else path A from
-        // 32 rows, else path C
+        // in place of path C; fit and fit,staged path B where TCM holds the activations next to a 32-column slab, else
+        // path A from 32 rows, else path C
         const int64_t m_stride = c.n / c.m > 64 ? c.m : 16;
         const bool    split_a  = (c.n * ((c.m + m_stride - 1) / m_stride) + 7) / 8 >= c.n;
         const bool    fit_b    = (int64_t) GGML_PAD(c.m * ime_act_row_bytes(c.type, c.k), 64) +
                                   32 * (int64_t) ime_row_bytes(c.type, c.k) <=
                               393216;
-        const char    expect[4] = { split_a ? 'A' : 'C', split_a || c.m >= 32 ? 'A' : 'C', split_a ? 'A' : 'B',
-                                    fit_b ? 'B' : c.m >= 32 ? 'A' : 'C' };
+        const char    fit_path      = fit_b ? 'B' : c.m >= 32 ? 'A' : 'C';
+        const char    expect[n_set] = { split_a ? 'A' : 'C', split_a || c.m >= 32 ? 'A' : 'C', split_a ? 'A' : 'B',
+                                        fit_path, fit_path };
         for (ggml_backend_t backend : backends) {
-            std::vector<float> out[4];
-            uint64_t           path_a[4] = {}, path_b[4] = {}, path_c[4] = {};
-            bool               ok        = true;
-            for (int s = 0; s < 4; s++) {
+            std::vector<float> out[n_set];
+            uint64_t           path_a[n_set] = {}, path_b[n_set] = {}, path_c[n_set] = {}, path_s[n_set] = {};
+            bool               ok            = true;
+            for (int s = 0; s < n_set; s++) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[s]);
                 ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
-                spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s]);
+                spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
                 ok = ok && ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
-                spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s]);
+                spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
                 out[s].resize(ggml_nelements(run.y));
                 ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
             }
@@ -1187,16 +1191,17 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
             bool        switched = true;
             int         differs  = 0;  // the first setting whose output differs from split's
             std::string paths;
-            for (int s = 0; s < 4; s++) {
+            for (int s = 0; s < n_set; s++) {
                 const char p = expect[s];
                 switched     = switched && path_a[s] == (uint64_t) (p == 'A') && path_b[s] == (uint64_t) (p == 'B') &&
-                           path_c[s] == (uint64_t) (p == 'C');
+                           path_c[s] == (uint64_t) (p == 'C') && path_s[s] == (uint64_t) (s == staged && p == 'B');
                 if (s > 0 && differs == 0 &&
                     std::memcmp(out[0].data(), out[s].data(), out[0].size() * sizeof(float)) != 0) {
                     differs = s;
                 }
                 paths += std::string(s == 0 ? "" : ", ") + names[s] + " " + std::to_string(path_a[s]) + "/" +
-                         std::to_string(path_b[s]) + "/" + std::to_string(path_c[s]) + " (" + p + ")";
+                         std::to_string(path_b[s]) + "/" + std::to_string(path_c[s]) + "/" +
+                         std::to_string(path_s[s]) + " (" + p + (s == staged && p == 'B' ? ", no turns" : "") + ")";
             }
             const bool finite = std::all_of(out[0].begin(), out[0].end(), [](float v) { return std::isfinite(v); });
             const bool same   = ok && finite && differs == 0;
@@ -1207,7 +1212,8 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                                                             " differs from split" :
                                                          std::string("a setting did not take its path");
                 std::fprintf(stderr,
-                             "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C taken, expected: %s)%s\n",
+                             "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C taken / path B without the "
+                             "turns, expected: %s)%s\n",
                              ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) c.m, what.c_str(),
                              paths.c_str(), backend != backends[0] ? " (tiles on threads)" : "");
                 g_failures++;
@@ -1221,9 +1227,9 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         ggml_backend_free(backend);
     }
     std::printf("mm       FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B where the "
-                "split gives no path A) and fit (path B where TCM holds the activations, else A or C) against the "
-                "default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, paths as "
-                "expected%s\n",
+                "split gives no path A), fit (path B where TCM holds the activations, else A or C) and fit,staged "
+                "(fit's paths, path B without the turns) against the default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 "
+                "rows with TCM%s: %d/%d identical, paths as expected%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
@@ -2420,12 +2426,12 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 }
 
 // fusion-and-splitting.md §7.3: the matmuls of a Qwen3-4B batch under FLAGOS_SPACEMIT_MM=rows (path A whenever every
-// tile gets 4 rows), spacemit (path B where the split gives no path A) and fit (path B where TCM holds the activations,
-// else A or C) against the default split, at the row counts of short prompts, of a prompt's last batch and of
-// llama-bench's batches: each shape alone with the path each setting took, and per batch the shapes weighted by how
-// often a batch runs them (36 q and attention outputs, 72 k and v, 72 gate and up, 32 + 4 down; the head runs on one
-// row). As in bench_gemv every run reads its weights from DRAM: it takes the next of enough copies of the weight (32 MB
-// together)
+// tile gets 4 rows), spacemit (path B where the split gives no path A), fit (path B where TCM holds the activations,
+// else A or C) and fit,staged (fit without path B's turns) against the default split, at the row counts of short
+// prompts, of a prompt's last batch and of llama-bench's batches: each shape alone with the path each setting took,
+// and per batch the shapes weighted by how often a batch runs them (36 q and attention outputs, 72 k and v, 72 gate
+// and up, 32 + 4 down; the head runs on one row). As in bench_gemv every run reads its weights from DRAM: it takes the
+// next of enough copies of the weight (32 MB together)
 static int bench_mm(ggml_backend_dev_t dev) {
     env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
     ggml_backend_t backend = nullptr;
@@ -2442,8 +2448,8 @@ static int bench_mm(ggml_backend_dev_t dev) {
     };
     const std::vector<int64_t> rows = { 2,  4,  8,  16, 17,  24,  31,  32,  33,  36,  40,  44, 48,
                                         64, 65, 96, 100, 112, 113, 128, 129, 149, 160, 256, 512 };
-    const char * const  settings[] = { "split", "rows", "spacemit", "fit" };
-    constexpr int       n_set      = 4;
+    const char * const  settings[] = { "split", "rows", "spacemit", "fit", "fit,staged" };
+    constexpr int       n_set      = 5;
     std::vector<double> batch[n_set];
     for (std::vector<double> & b : batch) {
         b.assign(rows.size(), 0.0);
@@ -2472,12 +2478,12 @@ static int bench_mm(ggml_backend_dev_t dev) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[k]);
                 bool     ok   = true;
                 size_t   next = 0;
-                uint64_t path_a, path_b, path_c;
-                spacemit_mm_paths_take(path_a, path_b, path_c);
+                uint64_t path_a, path_b, path_c, path_s;
+                spacemit_mm_paths_take(path_a, path_b, path_c, path_s);
                 t[k] = time_us(
                     [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
                     iters);
-                spacemit_mm_paths_take(path_a, path_b, path_c);
+                spacemit_mm_paths_take(path_a, path_b, path_c, path_s);
                 const std::pair<uint64_t, const char *> taken[] = { { path_a, "A" }, { path_b, "B" }, { path_c, "C" } };
                 for (const auto & [count, name] : taken) {
                     if (count > 0) {

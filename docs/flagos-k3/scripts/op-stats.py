@@ -5,6 +5,8 @@
 # Usage: op-stats.py show <file>...                  per kind of graph, every name's time per graph, largest first
 #        op-stats.py diff <file>... -- <file>...     per kind of graph in both sets, the second set against the first,
 #                                                    name by name, largest change first
+#        op-stats.py pairs <file>...                 per kind of graph with several rows, every matmul's even and odd
+#                                                    tiles: their mean times and the odd ones' excess (§7.3)
 # The files of one set (one mode's runs) are merged: per kind (launch, rows, n_kv), every name's values weighted by the
 # graphs counted. Times in us per graph: wall = the mean tile's kernel and barrier time, kernel = the mean tile's kernel
 # time, imbal. = each step's slowest tile less the mean, summed (busy - kernel), barrier = wall - busy (the barriers' own
@@ -105,11 +107,42 @@ def diff(paths_a, paths_b):
         print()
 
 
+def pairs(paths):
+    # the multiply steps of several rows: the even and the odd tiles' mean time per graph, the odd ones' excess and how
+    # often an odd tile was the slowest. Path B's pair turns leave the odd tile of each pair one slab's multiply behind
+    # the even one, about 0.9/R of the step for R slabs per tile (fusion-and-splitting.md §7.3); without them, and on
+    # paths A and C, neither side should lag
+    kinds = load(paths)
+    for key in sorted(kinds):
+        k = kinds[key]
+        if key[1] < 2 or k["tiles"] < 2:
+            continue
+        rows = []
+        for name, v in k["names"].items():
+            if not name.startswith("MUL_MAT.gemm") or name.endswith(" m1"):
+                continue
+            p = per_graph(v, k["graphs"])
+            even, odd = p["tile"][0::2], p["tile"][1::2]
+            e, o = sum(even) / len(even), sum(odd) / len(odd)
+            s = v["slowest"]
+            odd_slowest = 100 * sum(s[1::2]) / sum(s) if sum(s) else 0.0
+            rows.append((name, p["wall"], e, o, 100 * (o / e - 1) if e else 0.0, odd_slowest))
+        if not rows:
+            continue
+        print(title(key, k))
+        print(f"   {'name':46}{'wall':>11}{'even tiles':>12}{'odd tiles':>11}{'odd excess':>12}{'odd slowest':>13}")
+        for name, wall, e, o, excess, odd_slowest in sorted(rows, key=lambda r: -r[1]):
+            print(f"   {name:46}{wall:11.1f}{e:12.1f}{o:11.1f}{excess:+11.1f}%{odd_slowest:12.0f}%")
+        print()
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3 or sys.argv[1] not in ("show", "diff"):
-        sys.exit("usage: op-stats.py show <file>... | op-stats.py diff <file>... -- <file>...")
+    if len(sys.argv) < 3 or sys.argv[1] not in ("show", "diff", "pairs"):
+        sys.exit("usage: op-stats.py show <file>... | op-stats.py diff <file>... -- <file>... | op-stats.py pairs <file>...")
     if sys.argv[1] == "show":
         show(sys.argv[2:])
+    elif sys.argv[1] == "pairs":
+        pairs(sys.argv[2:])
     else:
         args = sys.argv[2:]
         if "--" not in args:
