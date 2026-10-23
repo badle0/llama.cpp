@@ -1548,6 +1548,35 @@ Next, by the user's plan (2026-10-22): prompts of 9-15 and 17-31 tokens, a model
 bigger models; then graph splitting, with fusion later. The default change and its acceptance runs after those checks
 (proposed).
 
+**Prompts of 8-32 tokens (the user's step 2), prepared 2026-10-23.** The runner's `PPODD` sets the prompt lengths of
+its run of single batches in llama-bench's `-p` form, ranges included (default the 17 lengths above; checked on the
+Mac: without it the runner's commands are the same as before for every experiment, and llama-bench takes `-p 8-32`
+and rejects a malformed range). Three sessions, `EXPS="fit fit-staged" PPODD=8-32 PPL_TEXT=`, without the logits check
+(the provider's check on the K3 compares the paths byte for byte at 2-128 rows, 17, 19, 21 and 28 among them):
+Qwen3-0.6B in Q4_0 and in Q8_0 (`REPS=5`), Qwen3-4B in Q4_0 (`REPS=3`).
+
+Predictions (estimates fixed before the run, from the runs at 8, 16 and 32 tokens, the grid and the code):
+
+| `fit,staged` | 0.6B Q4_0 | 0.6B Q8_0 | 4B Q4_0 |
+|---|---|---|---|
+| measured against `fit` at pp8 / pp16 / pp32 | +0.1% / +5.1% / +7.5% | -5.6% / +1.8% / +6.7% | -5.7% / +3.1% / +3.9% |
+| measured against `split` at pp16 / pp32 | +12.2% / +17.1% | +5.4% / +7.5% | +29.2% / +47.6% |
+| against `fit` at 9-15 tokens | level or faster | slower up to about 12-15 | slower up to about 11-14 |
+| against `fit` at 17-31 tokens | +5-8% | +2-7% | +3-4% |
+| against `split` at 17-31 tokens | above +12% | above +5.4% | above +29% |
+
+- `split` from 17 rows (read in the code): its path C cuts the rows into blocks of 16 for the matrices with at most 64
+  output columns per batch row and reads their weights once per block (flagos-spacemit-ime.cpp:461-468, 504-524): on
+  0.6B k, v, o and down, about 47% of a layer's weight bytes, on 4B k and v, about 5%. So on 0.6B `split` should lose
+  speed from pp16 to pp17, and the gain over it at 17-31 tokens should exceed pp16's (estimate; no model of the cost).
+- Every setting's rate should dip at lengths that are not a multiple of 4: the last rows go one at a time
+  (flagos-spacemit-ime.cpp:133-142; the grid: 6, 10 and 14 rows a median 5.3% slower than 8, 12 and 16 on path B). So
+  the comparisons are read length by length.
+
+Criterion (fixed before the run): on each model, at 17-31 tokens no length more than 1% slower than `split` and every
+length at least 5% faster (the rule's two parts, from 16 tokens). 9-15 tokens and the comparison with `fit` are
+reported, with no bar. If the criterion fails, the default change waits and the failing lengths are examined first.
+
 ### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
@@ -1651,3 +1680,6 @@ bigger models; then graph splitting, with fusion later. The default change and i
   `fit` +1.8% at pp16, +6.7-10.2% at 32-129 tokens, +5.2-5.4% at 160-256, level at 320 (path B's TCM limit for Q8_0,
   294 rows of 1,024 values), -5.6 to -9.7% at 2-8. The choice holds on Q8_0. Next: the user's plan (prompts of 9-15
   and 17-31 tokens, another family, bigger models), then graph splitting.
+- 2026-10-23: step 2 prepared (§7.3; user request): the runner's `PPODD` (the prompt lengths of its single-batch run;
+  default unchanged, checked on the Mac by dry runs of every experiment), three sessions at 8-32 tokens with
+  predictions and criterion. Not yet run on the K3.

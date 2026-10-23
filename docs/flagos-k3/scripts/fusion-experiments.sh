@@ -24,6 +24,8 @@
 #        fusion-experiments.sh summary <out>            the summary again from the logs
 # Env:   EXPS      experiments (default "q6"; ref and ops always run)
 #        REPS      llama-bench repetitions per mode (default 5; 0 skips llama-bench)
+#        PPODD     the prompt lengths pb, fit, fit-staged and fit-mixed add, in llama-bench's -p form (a list; ranges
+#                  first-last[+step]); default 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 0)
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
 #        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
@@ -55,6 +57,7 @@ BUILD_A=${BUILD_A:-$REPO/build-flagos}
 TCM_RELEASE=${TCM_RELEASE:-$HOME/tcmtest/tcmrelease}
 EXPS=${EXPS:-q6}
 REPS=${REPS:-5}
+PPODD=${PPODD:-2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129}
 DEPTH=${DEPTH:-0}
 PPL_TEXT=${PPL_TEXT-$HOME/ppl.txt}
 CHUNKS=${CHUNKS:-8}
@@ -311,7 +314,7 @@ run_all() {
     if [ -z "$DRY" ]; then
         {
             echo "date: $(date -u +%Y-%m-%dT%H:%MZ)"
-            echo "model: $M; EXPS: $EXPS; REPS: $REPS; DEPTH: $DEPTH; PPL_TEXT: $PPL_TEXT; CHUNKS: $CHUNKS"
+            echo "model: $M; EXPS: $EXPS; REPS: $REPS; PPODD: $PPODD; DEPTH: $DEPTH; PPL_TEXT: $PPL_TEXT; CHUNKS: $CHUNKS"
             echo "A: $BUILD_A at $(g -C "$REPO" rev-parse --short HEAD)"
         } > "$OUT/info.txt"
     fi
@@ -329,7 +332,7 @@ run_all() {
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
                 if has pb || has fit || has fit-staged || has fit-mixed; then
-                    bench "$m" "ppodd-$i" -p 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129 -n 0
+                    bench "$m" "ppodd-$i" -p "$PPODD" -n 0
                 elif has mm; then
                     bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
                 fi
@@ -382,5 +385,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,49p' "$0"; exit 1 ;;
+    *) sed -n '2,51p' "$0"; exit 1 ;;
 esac
