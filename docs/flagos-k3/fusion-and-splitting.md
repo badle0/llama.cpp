@@ -1577,6 +1577,70 @@ Criterion (fixed before the run): on each model, at 17-31 tokens no length more 
 length at least 5% faster (the rule's two parts, from 16 tokens). 9-15 tokens and the comparison with `fit` are
 reported, with no bar. If the criterion fails, the default change waits and the failing lengths are examined first.
 
+**Prompts of 8-32 tokens on the K3 (2026-10-23, build `2c7c761`, whose code is `cdfd29e`'s; the modes interleaved, 5
+runs per mode on Qwen3-0.6B in Q4_0 and in Q8_0, 3 on Qwen3-4B; `~/fx-mid06.log`, `~/fx-mid06q8.log`,
+`~/fx-mid4b.log`).** All runs returned 0 (123, 123 and 75), every mode generated the same text on each model, and the
+criterion is met on all three models.
+
+| `fit,staged` | 0.6B Q4_0 | 0.6B Q8_0 | 4B Q4_0 |
+|---|---|---|---|
+| against `split` at 17-31 tokens (the criterion: +5% or more) | +16.4% to +30.6% (lowest pp27) | +7.5% to +22.2% (pp27) | +23.5% to +36.7% (pp20) |
+| predicted | above +12%: met | above +5.4%: met | above +29%: missed at pp20-pp28 (4B's down, below) |
+| against `split` at 9-16 tokens (no bar) | +4.0% to +14.9% | -1.2% to +7.2% | +15.0% to +29.6% |
+| against `fit` at 9-15 tokens | +1.9% to +7.0% | -3.1% to +3.5% | -0.6% to +3.6% |
+| predicted | level or faster: met | slower up to about 12-15: met (the crossover below) | slower up to about 11-14: missed (crossover at 9-10 rows) |
+| against `fit` at 17-31 tokens | +4.2% to +7.9% | +2.7% to +8.4% | +2.4% to +4.8% |
+| predicted | +5-8%: 14 of 15 lengths (pp17 +4.2%) | +2-7%: 10 of 15 (5 up to 1.4 points above) | +3-4%: 11 of 15 (4 within 0.9 points) |
+| pp8 / pp16 / pp32 against `fit`, here (earlier runs) | +0.5 / +5.4 / +8.2% (+0.1 / +5.1 / +7.5%) | -5.1 / -0.1 / +7.2% (-5.6 / +1.8 / +6.7%) | -6.4 / +3.5 / +3.5% (-5.7 / +3.1 / +3.9%) |
+| pp16 / pp32 against `split`, here (earlier runs) | +12.1 / +17.8% (+12.2 / +17.1%) | +3.0 / +7.2% (+5.4 / +7.5%) | +29.5 / +47.1% (+29.2 / +47.6%) |
+
+- The criterion: at 17-31 tokens the smallest gains over `split` are +16.4% (0.6B Q4_0, pp27), +7.5% (Q8_0, pp27) and
+  +23.5% (4B, pp20). No length from 8 to 32 is more than 1.2% slower than `split` (Q8_0's pp8 and pp9, -1.2% each,
+  standard deviations 1.6-2.4%, below 16 tokens).
+- pp16 on Q8_0, the one point that did not repeat: `split` and `fit` within 1% of the Q8_0 check's (300.3 against
+  301.7 t/s, 309.5 against 312.3), `fit,staged` 309.1 ± 5.8 against 318.0 ± 0.9, so +3.0% over `split` where that check
+  had +5.4% (the counter modes +4.0% and +5.1%). At exactly 16 tokens on Q8_0 the gain sits at part 2's bar (3.0-5.4%
+  in the four measurements); from 17 tokens it is at least 7.5%. Not this run's criterion (17-31 tokens); part 2 from
+  16 tokens is the user's trial (2026-10-22).
+- The crossover with `fit` (the counter modes' graph times): on 0.6B Q4_0 level at 8 rows (+0.2%), `fit,staged` 2.7-5.0%
+  faster from 9; on Q8_0 slower at 8-10 and 12-13 rows (0.5-7.1%), level at 11, 1.4-2.7% faster from 14; on 4B slower
+  at 8-9 (3.3-4.5%), faster from 10 (1.0-4.0%) but for 12 (+0.8%). llama-bench agrees within its noise (Q8_0's
+  pp10-pp13 within ±1.7%).
+- `split` from 17 rows, as predicted: on 0.6B its rate falls 16.9% (Q4_0) and 16.3% (Q8_0) from pp16 to pp17, on 4B
+  7.4%, against 0.7-4.6% for both fit settings. The counters: on 0.6B Q4_0 k, v, o and down take 75-83% longer at 17
+  rows than at 16, q, gate and up 13-15%; on 4B k and v 73-77%, the others 12-17%. By the code
+  (flagos-spacemit-ime.cpp:461-468, 504-524), from 17 rows those matrices take blocks of 16 rows, one (block, column
+  range) task per tile, so half the tiles multiply 16 rows over twice the columns they had at 16 rows; their time then
+  stays near that level (k on 0.6B Q4_0: 2,732-2,852 µs per graph at 17-29 rows against 1,612 at 16; 3,350 at 31,
+  where the 15-row block's remainder rows make it the slower half).
+- 4B's down leaves path B at 20 rows (read in the code, seen in the counters): path B needs the batch's activations
+  and one slab in a tile's 393,216 bytes of TCM (`slabs_hold_activations`, flagos-spacemit-ime.cpp:283-285). 4B's down
+  has rows of 9,728 values: 11,020 bytes of Q4_0 activations per row next to a 175,104-byte slab, so up to 19 rows;
+  its four Q4_1 layers (i8 activations, 11,552 bytes per row; slab 184,832) up to 18
+  (flagos-spacemit-ime-kernels.h:54-68). Path A needs 4 rows for every tile (32 rows), so from there to 31 rows down
+  runs on path C in both fit settings, as in `split`: under `fit,staged` its time is within 0.7% of `split`'s at 20
+  rows (Q4_1: 0.3% at 19), against 36% less at 18; under `fit` its odd tiles' excess falls from 8.3% to 0.7% (Q4_1:
+  8.8% to 1.9%). So the gain over `split` falls from +34.3% at pp19 to +23.5% at pp20 and returns at pp32 (+47.1%,
+  down on path A). The prediction missed it by not computing path B's reach on 4B, as Q8_0's pp320 did. On 0.6B every
+  matrix stays on path B through 32 rows (down up to 97 rows in Q4_0, 79 in Q8_0).
+- The remainder rows (measured): in every setting on every model, a batch of 4q+4 tokens takes less time than one of
+  4q+3: under `fit,staged` 5.0-11.7% less on 0.6B and 9.1-15.5% on 4B (where no path changes between the two
+  lengths), under `split` 2.9-16.4%. The counters put the difference in the matmuls: each of a batch's last 1-3 rows
+  costs 0.6-0.9 of a group of 4 (three of them 1.8-2.6 groups); gemm_rows runs them one at a time
+  (flagos-spacemit-ime.cpp:133-142), and why one row costs that much inside the kernel is not isolated. The padding
+  proposed above (the last 2-3 rows through the 4-row kernel) would bring a batch of 4q+3 tokens near the time of 4q+4
+  and save a few percent at 4q+2 (estimates); it applies to every setting, `split` included, and changes Q4_0's
+  outputs (a logits check decides).
+- The pair turns at 8-31 rows (counters): under `fit` the odd tiles lag by 4.6-22.4% on 0.6B (about 0.9/R as before,
+  growing slowly with the rows) and 1.6-20.4% on 4B; under `fit,staged` by 0.3-4.8% on 0.6B and up to 6.6% on 4B (its
+  Q4_1 down at 8 rows): the residual odd-tile disadvantage seen from 32 rows, also at 8-31.
+- pp128-pp320, pp512 and tg128 as in the earlier runs: against `fit` +3.5 to +6.0% (0.6B Q4_0), +5.3 to +7.8% to pp256
+  and level at pp320 (Q8_0), level on 4B; pp512 and tg128 within 0.4% of `split` on all three.
+- For bigger models (the user's step 4), read in the code: the longer a matrix's rows, the fewer batch rows path B
+  holds, so more of a model's matmuls run on path C between that limit and 32 rows, under every setting. For Q4_0, a
+  down with rows of 12,288 values would hold 12 rows (13,920 bytes of activations per row next to a 221,184-byte
+  slab); a model's limits follow from its shapes before any run.
+
 ### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
@@ -1683,3 +1747,10 @@ reported, with no bar. If the criterion fails, the default change waits and the 
 - 2026-10-23: step 2 prepared (§7.3; user request): the runner's `PPODD` (the prompt lengths of its single-batch run;
   default unchanged, checked on the Mac by dry runs of every experiment), three sessions at 8-32 tokens with
   predictions and criterion. Not yet run on the K3.
+- 2026-10-23: step 2 run on the K3 and read (§7.3; build `2c7c761`, 5 runs per mode on Qwen3-0.6B in Q4_0 and Q8_0,
+  3 on Qwen3-4B): the criterion met on all three (at 17-31 tokens at least +16.4%, +7.5% and +23.5% against `split`;
+  at 8-32 never more than 1.2% slower); against `fit` +4.2 to +7.9%, +2.7 to +8.4% and +2.4 to +4.8% at 17-31 tokens,
+  the crossover at about 9, 14 and 10 rows. pp16 on Q8_0 +3.0% against `split` (the Q8_0 check: +5.4%), at part 2's
+  bar. Also found: `split`'s 16-row blocks from 17 rows (k, v, o, down 75-83% slower on 0.6B), 4B's down off path B
+  from 20 rows (19 for Q4_1) until path A at 32, and the remainder rows (a batch of 4q+4 tokens 5-16% faster than one
+  of 4q+3, in every setting). Next: the user's step 3 (a model of another family of similar size).
