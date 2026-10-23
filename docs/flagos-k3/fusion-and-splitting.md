@@ -1637,9 +1637,80 @@ criterion is met on all three models.
 - pp128-pp320, pp512 and tg128 as in the earlier runs: against `fit` +3.5 to +6.0% (0.6B Q4_0), +5.3 to +7.8% to pp256
   and level at pp320 (Q8_0), level on 4B; pp512 and tg128 within 0.4% of `split` on all three.
 - For bigger models (the user's step 4), read in the code: the longer a matrix's rows, the fewer batch rows path B
-  holds, so more of a model's matmuls run on path C between that limit and 32 rows, under every setting. For Q4_0, a
-  down with rows of 12,288 values would hold 12 rows (13,920 bytes of activations per row next to a 221,184-byte
-  slab); a model's limits follow from its shapes before any run.
+  holds, so more of a model's matmuls run on path C between that limit and 32 rows under `split`, `fit` and
+  `fit,staged` (`spacemit` keeps path B there, reading the activations from the workspace: gemm_slabs,
+  flagos-spacemit-ime.cpp:326-328). For Q4_0, a down with rows of 12,288 values would hold 12 rows (13,920 bytes of
+  activations per row next to a 221,184-byte slab); a model's limits follow from its shapes before any run.
+
+**Another family: Llama-3.2-1B-Instruct (the user's step 3), prepared 2026-10-23.** The user's choice among candidates
+checked the same day against the provider's rules: llama.cpp's graph builder per architecture (only ops the provider
+takes), the published configs (Q4_0 rows a multiple of 256 values, every weight's output rows a multiple of 32,
+attention heads of at most 128 values: flagos-spacemit-weights.cpp:10-28, flagos-spacemit-attn.cpp:26) and the GGUF
+files' tensor lists (read from their headers). The files: unsloth's on ModelScope, like the Qwen3 files, downloaded on
+the board directly (its DNS resolves modelscope.cn): Q4_0 773,025,824 bytes (SHA-256 `66bfbb2d...1a70c2`), every
+matmul Q4_0 but `ffn_down` of layers 0-1 (Q4_1, the imatrix rule), the tied embedding and head Q6_K, `rope_freqs`
+F32; Q8_0 1,321,082,528 bytes (`3f87a880...c7ffd1`), all Q8_0. 16 layers, hidden 2,048, 32 query heads of 64 values
+and 8 KV heads, feed-forward 8,192, vocabulary 128,256. On the Mac's simulated device (`build-host`, the same op checks
+as the board) both files take 2 graph splits with flash attention on. Also fit by the code and the files (unsloth's
+Q4_0 and Q8_0 on ModelScope): ERNIE-4.5-0.3B, OLMo-2-1B, Llama-3.2-3B, Ministral-3-3B, SmolLM3-3B. Not: Gemma 3
+(GELU, tanh, SCALE; heads of 256 values on 1B), Phi-4-mini (a SCALE on Q in every layer, src/models/phi3.cpp:123),
+Granite (SCALE), LFM2 (convolutions), Falcon3 (heads of 256).
+
+What differs from Qwen3 (read in the code; shares by weight count):
+
+| Matrix (K x N) | q 2048 x 2048 | k, v 2048 x 512 | o 2048 x 2048 | gate, up 2048 x 8192 | down 8192 x 2048 |
+|---|---|---|---|---|---|
+| share of a layer's weights | 6.9% | 3.4% (both) | 6.9% | 55.2% (both) | 27.6% |
+| slabs per tile (N/256; Qwen3 4-38) | 8 | 2 | 8 | 32 | 8 |
+| path B holds, rows (Q4_0 / Q8_0) | 153 / 133 | 153 / 133 | 153 / 133 | 153 / 133 | 26 / 11 (Q4_1: 24) |
+| `split`'s 16-row blocks from (rows) | 32 | 17 | 32 | 128 | 32 |
+
+- Under `fit` and `fit,staged`, down leaves path B at 27 rows in Q4_0 (25 for the Q4_1 layers) and at 12 in Q8_0, then
+  runs path C, as under `split`, until path A at 32. Under `spacemit` it stays on path B with the activations outside
+  TCM (gemm_slabs, above), a comparison at 12-31 rows that no run has made.
+- `split` should slow less at 17 rows than on Qwen3-0.6B: only k and v take 16-row blocks there (3.4% of the weights,
+  against 47%). From 33 rows its blocks leave the tiles uneven for q, o, down, k and v (at 33 rows 9 tasks for 8
+  tiles: four tiles take two tasks of 16 rows by 768 columns, three none; flagos-spacemit-ime.cpp:504-524), as on
+  Qwen3 at 33 tokens.
+- Heads of 64 values and normal-mode RoPE with frequency factors run in a model on the provider for the first time
+  (their op tests passed on the K3: ROPE 165 cases, attention 1,324; build.md §7). So the sessions start with the
+  acceptance script against the CPU.
+
+Sessions, in one chain: (1) `spacemit_check.py --milestone m2e --model` the Q4_0 file (2 graph splits, flash
+attention kept under `-fa auto`, perplexity within 1% of the CPU, KLD against the CPU at 512-token batches and `-ub 1`;
+llama-bench of the provider, the CPU and the IME path); (2) `EXPS="mm pb fit fit-staged" REPS=5` on the Q4_0 file with
+`PPODD=2,4,8,16,24,26,27,28,32,33,36,37,40,44,48,64,65,96,100,128,129` (down's limit at 26-28 added); (3) the same on
+the Q8_0 file with `PPODD=2,4,8,11,12,13,16,24,32,33,36,37,40,44,48,64,65,96,100,128,129` (its limit at 11-13).
+
+Predictions (estimates fixed before the run, from the Qwen3 runs' per-matrix times, the shapes and the code):
+
+- Placement and accuracy: 2 graph splits per token and flash attention on the provider, as on the Mac. Perplexity
+  within 1% of the CPU likely, not certain (Qwen3-0.6B +0.89%, 4B +0.05%); mean KLD against the CPU at 512-token
+  batches between 4B's 0.0034 and 0.6B's 0.0147 (no model of it).
+- Outputs: every candidate the same text as `split` and KLD at the floor at `-ub` 128, 64 and 16.
+- Counters: under `fit` the odd tiles lag by about 0.9/R (about 45% for k and v, 11% for q, o and down, 3% for gate and
+  up), under `fit,staged` by 0-5%; down's lag under `fit` falls to about zero from 27 rows in Q4_0 (25 for Q4_1) and
+  from 12 in Q8_0.
+- `fit,staged` against `split`, Q4_0: +12 to +25% at 16-26 tokens (path B's gain over path C at 16 rows on Qwen3,
+  1.15-1.25x per matrix on 0.6B and 1.22-1.53x on 4B, weighted by these shares), +8 to +18% at 27-31 (down as in
+  `split`), +25 to +50% at 32 (down on path A; 4B +47%), at least that from 33 to 100 at the lengths that are not
+  multiples of 16 (`split`'s blocks), +5 to +15% at 128-129 (path B against `split`'s path A for six matrices),
+  within ±1% at 160-512 (path A everywhere), tg128 within ±0.5%. `split` from pp16 to pp17: -4 to -8% (Qwen3-0.6B
+  -16.9%).
+- Q8_0: +2 to +8% at 12-31 tokens (path B's gain at 16 rows on 0.6B in Q8_0: 1.04-1.10x per matrix; down as in
+  `split`), so part 2 of the rule (+5%) is at risk there; from 32 tokens as Q4_0, with smaller gains per matrix.
+- Against `fit`: slower at 2-8 tokens (as on Qwen3), +2 to +6% at 10-26 (the turns' tail, largest on k and v), +1 to
+  +3% from 27 (down off path B in both).
+- `spacemit` as `fit` where path B holds the activations; at 27-31 tokens (Q4_0) and 12-31 (Q8_0), where its down
+  reads them from the workspace, no estimate of the sign; 2-8% slower than `fit,staged` at 128-129 (its down there).
+  `rows` as `split` below 32 tokens; from 32 level with `fit,staged` at multiples of 32 and behind it elsewhere (as on
+  Qwen3-0.6B).
+
+Criterion (fixed before the run), per file: from 16 tokens no tested length more than 1% slower than `split` and every
+tested length from 16 to 100 at least 5% faster (the rule's two parts from 16 tokens), with outputs identical; and the
+acceptance script's checks pass (if its perplexity bound fails, the model's accuracy is examined first, against the IME
+path on the same file). The comparisons with `fit`, `rows` and `spacemit` are reported, with no bar. If the criterion
+fails, the default change waits and the failing lengths are examined first.
 
 ### 7.4 Still proposed
 
@@ -1754,3 +1825,8 @@ criterion is met on all three models.
   bar. Also found: `split`'s 16-row blocks from 17 rows (k, v, o, down 75-83% slower on 0.6B), 4B's down off path B
   from 20 rows (19 for Q4_1) until path A at 32, and the remainder rows (a batch of 4q+4 tokens 5-16% faster than one
   of 4q+3, in every setting). Next: the user's step 3 (a model of another family of similar size).
+- 2026-10-23: step 3 prepared (§7.3; the user's choice among candidates checked the same day against the provider's
+  rules): Llama-3.2-1B-Instruct in Q4_0 and Q8_0 (unsloth, ModelScope, downloaded on the board), 2 graph splits on
+  the Mac's simulated device; the acceptance script against the CPU, then `EXPS="mm pb fit fit-staged"` on both files,
+  with predictions and criterion (part 2 at risk on Q8_0 at 12-31 tokens, where down leaves path B). Not yet run on
+  the K3.
