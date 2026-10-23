@@ -1499,6 +1499,55 @@ than `split` and every length from 16 to 100 tokens is at least 5% faster than `
 tokens; `rows` is not in this run). Against `fit` the run reports, with no bar. If the criterion fails, the default
 change waits and the Q8_0 case is examined first.
 
+**The Q8_0 check on the K3 (2026-10-22, build `cdfd29e`; 5 runs per mode, the modes interleaved; `~/fx-q8fs.log`).**
+All 132 runs returned 0, and the criterion is met: the choice holds on Q8_0.
+
+| Tokens | `fit,staged` against `split` | against `fit` | Predicted against `fit` |
+|---|---|---|---|
+| pp2, pp4, pp8 | -3.7%, +1.7%, -1.7% | -9.7%, -5.8%, -5.6% | slower: met |
+| pp16 | +5.4% | +1.8% | within 3%: met |
+| pp32-pp48 (7 lengths) | +7.5% to +78.4% | +6.7% to +8.1% | 4-9%: met |
+| pp64, pp65 | +11.4%, +126.5% | +9.8%, +10.2% | 4-9%: about a point above |
+| pp96-pp129 (4 lengths) | +9.3% to +105.7% | +7.1% to +7.7% | 4-9%: met |
+| pp160-pp256 (3 lengths) | +8.6% to +9.0% | +5.2% to +5.4% | 2-5%: 0.2-0.4 points above |
+| pp320 | -0.2% | +0.0% | 2-5%: missed (path B no longer runs, below) |
+| pp512, tg128 | -0.2%, +0.2% | +0.0%, -0.1% | unchanged within 0.5%: met |
+
+- The criterion: from 16 tokens the slowest length against `split` is pp320 at -0.2% (bar -1%), and the smallest gain
+  at 16-100 tokens is pp16's +5.4% (bar +5%; the standard deviations 0.3% of the means), so both parts hold. pp2 and
+  pp8 (-3.7%, -1.7%; pp8's runs scatter by 3.0-3.3% in all modes) are among the small batches set aside.
+- Outputs: the same text in all three modes; KLD at the floor (mean 0.000000, maximum 0.000056) for both candidates at
+  `-ub` 128, 64 and 16; `split`'s perplexity the same at all three (13.6107). The same top token in 99.951% of the
+  2,040 tokens compared, not 100% as predicted: one token, in both candidates at all three batch sizes. Checked
+  2026-10-23 from the runs' own output: the candidates' perplexity (`Mean PPL(Q)`, in `kld-*.out`: llama-perplexity's
+  plain `LOG` goes to stdout) is 13.610728 ± 1.024828 in all six runs and `split`'s 13.6107 ± 1.02483 at all three
+  batch sizes, the same to every digit printed; and the provider's check on the K3 (the prepare step, all checks
+  passed) compares every setting's output with `split`'s byte for byte, Q8_0 at 3, 28 and 64 rows among its cases
+  (`check_mm_paths`). So the one token comes from the comparison: llama-perplexity keeps the reference's
+  log-probabilities in 16 bits and takes the reference's top token from those (tools/perplexity/perplexity.cpp:79-104,
+  222-239), so a near-tie can count as a different top token. Not shown directly (a one-ulp difference at one token
+  would not move the perplexity's digits); `split` against its own base would. Also read there: the base clamps
+  log-probabilities at 16 below the top logit (perplexity.cpp:86), so its own perplexity reads 1.0% lower (`Mean
+  PPL(Q)/PPL(base)` 1.010142 with the same logits); no criterion here uses it.
+- Path B's reach (read in the code, matching the counters): path B runs while the batch's activations and one slab fit
+  in a tile's 393,216 bytes of TCM (`slabs_hold_activations`, flagos-spacemit-ime.cpp:283-285). With Q8_0's 38-byte
+  activation blocks and 34-byte weight blocks per 32 values (flagos-spacemit-ime-kernels.h:36-67) that is up to 294
+  rows for 0.6B's q, k, v, gate and up (rows of 1,024 values), 133 for o (2,048) and 79 for down (3,072). In `fit-ops`
+  down's odd tiles lag at 65 rows and not at 96, o's at 129 and not at 160, the other five's at 256 and not at 320. So
+  at pp320 both settings run the same paths (equal times, odd excess ±0.0% in both); the prediction, taken from Q4_0
+  0.6B, missed because Q4_0's smaller blocks fit 323 rows of 1,024 values. The gain against `fit` falls as matrices
+  leave path B: 6.7-10.2% while all seven take it (32-65 tokens), 7.1-7.7% without down (96-129), 5.2-5.4% without o
+  and down (160-256), none at 320. Within 32-65 tokens it is largest at 64 and 65 (by the code the turns' tail, one
+  slab's multiply, grows with the rows while the copies' collisions do not; inference).
+- The turns' tail as on Q4_0: under `fit`, in path B from 32 rows, the odd tiles lag by 19.0-24.0% with 4 slabs per
+  tile (k, v, o, down), 10.1-12.0% with 8 (q) and 6.9-8.1% with 12 (gate, up), about 0.9/R; under `fit,staged` by
+  0.2-3.5%, less with more rows (0.8-3.5% at 32-65 rows, 0.2-1.3% at 160-256): the residual odd-tile disadvantage seen
+  on Q4_0, cause not isolated.
+
+Next, by the user's plan (2026-10-22): prompts of 9-15 and 17-31 tokens, a model of another family of similar size,
+bigger models; then graph splitting, with fusion later. The default change and its acceptance runs after those checks
+(proposed).
+
 ### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
@@ -1595,3 +1644,10 @@ change waits and the Q8_0 case is examined first.
   from 16 tokens, a decision after the data); `fit,mixed` and the one-slab condition not pursued. Next: its check on
   Qwen3-0.6B in Q8_0 against `split` and `fit` (§7.3, predictions and criterion fixed before the run), then the
   default change and the acceptance runs on both models.
+- 2026-10-23: the Q8_0 check read (§7.3; run on the K3 2026-10-22, build `cdfd29e`, 5 runs per mode): the criterion
+  met (from 16 tokens at worst -0.2% against `split`, every length from 16 to 100 at least +5.4%), outputs identical by
+  text, KLD and perplexity (13.610728 in all six runs, `split`'s 13.6107; the same top token 99.951%, one token, from
+  the reference's 16-bit storage, not shown directly). Against
+  `fit` +1.8% at pp16, +6.7-10.2% at 32-129 tokens, +5.2-5.4% at 160-256, level at 320 (path B's TCM limit for Q8_0,
+  294 rows of 1,024 values), -5.6 to -9.7% at 2-8. The choice holds on Q8_0. Next: the user's plan (prompts of 9-15
+  and 17-31 tokens, another family, bigger models), then graph splitting.
