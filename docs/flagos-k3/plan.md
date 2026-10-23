@@ -377,6 +377,11 @@ Not in M2d: attention (`FLASH_ATTN_EXT`, and the `-fa off` path) stays on the CP
 
 **Scope (M2c.1):** Q4_1 `MUL_MAT` with the same op check as Q4_0: weight 2-D, rows % 32 == 0, not a view, in the provider's buffer (or unallocated); activations F32 contiguous; output F32 contiguous. Any row length (Q4_1 blocks are 32 values, which is also the layout's K block). Qwen3-4B: 4 x (9728 -> 2560); Qwen3-0.6B: 3 x (3072 -> 1024).
 
+**Superseded 2026-10-23 (user decision; `fusion-and-splitting.md` §7.3):** on Llama-3.2-1B Q4_0 the zero-point rounding
+below costs +5.5% perplexity against the CPU (mean KLD 0.055, the upstream IME path alike), so Q4_1 weights are now
+requantized to Q8_0 at load, as Q6_K is (layout `q4_1_q8_0_32x32`, the Q8_0 kernels; reads return the nearest Q4_1);
+this route stays behind `FLAGOS_SPACEMIT_Q4_1=zero-point` (test-only) for comparisons.
+
 **Route: the in-tree IME path's Q4_1 route, unchanged.** In-tree `ggml-cpu/spacemit` and ggml-spacemit both choose `q4_1_32x32_q8_0` on the A100 cores (`ime.cpp:1299-1319`; a Q4_1 variant of the 32x256 layout is commented out there as TODO), and the IME baseline's perplexity on Qwen3-4B (9.7680, CPU 9.7740) includes it:
 - weights, layout `q4_1 32x32`: 32 rows interleaved, K in blocks of 32; per row and block an fp16 scale d, a uint8 zero point zp and 32 4-bit values q, a weight being d x (q - zp). 19 bytes per 32 weights (GGUF Q4_1: 20). Repack `repack_q4_1_to_q4_1_32_bl_ref` with `make_block_q4_1x32`, the scalar version: upstream calls an RVV version that divides in fp16, so near .5 it can round a zero point differently; the scalar one gives the same bytes on the Mac and the K3.
 - activations: int8 per 32 values with an fp32 scale and the negated int16 sum, 38 bytes per 32 values (`quantize_a_row_i8`, `quantize_a_4row_i8`).

@@ -89,13 +89,15 @@ size_t q8_0_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
 void copy(void * dst, const void * src, size_t size);
 
 // GGUF bytes <-> IME layout in t->data; repack returns 0 on success. unpack_q4_0 and unpack_q8_0 restore the GGUF
-// bytes; unpack_q4_1 returns the converted tensor (m = -zp * d), the weights the kernels compute with; unpack_q6_k
-// returns the nearest Q6_K to the stored Q8_0 values (approximate). repack_q6_k writes
-// nrows * q8_0_weight_row_bytes(ne[0]) bytes, more than ggml_nbytes(t)
+// bytes; unpack_q4_1 returns the converted tensor (m = -zp * d), the weights the kernels compute with; unpack_q4_1_q8_0
+// and unpack_q6_k return the nearest Q4_1 and Q6_K to the stored Q8_0 values (approximate). repack_q4_1_q8_0 and
+// repack_q6_k write nrows * q8_0_weight_row_bytes(ne[0]) bytes, more than ggml_nbytes(t)
 int  repack_q4_0(ggml_tensor * t, const void * data, size_t size);
 void unpack_q4_0(const ggml_tensor * t, void * data);
 int  repack_q4_1(ggml_tensor * t, const void * data, size_t size);
 void unpack_q4_1(const ggml_tensor * t, void * data);
+int  repack_q4_1_q8_0(ggml_tensor * t, const void * data, size_t size);
+void unpack_q4_1_q8_0(const ggml_tensor * t, void * data);
 int  repack_q8_0(ggml_tensor * t, const void * data, size_t size);
 void unpack_q8_0(const ggml_tensor * t, void * data);
 int  repack_q6_k(ggml_tensor * t, const void * data, size_t size);

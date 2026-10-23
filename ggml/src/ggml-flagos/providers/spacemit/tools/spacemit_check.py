@@ -15,7 +15,9 @@
 #         with the reference kernels; flagos-check-spacemit adds a Qwen3-like layer against the CPU
 #   m2c:  as m2d, with Q4_1 matmuls (the IME layout q4_1 32x32, lossy): flagos-check-spacemit adds Q4_1 against the
 #         CPU on the converted weights, the conversion's own effect and the 1-row kernel's zero-point probe (both
-#         informational), and the layer with a Q4_1 down projection; the benchmark adds Q4_1 at Qwen3-4B's ffn_down
+#         informational), and the layer with a Q4_1 down projection; the benchmark adds Q4_1 at Qwen3-4B's ffn_down.
+#         From 2026-10-23 Q4_1 is requantized to Q8_0 at load (checked as Q6_K); the zero-point layout and its checks
+#         only with FLAGOS_SPACEMIT_Q4_1=zero-point
 #   m2c2: as m2c, with Q8_0 and Q6_K matmuls (the IME layout q8_0 32x32; Q6_K requantized to Q8_0 at load): it claims
 #         MUL_MAT cases of test-backend-ops (Q8_0 and Q6_K weights with rows a multiple of 32), which pass with the IME
 #         and with the reference kernels (which read Q6_K back, so they cannot see the requantization);

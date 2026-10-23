@@ -33,7 +33,7 @@ const mm_format k_q4_0_32x256 = { (int64_t) spacemit_ime::q4_0_k_block, spacemit
 const mm_format k_q4_1_32x32  = { (int64_t) spacemit_ime::q4_1_k_block, spacemit_ime::i8_act_row_bytes,
                                   spacemit_ime::q4_1_weight_row_bytes,  spacemit_ime::i8_quantize_row,
                                   spacemit_ime::i8_quantize_4rows,      spacemit_ime::q4_1_gemm };
-// Q8_0 weights, and Q6_K weights requantized to Q8_0 at load: the same layout and kernels
+// Q8_0 weights, and Q4_1 and Q6_K weights requantized to Q8_0 at load: the same layout and kernels
 const mm_format k_q8_0_32x32  = { (int64_t) spacemit_ime::q8_0_k_block, spacemit_ime::i8_act_row_bytes,
                                   spacemit_ime::q8_0_weight_row_bytes,  spacemit_ime::i8_quantize_row,
                                   spacemit_ime::i8_quantize_4rows,      spacemit_ime::q8_0_gemm };
@@ -45,6 +45,7 @@ const mm_format & mm_format_of(const ggml_tensor * w) {
             return k_q4_0_32x256;
         case spacemit_layout::q4_1_32x32:
             return k_q4_1_32x32;
+        case spacemit_layout::q4_1_q8_0_32x32:
         case spacemit_layout::q8_0_32x32:
         case spacemit_layout::q6_k_q8_0_32x32:
             return k_q8_0_32x32;

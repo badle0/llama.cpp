@@ -1707,10 +1707,193 @@ Predictions (estimates fixed before the run, from the Qwen3 runs' per-matrix tim
   Qwen3-0.6B).
 
 Criterion (fixed before the run), per file: from 16 tokens no tested length more than 1% slower than `split` and every
-tested length from 16 to 100 at least 5% faster (the rule's two parts from 16 tokens), with outputs identical; and the
-acceptance script's checks pass (if its perplexity bound fails, the model's accuracy is examined first, against the IME
-path on the same file). The comparisons with `fit`, `rows` and `spacemit` are reported, with no bar. If the criterion
-fails, the default change waits and the failing lengths are examined first.
+tested length from 16 to 100 at least 5% faster (the rule's two parts from 16 tokens), with outputs identical; and, on
+the Q4_0 file only, the acceptance script's checks pass: the paths new to a model (heads of 64 values, RoPE with
+frequency factors) do not depend on the weight format, and Q8_0 changes only the matmuls, whose op tests pass on the
+K3 (if its perplexity bound fails, the model's accuracy is examined first, against the IME path on the same file).
+The comparisons with `fit`, `rows` and `spacemit` are reported, with no bar. If the criterion fails, the default change
+waits and the failing lengths are examined first.
+
+**Llama-3.2-1B in Q4_0 on the K3 (2026-10-23, build `2c7c761`, whose code is `cdfd29e`'s; `~/acc-l1b.log`,
+`~/fx-l1b.log`).** The acceptance script passes 32 of its 34 checks; the two failures are its perplexity bound, so by
+the criterion the model's accuracy is examined first and the default change waits. The benchmark meets its part of the
+criterion with wide margins.
+
+- Accuracy against the CPU (8 x 512 tokens): perplexity 14.149 against 13.4182 (+5.45%), with `-fa on` and under
+  `-fa auto`; mean KLD 0.0548 ± 0.0022 at 512-token batches (99% 0.468, maximum 1.28, same top token 88.5%) and
+  0.0513 ± 0.0020 at `-ub 1` (0.460, 1.23, 89.1%), against Qwen3-0.6B's 0.0147 and Qwen3-4B's 0.0034, so the prediction
+  missed. The generated text leaves the CPU's after 47 characters. Passed: 2 graph splits per token, flash attention
+  kept under `-fa auto`, all op tests. llama-bench (3 runs): the provider pp128 371.8 and tg128 33.5 t/s, the IME path
+  349.3 and 32.5, the CPU 76.1 and 16.4.
+- What the two KLD values say (inference, from the code): they are nearly equal, so the paths that run only in batches
+  (Q4_0's 4-row quantizer, one scale per 32 values over four rows, flagos-spacemit-ime-kernels.cpp:1526-1534) explain
+  at most their difference, and two different attention kernels (tiled at 512-token batches, one-chunk at `-ub 1`)
+  would have to fail alike. The suspects: the lossy Q4_1 conversion of `ffn_down` in layers 0-1 (the check tool
+  measures the conversion alone at NMSE 5.86e-3 on random weights, its INFO line in the same log; llama-quantize makes
+  exactly these layers Q4_1 to "guard against craziness in the first few ffn_down layers", src/llama-quant.cpp:620),
+  RoPE in normal mode with frequency factors, and the head's requantization. Queued after the Q8_0 session: the IME
+  path on the same file and the Q8_0 file against the CPU, and `-fa off` (attention on the CPU).
+- The benchmark: all 220 runs returned 0, the five settings generated the same text, and every candidate's logits equal
+  `split`'s at `-ub` 128, 64 and 16 (mean KLD 0.000000, maximum 0.000042, same top token 100%). From 16 tokens the
+  worst length against `split` is pp160 at -0.15% (bar -1%), and the smallest gain at 16-100 tokens is pp28's +19.5%
+  (bar +5%). `fit,staged` is the fastest of the five at every tested length from 16 to 129 tokens; from 160 tokens and
+  in tg128 all five lie within 1% of one another; below 16 tokens `spacemit` and `fit` lead it by 2-7% (the small
+  batches set aside).
+
+| `fit,staged` against | `split` | `fit` | `rows` | `spacemit` |
+|---|---|---|---|---|
+| pp2, pp4, pp8 | +3.8, +20.6, +11.8% | -5.2, -4.0, -2.4% | +6.8, +22.3, +12.1% | -7.3, -6.2, -3.1% |
+| pp16, pp24, pp26 | +25.6 to +31.8% | +4.2 to +5.1% | +26.5 to +31.7% | +4.4 to +5.7% |
+| pp27, pp28 | +20.0, +19.5% | +3.4, +3.2% | +19.5, +19.4% | +8.8, +8.3% |
+| pp32 | +32.4% | +4.1% | +3.6% | +21.1% |
+| pp33-pp48 (6 lengths) | +72.3 to +91.1% | +3.0 to +3.8% | +19.4 to +32.9% | +6.2 to +13.2% |
+| pp64, pp65 | +43.7, +102.7% | +3.6, +3.9% | +9.0, +24.0% | +22.1, +15.3% |
+| pp96, pp100 | +97.7, +98.4% | +4.1, +3.9% | +11.6, +24.8% | +21.3, +14.1% |
+| pp128, pp129 | +11.8, +20.2% | +3.4, +3.7% | +12.0, +20.2% | +12.0, +19.5% |
+| pp160-pp512 (5 lengths) | -0.2 to +0.1% | -0.2 to +0.3% | -0.3 to +0.2% | -0.8 to +0.1% |
+| tg128 | +0.4% | +0.4% | +0.5% | +0.1% |
+
+- Against the predictions: against `split` +25.6 to +31.8% at 16-26 tokens (predicted +12 to +25%) and +19.5 to
+  +20.0% at 27-28 (+8 to +18%), both above: path B's gain per matrix at 16 rows is 1.24-1.55x, nearer Qwen3-4B's than
+  0.6B's, as Llama's gate, up and down (83% of the weights) gain 1.38-1.55x. pp32 +32.4% (+25 to +50%: met), every
+  length from 33 to 100 at least that (met), pp128 and pp129 +11.8% and +20.2% (+5 to +15%: pp129 above), 160-512 and
+  tg128 within 0.4% (met). Against `fit`: slower at 2-8 tokens (met), +4.2 to +5.1% at 16-26 (+2 to +6%: met), +3.0 to
+  +4.1% from 27 tokens (+1 to +3%: up to 1.1 points above; k and v keep their turns' tail on path B). `split` from pp16
+  to pp17: not tested (pp17 not in the run). `spacemit` as `fit` where path B holds the activations (pp16-26 within
+  0.6%: met); 10.7-16.3% behind `fit,staged` at pp128-129 (predicted 2-8%: missed). `rows` as `split` below 32 tokens
+  (met), but behind `fit,staged` even at multiples of 32, by 3.6-12.0% (predicted level: missed).
+- Path B with the activations outside TCM, the open comparison: at pp27 and pp28, where only `spacemit` keeps down on
+  path B (the activations read from the workspace), it is 5.0% and 4.7% slower than `fit`, whose down takes path C
+  there; at pp32, against `fit`'s path A, 14.0% slower. So `fit`'s rule (path C below 32 rows when the activations do
+  not fit) is the faster choice on this shape.
+- The counters, as predicted: under `fit` the odd tiles lag by 16-44% on k and v (2 slabs per tile; rising with the
+  rows toward the predicted 45%), 4-12% on q, o and down (8 slabs; predicted 11%) and 1-3% on gate and up (32 slabs;
+  predicted 3%), under `fit,staged` by 0.2-6.0% (predicted 0-5%). Down's lag under `fit` falls to 1.3% at 27 rows
+  (Q4_1: 2.2% at 26); from there down takes `split`'s time under `fit,staged` (ratio 0.99-1.00) and from 32 rows is
+  1.54x faster (path A). At 33 rows `split`'s k, v, q and o take 3.3-3.6x as long as under `fit,staged` (its 16-row
+  blocks give four tiles two tasks and three none, flagos-spacemit-ime.cpp:504-524), its gate and up 1.56x (no blocks
+  below 128 rows).
+
+**Llama-3.2-1B in Q8_0, and the accuracy follow-up (K3, 2026-10-23, same build; `~/fx-l1bq8.log`, `~/kld/l1b-*.txt`).**
+The Q8_0 benchmark meets its criterion, narrowly as predicted: all 220 runs returned 0, the five settings generated the
+same text, every candidate's logits equal `split`'s (mean KLD 0.000000, maximum 0.000048, same top token 100%); from
+16 tokens the worst length against `split` is pp256 at -0.28%, and the smallest gain at 16-100 tokens pp16's +5.70%
+(bar +5%).
+
+| `fit,staged` against | `split` | `fit` | `rows` | `spacemit` |
+|---|---|---|---|---|
+| pp2, pp4, pp8 | +7.2, +18.5, +6.0% | -10.8, -6.3, -10.0% | +4.3, +15.3, +5.4% | -10.0, -7.9, -11.0% |
+| pp11, pp12, pp13 | +19.4, +1.2, +3.0% | -0.7, -1.0, +0.5% | +18.7, +3.7, +3.3% | -1.2, -6.7, -6.5% |
+| pp16, pp24 | +5.7, +9.1% | +3.2, +2.4% | +6.1, +8.4% | -5.0, -5.8% |
+| pp32 | +20.6% | +4.0% | +1.0% | +16.6% |
+| pp33-pp48 (6 lengths) | +62.6 to +82.5% | +3.2 to +4.0% | +21.1 to +36.5% | +1.6 to +9.4% |
+| pp64, pp65, pp96, pp100 | +27.4, +86.5, +79.4, +78.5% | +3.8 to +4.5% | +8.3, +26.4, +9.6, +25.3% | +8.9 to +17.4% |
+| pp128, pp129 | +10.7, +20.6% | +4.0, +3.8% | +11.2, +21.1% | +11.1, +20.7% |
+| pp160-pp512 (5 lengths), tg128 | -0.3 to +0.1% | -0.2 to +0.2% | -0.3 to +0.1% | -0.3 to +0.1% |
+
+- Against the predictions: +1.2 to +9.1% against `split` at 12-24 tokens (predicted +2 to +8%: pp12 below, pp24 above),
+  so part 2 held at pp16 by 0.7 points; from 32 tokens the Q4_0 pattern with smaller gains (met). Against `fit`: level
+  at 11-13 tokens (predicted +2 to +6%: missed; the crossover is near 13-16 rows, as on Qwen3-0.6B in Q8_0), +2.4 to
+  +3.2% at 16-24, +3.2 to +4.5% from 32 (predicted +1 to +3%: above). `rows` as `split` below 32 tokens (met).
+- `spacemit` is the fastest setting at 4-24 tokens on this file (1-11% ahead of `fit,staged`). The counters place it
+  in down: under `fit` and `fit,staged` down leaves path B at 12 rows (`fit`'s odd-tile lag +9.3% at 11 rows, -0.2% at
+  12) and takes `split`'s time (24.1 against 23.9 ms per graph at 12 rows), while `spacemit` keeps it on path B with
+  the activations outside TCM, 20-26% faster at 12-24 rows (25.1 against 31.6 ms at 16). On the Q4_0 file the same
+  path is 18.5-21.9% slower than path C at 27-28 rows (its Q4_1 layers 9.5-11.6%), and at 32 rows path A beats both on
+  both files. So path B with the activations outside TCM wins at 12-24 rows (Q8_0) and loses at 27-32 rows (Q4_0, Q4_1
+  and Q8_0); the mechanism is not isolated, and with one shape per file the boundary between 24 and 27 rows is an
+  inference. A rule using that path below some row count would gain about 5-9% at 12-24 tokens on this file (an
+  estimate from `spacemit`'s lead); not pursued without the user.
+- Accuracy against the CPU (8 x 512 tokens): the provider on the Q8_0 file matches the CPU (mean KLD 0.000756 ±
+  0.000025, same top token 99.27%, perplexity 12.8092 against 12.8217, -0.05%), and on the Q4_0 file with `-fa off`
+  (attention on the CPU) it misses as with flash attention (mean KLD 0.0559, same top token 88.3%, perplexity +5.44%).
+  Both files run the same graph (RoPE in normal mode with frequency factors, heads of 64 values, the norms), so those
+  ops and the Q8_0 matmuls are cleared, and the error lies in the Q4_0 file's weights on the provider: the Q4_1
+  conversion of layers 0-1's down, the head's requantization from Q6_K, or the Q4_0 kernels (inference from the two
+  runs).
+- Invalid: the follow-up's first CPU run on the Q4_0 file produced NaN log-probabilities (its log has no `Final
+  estimate`, which llama-perplexity prints only when the variance is positive, tools/perplexity/perplexity.cpp:650-657),
+  so the provider and IME comparisons made against its base (both report the base perplexity as nan) are discarded.
+  The same CPU command before (the acceptance script) and after (`l1b-cpu2.txt`) gave 13.4182: an intermittent fault in
+  a CPU-only run, cause not isolated (compare question 8's intermittent CPU-backend crash).
+- Next (prepared 2026-10-23): two test files made by llama-quantize from the Q4_0 file, every other tensor copied
+  unchanged (src/llama-quant.cpp:705-708, 1161-1163): layers 0-1's down in Q8_0, and the head in Q8_0 (layers 0-1 kept
+  in Q4_1, as the imatrix rule applies only with an imatrix, :619); each against the CPU on its own file, and the IME
+  comparison rerun. Predicted: if the Q4_1 conversion is the main cause, the first file's KLD falls to Qwen3-0.6B's
+  range (0.015 or less); the head alone moved Qwen3's KLD by 0.0001-0.0002 (M2c.2), so the second file should change
+  little.
+
+**The cause: the Q4_1 conversion (K3 and the Mac, 2026-10-23; `~/kld/t-*.txt`).** Each file against the CPU on itself,
+8 x 512 tokens, in one session:
+
+| File | CPU perplexity | Provider against the CPU: perplexity, mean KLD, same top token |
+|---|---|---|
+| the Q4_0 file | 13.4182 | +5.52%, 0.0548, 88.3% (the upstream IME path: +5.62%, 0.0554, 88.3%) |
+| layers 0-1's down in Q8_0 (2 tensors converted) | 13.4226 | +0.24%, 0.0026, 97.0% |
+| the head in Q8_0 (1 tensor converted) | 13.3983 | +5.76%, 0.0538, 88.3% |
+
+- Giving the provider those two tensors in a layout it reads exactly (the Q8_0 file matched the CPU at KLD 0.00076)
+  removes 95% of the KLD and brings the perplexity within 1%, while the CPU's own perplexity barely moves (+0.03%):
+  the Q4_1 conversion of layers 0-1's down is the cause, both predictions met. The head's requantization changes the
+  KLD by 0.001, within its error. The upstream IME path makes the same error, so it is the in-tree route's (copied at
+  M2c.1), not the provider's.
+- The mechanism, read in the code and the file: the conversion stores Q4_1's fp16 minimum m as an integer zero point,
+  zp = -round(m/d) clamped to [0, 15], and the kernels compute d*(q - zp) (make_block_q4_1x32,
+  flagos-spacemit-ime-kernels.cpp:163-170, from upstream), so every weight of a 32-value block moves by m + d*zp, up to
+  d/2. Read from the file on the Mac (all 524,288 blocks of each tensor): -m/d lies in 0.6-14.6, so no block is
+  clamped, and the rounding adds error energy of 0.677% and 0.672% of the weights' energy in layers 0 and 1 (the check
+  tool's 5.86e-3 on random weights alike). The shift is common to a block's 32 weights, so it adds up in a dot product
+  rather than averaging out (inference), and it falls on the layers llama-quantize makes Q4_1 because Q4_0 fails there.
+- The bad CPU run had chunks 1-4 normal (13.65, 13.64, 15.57, 12.32, running estimates) and NaN from chunk 5; the disk
+  had 91 GB free.
+- The same test on Qwen3 (K3, the same day; test files with the Q4_1 layers in Q8_0, layers 0-2 of Qwen3-0.6B and 0-3
+  of Qwen3-4B, each converted from q4_1 as listed by llama-quantize; each file against the CPU on itself): Qwen3-0.6B
+  mean KLD 0.0149 -> 0.0044 (-71%), same top token 93.5% -> 96.4%; Qwen3-4B 0.00334 (M2e's 0.003354) -> 0.00260
+  (-22%), 96.9% -> 97.3%; the CPU's own perplexity moves by +0.09% and -0.02%. So the conversion is also most of
+  Qwen3-0.6B's error against the CPU, which M2e had put down to the IME approach as a whole (the upstream IME path
+  had the same KLD). The printed `Mean PPL(Q)/PPL(base)` ratios (0.6B 1.018 -> 1.013, 4B 1.0099 -> 1.0092) carry the
+  base's clamp (perplexity.cpp:86), about 1% on Qwen3 (4B's 1.0099 against M2e's +0.05% from the final estimates), so
+  KLD is the measure here.
+- For step 3: the criterion's accuracy part fails for a reason outside the settings and outside the paths new in this
+  model; the benchmark results stand (every setting computes the same bytes).
+- Options for Q4_1 (estimates; a decision for the user and the mentor, D4): (a) requantize Q4_1 to Q8_0 at load, as the
+  head's Q6_K already is: accurate (this run: KLD 0.0026 with those layers in Q8_0), 1.79x the bytes for those layers,
+  about 2% more weight bytes per token on this model and on Qwen3-4B (generation about 2% slower), 1% on Qwen3-0.6B;
+  (b) keep the 19-byte layout and add the minimum's exact term outside the IME kernel, out += sum over blocks of (m +
+  d*zp) * sum(a), from the activation sums the i8 format already stores: exact, about 1/32 more arithmetic for those
+  layers and 2 more bytes per block, new kernel code; (c) keep it, documented as the IME approach's limit. Measuring the
+  same test on Qwen3-0.6B (layers 0-2) and Qwen3-4B (0-3) would show how much of their KLD (0.0147, 0.0034) it is.
+
+**The fix: Q4_1 requantized to Q8_0 at load (option (a), the user's choice, 2026-10-23; implemented and checked on the
+Mac the same day, not yet run on the K3).**
+- What changed (providers/spacemit only): a layout `q4_1_q8_0_32x32` for Q4_1 matmul weights, the default. At load
+  each 32-row group is dequantized and requantized by ggml's own Q8_0 quantizer, the function llama-quantize used for
+  the test file above, then stored in the q8_0 32x32 layout and multiplied by the Q8_0 kernels, as the Q6_K head
+  already is (`repack_q4_1_q8_0`, `unpack_q4_1_q8_0` in flagos-spacemit-ime-kernels.cpp; flagos-spacemit-weights.cpp;
+  `mm_format_of` in flagos-spacemit-ime.cpp). Reads return the nearest Q4_1 and writes must be whole, as for Q6_K. The
+  old route stays for comparisons behind `FLAGOS_SPACEMIT_Q4_1=zero-point` (test-only, read once per process, as a
+  weight must be read in the layout it was stored in). flagos-check-spacemit checks Q4_1 as it checks Q6_K (against
+  the CPU's Q4_1, and tightly against ggml's Q8_0 of the same weights), and the zero-point layout's own checks under
+  the switch.
+- The cost, from the layouts (estimates of speed): 34 bytes per 32 weights instead of 19 for the Q4_1 layers, so the
+  provider reads 15.7 MB more per generated token on Llama-3.2-1B (+1.9% of its weight bytes), 46.7 MB on Qwen3-4B
+  (+1.9%) and 4.4 MB on Qwen3-0.6B (+1.1%); generation about as much slower, prompt processing less.
+- Checked on the Mac (host build, simulated device): flagos-check-spacemit passes all checks on both routes; Q4_1
+  against the CPU's Q4_1 max NMSE 1.8e-5 (16 cases, 1-128 rows; bound 5e-4), against ggml's Q8_0 of the same weights
+  4.4e-8 (bound 5e-6), the requantization alone 1.45e-5 (the zero-point conversion: 5.86e-3), reads within 5.4e-6 of
+  the GGUF weights (bound 5e-5), the layer with a Q4_1 down 5.4e-4 (bound 1e-3). Two mutations caught: stored scales
+  0.3% too large (only by the tight bound: 8-9e-6) and a 32-row group stored in reverse (everywhere). test-backend-ops
+  passes every claimed case (MUL_MAT 3, ADD 54, MUL 46, RMS_NORM 52, ROPE 165, SET_ROWS 87, GET_ROWS 9, SWIGLU 12).
+  Llama-3.2-1B Q4_0 on the simulated device against the Mac's CPU (2 x 512 tokens of plan.md): perplexity +0.24%,
+  mean KLD 0.0022, same top token 96.3%; the zero-point route +1.48%, 0.0565, 84.7%, close to the K3's 0.0548, so the
+  reference kernels reproduce the IME's arithmetic here.
+- Predicted on the K3 (estimates): Llama-3.2-1B Q4_0 against the CPU within 0.5% in perplexity, mean KLD 0.002-0.003
+  (the test file gave 0.0026); Qwen3-0.6B and 4B as their test files with the Q4_1 layers in Q8_0 (the provider's
+  weights for those layers are the same bytes): mean KLD about 0.0044 and 0.0026; tg128 1-2% slower on Llama-3.2-1B
+  and Qwen3-4B and about 1% on
+  Qwen3-0.6B (FLAGOS_SPACEMIT_Q4_1=zero-point in the same session as the comparison); the fit settings' comparisons
+  unchanged in kind, as Q4_1 now has Q8_0's thresholds (path B to 11 rows for a down of 8,192 values, as on the Q8_0
+  file).
 
 ### 7.4 Still proposed
 
@@ -1830,3 +2013,29 @@ fails, the default change waits and the failing lengths are examined first.
   the Mac's simulated device; the acceptance script against the CPU, then `EXPS="mm pb fit fit-staged"` on both files,
   with predictions and criterion (part 2 at risk on Q8_0 at 12-31 tokens, where down leaves path B). Not yet run on
   the K3.
+- 2026-10-23: step 3's Q4_0 half run on the K3 and read (§7.3; build `2c7c761`): the acceptance script 32/34, its
+  perplexity bound failed (+5.45% against the CPU; mean KLD 0.0548 at 512-token batches, 0.0513 at `-ub 1`, against
+  Qwen3-0.6B's 0.0147), so the accuracy is examined first and the default change waits; suspects the Q4_1 conversion
+  of layers 0-1's `ffn_down`, RoPE with frequency factors, the head's requantization. The benchmark's criterion met
+  (from 16 tokens at worst -0.15% against `split`, at least +19.5% at 16-100); `fit,staged` the fastest setting at
+  every length from 16 to 129 tokens; `spacemit`'s path B with the activations outside TCM 4.7-5.0% slower than path
+  C at 27-28 rows. The Q8_0 session and the accuracy runs (the IME path, the Q8_0 file, `-fa off`) running.
+- 2026-10-23: step 3's Q8_0 half and the accuracy follow-up read (§7.3): the Q8_0 benchmark's criterion met narrowly
+  (pp16 +5.70% against `split`, bar +5%; from 16 tokens at worst -0.28%); `spacemit` fastest at 4-24 tokens there, its
+  down on path B with the activations outside TCM 20-26% faster than path C at 12-24 rows (18.5-21.9% slower at 27-28
+  rows on Q4_0). Accuracy: the Q8_0 file matches the CPU (mean KLD 0.00076), the Q4_0 file with `-fa off` misses as
+  before (0.0559), so attention, RoPE and the other non-matmul ops are cleared and the error lies in the Q4_0 file's
+  weight path; one CPU run gave NaN (intermittent; its two comparisons discarded). Next: test files with layers 0-1's
+  down, or the head, in Q8_0.
+- 2026-10-23: the cause found (§7.3): with layers 0-1's down in Q8_0 the provider matches the CPU (perplexity +0.24%,
+  mean KLD 0.0026, from +5.52% and 0.0548); the head in Q8_0 changes nothing; the upstream IME path makes the same
+  error (0.0554). The in-tree Q4_1 conversion rounds the block minimum to an integer zero point (no block clamped in
+  this file; error energy 0.67% of the weights'). Options (Q4_1 to Q8_0 at load, an exact correction term, or keep)
+  for the user and the mentor; the Qwen3 test proposed.
+- 2026-10-23: the fix, option (a) (user): Q4_1 requantized to Q8_0 at load, as Q6_K (layout `q4_1_q8_0_32x32`, the
+  default; `FLAGOS_SPACEMIT_Q4_1=zero-point` keeps the old route, test-only). On the Mac all checks pass on both routes,
+  two mutations caught, test-backend-ops unchanged; Llama-3.2-1B on the simulated device against the CPU: perplexity
+  +0.24%, KLD 0.0022 (zero-point +1.48%, 0.0565). About 1-2% more weight bytes per token. Not yet run on the K3.
+- 2026-10-23: the Q4_1 test on Qwen3 (K3, §7.3): with their Q4_1 layers in Q8_0 the provider's mean KLD against the
+  CPU falls 0.0149 -> 0.0044 on Qwen3-0.6B (-71%) and 0.00334 -> 0.00260 on Qwen3-4B (-22%): the conversion is also
+  most of 0.6B's error, which M2e had put down to the IME approach as a whole.

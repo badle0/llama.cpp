@@ -3131,4 +3131,65 @@ void unpack_q6_k(const ggml_tensor * t, void * data) {
     }
 }
 
+// flagos: Q4_1 weights requantized to Q8_0 by ggml's own quantizer (per 32 values d = max|w| / 127, q = round(w / d);
+// quantize_row_q8_0_ref), then stored in the q8_0 32x32 layout as repack_q8_0_to_q8_0_32_bl_ref stores Q8_0. Each
+// weight moves by at most half a Q8_0 step, where the q4_1 32x32 layout moves every weight of a block by its minimum's
+// rounding to a whole Q4_1 step (fusion-and-splitting.md §7.3, 2026-10-23). 32 rows at a time
+int repack_q4_1_q8_0(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_1);
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t k       = t->ne[0];
+    const int64_t nblocks = k / QK8_0;
+    if (k % QK8_0 != 0 || size != ggml_nbytes(t)) {
+        return -1;
+    }
+    const size_t            row_size = ggml_row_size(GGML_TYPE_Q4_1, k);
+    const uint8_t *         src      = static_cast<const uint8_t *>(data);
+    block_q8_0x32 *         dst      = static_cast<block_q8_0x32 *>(t->data);
+    std::vector<float>      rows((size_t) (32 * k));
+    std::vector<block_q8_0> q8((size_t) (32 * nblocks));
+    block_q8_0              group[32];
+
+    for (int64_t b = 0; b < nrow; b += 32) {
+        const int64_t nr = std::min<int64_t>(32, nrow - b);
+        ggml_get_type_traits(GGML_TYPE_Q4_1)->to_float(src + b * row_size, rows.data(), nr * k);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, rows.data(), q8.data(), 0, nr, k, nullptr);
+        for (int64_t x = 0; x < nblocks; x++) {
+            int64_t i = 0;
+            for (; i < nr; i++) {
+                group[i] = q8[x + i * nblocks];
+            }
+            for (; i < 32; i++) {
+                std::memset(&group[i], 0, sizeof(block_q8_0));
+            }
+            *dst++ = make_block_q8_0x32(group, 32);
+        }
+    }
+    return 0;
+}
+
+// flagos: as unpack_q6_k, the requantization cannot be undone: Q4_1 cannot express the stored Q8_0 values, so this
+// returns the nearest Q4_1, the stored values quantized again with ggml's Q4_1 quantizer (approximate)
+void unpack_q4_1_q8_0(const ggml_tensor * t, void * data) {
+    const block_q8_0x32 * src      = static_cast<const block_q8_0x32 *>(t->data);
+    const int64_t         nrow     = ggml_nrows(t);
+    const int64_t         k        = t->ne[0];
+    const int64_t         nblocks  = k / QK8_0;
+    const size_t          row_size = ggml_row_size(GGML_TYPE_Q4_1, k);
+    std::vector<float>    rows((size_t) (32 * k));
+
+    for (int64_t b = 0; b < nrow; b += 32) {
+        const int64_t nr = std::min<int64_t>(32, nrow - b);
+        for (int64_t x = 0; x < nblocks; x++, src++) {
+            for (int64_t i = 0; i < nr; i++) {
+                const float d = GGML_FP16_TO_FP32(src->d[i]);
+                for (int64_t j = 0; j < QK8_0; j++) {
+                    rows[i * k + x * QK8_0 + j] = d * (float) (int8_t) src->qs[i * QK8_0 + j];
+                }
+            }
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q4_1, rows.data(), static_cast<char *>(data) + b * row_size, 0, nr, k, nullptr);
+    }
+}
+
 }  // namespace spacemit_ime
