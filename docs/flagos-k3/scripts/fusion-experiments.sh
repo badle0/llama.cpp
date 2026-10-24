@@ -16,6 +16,11 @@
 #   fit-mixed
 #        fit with path B's pair turns only while the batch's activations take fewer bytes than a slab (16 rows for
 #        Q4_0 and Q4_1, 29 for Q8_0; §7.3): FLAGOS_SPACEMIT_MM=fit,mixed; the same prompts as fit-staged
+#   tail the defaults with path A's last m % 4 rows all on one tile, as ime.cpp, where the build deals them to the
+#        tiles idle in path A's last round (§7.3): FLAGOS_SPACEMIT_TAIL=one-tile; the same prompts as pb
+#   fs-tail
+#        fit,staged with them on one tile: FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile, to compare
+#        with fit-staged; the same prompts as pb
 #
 # Usage: fusion-experiments.sh prepare                  build A's tools and its provider checks, run once (they compare
 #                                                       every candidate with the defaults, byte for byte)
@@ -24,13 +29,16 @@
 #        fusion-experiments.sh summary <out>            the summary again from the logs
 # Env:   EXPS      experiments (default "q6"; ref and ops always run)
 #        REPS      llama-bench repetitions per mode (default 5; 0 skips llama-bench)
-#        PPODD     the prompt lengths pb, fit, fit-staged and fit-mixed add, in llama-bench's -p form (a list; ranges
-#                  first-last[+step]); default 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129
+#        PPODD     the prompt lengths pb, fit, fit-staged, fit-mixed, tail and fs-tail add, in llama-bench's -p form (a
+#                  list; ranges first-last[+step]); default 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 0)
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
 #        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
 #                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ, pb's with 64
-#                  and 16 rows, fit's and fit-staged's with 128, 64 and 16, fit-mixed's also with 8 (the turns' side)
+#                  and 16 rows, fit's and fit-staged's with 128, 64 and 16, fit-mixed's also with 8 (the turns' side),
+#                  tail's with 131 (the split's path A, 3 rows left over), fs-tail's with 79 and 131
+#        KLD_SETS  the logits check's ubatch sets instead of the experiments' (batch, ub1, ub128, ub64, ub16, ub8,
+#                  ub79, ub131; e.g. "ub79 ub131" for fit-staged, tail and fs-tail together); every set runs every mode
 #        BUILD_A   the build (default <repo>/build-flagos); TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
@@ -49,6 +57,10 @@
 #   fit-staged-ops  fit-staged with the op counters
 #   fit-mixed       FLAGOS_SPACEMIT_MM=fit,mixed
 #   fit-mixed-ops   fit-mixed with the op counters
+#   tail            FLAGOS_SPACEMIT_TAIL=one-tile
+#   tail-ops        tail with the op counters
+#   fs-tail         FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile
+#   fs-tail-ops     fs-tail with the op counters
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -62,6 +74,7 @@ DEPTH=${DEPTH:-0}
 PPL_TEXT=${PPL_TEXT-$HOME/ppl.txt}
 CHUNKS=${CHUNKS:-8}
 KLD_UB1=${KLD_UB1:-1}
+KLD_SETS=${KLD_SETS:-}
 TIMEOUT=${TIMEOUT:-3600}
 DRY=${DRY:-}
 TOOLS="llama-completion llama-bench llama-perplexity"
@@ -71,7 +84,7 @@ TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
 unset FLAGOS_SPACEMIT_TEST_OP_STATS FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_MM \
-    FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
+    FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV FLAGOS_SPACEMIT_TAIL
 
 mode_env() {
     case $1 in
@@ -81,6 +94,8 @@ mode_env() {
         fit | fit-ops) echo "FLAGOS_SPACEMIT_MM=fit" ;;
         fit-staged | fit-staged-ops) echo "FLAGOS_SPACEMIT_MM=fit,staged" ;;
         fit-mixed | fit-mixed-ops) echo "FLAGOS_SPACEMIT_MM=fit,mixed" ;;
+        tail | tail-ops) echo "FLAGOS_SPACEMIT_TAIL=one-tile" ;;
+        fs-tail | fs-tail-ops) echo "FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile" ;;
         *) echo "" ;;
     esac
 }
@@ -140,6 +155,7 @@ prepare() {
     rc=$?
     echo "   flagos-check-spacemit: rc=$rc: $(tail -1 "$BUILD_A/fx-check.out")"
     grep -E "^layer" "$BUILD_A/fx-check.out" | grep -oE "one quantization for[^;]*" | sed 's/^/      /'
+    grep -E "^mm " "$BUILD_A/fx-check.out" | grep -oE "Q4_0, Q4_1.*" | sed 's/^/      matmul paths: /'
     grep -E "FAIL" "$BUILD_A/fx-check.err" | head -5 | sed 's/^/      /'
 }
 
@@ -266,6 +282,12 @@ EOF
             python3 -I "$HERE/op-stats.py" diff "$OUT"/bench-fit-ops-*.ops -- "$OUT"/bench-fit-staged-ops-*.ops |
                 sed 's/^/   /'
         fi
+        # path A's leftover rows dealt (fit-staged) against all on one tile (fs-tail), the same paths otherwise
+        if compgen -G "$OUT/bench-fit-staged-ops-*.ops" > /dev/null && compgen -G "$OUT/bench-fs-tail-ops-*.ops" > /dev/null; then
+            echo "== op counters, fs-tail-ops against fit-staged-ops: name by name, us per graph"
+            python3 -I "$HERE/op-stats.py" diff "$OUT"/bench-fit-staged-ops-*.ops -- "$OUT"/bench-fs-tail-ops-*.ops |
+                sed 's/^/   /'
+        fi
         for c in fit fit-staged fit-mixed; do
             if compgen -G "$OUT/bench-$c-ops-*.ops" > /dev/null; then
                 echo "== op counters, $c-ops: the matmuls' even and odd tiles (path B's pair turns), us per graph"
@@ -310,6 +332,9 @@ run_all() {
     if has fit-mixed; then
         modes+=" fit-mixed fit-mixed-ops" kld_modes+=" fit-mixed" kld_sets+=" ub128 ub64 ub16 ub8"
     fi
+    if has tail; then modes+=" tail tail-ops" kld_modes+=" tail" kld_sets+=" ub131"; fi
+    if has fs-tail; then modes+=" fs-tail fs-tail-ops" kld_modes+=" fs-tail" kld_sets+=" ub79 ub131"; fi
+    if [ -n "$KLD_SETS" ]; then kld_sets=$KLD_SETS; fi
     kld_sets=$(printf '%s\n' $kld_sets | awk '!seen[$0]++' | tr '\n' ' ')
     if [ -z "$DRY" ]; then
         {
@@ -331,7 +356,7 @@ run_all() {
             for m in $modes; do
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
-                if has pb || has fit || has fit-staged || has fit-mixed; then
+                if has pb || has fit || has fit-staged || has fit-mixed || has tail || has fs-tail; then
                     bench "$m" "ppodd-$i" -p "$PPODD" -n 0
                 elif has mm; then
                     bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
@@ -359,6 +384,11 @@ run_all() {
                 ub64) args="-ub 64" ;;
                 ub16) args="-ub 16" ;;
                 ub8) args="-ub 8" ;;
+                # path A with 3 rows left over: under fit,staged at 79 rows (down at least, on every model so far),
+                # under the split too at 131
+                ub79) args="-ub 79" ;;
+                ub131) args="-ub 131" ;;
+                *) echo "   unknown logits set $s"; continue ;;
             esac
             base=$OUT/kld-base-ref-$s.bin
             rm -f "$base"
@@ -385,5 +415,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,51p' "$0"; exit 1 ;;
+    *) sed -n '2,63p' "$0"; exit 1 ;;
 esac

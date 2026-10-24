@@ -160,6 +160,9 @@ MS=https://modelscope.cn/models/unsloth          # ModelScope: fast from the boa
 wget -c -q --show-progress $MS/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q4_0.gguf   # 382156480 bytes
 wget -c -q --show-progress $MS/Qwen3-4B-GGUF/resolve/master/Qwen3-4B-Q4_0.gguf       # 2375773472 bytes
 wget -c -q --show-progress $MS/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q8_0.gguf   # 639447744 bytes (fusion-and-splitting.md §7.3)
+wget -c -q --show-progress $MS/Qwen3-14B-GGUF/resolve/master/Qwen3-14B-Q4_0.gguf     # 8543001984 bytes (§7.3, step 4)
+# unsloth's Qwen3-8B repo has no Q4_0; bartowski's has unsloth's recipe (Q4_1 ffn_down in layers 0-3, Q6_K head)
+wget -c -q --show-progress https://modelscope.cn/models/bartowski/Qwen_Qwen3-8B-GGUF/resolve/master/Qwen_Qwen3-8B-Q4_0.gguf   # 4787332640 bytes
 ```
 List a repo's files: `wget -qO- "https://modelscope.cn/api/v1/models/unsloth/Qwen3-4B-GGUF/repo/files?Revision=master&Recursive=true"`. The 4B file matches SpacemiT's table (2.21 GiB); their 0.6B file was about 6 MiB smaller, so compare 0.6B numbers to their table loosely.
 SpacemiT's doc benchmarks Qwen3-0.6B Q4_0 and qwen35 2B Q4_1 (`docs/build-riscv64-spacemit.md`); A100 IME supports Q2_K–Q6_K, Q4_0/1, Q5_0/1, Q8_0.
@@ -689,6 +692,7 @@ Experiment switches of the provider (environment variables; test-only unless not
 | `FLAGOS_SPACEMIT_TEST_REFERENCE=1` | kernels on the K3 | the portable reference kernels on the AI cores (slow); tells a kernel error from an orchestration error |
 | `FLAGOS_SPACEMIT_STREAM=per-call` | executor on the K3 | a new spine-runtime stream per graph, releasing the AI cores in between (experiment switch, plan §2.4) |
 | `FLAGOS_SPACEMIT_MM=rows`, `spacemit`, `fit`, `fit,staged` or `fit,mixed` | matmuls of several rows, read at every call (`fusion-and-splitting.md` §7.3) | `split` (the default): ime.cpp's choice of path A, path C where ime.cpp takes path B; `rows`: path A whenever every tile gets 4 rows; `spacemit`: path B where `split` takes path C and TCM holds a 32-column slab (SpacemiT's rule); `fit`: path B where TCM holds the batch's activations next to a slab, else path A from 32 rows, else path C; `fit,staged`: `fit`'s paths, path B without the pair turns; `fit,mixed`: `fit`'s paths, path B with the turns while the activations take fewer bytes than a slab (16 rows for Q4_0 and Q4_1, 29 for Q8_0). The same bytes in all six |
+| `FLAGOS_SPACEMIT_TAIL=one-tile` | path A, read at every call (`fusion-and-splitting.md` §7.3) | the batch's last m % 4 rows all on the tile after the last group, as ime.cpp; by default (`dealt`) one per tile idle in path A's last round, at most two each, a third to tile 0 after its group when only one is idle. The same bytes |
 | `FLAGOS_SPACEMIT_QUANTIZE=shared` | matmuls (`fusion-and-splitting.md` §7.2) | one quantization of the activations for Q, K and V and one for gate and up |
 | `FLAGOS_SPACEMIT_TEST_OP_STATS=<file>` | every graph (`fusion-and-splitting.md` §7.1) | per-op counters, written to the file when the process ends |
 | `FLAGOS_SPACEMIT_TEST_TCM=<bytes>` | host executor (Mac) | a TCM stand-in per tile, so the 1-row path and paths A and B run; `flagos-check-spacemit` sets 393216 for its 1-row and path checks |

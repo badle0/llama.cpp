@@ -1946,6 +1946,362 @@ matmul setting), the fix against `zero-point`:
   2 bytes per block: about +0.25% of the weight bytes instead of +1.9% (an estimate), for new kernel code. The user
   kept the fix as the default after these results (2026-10-24).
 
+**Bigger models: Qwen3-8B and Qwen3-14B (the user's step 4), prepared 2026-10-24.** The same family as the targets, so
+only the size changes (step 3 covered another family). Both files downloaded on the board from ModelScope and checked
+there by SHA-256; their tensor lists read from their headers (the first 20 MB of each, on the Mac):
+
+- Qwen3-8B Q4_0: `bartowski/Qwen_Qwen3-8B-GGUF`, `Qwen_Qwen3-8B-Q4_0.gguf`, 4,787,332,640 bytes (`c9bd6e55...2b893c`).
+  Unsloth's 8B repository has no Q4_0 (it has Q4_1, Q4_K_M, IQ4_NL, Q8_0 and others, by its file list); bartowski's
+  file has unsloth's recipe: an imatrix, `ffn_down` of layers 0-3 in Q4_1 (llama-quantize's rule for the first
+  n_layer/8 layers with an imatrix, src/llama-quant.cpp:618-622), the head in Q6_K, every other matmul and the token
+  embedding in Q4_0. Not chosen: QuantFactory's (no imatrix, so no Q4_1 layers) and Mungert's (the head in Q4_0).
+- Qwen3-14B Q4_0: `unsloth/Qwen3-14B-GGUF`, `Qwen3-14B-Q4_0.gguf`, 8,543,001,984 bytes (`009f54ff...9ff78e`): `ffn_down`
+  of layers 0-4 in Q4_1, the head in Q6_K, the rest Q4_0 (bartowski's 14B file has the same types).
+
+Checked against the code (nothing run yet): every weight takes an IME layout (flagos-spacemit-weights.cpp:30-47); the
+attention heads have 128 values, and 40 query heads over 8 KV heads are claimed, as 8 divides 40
+(flagos-spacemit-attn.cpp:415-418). The one-chunk kernels group only rows that share a KV head
+(flagos-spacemit-rvv-attn.cpp:1247-1276) and the split over the tiles takes 4 query heads at a time, then the rest one
+by one (:1725-1726), so 14B's 5 query heads per KV head run as 4 + 1, which no model run has had (test-backend-ops
+covers 1, 4 and 12 per KV head at heads of 128 values, tests/test-backend-ops.cpp:9596-9598); with 40 heads the
+split's TCM layout still holds blocks of 64 positions (split_layout_of, flagos-spacemit-rvv-attn.cpp:1057-1095: about
+311 KB). The token embedding is Q4_0 in both files (Q6_K on Qwen3-0.6B and 4B, whose head shares it) and stays on the
+X100 cores, as the provider's GET_ROWS takes F32 tables only (flagos-spacemit-ops.cpp:68-71); the head is a tensor of
+its own, requantized to Q8_0 as before. So 2 graph splits per token are expected.
+
+| | Qwen3-4B (for comparison) | Qwen3-8B | Qwen3-14B |
+|---|---|---|---|
+| layers; hidden; feed-forward; query / KV heads | 36; 2,560; 9,728; 32 / 8 | 36; 4,096; 12,288; 32 / 8 | 40; 5,120; 17,408; 40 / 8 |
+| Q4_1 `ffn_down`, requantized to Q8_0 | layers 0-3 | layers 0-3 | layers 0-4 |
+| shares of a layer's weights: q, k + v, o, gate + up, down | 10.4, 5.2, 10.4, 49.4, 24.7% | 8.7, 4.3, 8.7, 52.2, 26.1% | 7.9, 3.2, 7.9, 54.0, 27.0% |
+| slabs per tile (N/256), same order | 16, 4, 10, 38, 10 | 16, 4, 16, 48, 16 | 20, 4, 20, 68, 20 |
+| path B holds, rows: q, k, v, gate, up / o / down / the Q8_0 downs | 119 / 68 / 19 / 5 | 68 / 68 / 12 / none | 51 / 51 / 4 / none |
+| `split`'s 16-row blocks from, rows: q / o, down / gate, up (k, v: 17) | 64 / 40 / 150 | 64 / 64 / 190 | 79 / 79 / 268 |
+| weight bytes per generated token | 2.51 GB | 4.67 GB | 8.48 GB |
+
+- New on these shapes (read in the code): a 32-row Q8_0 slab of 12,288 or 17,408 values (417,792 or 591,872 bytes) is
+  larger than a tile's TCM, so the requantized downs never take path B under any setting
+  (flagos-spacemit-ime.cpp:497-498), and the 1-row path reads them straight from DRAM in 4-slab chunks instead of
+  staging them (:211-221; staging was 9.8% faster per token on Qwen3-4B's shapes, build.md §7). Every Q4_0 slab still
+  fits (221,184 and 313,344 bytes).
+- `fit` and `fit,staged`: path B for q, k, v, o, gate and up up to 68 rows (8B) or 51 (14B), against 119 on 4B, then
+  path A; down on path B up to 12 or 4 rows, then path C, then path A from 32 rows; the Q8_0 downs path C, then path A
+  from 32. So from 69 or 52 tokens every matrix takes path A, whose last round (the leftover rows on the first tiles)
+  costs about two-thirds of a full round when it holds 1 row and nearly a full one with 4 (Qwen3-4B's counters: 68.6
+  ps per weight per full round, +46.7 with 1 row, +63.5 with 4).
+- `split`: path C, with path A from 113 rows wherever its 16-row blocks give every tile whole rows (q, k, v, o, down);
+  gate and up stay on path C in one block of all rows up to 189 rows on 8B and 267 on 14B, so the two settings differ
+  there at 160 tokens (8B) and 160-256 (14B), where on 4B they did not. Its blocks leave the tiles uneven for q, o and
+  down from 65 rows on 8B and from 79 on 14B (5 blocks for 8 tiles: five tiles take two tasks, three none; the busiest
+  has 2.46x the mean work at 65 rows, 2.03x at 79; flagos-spacemit-ime.cpp:504-524), and for k and v from 17 rows;
+  from 32 to 78 rows 14B's q, o and down run in one block of all rows, evenly spread.
+
+Sessions, one file at a time, the 8B file first (the user's choice; commands in the chat of 2026-10-24), each a chain
+of three: (1) the acceptance script (2 graph splits, flash attention kept under `-fa auto`, perplexity within 1% of the
+CPU, KLD against the CPU at 512-token batches and at `-ub 1 -b 512`, which on 14B also runs its 4 + 1 heads in both
+attention kernels; llama-bench of the provider, the CPU and the IME path); (2) `EXPS="fit fit-staged" REPS=3` with
+`PPODD=2,4,8,12,13,16,24,32,33,36,37,40,44,48,51,52,64,65,68,69,78,79,96,100,128,129` on both files (8B's limits at 12-13
+and 68-69, 14B's at 51-52 and `split`'s blocks at 78-79 added) and the runner's 160-320; `rows` and `spacemit` left out,
+as proposed and agreed the same day (no bar in the criterion), `fit` kept for the turns at these slab counts; (3)
+optional, the fix against `FLAGOS_SPACEMIT_Q4_1=zero-point`, 3 interleaved rounds of pp128 and tg128. Board time, an
+estimate from step 3's 47 minutes for 220 runs, scaled by the weights: on 8B about 45 minutes for (1) and 1.5 h for
+(2), on 14B about 75 minutes and 2.5-3 h.
+
+Predictions (estimates fixed before the run). Speed from a model of a batch, matrix by matrix: Qwen3-4B's op counters
+of the `fit,staged` run (2026-10-22, above) give each path's time per weight at each row count (path A 68.6 ps per
+weight per full round plus the last round's; path B by rows and slabs per tile; path C by rows, and where `split`'s
+16-row blocks are uneven by the busiest tile's work, at 2.71 ps per weight per row; k and v from 4B's own k and v),
+applied to every matrix of a model with its path by the code (`spacemit_mul_mat_gemm`), plus 4B's other steps scaled by
+width (1.35x on 8B, 1.8x on 14B; 4-10% of a batch). On 4B path C's time per weight grows a little with the row length
+(down 0-20% above gate at 16-37 rows), which the model leaves out, so it errs toward `split`. Checked on runs it was not
+fitted to: on Llama-3.2-1B Q4_0 (step 3) the gains against `split` fall within -11 to +4 points of the measured ones
+(pp16-26 +16 to +31% against +25.6 to +31.8%, pp27-28 +23 to +24% against +19.5 to +20.0%, pp33-48 +66 to +82%
+against +72 to +91%, pp65-100 +88 to +93% against +98 to +103%, pp128 +10% against +11.8%); on 4B itself within -9 to
++1 points.
+
+| `fit,staged` against `split` (the model) | Qwen3-8B | Qwen3-14B |
+|---|---|---|
+| pp2, pp4, pp8 | +1, +8, +7% | +2, +9, +8% |
+| pp12, pp13 | +18, +15% | +15, +17% |
+| pp16, pp24 | +19, +28% | +20, +29% |
+| pp32 | +48% | +51% |
+| pp33-pp51 (7 lengths) | +38 to +52% | +38 to +54% |
+| pp52 | +53% | +29% (path A from 52 rows) |
+| pp64 | +48% | +48% |
+| pp65, pp68, pp69 | +113, +106, +57% | +21, +15, +17% |
+| pp78, pp79 | +63, +63% | +28, +64% |
+| pp96, pp100 | +86, +62% | +88, +62% |
+| pp128, pp129 | +18, +10% | +19, +11% |
+| pp160 | +17% | +18% |
+| pp192, pp256 | within 1% | +17, +15% |
+| pp320, pp512 | within 1% | within 1% |
+| `split`'s t/s at pp128 and pp512 | about 50 and 55 | about 27 and 31 |
+
+- So both parts of the criterion hold on both files with at least 10 points to spare after the model's largest
+  overestimate (+4 points). The narrowest is 14B at 65-69 tokens (+15 to +21%), where every matrix takes path A (three
+  rounds, the last nearly empty) against `split`'s one block of all rows, evenly spread; on 8B it is pp16 (+19%),
+  where down runs path C under both.
+- tg128 the same in all settings within 0.5% (the 1-row path does not depend on them): 8B 5.6-6.2 t/s, 14B 3.1-3.5
+  (the weights' bytes per token against 4B's 2.51 GB at 11.03 t/s, plus 4B's other per-token costs, scaled; the
+  requantized downs read from DRAM add about 0.5%).
+- Placement and accuracy: 2 graph splits per token, flash attention on the provider under `-fa auto`; perplexity within
+  1% of the CPU likely (4B -0.00% with the fix; no model of how it changes with size); mean KLD against the CPU
+  0.0015-0.0035 at 512-token batches (4B 0.00249), no higher at `-ub 1 -b 512`.
+- Outputs: `fit` and `fit,staged` the same text as `split` and KLD at the floor at `-ub` 128, 64 and 16.
+- Against `fit`: slower at 2-8 tokens (as on every model so far), about level at 12-13, 1.5-3.5% faster from 16 tokens
+  to 68 (8B) or 51 (14B), within 1% beyond (path A under both).
+- Counters: the paths as above; under `fit` the odd tiles lag by about 0.9/R (8B: 22% for k and v, 6% for q and o, 2%
+  for gate and up; 14B: 22%, 4.5%, 1.3%), under `fit,staged` by 0-5%.
+- The fix (optional (5)): tg128 2.0-3.0% slower than `zero-point` (the requantized downs add 88 MB per token on 8B,
+  +1.9%, and 196 MB on 14B, +2.4%, and are read from DRAM), pp128 within 1.5%.
+
+Criterion (fixed before the run), per file, as step 3's: from 16 tokens no tested length more than 1% slower than
+`split`, every tested length from 16 to 100 at least 5% faster, outputs identical; and the acceptance script's checks
+pass. If both files meet it, the user's plan of 2026-10-22 is complete and the default change to `fit,staged` with its
+acceptance runs comes next (proposed); if not, the change waits and the failing lengths are examined first. The lengths
+below 16 tokens and the comparisons with `fit` are reported, with no bar.
+
+**Qwen3-8B on the K3: the acceptance script (2026-10-24, the board's build of `bd4b655`, as for the fix's runs;
+`~/acc-q8b.log`, its logs copied to `~/acc-q8b-logs`).** All 34 checks pass:
+- Placement: 2 graph splits per token (1 with the provider disabled), flash attention kept on the provider under `-fa
+  auto` (C5a), 4,453.8 MiB of weights on the provider (4.67 GB, the table's bytes per token) and a compute buffer of
+  304.8 MiB. test-backend-ops passes every claimed case (1,742, of which `FLASH_ATTN_EXT` 1,324), the reference kernels
+  13/13; no TCM block left held.
+- Accuracy against the CPU (8 x 512 tokens): perplexity 8.2002 against 8.2121 (-0.14%), with `-fa on` and with `-fa
+  auto`; mean KLD 0.003116 ± 0.000117 at 512-token batches and 0.002137 ± 0.000079 at `-ub 1 -b 512`. The greedy text
+  differs from the CPU's after 47 characters, as on Llama-3.2-1B (reported, not checked: the IME kernels quantize the
+  activations differently, spacemit_check.py:282).
+- llama-bench, pp128 and tg128 (`-ub 128 -fa 1`, 3 repetitions, the default matmul setting `split`): the provider 50.59
+  and 6.05 t/s, the IME path 45.07 and 6.08, the CPU 11.24 and 3.24. So against the IME path prompt processing +12.2%
+  (Qwen3-4B at M2e's final run, before the fix: +16.6%) and generation -0.5%, in one session.
+- Against the predictions: all met. 2 graph splits and flash attention on the provider; perplexity within the 1% bound;
+  the KLD inside 0.0015-0.0035 at 512-token batches (Qwen3-4B with the fix 0.00249, against another CPU run) and lower
+  at `-ub 1 -b 512`; tg128 6.05 inside 5.6-6.2; `split`'s pp128 50.59 against about 50. Generation reads 4.67 GB of
+  weights per token at 6.05 t/s, 28.3 GB/s, against 27.7 on Qwen3-4B (2.51 GB at 11.03 t/s, the fix's session):
+  computed from the speeds; how a token's time divides between the weights and the rest is not measured here (the
+  runner's op counters will show it).
+- The script's fixed benchmarks run Qwen3-4B's shapes and read as in step 3's run (2026-10-23, `~/acc-l1b.log`): the
+  Q4_0 matmul at 128 rows 9,643 against 9,668 µs, one-token attention at n_kv 4096 1,115 against 1,131 µs, so the board
+  ran as then; the gemv per Qwen3-4B token 89.3 ms against 88.0, for 2,507 MB of weights against 2,460 (the fix's Q8_0
+  downs).
+
+**Qwen3-8B on the K3: the benchmark (2026-10-24, build `bd4b655`; `EXPS="fit fit-staged" REPS=3` with the lengths
+above; `~/fx-q8b.log`, its logs in `~/fx/q8b` on the board).** Outputs identical: the same text in the three settings,
+and against `split` mean KLD 0.000000, maximum 0.000052 (the floor; step 3's Q8_0 file 0.000048) and the same top token
+100% at `-ub` 128, 64 and 16. The counters move a result by at most 0.9% (`fit,staged`'s pp24), apart from `fit`'s
+pp2 (-2.7%). t/s, mean of 3 runs
+(standard deviations at most 0.37), the model's predictions in brackets:
+
+| tokens | `split` | `fit,staged` | against `split` (predicted) | against `fit` |
+|---|---|---|---|---|
+| 2, 4, 8 | 9.58, 16.53, 30.37 | 10.11, 21.28, 35.45 | +5.5, +28.7, +16.7% (+1, +8, +7) | -8.6, -5.0, -5.1% |
+| 12, 13 | 34.36, 31.67 | 43.66, 36.93 | +27.1, +16.6% (+18, +15) | +1.2, +1.3% |
+| 16, 24 | 35.76, 35.32 | 42.99, 46.80 | +20.2, +32.5% (+19, +28) | +1.6, +3.0% |
+| 32 | 36.24 | 60.41 | +66.7% (+48) | +3.4% |
+| 33, 36, 37, 40, 44, 48 | 32.67-35.43 | 50.44-57.10 | +49.8 to +61.2% (+38 to +50) | +2.5 to +2.9% |
+| 51, 52 | 34.00, 36.51 | 48.27, 58.97 | +42.0, +61.5% (+52, +53) | +2.5, +2.9% |
+| 64 | 43.67 | 65.39 | +49.7% (+48) | +3.0% |
+| 65, 68, 69 | 26.34, 27.48, 27.71 | 59.24, 59.75, 45.67 | +124.9, +117.4, +64.8% (+113, +106, +57) | +2.8, +2.8, -0.1% |
+| 78, 79 | 29.85, 29.90 | 44.39, 38.46 | +48.7, +28.6% (+63, +63) | 0.0, 0.0% |
+| 96, 100 | 31.35, 29.35 | 60.40, 49.17 | +92.7, +67.5% (+86, +62) | 0.0, -0.0% |
+| 128, 129, 160 | 50.65, 47.91, 51.36 | 59.19, 52.32, 59.93 | +16.9, +9.2, +16.7% (+18, +10, +17) | -0.1, -0.1, +0.2% |
+| 192, 256, 320, 512 | 59.04, 58.62, 58.17, 55.88 | 58.89, 58.61, 58.32, 56.29 | -0.3, -0.0, +0.3, +0.7% (within 1) | -0.6 to +0.3% |
+| tg128 | 6.05 | 6.04 | -0.1% (within 0.5) | -0.1% |
+
+- The criterion is met on this file: from 16 tokens at worst -0.25% against `split` (pp192), every tested length from
+  16 to 100 at least +20.2% (pp16, the narrowest predicted too), outputs identical, the acceptance script's checks
+  passed (above).
+- Against the predictions: from 16 to 100 tokens the gains lie between -34.7 and +19.1 points of the model's, above it
+  at 16 of the 19 lengths; from 128 tokens within 1 point. Above: `split` is slower than modelled, as down's path C on
+  rows of 12,288 values costs 5-45% more per weight than the model's (taken from gate's rows of 2,560 on 4B; the row
+  length left out, as stated), and the 4 requantized Q8_0 downs, which the model costed per weight as Q4_0, cost
+  1.65-1.71x that on path A (without leftover rows) and 1.6-4.4x on path C. Below, at pp51 (-10 points), pp78 (-14)
+  and pp79 (-35): path A's leftover rows, next. Against `fit`, the odd tiles and tg128: as predicted (the odd tiles'
+  excess under `fit` on path B: k and v +8 to +22%, q and o +2 to +6%, gate and up +0.7 to +2.0%, the predicted 22, 6
+  and 2% reached from about 32 rows; under `fit,staged` -0.6 to +5.4%). The paths'
+  boundaries show in the counters where the code puts them: down from path B to path C at 13 rows, the other matrices
+  to path A at 69, the Q8_0 downs on path A from 32.
+- Found, path A's leftover rows (read in the code, matching the counters): `gemm_rows` multiplies 4 rows per kernel
+  call while 4 remain, then one row per call (flagos-spacemit-ime.cpp:134-143), and path A gives each tile 4
+  consecutive rows per round (:483-490), so the batch's last m mod 4 rows all go to one tile, which runs them one call
+  at a time over every slab of the weights. On this run's counters path A's last round costs, per weight (a full
+  round 66-67): 45.7 when it holds one tile with 1 row (pp65's down), 61.7-63.4 with tiles of 4 rows (pp68, pp69), 96.4
+  with a tile of 2 rows (pp78) and 133.6-138.0 with a tile of 3 (pp51's down, pp79): r leftover rows cost about r
+  one-row passes (whether the extra passes read DRAM or cache is not isolated). The model took 52 and 58 for 2 and 3
+  rows, interpolated: no earlier run had a length with 2 or 3 leftover rows on path A (the 11 runner logs before this
+  one, from 32 rows all 4q or 4q+1; the shape benches' path-A cells likewise, and the grid's at 32, 40 and 48 rows).
+  The 4q+2 and 4q+3 batches tested before (8-31 tokens, the grid's 6, 10 and 14 rows) ran on path B or C, where
+  every tile runs the one-row calls on its own columns: they cost 5-16% there (step 2, "the remainder rows").
+  `split` pays the same where it takes path A (from 113 rows). Path B
+  also runs the leftover rows one call each, on every tile (pp51's path-B matrices 8-9% above the model), which
+  dealing them out cannot change.
+- Inherited from SpacemiT's code, and not fixed upstream (checked 2026-10-24): the provider's path A is a port of the
+  in-tree IME path's (ggml-cpu/spacemit/ime.cpp:405-434), which ggml-spacemit carries unchanged; the loop is the same,
+  whitespace aside, in ggml-org master (`df9beac`) and in both files on 9 of spacemit-com's 10 branches (the tenth,
+  `add-spacemit-backend`, predates path A), and the dense kernels still take 4 rows or 1 per call (the 2-row kernels
+  are MoE's, `moe_m2_*`; ime2_kernels.cpp is master's byte for byte). No pull request or issue in either repository
+  addresses it (their lists, 2026-10-24); upstream's one fix in this scheduler, #16629 (2025), corrected an
+  out-of-bounds task index. SpacemiT's open #51 adds an f16 Q4_0 path for prompt processing to ggml-spacemit whose
+  kernel zero-pads the last of its 16-row tiles, so it would not run rows one call each (by its diff; not merged, not
+  measured). Correct results in every case: the cost is time, where a call takes path A and m mod 4 is 2 or 3, in
+  SpacemiT's rule and `split` from 113 rows (gate and up from 150, 190 or 268 rows on 4B, 8B, 14B), under `fit` and
+  `fit,staged` from 32 rows wherever path B's TCM cannot hold the batch (down from 32 on all three; q, k, v, o, gate
+  and up from 69 on 8B and 52 on 14B; on 4B o from 69, the rest from 120).
+- The model with this correction (r one-row passes; 8B's measured ratios for down's path C and the Q8_0 downs, so
+  in-sample for those): the gains at the tested lengths from 16 to 100 within -0.2 to +8.1 points of the measured,
+  from 128 within ±0.7. For lengths not tested it predicts dips at 4q+2 and 4q+3 tokens wherever `fit,staged` takes
+  path A and `split` path C (estimates): on 8B from 113 to 189 tokens, gate and up only: pp131 -2.0%, pp135 -0.8%,
+  pp163 -0.2% (part 1 allows -1%); on 4B pp131 -1.8%; on 14B, every matrix on path A from 52 tokens against `split`'s
+  balanced path C up to 78: pp55 -6.3%, pp59 -2.8%, pp67 -14.7%, pp71 -10.8%, pp75 -6.9%, and under +5% at pp63, pp66
+  and pp70, none of them in the planned 14B lengths; pp131 -2.1%.
+- Proposed (the user's decision): the 14B benchmark with those lengths added (54, 55, 58, 59, 62, 63, 66, 67, 70, 71,
+  74, 75, 130, 131, 135); and path A dealing the leftover rows one per tile idle in its last round (each row keeps its
+  bytes and its one-row kernel call, so the outputs stay identical by the code; when tile 7 holds them, the rest go to
+  tiles 0 onwards after their group). Estimated by the corrected model: `fit,staged` +16% at pp51, +13% at pp78, +34% at
+  pp79 on 8B; `split` +9 to +11% at pp131-163 and `fit,staged` +20 to +26% there; on 14B `fit,staged` at least +11%
+  against `split` at every length listed above.
+- Generation (tg128; E3c's counters and the op counters on the defaults): 165.9 ms per token, the matmuls 159.3 ms
+  (4.67 GB at 29.3 GB/s), the head 22.5 ms of it, the 4 requantized downs 7.8 ms (1.96 ms each against 1.00 for a Q4_0
+  down: 1.89x the bytes, read from DRAM), attention 1.6 ms; the AI cores idle 1.0% of a token.
+- The fix against `FLAGOS_SPACEMIT_Q4_1=zero-point` (3 interleaved rounds, `~/kld/step4-fix-bench.csv`): tg128 6.038
+  against 6.182, -2.34% (rounds -2.18 to -2.50%), pp128 50.67 against 50.85, -0.35%; predicted 2.0-3.0% and within
+  1.5%: met. With `zero-point` the provider's tg128 would be above the IME path's 6.08 (acceptance run), with the fix
+  0.5% under it.
+
+**Path A's leftover rows dealt to the idle tiles (the user's decision, 2026-10-24; implemented and checked on the Mac
+the same day, not yet run on the K3).**
+- What changed (providers/spacemit only): in path A (`spacemit_mul_mat_gemm`, flagos-spacemit-ime.cpp) the groups of 4
+  rows go to the tiles as before, and the batch's last m % 4 rows, which the quantize step stores one by one, go one
+  per tile among those without a group in the last round (`path_a_tail_tile`): tiles g to 7, g the tile after the last
+  group, which held them all; a second row each when fewer are idle than rows; a third row, when only tile 7 is idle
+  (m % 32 = 31), to tile 0 after its group. By 8B's counters two one-row passes (1.44 rounds) take less time than a
+  group and a row (0.93 + 0.68), hence two per idle tile before a busy one. Each row keeps its bytes and its one-row
+  kernel call, whose result does not depend on how many rows the call was given (the 1-row kernels do not read
+  `count_m`, flagos-spacemit-ime-kernels.cpp), so the output stays the same. ime.cpp's assignment stays for
+  comparisons behind `FLAGOS_SPACEMIT_TAIL=one-tile` (test-only, read at every call). `split` takes path A from 113
+  rows, so it changes there too.
+- Why this way: the smallest change that removes the measured cost (r one-row passes on one tile) with the outputs
+  unchanged. Not chosen: the last round balanced by columns over all tiles (also the dips past each multiple of 32,
+  but a larger change, and on 8B's and 14B's downs the last round's rows do not fit in a tile's TCM at once); padding
+  the leftover rows to a group of 4 (changes Q4_0's outputs: its 4-row quantizer shares a scale across the rows); a 2-
+  or 3-row kernel (none for dense matmuls, new kernel code).
+- Checked on the Mac (host build, simulated device): flagos-check-spacemit passes all checks; its path check, now 32
+  cases (11 new with 2 or 3 leftover rows on path A, among them the tile-7 cases at 62 and 63 rows and the split's
+  path A at 115) with a seventh setting, `rows` with `FLAGOS_SPACEMIT_TAIL=one-tile`, 64/64 identical with the tiles in
+  turn and on threads, and every tile's count of leftover rows (test-only, `spacemit_mm_tail_take`) as the rule gives.
+  Three mutations caught: the last leftover row skipped (32 failures, by the outputs), rows dealt one tile off (26, by
+  the counts alone, the outputs being identical), m % 32 = 31's third row on tile 7 (4, at 63 rows). ThreadSanitizer
+  clean. test-backend-ops unchanged (MUL_MAT 3, ADD 54, MUL 46, RMS_NORM 52, ROPE 165, SET_ROWS 87, GET_ROWS 9, SWIGLU
+  12). Not timed on the Mac: its reference kernels do not cost what the IME's do per row.
+- For the K3: `--bench-mm` has the seventh setting too and rows of 34, 35, 51, 63, 79, 115 and 131; the runner has
+  `EXPS` `tail` (`split` with one-tile) and `fs-tail` (`fit,staged` with one-tile), logits checked at `-ub 79` and
+  `-ub 131` (`KLD_SETS="ub79 ub131"` keeps it to those with `fit-staged` in the same session).
+- Predictions (estimates fixed before the run; the costs of a last round from 8B's counters, in full rounds: a group
+  0.93, a row alone 0.68, two rows on a tile 1.44, three 2.05): outputs identical (the checks on the board; KLD at the
+  floor at `-ub 79` and `-ub 131`); lengths of 4q and 4q+1 tokens, of 32k+30 (the tile-7 case with 2 rows), tg128
+  and pp512 unchanged within 1%. `--bench-mm`, gate, up and down on path A, one-tile's time over the dealt one's: 34
+  rows 1.45x, 35 1.82x, 51 1.58x, 63 1.17x, 79 1.38x, 115 1.28x, 131 1.29x (the rounds, today against dealt: 2.44
+  against 1.68, 3.05 against 1.68, 3.05 against 1.93, 3.05 against 2.61, 4.05 against 2.93, 5.05 against 3.93, 6.05
+  against 4.68). The models, `fit,staged` against `fs-tail` (the corrected model above): 8B pp51 +16%, pp78 +13%, pp79
+  +34%, pp131 +26%, pp135 +20%, pp163 +21%; 14B pp55 +52%, pp59 +16%, pp63 +16%, pp67 +47%, pp71 +35%, pp75 +35%, pp79
+  +35%; `split` against `tail` from 113 tokens: 8B pp131 +11%, pp135 +9%, pp163 +9%, 14B pp131 +11%; and `fit,staged`
+  then at least 11% faster than `split` at 14B's lengths listed in step 4's corrections (pp55-75, pp131; the
+  least at pp131, +11.2%, and pp59, +12.3%). Corrected 2026-10-25, before the run: that model deals the rows by the
+  first proposal, which differs from the rule as implemented where m % 32 is 27 or 30 (a group and a row on tile 0,
+  110.2 ps per weight, against two rows on one idle tile, 93.4); with the implemented rule 14B's pp59 is +26.5% (not
+  +16%) and +23.0% against `split` (not +12.3%), so the least are pp131 and pp63 (+16.1%). No other length or bench
+  row listed is 27 or 30 mod 32.
+- Proposed rule (fixed before the run): the dealing stays if the outputs are identical, no tested length is more than
+  1% slower than with one-tile under the same matmul setting, and tg128 and pp512 are within 1%; otherwise it is
+  examined first.
+
+**Qwen3-14B on the K3: the acceptance script (2026-10-24, build `bd4b655`; `~/acc-q14b.log`, its logs copied to
+`~/acc-q14b-logs`).** All 34 checks pass:
+- Placement: 2 graph splits per token (1 with the provider disabled), flash attention kept on the provider under `-fa
+  auto` (C5a), 8,089.9 MiB of weights on the provider (8.48 GB) and a compute buffer of 306.8 MiB. test-backend-ops
+  passes every claimed case (1,742, of which `FLASH_ATTN_EXT` 1,324), the reference kernels 13/13; no TCM block left
+  held.
+- Accuracy against the CPU (8 x 512 tokens): perplexity 7.757 against 7.7512 (+0.07%), with `-fa on` and with `-fa
+  auto`; mean KLD 0.004728 ± 0.000549 at 512-token batches and 0.004029 ± 0.000505 at `-ub 1 -b 512`, the first runs
+  of a model with 5 query heads per KV head (the one-chunk kernels take them as 4 + 1). The greedy text is the CPU's.
+- llama-bench, pp128 and tg128 (`-ub 128 -fa 1`, 3 repetitions, `split`): the provider 27.48 and 3.37 t/s, the IME
+  path 24.75 and 3.45, the CPU 5.73 and 1.89; so against the IME path prompt processing +11.0% and generation -2.3%,
+  in one session.
+- Against the predictions: 2 graph splits and flash attention on the provider, perplexity within the 1% bound, tg128
+  3.37 inside 3.1-3.5 and `split`'s pp128 27.48 against about 27: met. Missed: the mean KLD at 512-token batches,
+  0.0047 against the predicted 0.0015-0.0035 (8B 0.0031, 4B with the fix 0.00249, each against its own CPU run); at
+  `-ub 1 -b 512` lower (0.0040), as predicted. The script reports the KLD with no bound (a KLD check fails only when
+  no value comes out, spacemit_check.py:375-379), so the check passed. Cause not isolated; the tests that would
+  settle it: the IME path's KLD on this file against the same CPU logits (on Qwen3-0.6B the two matched, the IME
+  approach's own), and test files with the 5 requantized downs or the head in Q8_0, as for Llama-3.2-1B.
+- Generation reads 8.48 GB of weights per token at 3.37 t/s, 28.6 GB/s (8B 28.3, 4B 27.7; computed from the speeds).
+  The script's fixed benchmarks (Qwen3-4B's shapes) read as in 8B's session: the Q4_0 matmul at 128 rows 9,631
+  against 9,643 µs, one-token attention at n_kv 4096 1,111 against 1,115 µs, the gemv per Qwen3-4B token 88.6 against
+  89.3 ms; the 16M-float `ADD` 19.86 against 16.11 GB/s (not examined).
+
+**Qwen3-14B on the K3: the benchmark (2026-10-24, build `bd4b655`; `EXPS="fit fit-staged" REPS=3`; `~/fx-q14b.log`,
+its logs in `~/fx/q14b` on the board).** The run took step 4's first list of lengths (the 26 in the board's
+`info.txt`), not the one with the lengths added after 8B's run (54, 55, 58, 59, 62, 63, 66, 67, 70, 71, 74, 75, 130,
+131, 135): those are not tested here; the dealing's 14B session has them under both assignments (`tail` and `fs-tail`
+run today's). Outputs identical: the same text in the three settings, and against `split` mean KLD 0.000000, maximum
+0.000056 (the floor) and the same top token 100% at `-ub` 128, 64 and 16. The counters move a result by at most 1.0%
+from 12 tokens (`ops`' pp12), by up to 3.7% at 2-8 tokens (pp2 -2.0 to -3.7% in the three settings, pp4 +2.6 and
++2.8% under `ops` and `fit,staged`). t/s, mean of 3 runs (standard deviations at most 0.36), the model's predictions
+in brackets:
+
+| tokens | `split` | `fit,staged` | against `split` (predicted) | against `fit` |
+|---|---|---|---|---|
+| 2, 4, 8 | 4.81, 10.72, 15.63 | 5.85, 11.75, 18.10 | +21.8, +9.6, +15.8% (+2, +9, +8) | -4.9, -8.6, +0.7% |
+| 12, 13 | 17.08, 15.03 | 20.25, 18.15 | +18.6, +20.8% (+15, +17) | +0.9, +1.3% |
+| 16, 24 | 16.99, 16.94 | 21.27, 22.06 | +25.2, +30.2% (+20, +29) | +1.3, +1.7% |
+| 32 | 17.15 | 33.53 | +95.5% (+51) | +2.9% |
+| 33, 36, 37, 40, 44, 48 | 15.61-16.92 | 27.67-31.35 | +70.6 to +85.3% (+38 to +51) | +2.1 to +2.8% |
+| 51, 52 | 15.82, 17.40 | 26.14, 27.10 | +65.2, +55.8% (+54, +29) | +2.2, -0.0% |
+| 64 | 18.08 | 33.02 | +82.6% (+48) | 0.0% |
+| 65, 68, 69 | 17.06, 17.61, 17.19 | 25.32, 24.46, 24.59 | +48.4, +38.9, +43.1% (+21, +15, +17) | -0.1, +0.1, 0.0% |
+| 78, 79 | 16.97, 15.77 | 23.81, 20.56 | +40.3, +30.4% (+28, +64) | 0.0, 0.0% |
+| 96, 100 | 16.68, 15.68 | 32.87, 26.51 | +97.1, +69.0% (+88, +62) | -0.0, +0.1% |
+| 128, 129, 160 | 27.54, 25.76, 27.52 | 32.81, 28.48, 32.75 | +19.1, +10.6, +19.0% (+19, +11, +18) | 0.0, -0.0, +0.3% |
+| 192, 256, 320, 512 | 27.53, 27.30, 32.27, 31.42 | 32.70, 32.28, 32.28, 31.44 | +18.8, +18.3, +0.0, +0.1% (+17, +15, within 1) | -0.1 to +0.0% |
+| tg128 | 3.37 | 3.37 | +0.0% (within 0.5) | +0.1% |
+
+- The criterion is met at this run's lengths: from 16 tokens never slower than `split` (the least pp320, +0.0%), every
+  tested length from 16 to 100 at least +25.2% (pp16), outputs identical, the acceptance script's checks passed
+  (above). With 8B's run both files meet it at the lengths tested; the lengths where the corrected model put dips were
+  not tested on 14B (estimates in the last bullet).
+- Against the predictions: from 16 to 100 tokens the gains lie between -33.5 (pp79) and +44.5 points (pp32) of the
+  model's, above it at 18 of the 19 lengths; from 128 tokens within -0.1 to +3.1 points. Above: `split` is slower than
+  modelled (by 10-23% at 52-78 tokens), as on 8B but more: by the op counters its down on path C on rows of 17,408
+  values costs 1.5-2.0x per weight the model's at 8-78 rows (8B's rows of 12,288: 1.05-1.45x), and the 5 requantized
+  downs, costed per weight as Q4_0, 3.1-4.2x there; the other matrices' path C within 0.74-1.39x (k, with `split`'s
+  uneven blocks, the widest). `fit,staged` lies within -11 to +4% of the corrected model (its down on path C too at
+  8-24 rows). Below, at pp79: path A's leftover rows (3, on tile 3). Against `fit`: slower at pp2 and pp4 (-4.9,
+  -8.6%), not at pp8 (+0.7%, the first model where it is not), about level at 12-13, +1.3 to +2.9% from 16 to 51
+  tokens (predicted 1.5-3.5%), within 0.3% from 52 (path A under both): as predicted but pp8 and pp16.
+- The odd tiles on path B (predicted under `fit` 22% for k and v, 4.5% for q and o, 1.3% for gate and up; under
+  `fit,staged` 0-5%): under `fit` k and v +8.5 to +21.7%, rising with the rows (21.7% at 51), q and o +1.8 to +4.6%,
+  gate and up +0.5 to +1.4%; under `fit,staged` -0.2 to +5.5% (k at 16 rows the highest). The paths' boundaries show
+  in the counters where the code puts them: down on path B at 2-4 rows, path C at 8-24, path A from 32; the
+  requantized downs on path C up to 24 rows (never path B) and path A from 32; the other matrices on path B up to 51
+  rows, path A from 52. Path A's last round as on 8B: at 65 rows tile 0's leftover row makes the even tiles the slower
+  (-8%), at 78 and 79 tile 3's 2 and 3 rows the odd ones (+4.0 to +6.2%, +10.7 to +13.1%).
+- Generation (tg128; E3c's counters and the op counters on the defaults): 296.0 ms per token in graph compute, the
+  matmuls 288.9 ms (8.48 GB at 29.4 GB/s; 8B 29.3), the head 28.3 ms of it, the 5 requantized downs 17.1 ms (3.43 ms
+  each against 1.79 for a Q4_0 down: 1.91x, the bytes 1.89x, read from DRAM), attention 2.5 ms; imbalance 6.9 ms, the
+  AI cores idle 0.6% of a token. tg128 3.37 in all three settings, as predicted.
+- The fix against `FLAGOS_SPACEMIT_Q4_1=zero-point` (3 interleaved rounds, `~/kld/step4-fix-bench.csv`): tg128 3.371
+  against 3.463, -2.64% (rounds -2.49 to -2.80%), pp128 27.51 against 27.67, -0.59%; predicted 2.0-3.0% and within
+  1.5%: met. With `zero-point` the provider's tg128 would be 0.4% above the IME path's 3.45 (acceptance run), with
+  the fix 2.3% under it.
+- The untested lengths re-estimated (estimates, made after this run): the corrected model's `split` and `fit,staged`,
+  each scaled by its measured-over-model ratio at the nearest tested lengths (`split` 0.82-0.97 at 52-79 tokens,
+  1.02-1.03 at 128-160; `fit,staged` 1.00-1.03). With today's assignment `fit,staged` against `split`: pp54 +34.0%,
+  pp55 +7.8%, pp58 +43.1%, pp59 +15.0%, pp62 +52.2%, pp63 +22.1%, pp66 +20.8%, pp67 +2.1%, pp70 +27.3%, pp71 +8.3%,
+  pp74 +33.7%, pp75 +13.8%, pp130 +3.5%, pp131 -2.0%, pp135 -0.6%, so part 2 would fail at pp67 and part 1 at pp131
+  (8B's pp131 estimated -2.0% too). With the leftover rows dealt by the implemented rule, `split` dealt as well from
+  113 tokens: at least +41.1% at 54-79 tokens (pp63) and +10.1 to +11.3% at 130-135. The dealing's 14B session
+  measures both.
+
 ### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
@@ -2097,3 +2453,34 @@ matmul setting), the fix against `zero-point`:
   only, against those layers in F32) the requantized Q8_0 lies a little further from exact arithmetic than the CPU's
   own Q4_1 path (KLD 0.00138 against 0.00109). Speed in the same session (3 rounds): tg128 -2.4%, -1.0% and -2.0%,
   pp128 -1.2%, -0.3% and -0.6%; Qwen3-4B's tg128 11.03, under M0's 11.1. Kept as the default (user).
+- 2026-10-24: step 4 prepared (§7.3; the user's choice of models): Qwen3-8B Q4_0 (bartowski's file, unsloth's recipe;
+  unsloth has no 8B Q4_0) and Qwen3-14B Q4_0 (unsloth), downloaded and checked on the board, fit by the code (2 graph
+  splits expected; 14B's 5 query heads per KV head new; the requantized downs too large for TCM, so never path B and
+  read from DRAM in generation). Predictions from a per-matrix model calibrated on Qwen3-4B's counters (within -11 to
+  +4 points of Llama-3.2-1B's measured gains): `fit,staged` at least 15% faster than `split` from 16 to 100 tokens on
+  both files, the narrowest 14B at 65-69 tokens; criterion as step 3's.
+- 2026-10-24: step 4, Qwen3-8B's acceptance script on the K3 (§7.3): 34/34 checks; perplexity -0.14% against the CPU,
+  mean KLD 0.003116 / 0.002137 (512-token batches / `-ub 1 -b 512`); pp128 50.59 (`split`) and tg128 6.05 against the
+  IME path's 45.07 and 6.08; every prediction for it met. The runner's session on this file next.
+- 2026-10-24: step 4, Qwen3-8B's benchmark on the K3 (§7.3): the criterion met (from 16 tokens at worst -0.25% against
+  `split`, at least +20.2% from 16 to 100, outputs identical); against `fit`, the odd tiles, tg128 and the fix's cost
+  (-2.34%) as predicted. Found: path A runs the batch's last m mod 4 rows on one tile, one kernel call each
+  (flagos-spacemit-ime.cpp:134-143, 483-490), so 2 or 3 leftover rows cost 2 or 3 one-row passes (pp78, pp79 14 and 35
+  points under the model); the corrected model predicts `fit,staged` slower than `split` at untested lengths (8B
+  pp131 -2.0%, 14B pp55-75 at 4q+2 and 4q+3 tokens, down to -14.7% at pp67). Proposed: those lengths in the 14B run;
+  path A dealing the leftover rows one per idle tile (outputs identical by the code).
+- 2026-10-24: the same loop found in SpacemiT's in-tree path and in ggml-spacemit on every branch that has path A, and
+  in ggml-org master, with no fix posted upstream (§7.3). Path A's leftover rows dealt to the idle tiles (§7.3; the
+  user's decision): `path_a_tail_tile`, ime.cpp's assignment behind `FLAGOS_SPACEMIT_TAIL=one-tile` (test-only); on
+  the Mac all checks pass, the path check 64/64 with each tile's leftover rows counted, three mutations caught,
+  ThreadSanitizer clean, test-backend-ops unchanged; `--bench-mm`'s seventh setting and the runner's `tail` and
+  `fs-tail` for the K3; predictions and rule fixed. Not yet run on the K3.
+- 2026-10-25: step 4, Qwen3-14B on the K3 (runs of 2026-10-24, build `bd4b655`; §7.3): the acceptance script 34/34
+  (perplexity +0.07% against the CPU, mean KLD 0.004728 / 0.004029, the first above its predicted 0.0015-0.0035,
+  cause not isolated; the script reports KLD without a bound), pp128 27.48 and tg128 3.37 against the IME path's
+  24.75 and 3.45. The benchmark, at step 4's first 26 lengths (the ones added after 8B's run not in it), met the
+  criterion: from 16 tokens never slower than `split`, at least +25.2% from 16 to 100, outputs identical; the gains up
+  to 44.5 points above the model's, `split`'s down on path C on rows of 17,408 values 1.5-2.0x the model's cost per
+  weight; the fix's cost -2.64%. The untested lengths re-estimated: with today's assignment pp67 +2.1% and pp131 -2.0%
+  (the criterion would fail there), with the dealing at least +10.1%. The dealing's predictions corrected for pp59
+  (the model used the first proposal where m % 32 is 27 or 30), before its run.

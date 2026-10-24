@@ -16,7 +16,8 @@
 //                    one-chunk, against the default)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under FLAGOS_SPACEMIT_MM=rows
 //                    (path A), spacemit (path B), fit (path B where TCM holds the activations), fit,staged (fit
-//                    without path B's turns) and fit,mixed (the turns for few rows only) against the default split
+//                    without path B's turns), fit,mixed (the turns for few rows only) and rows with
+//                    FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m % 4 rows on one tile) against the default split
 //   --bench-grid     only path B's turns, independent of any model: fit, fit,staged and fit,mixed for Q4_0, Q4_1 and
 //                    Q8_0 weights of 1,024-9,728 values per row and 256-9,728 columns at 2-48 rows (not in --bench)
 //   --e3b[=runs]     only structural-experiments.md E3b-diag: why launches ordered in the cores differ (default 20 runs
@@ -1187,10 +1188,14 @@ static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
 // steps without the turns: fit,staged's all, fit,mixed's from its threshold (16 rows for Q4_0 and for Q4_1 in the
 // zero-point layout, 29 for Q8_0, Q6_K and Q4_1 stored as Q8_0 at rows of 512 values), no other setting's; the output is
 // filled with NaN before every run, so columns a path skips show, and split's
-// must come out finite. Paths A and B need TCM: as check_gemv_strategies, a stand-in of the K3's 384 KiB on a host
-// without the AI cores, there also with tiles on threads, where path B's pair waits wait
+// must come out finite. Path A's last m % 4 rows are counted by the tile that multiplied them (spacemit_mm_tail_take)
+// and compared with their dealing, worked out here again, and with FLAGOS_SPACEMIT_TAIL=one-tile (ime.cpp's: all on
+// the tile after the last group), run as a seventh setting with rows' paths. Paths A and B need TCM: as
+// check_gemv_strategies, a stand-in of the K3's 384 KiB on a host without the AI cores, there also with tiles on
+// threads, where path B's pair waits wait
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
+    env_override                tail("FLAGOS_SPACEMIT_TAIL", nullptr);
     std::vector<ggml_backend_t> backends;
     for (const char * threads : { (const char *) nullptr, "1" }) {
         if (threads != nullptr && !host) {
@@ -1228,10 +1233,24 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         { GGML_TYPE_Q4_1, 512, 1024, 16 },  // zero-point layout: 16 x 608 = 9728: none
         { GGML_TYPE_Q8_0, 512, 1024, 28 },  // 28 x 608 < 32 x 544
         { GGML_TYPE_Q8_0, 512, 1024, 29 },  // 29 x 608 >= 17408: none
+        // path A's last m % 4 rows, dealt to the tiles without a group in the last round (37, 66 and 113 above too)
+        { GGML_TYPE_Q4_0, 512, 1024, 34 },   // no group in the last round: tiles 0 and 1 take a row each
+        { GGML_TYPE_Q4_0, 512, 1024, 35 },   // tiles 0, 1 and 2
+        { GGML_TYPE_Q4_0, 512, 1024, 47 },   // tiles 0-2 hold the last round's groups: tiles 3, 4 and 5
+        { GGML_TYPE_Q4_0, 512, 1024, 59 },   // only tiles 6 and 7 idle: tile 6 two rows, tile 7 one
+        { GGML_TYPE_Q4_0, 512, 1024, 62 },   // only tile 7 idle: it keeps both rows
+        { GGML_TYPE_Q4_0, 512, 1024, 63 },   // tile 7 two rows, tile 0 the third after its group
+        { GGML_TYPE_Q8_0, 512, 1024, 59 },
+        { GGML_TYPE_Q4_1, 512, 1024, 63 },
+        { GGML_TYPE_Q6_K, 512, 1024, 47 },
+        { GGML_TYPE_Q4_0, 9728, 512, 35 },   // fit's path A (the activations do not fit next to a slab): tiles 0-2
+        { GGML_TYPE_Q4_0, 512, 1024, 115 },  // the split's path A: tiles 4, 5 and 6
     };
-    constexpr int      n_set           = 6;
-    const char * const settings[n_set] = { nullptr, "rows", "spacemit", "fit", "fit,staged", "fit,mixed" };
-    const char * const names[n_set]    = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed" };
+    constexpr int      n_set           = 7;
+    const char * const settings[n_set] = { nullptr, "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows" };
+    const char * const tails[n_set]    = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile" };
+    const char * const names[n_set]    = { "split",      "rows",      "spacemit",     "fit",
+                                           "fit,staged", "fit,mixed", "rows,one-tile" };
     int                n_same = 0, n_runs = 0;
     for (const mm_case & c : cases) {
         mm_weight w;
@@ -1251,25 +1270,50 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                               393216;
         const bool    mixed_staged  = c.m * ime_act_row_bytes(c.type, c.k) >= 32 * (int64_t) ime_row_bytes(c.type, c.k);
         const char    fit_path      = fit_b ? 'B' : c.m >= 32 ? 'A' : 'C';
-        const char    expect[n_set] = { split_a ? 'A' : 'C', split_a || c.m >= 32 ? 'A' : 'C', split_a ? 'A' : 'B',
-                                        fit_path, fit_path, fit_path };
-        const bool    no_turns[n_set] = { false, false, false, false, true, mixed_staged };
+        const char    rows_path     = split_a || c.m >= 32 ? 'A' : 'C';
+        const char    expect[n_set] = { split_a ? 'A' : 'C', rows_path, split_a ? 'A' : 'B', fit_path, fit_path,
+                                        fit_path,            rows_path };
+        const bool    no_turns[n_set] = { false, false, false, false, true, mixed_staged, false };
+        // path A's last m % 4 rows by tile: dealt, one to each tile from g, the tile after the last group, to tile 7,
+        // then once more over those tiles, then to tile 0 onwards; one-tile, all on tile g
+        constexpr int tiles = 8;
+        const int64_t left  = c.m % 4;
+        const int64_t g     = (c.m - left) / 4 % tiles;
+        uint64_t      tail_dealt[tiles] = {}, tail_one[tiles] = {};
+        tail_one[g] = (uint64_t) left;
+        for (int64_t j = 0, t = g, pass = 0, extra = 0; j < left; j++) {
+            if (pass < 2) {
+                tail_dealt[t]++;
+                if (++t == tiles) {
+                    t = g;
+                    pass++;
+                }
+            } else {
+                tail_dealt[extra++]++;
+            }
+        }
         for (ggml_backend_t backend : backends) {
             std::vector<float> out[n_set];
             uint64_t           path_a[n_set] = {}, path_b[n_set] = {}, path_c[n_set] = {}, path_s[n_set] = {};
+            uint64_t           tail_rows[n_set][tiles] = {};
             bool               ok            = true;
             for (int s = 0; s < n_set; s++) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[s]);
+                set_env("FLAGOS_SPACEMIT_TAIL", tails[s]);
                 ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
                 spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
+                spacemit_mm_tail_take(tail_rows[s], tiles);
                 ok = ok && ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
                 spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
+                spacemit_mm_tail_take(tail_rows[s], tiles);
                 out[s].resize(ggml_nelements(run.y));
                 ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
             }
             set_env("FLAGOS_SPACEMIT_MM", nullptr);
+            set_env("FLAGOS_SPACEMIT_TAIL", nullptr);
             bool        switched = true;
-            int         differs  = 0;  // the first setting whose output differs from split's
+            int         differs  = 0;   // the first setting whose output differs from split's
+            int         misdealt = -1;  // the first setting whose leftover rows are not on the expected tiles
             std::string paths;
             for (int s = 0; s < n_set; s++) {
                 const char p = expect[s];
@@ -1280,10 +1324,32 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                     std::memcmp(out[0].data(), out[s].data(), out[0].size() * sizeof(float)) != 0) {
                     differs = s;
                 }
+                for (int i = 0; i < tiles && misdealt < 0; i++) {
+                    const uint64_t want = p != 'A' ? 0 : tails[s] != nullptr ? tail_one[i] : tail_dealt[i];
+                    if (tail_rows[s][i] != want) {
+                        misdealt = s;
+                    }
+                }
                 paths += std::string(s == 0 ? "" : ", ") + names[s] + " " + std::to_string(path_a[s]) + "/" +
                          std::to_string(path_b[s]) + "/" + std::to_string(path_c[s]) + "/" +
                          std::to_string(path_s[s]) + " (" + p + (s_no_turns ? ", no turns" : "") + ")";
             }
+            switched = switched && misdealt < 0;
+            std::string dealt;  // the leftover rows by tile, of the first misdealt setting and as expected
+            if (misdealt >= 0) {
+                dealt = std::string(", ") + names[misdealt] + "'s leftover rows by tile";
+                for (int i = 0; i < tiles; i++) {
+                    dealt += (i == 0 ? " " : ",") + std::to_string(tail_rows[misdealt][i]);
+                }
+                dealt += ", expected";
+                for (int i = 0; i < tiles; i++) {
+                    const uint64_t want = expect[misdealt] != 'A'      ? 0 :
+                                          tails[misdealt] != nullptr ? tail_one[i] :
+                                                                       tail_dealt[i];
+                    dealt += (i == 0 ? " " : ",") + std::to_string(want);
+                }
+            }
+            paths += dealt;
             const bool finite = std::all_of(out[0].begin(), out[0].end(), [](float v) { return std::isfinite(v); });
             const bool same   = ok && finite && differs == 0;
             if (!same || !switched) {
@@ -1291,6 +1357,7 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                                          !finite       ? std::string("split's output is not finite") :
                                          differs != 0  ? std::string("FLAGOS_SPACEMIT_MM=") + names[differs] +
                                                             " differs from split" :
+                                         misdealt >= 0 ? std::string("path A's leftover rows on unexpected tiles") :
                                                          std::string("a setting did not take its path");
                 std::fprintf(stderr,
                              "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C taken / path B without the "
@@ -1309,9 +1376,10 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     }
     std::printf("mm       FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B where the "
                 "split gives no path A), fit (path B where TCM holds the activations, else A or C), fit,staged (fit's "
-                "paths, path B without the turns) and fit,mixed (the turns below a slab's bytes of activations) "
-                "against the default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, paths "
-                "and turns as expected%s\n",
+                "paths, path B without the turns), fit,mixed (the turns below a slab's bytes of activations) and rows "
+                "with FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m %% 4 rows on one tile, as ime.cpp) against the "
+                "default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, paths, turns and "
+                "path A's leftover rows by tile as expected%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
@@ -2516,13 +2584,16 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 
 // fusion-and-splitting.md §7.3: the matmuls of a Qwen3-4B batch under FLAGOS_SPACEMIT_MM=rows (path A whenever every
 // tile gets 4 rows), spacemit (path B where the split gives no path A), fit (path B where TCM holds the activations,
-// else A or C), fit,staged (fit without path B's turns) and fit,mixed (the turns for few rows only) against the default
-// split, at the row counts of short prompts, of a prompt's last batch and of llama-bench's batches: each shape alone
-// with the path each setting took, and per batch the shapes weighted by how often a batch runs them (36 q and
-// attention outputs, 72 k and v, 72 gate and up, 32 + 4 down; the head runs on one row). As in bench_gemv every run
-// reads its weights from DRAM: it takes the next of enough copies of the weight (32 MB together)
+// else A or C), fit,staged (fit without path B's turns), fit,mixed (the turns for few rows only) and rows with
+// FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m % 4 rows all on one tile, as ime.cpp) against the default split, at
+// the row counts of short prompts, of a prompt's last batch, of llama-bench's batches and with 2 or 3 rows left over
+// after the groups of 4: each shape alone with the path each setting took, and per batch the shapes weighted by how
+// often a batch runs them (36 q and attention outputs, 72 k and v, 72 gate and up, 32 + 4 down; the head runs on one
+// row). As in bench_gemv every run reads its weights from DRAM: it takes the next of enough copies of the weight (32 MB
+// together)
 static int bench_mm(ggml_backend_dev_t dev) {
     env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
+    env_override   tail("FLAGOS_SPACEMIT_TAIL", nullptr);
     ggml_backend_t backend = nullptr;
     {
         env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM (check_mm_paths)
@@ -2535,10 +2606,12 @@ static int bench_mm(ggml_backend_dev_t dev) {
         { "attn out", GGML_TYPE_Q4_0, 4096, 2560, 36 }, { "gate, up", GGML_TYPE_Q4_0, 2560, 9728, 72 },
         { "down", GGML_TYPE_Q4_0, 9728, 2560, 32 },     { "down Q4_1", GGML_TYPE_Q4_1, 9728, 2560, 4 },
     };
-    const std::vector<int64_t> rows = { 2,  4,  8,  16, 17,  24,  31,  32,  33,  36,  40,  44, 48,
-                                        64, 65, 96, 100, 112, 113, 128, 129, 149, 160, 256, 512 };
-    const char * const  settings[] = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed" };
-    constexpr int       n_set      = 6;
+    const std::vector<int64_t> rows = { 2,  4,  8,  16, 17,  24,  31,  32,  33,  34,  35,  36,  40,  44,  48,  51,
+                                        63, 64, 65, 79, 96, 100, 112, 113, 115, 128, 129, 131, 149, 160, 256, 512 };
+    const char * const  settings[] = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows,one-tile" };
+    const char * const  mm_of[]    = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows" };
+    const char * const  tail_of[]  = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile" };
+    constexpr int       n_set      = 7;
     std::vector<double> batch[n_set];
     for (std::vector<double> & b : batch) {
         b.assign(rows.size(), 0.0);
@@ -2564,7 +2637,8 @@ static int bench_mm(ggml_backend_dev_t dev) {
             double      t[n_set] = {};
             std::string path[n_set];
             for (int k = 0; k < n_set; k++) {
-                set_env("FLAGOS_SPACEMIT_MM", settings[k]);
+                set_env("FLAGOS_SPACEMIT_MM", mm_of[k]);
+                set_env("FLAGOS_SPACEMIT_TAIL", tail_of[k]);
                 bool     ok   = true;
                 size_t   next = 0;
                 uint64_t path_a, path_b, path_c, path_s;
@@ -2582,6 +2656,7 @@ static int bench_mm(ggml_backend_dev_t dev) {
                 CHECK(ok);
             }
             set_env("FLAGOS_SPACEMIT_MM", nullptr);
+            set_env("FLAGOS_SPACEMIT_TAIL", nullptr);
             const double flop = 2.0 * s.k * s.n * m;
             std::string  line;
             for (int k = 0; k < n_set; k++) {
