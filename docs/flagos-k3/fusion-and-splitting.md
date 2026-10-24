@@ -1943,7 +1943,8 @@ matmul setting), the fix against `zero-point`:
   weight bytes per token grow 1.9%; the rest not isolated).
 - Qwen3-4B's tg128 with the fix, 11.03, is under M0's target of 11.1, the IME path's speed at M0, which carries the
   same conversion error (the IME path not run in this session). Option (b), exact, would keep the 19-byte layout plus
-  2 bytes per block: about +0.25% of the weight bytes instead of +1.9% (an estimate), for new kernel code.
+  2 bytes per block: about +0.25% of the weight bytes instead of +1.9% (an estimate), for new kernel code. The user
+  kept the fix as the default after these results (2026-10-24).
 
 ### 7.4 Still proposed
 
@@ -2095,4 +2096,4 @@ matmul setting), the fix against `zero-point`:
   +7% and -4% (they took the test files' values, measured against the CPU on the requantized weights). On the Mac (CPU
   only, against those layers in F32) the requantized Q8_0 lies a little further from exact arithmetic than the CPU's
   own Q4_1 path (KLD 0.00138 against 0.00109). Speed in the same session (3 rounds): tg128 -2.4%, -1.0% and -2.0%,
-  pp128 -1.2%, -0.3% and -0.6%; Qwen3-4B's tg128 11.03, under M0's 11.1.
+  pp128 -1.2%, -0.3% and -0.6%; Qwen3-4B's tg128 11.03, under M0's 11.1. Kept as the default (user).
