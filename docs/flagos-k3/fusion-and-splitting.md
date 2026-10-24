@@ -1865,7 +1865,7 @@ same text, every candidate's logits equal `split`'s (mean KLD 0.000000, maximum 
   same test on Qwen3-0.6B (layers 0-2) and Qwen3-4B (0-3) would show how much of their KLD (0.0147, 0.0034) it is.
 
 **The fix: Q4_1 requantized to Q8_0 at load (option (a), the user's choice, 2026-10-23; implemented and checked on the
-Mac the same day, not yet run on the K3).**
+Mac the same day, run on the K3 2026-10-24).**
 - What changed (providers/spacemit only): a layout `q4_1_q8_0_32x32` for Q4_1 matmul weights, the default. At load
   each 32-row group is dequantized and requantized by ggml's own Q8_0 quantizer, the function llama-quantize used for
   the test file above, then stored in the q8_0 32x32 layout and multiplied by the Q8_0 kernels, as the Q6_K head
@@ -1894,6 +1894,56 @@ Mac the same day, not yet run on the K3).**
   Qwen3-0.6B (FLAGOS_SPACEMIT_Q4_1=zero-point in the same session as the comparison); the fit settings' comparisons
   unchanged in kind, as Q4_1 now has Q8_0's thresholds (path B to 11 rows for a down of 8,192 values, as on the Q8_0
   file).
+
+**The fix on the K3 (2026-10-24, build `bd4b655`; `~/kld/fix-*.txt`, `~/kld/fix-bench.csv`).** flagos-check-spacemit passes all checks on the
+board on both routes (the default, and `FLAGOS_SPACEMIT_Q4_1=zero-point`). Accuracy against the CPU, 8 x 512 tokens,
+`-fa on`, both routes against the same CPU run:
+
+| Q4_0 file | CPU perplexity | `zero-point` (the old default): perplexity, mean KLD, same top token | the fix: perplexity, mean KLD, same top token |
+|---|---|---|---|
+| Llama-3.2-1B | 13.4182 | +5.45%, 0.0548, 88.5% | +0.20%, 0.00302, 97.2% |
+| Qwen3-0.6B | 14.3598 | +1.02%, 0.0148, 93.5% | +0.61%, 0.00472, 95.9% |
+| Qwen3-4B | 9.7740 | +0.08%, 0.00335, 96.7% | -0.00%, 0.00249, 97.4% |
+
+- The fix removes 94.5%, 68.2% and 25.8% of the mean KLD, and Llama-3.2-1B's perplexity is now within the acceptance
+  script's 1% bound (by this run; the script itself not rerun). `zero-point` gives the old default's outputs:
+  perplexity 14.149043, 14.506814 and 9.782019 (step 3's and M2e's values), Qwen3-4B's KLD 0.003354 (M2e's to the
+  last digit).
+- Qwen3-0.6B on the old route reads +1.02% against this CPU run, above the 1% bound it met at M2e (+0.89% against a CPU
+  run of 14.3795; CPU runs here are not bit-reproducible, `build.md` §7); the fix leaves it +0.61%.
+- Against the predictions: Llama-3.2-1B's perplexity within 0.5% (met), its KLD 0.00302 just above 0.002-0.003
+  (missed by 0.8%); Qwen3-0.6B 0.00472 against about 0.0044 (+7%), Qwen3-4B 0.00249 against about 0.0026 (-4%). The
+  predictions took the test files' values, which were measured against the CPU on the requantized weights; the
+  reference here is the CPU on the Q4_1 weights. On Llama-3.2-1B the provider's output is the test file's (perplexity
+  13.445556 ± 0.897488 in both runs: the same quantizer made both sets of weights) and the CPU run on the Q4_0 file
+  is the same in both sessions (13.4182), so the change from 0.0026 to 0.0030 is the reference's alone. On Qwen3 the
+  CPU runs also moved between the sessions (0.6B 14.3816 -> 14.3598, 4B 9.7717 -> 9.7740), so its differences are not
+  attributed.
+- How far the requantization itself moves the result (the Mac, CPU only, Llama-3.2-1B Q4_0, 8 x 512 tokens of
+  plan.md; layers 0-1's down rewritten by llama-quantize in F32, which holds the Q4_1 values exactly and runs without
+  quantizing the activations, or in Q8_0): against the F32 file, the CPU's Q4_1 path gives mean KLD 0.00109 (same top
+  token 97.9%) and the requantized Q8_0 0.00138 (97.7%); the two differ from each other by 0.00139, and the Q4_0 file
+  against itself gives 0.000000. So the requantized layers lie a little further from exact arithmetic than the CPU's
+  own Q4_1 path, and a KLD against the CPU's Q4_1 path counts the difference between two inexact computations. Option
+  (b) (exact Q4_1 weights, the IME's activations) would remove only the requantization's part; its share on the K3 is
+  not measured (on Llama-3.2-1B, changing the reference from the requantized weights to the Q4_1 ones moved the KLD by
+  0.0004).
+
+Speed in the same session (3 interleaved rounds of llama-bench pp128 and tg128 per route, `-fa auto`, the default
+matmul setting), the fix against `zero-point`:
+
+| Q4_0 file | tg128 | pp128 |
+|---|---|---|
+| Llama-3.2-1B | 32.70 against 33.50, -2.4% (rounds -2.1 to -2.9%) | 370.0 against 374.4, -1.2% |
+| Qwen3-0.6B | 54.98 against 55.57, -1.0% (rounds +0.1 to -1.7%) | 649.6 against 651.2, -0.3% |
+| Qwen3-4B | 11.03 against 11.26, -2.0% (rounds -1.8 to -2.5%) | 91.6 against 92.1, -0.6% |
+
+- Against the predictions (tg128 1-2% slower on Llama-3.2-1B and Qwen3-4B, about 1% on Qwen3-0.6B, prompt processing
+  less): Qwen3-0.6B and prompt processing met, Qwen3-4B at the range's top, Llama-3.2-1B 0.4 points above it (its
+  weight bytes per token grow 1.9%; the rest not isolated).
+- Qwen3-4B's tg128 with the fix, 11.03, is under M0's target of 11.1, the IME path's speed at M0, which carries the
+  same conversion error (the IME path not run in this session). Option (b), exact, would keep the 19-byte layout plus
+  2 bytes per block: about +0.25% of the weight bytes instead of +1.9% (an estimate), for new kernel code.
 
 ### 7.4 Still proposed
 
@@ -2039,3 +2089,10 @@ Mac the same day, not yet run on the K3).**
 - 2026-10-23: the Q4_1 test on Qwen3 (K3, §7.3): with their Q4_1 layers in Q8_0 the provider's mean KLD against the
   CPU falls 0.0149 -> 0.0044 on Qwen3-0.6B (-71%) and 0.00334 -> 0.00260 on Qwen3-4B (-22%): the conversion is also
   most of 0.6B's error, which M2e had put down to the IME approach as a whole.
+- 2026-10-24: the fix on the K3 (§7.3): all checks pass on both routes; against one CPU run per model the mean KLD
+  falls 0.0548 -> 0.00302 on Llama-3.2-1B (perplexity +5.45% -> +0.20%), 0.0148 -> 0.00472 on Qwen3-0.6B (+1.02% ->
+  +0.61%) and 0.00335 -> 0.00249 on Qwen3-4B; `zero-point` reproduces the old default. The Qwen3 predictions missed by
+  +7% and -4% (they took the test files' values, measured against the CPU on the requantized weights). On the Mac (CPU
+  only, against those layers in F32) the requantized Q8_0 lies a little further from exact arithmetic than the CPU's
+  own Q4_1 path (KLD 0.00138 against 0.00109). Speed in the same session (3 rounds): tg128 -2.4%, -1.0% and -2.0%,
+  pp128 -1.2%, -0.3% and -0.6%; Qwen3-4B's tg128 11.03, under M0's 11.1.
