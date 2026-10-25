@@ -22,7 +22,8 @@ bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor 
 // FLAGOS_SPACEMIT_MM=rows, spacemit, fit, fit,staged and fit,mixed switch the path, and which of them drop the turns)
 void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_b, uint64_t & path_c, uint64_t & path_b_staged);
 
-// test-only: of path A's last m % 4 rows since the last call, how many each tile multiplied (rows[i] for tile i <
-// n_tiles; all tiles' counts reset). flagos-check-spacemit checks that they are dealt to the tiles idle in the last
-// round, and that FLAGOS_SPACEMIT_TAIL=one-tile leaves them on one tile as ime.cpp does
-void spacemit_mm_tail_take(uint64_t * rows, uint32_t n_tiles);
+// test-only: of path A's last m % 4 rows since the last call, how many each tile multiplied and in how many calls
+// (rows[i] and calls[i] for tile i < n_tiles; all tiles' counts reset). flagos-check-spacemit checks that they are
+// dealt to the tiles idle in the last round, a tile's in one call, and that FLAGOS_SPACEMIT_TAIL=one-tile leaves them
+// on one tile as ime.cpp does
+void spacemit_mm_tail_take(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);

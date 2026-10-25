@@ -1188,11 +1188,12 @@ static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
 // steps without the turns: fit,staged's all, fit,mixed's from its threshold (16 rows for Q4_0 and for Q4_1 in the
 // zero-point layout, 29 for Q8_0, Q6_K and Q4_1 stored as Q8_0 at rows of 512 values), no other setting's; the output is
 // filled with NaN before every run, so columns a path skips show, and split's
-// must come out finite. Path A's last m % 4 rows are counted by the tile that multiplied them (spacemit_mm_tail_take)
-// and compared with their dealing, worked out here again, and with FLAGOS_SPACEMIT_TAIL=one-tile (ime.cpp's: all on
-// the tile after the last group), run as a seventh setting with rows' paths. Paths A and B need TCM: as
-// check_gemv_strategies, a stand-in of the K3's 384 KiB on a host without the AI cores, there also with tiles on
-// threads, where path B's pair waits wait
+// must come out finite. Path A's last m % 4 rows are counted by the tile that multiplied them, with its calls
+// (spacemit_mm_tail_take: one per tile that has any, as a tile's rows are consecutive and two rows in two calls
+// stream the weights twice), and compared with their dealing, worked out here again, and with
+// FLAGOS_SPACEMIT_TAIL=one-tile (ime.cpp's: all on the tile after the last group), run as a seventh setting with
+// rows' paths. Paths A and B need TCM: as check_gemv_strategies, a stand-in of the K3's 384 KiB on a host without the
+// AI cores, there also with tiles on threads, where path B's pair waits wait
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
     env_override                tail("FLAGOS_SPACEMIT_TAIL", nullptr);
@@ -1295,17 +1296,17 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         for (ggml_backend_t backend : backends) {
             std::vector<float> out[n_set];
             uint64_t           path_a[n_set] = {}, path_b[n_set] = {}, path_c[n_set] = {}, path_s[n_set] = {};
-            uint64_t           tail_rows[n_set][tiles] = {};
+            uint64_t           tail_rows[n_set][tiles] = {}, tail_calls[n_set][tiles] = {};
             bool               ok            = true;
             for (int s = 0; s < n_set; s++) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[s]);
                 set_env("FLAGOS_SPACEMIT_TAIL", tails[s]);
                 ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
                 spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
-                spacemit_mm_tail_take(tail_rows[s], tiles);
+                spacemit_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
                 ok = ok && ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
                 spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
-                spacemit_mm_tail_take(tail_rows[s], tiles);
+                spacemit_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
                 out[s].resize(ggml_nelements(run.y));
                 ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
             }
@@ -1326,7 +1327,7 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 }
                 for (int i = 0; i < tiles && misdealt < 0; i++) {
                     const uint64_t want = p != 'A' ? 0 : tails[s] != nullptr ? tail_one[i] : tail_dealt[i];
-                    if (tail_rows[s][i] != want) {
+                    if (tail_rows[s][i] != want || tail_calls[s][i] != (uint64_t) (want > 0)) {
                         misdealt = s;
                     }
                 }
@@ -1341,6 +1342,10 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 for (int i = 0; i < tiles; i++) {
                     dealt += (i == 0 ? " " : ",") + std::to_string(tail_rows[misdealt][i]);
                 }
+                dealt += " in calls";
+                for (int i = 0; i < tiles; i++) {
+                    dealt += (i == 0 ? " " : ",") + std::to_string(tail_calls[misdealt][i]);
+                }
                 dealt += ", expected";
                 for (int i = 0; i < tiles; i++) {
                     const uint64_t want = expect[misdealt] != 'A'      ? 0 :
@@ -1348,6 +1353,7 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                                                                        tail_dealt[i];
                     dealt += (i == 0 ? " " : ",") + std::to_string(want);
                 }
+                dealt += ", one call each";
             }
             paths += dealt;
             const bool finite = std::all_of(out[0].begin(), out[0].end(), [](float v) { return std::isfinite(v); });
@@ -1357,7 +1363,7 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                                          !finite       ? std::string("split's output is not finite") :
                                          differs != 0  ? std::string("FLAGOS_SPACEMIT_MM=") + names[differs] +
                                                             " differs from split" :
-                                         misdealt >= 0 ? std::string("path A's leftover rows on unexpected tiles") :
+                                         misdealt >= 0 ? std::string("path A's leftover rows not as expected") :
                                                          std::string("a setting did not take its path");
                 std::fprintf(stderr,
                              "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C taken / path B without the "
@@ -1379,7 +1385,7 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 "paths, path B without the turns), fit,mixed (the turns below a slab's bytes of activations) and rows "
                 "with FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m %% 4 rows on one tile, as ime.cpp) against the "
                 "default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, paths, turns and "
-                "path A's leftover rows by tile as expected%s\n",
+                "path A's leftover rows by tile, a tile's in one call, as expected%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
@@ -2606,8 +2612,8 @@ static int bench_mm(ggml_backend_dev_t dev) {
         { "attn out", GGML_TYPE_Q4_0, 4096, 2560, 36 }, { "gate, up", GGML_TYPE_Q4_0, 2560, 9728, 72 },
         { "down", GGML_TYPE_Q4_0, 9728, 2560, 32 },     { "down Q4_1", GGML_TYPE_Q4_1, 9728, 2560, 4 },
     };
-    const std::vector<int64_t> rows = { 2,  4,  8,  16, 17,  24,  31,  32,  33,  34,  35,  36,  40,  44,  48,  51,
-                                        63, 64, 65, 79, 96, 100, 112, 113, 115, 128, 129, 131, 149, 160, 256, 512 };
+    const std::vector<int64_t> rows = { 2,  4,  8,  16,  17,  24,  31,  32,  33,  34,  35,  36,  40,  44,  48,  51, 59,
+                                        62, 63, 64, 65, 79, 96, 100, 112, 113, 115, 128, 129, 131, 149, 160, 256, 512 };
     const char * const  settings[] = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows,one-tile" };
     const char * const  mm_of[]    = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows" };
     const char * const  tail_of[]  = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile" };

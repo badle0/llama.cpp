@@ -2302,6 +2302,145 @@ in brackets:
   113 tokens: at least +41.1% at 54-79 tokens (pp63) and +10.1 to +11.3% at 130-135. The dealing's 14B session
   measures both.
 
+**Path A's leftover rows dealt, on the K3: Qwen3-8B (2026-10-24, build `682c676`; `EXPS="fit-staged tail fs-tail"
+KLD_SETS="ub79 ub131" REPS=3`, step 4's 27 lengths for 8B and 160-320; `~/fx-q8b-tail.log`, `~/bench-mm-tail.out`, the
+logs in `~/fx/q8b-tail` on the board).** `ref` (`split`) and `fit-staged` deal the rows, `tail` and `fs-tail` are the
+same settings with `FLAGOS_SPACEMIT_TAIL=one-tile`. Outputs identical: the same text in the four settings; against
+`ref` mean KLD 0.000000, maximum 0.000052 (the floor) and the same top token 100% at `-ub 79` and `-ub 131` in the
+three others; on the board the path check 32/32 identical, each tile's leftover rows as the rule gives. The counters
+move a result by at most 0.85% (`ops`' pp68). t/s, mean of 3 runs (standard deviations at most 0.44), dealt against
+one-tile under the same setting, the predictions in brackets (`split` takes path A from 113 tokens):
+
+| tokens (m % 32) | `fit,staged` dealt, one-tile | change | `split` dealt, one-tile | change |
+|---|---|---|---|---|
+| 34, 35 (2, 3) | 49.80, 44.44; 49.02, 40.11 | +12.1, +22.2% | (path A not taken) | |
+| 51, 55 (19, 23) | 54.78, 48.22; 56.13, 49.75 | +13.6% (+16), +12.8% | | |
+| 62 (30) | 55.26, 56.02 | **-1.4%** (within 1) | | |
+| 63 (31) | 53.62, 51.82 | +3.5% | | |
+| 78, 79 (14, 15) | 49.00, 44.33; 49.47, 38.47 | +10.5% (+13), +28.6% (+34) | | |
+| 115, 119 (19, 23) | 54.55, 44.70; 55.64, 45.93 | +22.0, +21.1% | 48.19, 43.88; 48.47, 44.50 | +9.8, +8.9% |
+| 123 (27) | 51.44, 46.89 | +9.7% | 46.80, 44.84 | +4.4% |
+| 127 (31) | 50.63, 47.73 | +6.1% | 46.46, 45.27 | +2.6% |
+| 130, 131 (2, 3) | 52.54, 46.96; 52.63, 42.74 | +11.9%, +23.1% (+26) | 47.77, 45.26; 47.47, 42.97 | +5.5%, +10.5% (+11) |
+| 135, 163 (7, 3) | 51.19, 43.76; 53.82, 45.21 | +17.0% (+20), +19.0% (+21) | 46.95, 43.56; 48.20, 44.43 | +7.8% (+9), +8.5% (+9) |
+| the rest (0 or 1 row left over, or `split` off path A) | | -0.26 to +0.39% (within 1) | | -0.40 to +0.64% |
+| tg128, pp512 | 6.08, 6.08; 56.35, 56.21 | +0.0, +0.25% (within 1) | 6.08, 6.07; 56.30, 56.20 | +0.2, +0.2% |
+
+- The rule is not met at one length: pp62 under `fit,staged`, -1.36% (-0.98% under the counters, whose totals give
+  -0.99%). Everywhere else the dealing is within 0.4% of one-tile where it gives the same calls, and 2.6-28.6% faster
+  where it moves rows; tg128 and pp512 within 0.3%. So by the rule the dealing is examined first; what follows is that
+  examination.
+- The cause (read in the code, measured by the counters). At m % 32 = 30 the rule puts both leftover rows on tile 7,
+  the only idle tile, as ime.cpp does. But the dealt loop multiplies each row in a call of its own (`multiply(m4 + j,
+  1)`, flagos-spacemit-ime.cpp:549 at `682c676`), so tile 7 streams its weights twice. With one-tile, tile 7 multiplies
+  both rows in one call (:537 there): two one-row kernel calls per block of columns, the weights streamed once.
+  That the second call finds the weights in cache is an inference. At 62 rows only the downs take path A (the other
+  matrices take path B, unchanged within 0.1%): the Q4_0 downs take 266.5 ms per batch dealt against 255.5 with
+  one-tile (+4.3%), the requantized ones 63.0 against 61.4 (+2.6%). The same two calls happen at m % 32 = 27 (tile 6,
+  rows 0 and 2) and 31 (tile 7, rows 0 and 1), where the dealing still gains, since one-tile puts 3 rows on one tile
+  there. The prediction assumed two rows on a tile cost 1.44 rounds however they are called.
+- Path A's last round in full rounds, by the counters. These are `fit,staged`'s Q4_0 downs, at a round of 3,331 µs per
+  down (the median at 32-512 rows); the requantized downs and, from 78 rows, the other matrices show the same
+  pattern.
+  - A row alone: 0.69. Groups alone: 0.92-0.93. A group and a row on another tile: 0.94-0.95.
+  - Rows dealt one per idle tile: 0.69-0.74 with no group in the round, 1.02-1.11 with groups.
+  - One tile's 2 rows in one call: 1.34 alone, 1.45-1.47 with groups. One tile's 3 rows in one call: 1.99-2.11.
+  - Tile 7's 2 rows in two calls, with 7 groups: 1.58, against 1.47 in one call.
+  - Dealt at m % 32 = 27: 1.55; at m % 32 = 31: 1.79 (one-tile 2.07 and 2.11).
+- Against the predictions:
+  - `--bench-mm` (Qwen3-4B's shapes), one-tile's time over the dealt one's for gate, up and down: 1.35-1.40 at 34
+    rows (predicted 1.45), 1.67-1.69 at 35 (1.82), 1.45-1.48 at 51 (1.58), 1.11-1.15 at 63 (1.17), 1.33 at 79
+    (1.38), 1.24-1.26 at 115 (1.28), 1.25 at 131 (1.29). The other matrices are alike; the bench's single timings
+    differ by up to 6.8% where the calls are the same.
+  - The model's lengths come in 0.5-5.4 points under their predictions (table).
+  - Both are under because the dealt rows share the round with the groups: a last round with both costs 1.02-1.11
+    rounds, against the model's 0.93 (a group's); with no group it costs 0.69-0.74 (the model's 0.68). That the rows'
+    passes and the groups share DRAM bandwidth is an inference.
+- Step 3's criterion at this session's lengths (`fit,staged` against `split`) is met under the dealing: from 32
+  tokens at worst -0.22% (pp256), every length from 32 to 100 at least +49.1% (pp64), and 115-163 tokens +9.0 to
+  +14.8%. It is met with one-tile too: at worst -0.54% at pp131 (the corrected model had put it at -2.0%), and -0.46%
+  at pp192.
+- Generation: tg128 6.07-6.08 in all four settings; 165.1-165.3 ms per token by E3c's counters.
+- Proposed (the user's decision): a tile's leftover rows multiplied in one call, and a tile with two rows given
+  consecutive ones. At m % 32 = 27, tile 6 would take rows 0-1 and tile 7 row 2 (today tile 6 has rows 0 and 2).
+  - What stays the same: the outputs, by the code (each row the same one-row kernel call on the same bytes), and
+    each tile's count of leftover rows. At m % 32 = 30 the calls become one-tile's.
+  - The check would also count each tile's calls with leftover rows, so a return to one call per row fails it.
+  - Predicted on 8B (estimates from the last-round costs above, with the m-row matmuls 84-89% of a batch by the
+    counters): pp62 level with one-tile (the same calls); pp123 about +1.6% (1.55 -> about 1.47 rounds); pp63 +1 to
+    +2% and pp127 +1.7 to +3.4% (1.79 -> 1.61-1.70, as tile 0's group and row become the slowest). Nothing else
+    changes. Corrected the same day, before any run: at 63 and 127 rows tile 0, with its group and a row, is already
+    the slowest. By the counters the odd tiles are never the slowest there, while at 62 rows tile 7 always is and at
+    123 rows an even tile, tile 6 with its two calls. So the fix leaves that round as it is: pp63 and pp127 unchanged.
+    The fix's predictions are in its block below.
+- For 14B's session on this build, re-estimated from 8B's last-round costs before its results (every matrix takes
+  path A at 59-63 rows on 14B): pp62 about -4% against one-tile, pp59 about +19% (the dealing block's corrected
+  +26.5%), pp63 about +11% (+16%). The other predicted lengths may come in a few points under their predictions, as
+  on 8B. These are for today's dealing; 14B's session runs on the fix instead (its block below).
+
+**A tile's leftover rows in one call (the user's decision, 2026-10-25; implemented and checked on the Mac the same
+day, not yet run on the K3).**
+- What changed (providers/spacemit only):
+  - `path_a_tail_tile` takes the number of leftover rows. When fewer tiles are idle than rows, it gives the first
+    idle tiles two consecutive rows.
+  - Path A's loop multiplies each tile's run of rows in one call (flagos-spacemit-ime.cpp).
+  - Each tile's count of leftover rows stays as it was. With 8 tiles three cases change:
+    - m % 32 = 27: tile 6 takes rows 0-1 in one call and tile 7 row 2. Before, tile 6 had rows 0 and 2 in two
+      calls and tile 7 row 1.
+    - 30: tile 7 takes both rows in one call, as one-tile does.
+    - 31: tile 7 takes rows 0-1 in one call; tile 0 keeps row 2 as before.
+- Why the outputs stay the same, by the code:
+  - The six 1-row kernels (IME and reference) never read the row count they are given (flagos-spacemit-ime-kernels.cpp;
+    the only read is a 4-row kernel's assert, :915).
+  - `gemm_rows` advances one row per call (flagos-spacemit-ime.cpp:175-183).
+  - The leftover rows are quantized one by one into consecutive slots (:482-492), so a call of 2 rows gives the
+    kernel the same bytes as two calls of 1.
+  - One-tile has made such calls since the dealing came in, with identical outputs on the Mac and on the board.
+- Why this way: it is the smallest change that gives m % 32 = 30 one-tile's calls and removes the second pass at 27.
+  Not chosen:
+  - one-tile at m % 32 = 30 alone: a special case that leaves 27's two calls;
+  - gathering a tile's rows that are not consecutive into one call: a TCM copy per row and scattered output rows, a
+    larger change for the same calls.
+- Checked on the Mac (host build, simulated device):
+  - flagos-check-spacemit passes all checks. The path check now also counts each tile's calls with leftover rows
+    (`spacemit_mm_tail_take`): 64/64 identical, with rows and calls by tile as expected.
+  - Two mutations caught: one call per row, as before the fix (10 failures, at 59, 62 and 63 rows, by the calls);
+    and the previous rule in the new loop (4, at 59 rows, where it gives tile 6 rows 0 and 2).
+  - ThreadSanitizer clean; test-backend-ops unchanged (MUL_MAT 3, ADD 54, MUL 46, RMS_NORM 52, ROPE 165, SET_ROWS 87,
+    GET_ROWS 9, SWIGLU 12).
+  - An exhaustive simulation, with the rule's text taken from the source and the previous rule and ime.cpp's loop
+    alongside: tile counts 1-64 and every batch of up to 3 full rounds and 3 rows, 25,088 cases. Every row is
+    multiplied once, the groups are unchanged, a tile's leftover rows come in one call after its groups, and each
+    tile's count is as before. The calls are the previous ones wherever every tile has at most one leftover row, and
+    one-tile's wherever they are all on one tile.
+- For the K3: `--bench-mm` has rows of 59 and 62 too; the runner has the logits sets `ub59` and `ub63`.
+- Predictions (estimates fixed before the run, from the last-round costs above). Path A's matmul time is taken as
+  (k + L) rounds, k the full rounds and L the last. At m % 32 = 27 a tile's 2 rows in one call are taken as 1.47
+  rounds, as at 30; at 31 tile 0 stays the slowest, at 1.79.
+  - Outputs identical: the path check on the board; KLD at the floor at `-ub 59` and `-ub 63`.
+  - Qwen3-8B against one-tile under the same setting, `fit,staged`:
+    - pp62, pp94 and pp126 level within 1% (the same calls);
+    - pp59 +7%, pp91 +15%, pp123 +12% (today's dealing +9.7%);
+    - pp63 +3%, pp95 +7.5%, pp127 +6%, as today: the fix leaves m % 32 = 31's slowest tile as it is.
+  - Qwen3-8B, `split`: pp123 +5% (today's +4.4%), pp126 level, pp127 +2.6% (as today), level below 113 tokens (no
+    path A). tg128 and pp512 within 1%.
+  - Qwen3-8B against today's dealing (the run of 2026-10-24): pp62 +1.3%, pp123 +1.6% (`split` +0.7%), pp63 and
+    pp127 unchanged. Today's dealing would also have been 2.8% and 2.2% slower than one-tile at pp94 and pp126 (not
+    tested).
+  - `--bench-mm`, gate, up and down, one-tile's time over the dealt one's: 1.24 at 59 rows (today's dealing 1.20),
+    1.00 at 62 (0.96), 1.11 at 63 (as today).
+  - Qwen3-14B, `fit,staged` against one-tile (8B's costs in rounds carried over, the matmuls' shares from 14B's first
+    run): pp62 level, the lengths of 4q and 4q+1 tokens level; pp51 +19%, pp54 +17%, pp55 +43%, pp58 +17%, pp59
+    +22%, pp63 +10%, pp66 +22%, pp67 +43%, pp70 +12%, pp71 +29%, pp74 +12%, pp75 +30%, pp78 +10%, pp79 +29%, pp130
+    +12%, pp131 +24%, pp135 +17%.
+  - Qwen3-14B, `split`: pp130 +5%, pp131 +10%, pp135 +7%, its path-A share taken as 0.38 (8B's 0.39).
+  - These replace the dealing block's 14B predictions, which assumed 0.93 rounds for a last round of groups and dealt
+    rows (8B measured 1.02-1.11).
+- Rule (the dealing's, unchanged): the dealing with the fix stays if the outputs are identical, no tested length is
+  more than 1% slower than with one-tile under the same matmul setting, and tg128 and pp512 are within 1%; otherwise
+  it is examined first. Tested on 8B at the lengths the fix changes (2026-10-24's run stands for the others, whose
+  calls are the same) and on 14B at all its lengths.
+
 ### 7.4 Still proposed
 
 - Concurrent DRAM bandwidth: a stand-alone program streaming memory on the X100 cores and the AI cores at once, against
@@ -2484,3 +2623,17 @@ in brackets:
   weight; the fix's cost -2.64%. The untested lengths re-estimated: with today's assignment pp67 +2.1% and pp131 -2.0%
   (the criterion would fail there), with the dealing at least +10.1%. The dealing's predictions corrected for pp59
   (the model used the first proposal where m % 32 is 27 or 30), before its run.
+- 2026-10-25: the dealing on the K3, Qwen3-8B (run of 2026-10-24, build `682c676`; §7.3). Outputs identical: the same
+  text, KLD at the floor at `-ub 79` and `-ub 131`, the path check 32/32 on the board. The dealing is 2.6-28.6%
+  faster than one-tile where it moves rows (`fit,staged` pp79 +28.6%, `split` pp131 +10.5%), 0.5-5.4 points under
+  the predictions; tg128 and pp512 within 0.3%. But pp62 under `fit,staged` is -1.36%, so the rule is not met: at
+  m % 32 = 30 tile 7 multiplies the same two rows as with one-tile, in two calls instead of one (1.58 rounds against
+  1.47 by the counters). Step 3's criterion is met at every length under both assignments. Proposed (the user's
+  decision): a tile's leftover rows in one call, its two rows consecutive (predicted: pp62 level with one-tile,
+  pp123 about +1.6%; pp63 and pp127 unchanged, as corrected before any run, since tile 0 is the slowest there).
+- 2026-10-25: the fix, a tile's leftover rows in one call (§7.3; the user's decision): `path_a_tail_tile` gives the
+  first idle tiles two consecutive rows when fewer are idle than rows, and path A multiplies a tile's run in one call.
+  With 8 tiles only m % 32 = 27, 30 (one-tile's calls) and 31 change. On the Mac all checks pass, with each tile's
+  calls counted; two mutations are caught; ThreadSanitizer is clean; test-backend-ops is unchanged; an exhaustive
+  simulation of the rule (25,088 cases) is clean. Predictions for 8B at the lengths the fix changes and for 14B's
+  session (now on the fix) fixed; the dealing's rule unchanged. Not yet run on the K3.

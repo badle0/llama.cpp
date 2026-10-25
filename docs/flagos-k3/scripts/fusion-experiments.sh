@@ -38,7 +38,8 @@
 #                  and 16 rows, fit's and fit-staged's with 128, 64 and 16, fit-mixed's also with 8 (the turns' side),
 #                  tail's with 131 (the split's path A, 3 rows left over), fs-tail's with 79 and 131
 #        KLD_SETS  the logits check's ubatch sets instead of the experiments' (batch, ub1, ub128, ub64, ub16, ub8,
-#                  ub79, ub131; e.g. "ub79 ub131" for fit-staged, tail and fs-tail together); every set runs every mode
+#                  ub79, ub131, ub59, ub63; e.g. "ub79 ub131" for fit-staged, tail and fs-tail together); every set runs
+#                  every mode
 #        BUILD_A   the build (default <repo>/build-flagos); TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
@@ -388,6 +389,10 @@ run_all() {
                 # under the split too at 131
                 ub79) args="-ub 79" ;;
                 ub131) args="-ub 131" ;;
+                # path A with a tile taking two leftover rows in one call: m % 32 = 27 (tile 6 two, tile 7 one) and 31
+                # (tile 7 two, tile 0 the third after its group), under fit,staged (at least the downs)
+                ub59) args="-ub 59" ;;
+                ub63) args="-ub 63" ;;
                 *) echo "   unknown logits set $s"; continue ;;
             esac
             base=$OUT/kld-base-ref-$s.bin

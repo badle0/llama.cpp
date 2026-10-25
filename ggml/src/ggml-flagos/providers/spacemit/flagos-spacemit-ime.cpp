@@ -129,12 +129,14 @@ mm_setting mm_setting_from_env() {
 }
 
 // Path A's last m % 4 rows, which the quantize step stores one by one and the kernels multiply one call each
-// (gemm_rows): dealt to the tiles that have no group in path A's last round (path_a_tail_tile). In ime.cpp (406-433)
-// they all go to the tile after the last group, which multiplies them one after another while the others wait: on the
-// K3 a tile with 2 or 3 such rows takes about 1.4 or 2.05 times as long as a full round of path A, one row 0.68
-// (Qwen3-8B's op counters, fusion-and-splitting.md §7.3). The row's bytes and its kernel call stay the same, so the
-// output does. test-only: FLAGOS_SPACEMIT_TAIL=one-tile keeps ime.cpp's assignment, for comparisons; read at every
-// call with several rows, so a benchmark can switch; anything else is reported once and ignored
+// (gemm_rows): dealt to the tiles that have no group in path A's last round (path_a_tail_tile), a tile's rows in one
+// call of multiply. In ime.cpp (406-433) they all go to the tile after the last group, which multiplies them one after
+// another while the others wait: on the K3 a tile with 2 or 3 such rows takes about 1.4 or 2.05 times as long as a
+// full round of path A, one row 0.68 (Qwen3-8B's op counters, fusion-and-splitting.md §7.3). Two rows in two calls
+// stream the weights twice: with groups on the other tiles 1.58 rounds, in one call 1.47 (the same counters). The
+// rows' bytes and their kernel calls stay the same, so the output does. test-only: FLAGOS_SPACEMIT_TAIL=one-tile keeps
+// ime.cpp's assignment, for comparisons; read at every call with several rows, so a benchmark can switch; anything
+// else is reported once and ignored
 bool path_a_tail_one_tile() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_TAIL");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "dealt") == 0) {
@@ -150,19 +152,24 @@ bool path_a_tail_one_tile() {
     return false;
 }
 
-// the tile that multiplies leftover row j of path A when dealt. g is the tile after the last group, which holds them
-// in ime.cpp; tiles g to nth - 1 have no group in the last round. Each takes one row, two when fewer are idle than
-// rows (two one-row passes take less time than a group and a row, measured above); a row beyond that goes to tile 0
-// after its group (with 8 tiles only when m % 32 = 31: tile 7 takes two rows, tile 0 the third)
-int64_t path_a_tail_tile(int64_t j, int64_t g, int64_t nth) {
-    const int64_t idle = nth - g;
-    return j < 2 * idle ? g + j % idle : j - 2 * idle;
+// the tile that multiplies leftover row j of path A's r when dealt. g is the tile after the last group, which holds
+// them in ime.cpp; tiles g to nth - 1 have no group in the last round. Each takes one row, the first of them two
+// consecutive ones when fewer are idle than rows (two rows in one call take less time than a group and a row,
+// measured above); a row beyond that goes to tile 0 after its group (with 8 tiles only when m % 32 = 31: tile 7 takes
+// two rows, tile 0 the third). A tile's rows are consecutive, so it multiplies them in one call
+int64_t path_a_tail_tile(int64_t j, int64_t r, int64_t g, int64_t nth) {
+    const int64_t idle  = nth - g;
+    const int64_t pairs = std::min(std::max(r - idle, (int64_t) 0), idle);  // the idle tiles that take two rows
+    if (j < 2 * pairs) {
+        return g + j / 2;
+    }
+    return j < std::min(r, 2 * idle) ? g + j - pairs : j - 2 * idle;
 }
 
 // test-only (spacemit_mm_paths_take); g_path_b_staged: path B steps whose tile 0 ran without the pair turns
 std::atomic<uint64_t> g_path_a{ 0 }, g_path_b{ 0 }, g_path_c{ 0 }, g_path_b_staged{ 0 };
-// test-only (spacemit_mm_tail_take): path A's leftover rows each tile multiplied
-std::atomic<uint64_t> g_tail_rows[SPACEMIT_MAX_TILES];
+// test-only (spacemit_mm_tail_take): path A's leftover rows each tile multiplied, and in how many calls
+std::atomic<uint64_t> g_tail_rows[SPACEMIT_MAX_TILES], g_tail_calls[SPACEMIT_MAX_TILES];
 
 // rows [0, rows) of a block: 4 rows per kernel call while 4 remain, then 1
 void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, int64_t cols, const mm_dims & d,
@@ -428,11 +435,13 @@ void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_b, uint64_t & pat
     path_b_staged = g_path_b_staged.exchange(0);
 }
 
-void spacemit_mm_tail_take(uint64_t * rows, uint32_t n_tiles) {
+void spacemit_mm_tail_take(uint64_t * rows, uint64_t * calls, uint32_t n_tiles) {
     for (uint32_t i = 0; i < SPACEMIT_MAX_TILES; i++) {
         const uint64_t v = g_tail_rows[i].exchange(0);
+        const uint64_t c = g_tail_calls[i].exchange(0);
         if (i < n_tiles) {
-            rows[i] = v;
+            rows[i]  = v;
+            calls[i] = c;
         }
     }
 }
@@ -511,9 +520,9 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
     }
 
     // path A (batches with 4 rows for every tile): each tile stages 4 quantized rows in TCM and streams all weights
-    // past them, the groups of 4 dealt round-robin to the tiles, the last m % 4 rows one per idle tile
-    // (path_a_tail_tile). With FLAGOS_SPACEMIT_MM=rows whenever every tile gets 4 rows; with fit (and fit,staged and
-    // fit,mixed) then too, unless path B holds the activations in TCM
+    // past them, the groups of 4 dealt round-robin to the tiles, the last m % 4 rows one per idle tile, a tile's in
+    // one call (path_a_tail_tile). With FLAGOS_SPACEMIT_MM=rows whenever every tile gets 4 rows; with fit (and
+    // fit,staged and fit,mixed) then too, unless path B holds the activations in TCM
     const mm_setting setting = mm_setting_from_env();
     const bool       fit     = takes_fit_paths(setting);
     const bool       fit_b   = fit && tcm != nullptr && slabs_hold_activations(d, tile.tcm_size);
@@ -531,24 +540,34 @@ bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
             }
         };
         const int64_t m4 = d.m - d.m % row_align;  // the rows in groups of 4
+        const int64_t r  = d.m - m4;               // the rows left over
         const int64_t g  = m4 / row_align % nth;   // the tile after the last group
         if (path_a_tail_one_tile()) {
             for (int64_t m0 = ith * row_align; m0 < d.m; m0 += row_align * nth) {
                 multiply(m0, std::min(d.m - m0, row_align));
             }
-            if (ith == g) {
-                g_tail_rows[ith].fetch_add(d.m - m4, std::memory_order_relaxed);
+            if (ith == g && r > 0) {
+                g_tail_rows[ith].fetch_add(r, std::memory_order_relaxed);
+                g_tail_calls[ith].fetch_add(1, std::memory_order_relaxed);
             }
             return true;
         }
         for (int64_t m0 = ith * row_align; m0 < m4; m0 += row_align * nth) {
             multiply(m0, row_align);
         }
-        for (int64_t j = 0; j < d.m - m4; j++) {
-            if (path_a_tail_tile(j, g, nth) == ith) {
-                multiply(m4 + j, 1);
-                g_tail_rows[ith].fetch_add(1, std::memory_order_relaxed);
+        // the leftover rows in runs of the same tile, each run in one call (with the rule above, one run per tile)
+        for (int64_t j = 0; j < r;) {
+            const int64_t t     = path_a_tail_tile(j, r, g, nth);
+            int64_t       count = 1;
+            while (j + count < r && path_a_tail_tile(j + count, r, g, nth) == t) {
+                count++;
             }
+            if (t == ith) {
+                multiply(m4 + j, count);
+                g_tail_rows[ith].fetch_add(count, std::memory_order_relaxed);
+                g_tail_calls[ith].fetch_add(1, std::memory_order_relaxed);
+            }
+            j += count;
         }
         return true;
     }
