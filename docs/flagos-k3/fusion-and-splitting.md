@@ -2379,7 +2379,7 @@ one-tile under the same setting, the predictions in brackets (`split` takes path
   on 8B. These are for today's dealing; 14B's session runs on the fix instead (its block below).
 
 **A tile's leftover rows in one call (the user's decision, 2026-10-25; implemented and checked on the Mac the same
-day, not yet run on the K3).**
+day, run on the K3 the same day: the next block).**
 - What changed (providers/spacemit only):
   - `path_a_tail_tile` takes the number of leftover rows. When fewer tiles are idle than rows, it gives the first
     idle tiles two consecutive rows.
@@ -2440,6 +2440,177 @@ day, not yet run on the K3).**
   more than 1% slower than with one-tile under the same matmul setting, and tg128 and pp512 are within 1%; otherwise
   it is examined first. Tested on 8B at the lengths the fix changes (2026-10-24's run stands for the others, whose
   calls are the same) and on 14B at all its lengths.
+
+**The fix on the K3: Qwen3-8B at the lengths it changes, Qwen3-14B's dealing session (2026-10-25, build `f0e0549`;
+`EXPS="fit-staged tail fs-tail" REPS=3`; 8B with `KLD_SETS="ub59 ub63"` at the 9 lengths below 128 with m % 32 = 27,
+30 or 31, 14B with `KLD_SETS="ub63 ub79 ub131"` at its 26 lengths; `~/fx-q8b-fix.log`, `~/bench-mm-fix.out`,
+`~/fx-q14b-tail.log`, the logs in `~/fx/q8b-fix` and `~/fx/q14b-tail` on the board).** The settings as in the 8B
+block above: `ref` (`split`) and `fit-staged` deal the rows, `tail` and `fs-tail` are the same settings with
+`FLAGOS_SPACEMIT_TAIL=one-tile`.
+- Outputs identical on both models: the same text in the four settings; against `ref` mean KLD 0.000000, maximum
+  0.000059 on 8B (`-ub 59` and `-ub 63`) and 0.000055-0.000058 on 14B, the same in the three others at each batch
+  size. The same top token 100%, but on 14B at `-ub 79` 99.951% (one token of 2,048) in all three. `tail` is among
+  them, and at 79 rows it makes `ref`'s calls: under `split` no matrix takes path A below 113 rows
+  (flagos-spacemit-ime.cpp:513-519, 529), and its matmuls are within 0.75% of `ref`'s by the counters. So 99.951% is
+  the floor at that batch size; that a near tie in the stored logits causes it is an inference. On the board all
+  checks pass, the path check 32/32 with each tile's leftover rows and calls as the rule gives.
+- The counters move a result by at most 0.50% on 8B and 0.89% on 14B. Standard deviations at most 0.57 and 0.22 t/s.
+- Qwen3-8B, t/s (mean of 3 runs), dealt against one-tile under the same setting, the predictions in brackets:
+
+| tokens (m % 32) | `fit,staged` dealt, one-tile | change | `split` dealt, one-tile | change |
+|---|---|---|---|---|
+| 62, 94, 126 (30) | 55.94, 56.01; 51.93, 51.90; 53.39, 53.31 | -0.1, +0.1, +0.2% (level) | 126: 47.97, 47.93 | +0.1% (level) |
+| 59, 91, 123 (27) | 53.18, 50.65; 48.97, 43.83; 51.06, 46.79 | +5.0% (+7), +11.7% (+15), +9.1% (+12) | 123: 46.56, 44.78 | +4.0% (+5) |
+| 63, 95, 127 (31) | 53.95, 51.74; 49.23, 45.17; 51.00, 47.63 | +4.3% (+3), +9.0% (+7.5), +7.1% (+6) | 127: 46.67, 45.18 | +3.3% (+2.6) |
+| the rest (no leftover rows, or `split` off path A) | | -0.03 to +0.31% | | -0.34 to +0.58% |
+| tg128, pp512 | 6.05, 6.04; 56.06, 55.61 | +0.2, +0.8% (within 1) | 6.05, 6.04; 56.08, 55.93 | +0.2, +0.3% |
+
+- The rule is met on 8B. No length is more than 0.34% slower than one-tile (`split`'s pp128, the same calls); pp62 is
+  -0.12%, where the first dealing was -1.36%. tg128 and pp512 are within 0.8%.
+- Against the first dealing (its run of 2026-10-24). Each dealing is taken against one-tile in its own session, since
+  one-tile's calls are the same in both; this session ran 0.0-0.7% slower at the lengths whose calls are the same,
+  while the matmuls' rounds and the even and odd tiles' mean busy times there agree within 0.2%.
+  - m % 32 = 30: +1.2 points (pp62; predicted +1.3).
+  - 31: +0.8 and +1.0 (pp63, pp127; `split`'s pp127 +0.7; predicted unchanged).
+  - 27: -0.6 (pp123; `split` -0.4; predicted +1.6).
+- Path A's last round by the counters, in rounds of 32 rows (3,331-3,332 µs per Q4_0 down in both sessions), the
+  first dealing against the fix, `fit,staged`. The slowest tile, by the even and odd tiles' counters, is the same in
+  both runs.
+  - m % 32 = 30, tile 7 with its two rows (an odd tile the slowest every time): the Q4_0 downs 1.58 -> 1.48 (one-tile
+    1.47-1.48 in both sessions), the requantized downs 1.75 -> 1.59-1.60.
+  - 31, tile 0 with its group and row (an even tile the slowest in 92-100% of the steps): the Q4_0 downs 1.79 ->
+    1.73, the requantized downs 1.90 -> 1.78-1.88, gate and up 1.78-1.79 -> 1.71-1.72, q and o 1.73-1.74 ->
+    1.71-1.73, k and v 1.61 -> 1.65-1.68. Tile 0's work is the same in both. That it runs faster because tile 7 no
+    longer streams the weights twice is an inference.
+  - 27, tile 6 (an even tile the slowest every time): the Q4_0 downs 1.55 -> 1.59-1.60, the requantized downs
+    1.73-1.76 -> 1.90-1.92, gate and up 1.54-1.55 -> 1.57, q and o 1.52-1.53 -> 1.52-1.54, k and v 1.43 -> 1.37-1.40.
+    So for the larger matrices, two rows in one call next to tile 7's single row take longer than the two calls did.
+    At 30, next to tile 6's group, one call takes 0.10 rounds less than two.
+  - At 123 rows the other tiles slowed too: the even and the odd tiles' mean busy times on the Q4_0 downs rose 1.1%
+    and 1.4%, although the odd tiles' work is the same in both. At 127 rows both fell 1.2-1.5%. The cause is not
+    isolated; a same-session run of the two assignments at 59, 91 and 123 tokens would settle the difference.
+- The predictions missed only by these two costs. With the measured last rounds (1.59-1.60 at 27, 1.73 at 31) the
+  same formula gives pp59 +5.3%, pp91 +11.8%, pp123 +9.3%, pp63 +4.3%, pp95 +9.0% and pp127 +7.1%, within 0.3 points
+  of the measurements. The predictions had taken 30's one call (1.47) for 27, and kept 31 at the first dealing's 1.79.
+- `--bench-mm` (Qwen3-4B's shapes), one-tile's time over the dealt one's:
+  - 62 rows 0.99-1.00 (predicted 1.00);
+  - 59 rows 1.14-1.24 (predicted 1.24): k and v 1.24, the others 1.14-1.20, as the counters' 27;
+  - 63 rows 1.11-1.22, against the first dealing's 1.11-1.18 (predicted unchanged). The rows whose calls are the same
+    differ by up to 0.06 between the two runs.
+- Generation on 8B: tg128 6.04-6.05 in the four settings (the first dealing's run 6.07-6.08); 165.8-166.3 ms per token
+  by E3c's counters.
+- Qwen3-14B, t/s (mean of 3 runs), dealt against one-tile, the predictions in brackets:
+
+| tokens (m % 32) | `fit,staged` dealt, one-tile | change |
+|---|---|---|
+| 51 (19) | 29.96, 26.12 | +14.7% (+19) |
+| 54, 55 (22, 23) | 27.17, 22.99; 26.90, 18.88 | +18.2% (+17), +42.5% (+43) |
+| 58, 59 (26, 27) | 28.34, 24.21; 23.13, 19.95 | +17.1% (+17), +15.9% (+22) |
+| 62, 63 (30, 31) | 25.26, 25.25; 23.61, 20.88 | +0.0% (level), +13.1% (+10) |
+| 66, 67 (2, 3) | 25.59, 21.00; 25.68, 18.02 | +21.9% (+22), +42.5% (+43) |
+| 70, 71 (6, 7) | 24.61, 21.96; 24.44, 18.86 | +12.1% (+12), +29.6% (+29) |
+| 74, 75 (10, 11) | 25.55, 22.97; 25.17, 19.75 | +11.2% (+12), +27.4% (+30) |
+| 78, 79 (14, 15) | 26.26, 23.77; 26.55, 20.55 | +10.5% (+10), +29.2% (+29) |
+| 130, 131, 135 (2, 3, 7) | 28.60, 25.43; 28.65, 23.03; 27.72, 23.57 | +12.5% (+12), +24.4% (+24), +17.6% (+17) |
+| `split` at 130, 131, 135 | 25.64, 24.37; 25.45, 23.10; 25.14, 23.37 | +5.2% (+5), +10.2% (+10), +7.6% (+7) |
+| the rest (no leftover rows, or `split` off path A) | | `fit,staged` 0.00 to +0.43%, `split` -0.39 to +0.52% |
+| tg128, pp512 | 3.35, 3.35; 31.24, 31.29 | 0.0, -0.2% (`split` +0.3, -0.7%) |
+
+- The rule is met on 14B. No length is more than 0.39% slower than one-tile, except `split`'s pp512 at -0.73% (the
+  same calls; its `-ops` runs +0.16%). tg128 and pp512 are within 1%.
+- The predictions are within 3 points except at pp51, pp59 and pp63.
+  - pp59 and pp63 missed by 8B's two costs: 14B's last round is 1.61-1.64 rounds at 59 rows for gate, up and the
+    Q4_0 downs, and 1.72-1.73 at 63.
+  - pp51 missed by the share. At 51 rows only the downs take path A: 30.0% of the dealt batch and 39.0% of the
+    one-tile one, by the counters. The prediction took 0.39 from 14B's first run (one-tile), where the formula needs
+    the dealt share; with 0.30 it gives +14.5%.
+- Step 3's criterion is met on 14B under the dealing at this session's lengths. `fit,staged` is never slower than
+  `split` (worst -0.03%, pp512); at 51-96 tokens it is at least +39.2% faster (pp68), at 129-135 +10.3 to +12.6%. With
+  one-tile (`fs-tail` against `tail`) it would also have been met at the lengths feared before the run: pp67 +11.4%
+  and pp131 -0.3%, estimated at +2.1% and -2.0%.
+- Against 14B's first session (2026-10-24, before the dealing), at the lengths whose calls are the same: within 0.2%
+  for `fit,staged` and 0.5% for `split`; tg128 3.35 against 3.37.
+- Generation on 14B: tg128 3.34-3.35; 299.5-299.7 ms per token by E3c's counters.
+- Step 4 is done. The dealing with the fix meets its rule on Qwen3-8B and 14B, and `fit,staged` with it meets step 3's
+  criterion on both.
+- Proposed (the user's decision):
+  - Keep the fix as it is and go to the default change (`fit,staged`, with the dealing) and its acceptance runs. The
+    rule is met on both models; what remains at m % 32 = 27 (about 0.5% at pp123) is a cross-session measurement at
+    one class of lengths, and the matrices differ in its direction.
+  - Or the previous rule in the fix's loop. That gives the first dealing's calls at 27 (two on tile 6, rows 0 and 2)
+    and the fix's at 30 and 31 (a tile's consecutive rows in one call). Each case's calls have been measured, and
+    these were the faster ones for the batch in each, so expected about +0.5% at m % 32 = 27 and nothing else
+    (cross-session). The change is the previous one-line rule plus the check counting runs of consecutive rows, with a
+    same-session run at 59, 91 and 123 tokens on 8B.
+
+**The default change (the user's decision, 2026-10-25: the fix kept as it is; made and checked on the Mac the same
+day, its acceptance runs on the K3 pending).** The unset `FLAGOS_SPACEMIT_MM` (and an empty or unknown value) now
+selects `fit,staged`: path B without the pair turns where TCM holds the batch's activations next to a 32-column slab,
+else path A from 32 rows, else path C, with path A's leftover rows dealt to the idle tiles, a tile's in one call
+(`mm_setting_from_env`, flagos-spacemit-ime.cpp). `split`, the default until then, and `rows`, `spacemit`, `fit` and
+`fit,mixed` stay as test-only settings for comparisons, the same bytes in all six. The runner gains `EXPS=split`, since
+its `ref` (the defaults) now measures what `fit-staged` measured, and its earlier runs compared with `split`.
+- Why: the rule of 2026-10-22 (from 16 tokens never more than 1% slower than `split` or `rows`, and every length from
+  16 to 100 tokens at least 5% faster than `split`) was met on Qwen3-0.6B and Qwen3-4B in Q4_0, and step 3's
+  criterion (the same against `split` alone) on Qwen3-0.6B in Q8_0, Llama-3.2-1B in Q4_0 and Q8_0, Qwen3-8B and
+  Qwen3-14B. Prompts below 16 tokens were set aside by the user (2026-10-22): there `fit,staged` was up to 8.0% slower
+  than `fit` on 4B (pp2-pp8) and 4.5% slower than `split` on 0.6B (pp2).
+- Checked on the Mac: all checks pass. The path check runs `split` by name and the unset setting as an eighth, which
+  must take `fit,staged`'s paths with no turns and deal the leftover rows: 64/64 cases (tiles in turn and on threads).
+  Three mutations of the default are caught: the unset setting as `split` with `fit,staged` right by name (60 failing
+  lines, in each only the default off its path; the other 4 runs are the two cases where both rules give path C), the
+  unset setting and `fit,staged` both as `split` (60), both as `fit` (56).
+  test-backend-ops `MUL_MAT` with the TCM stand-in passes its 3 claimed cases, serial and on threads.
+- What moves on the K3, by the code. TCM holds the activations next to a slab up to 119 rows for Qwen3-4B's q, k, v,
+  gate and up, 68 for the attention output, 19 for down and 5 for the Q4_1 downs (stored as Q8_0); on Qwen3-0.6B up to
+  323, 153, 97 and 79. So at llama-bench's pp128 (`-ub 128`) 4B's gate and up leave path C for path A (the other
+  matrices were on path A already), and 0.6B's matrices other than down take path B (path A before). Prompts of 2-31
+  tokens take path B where it fits. Generation (the 1-row path), perplexity's 512-token batches and pp512 (path A
+  under both settings) keep their paths.
+
+Predictions for the acceptance runs (fixed before them; the script's llama-bench takes `-ub 128 -fa 1 -r 3`):
+
+| | Qwen3-4B Q4_0, `--build --depth` | Qwen3-0.6B Q4_0 |
+|---|---|---|
+| checks | 37/37 | 34/34 |
+| perplexity at 512-token batches, `-fa on` and `-fa auto` | the fix's of 2026-10-24 to the last digit (-0.00% against that day's CPU run of 9.7740) | the fix's to the last digit (+0.61% against 14.3598) |
+| mean KLD at 512-token batches | the fix's 0.00249 within 0.0002 (the CPU reference is not bit-reproducible) | 0.00472 within 0.0002 |
+| mean KLD at `-ub 1 -b 512` | under M2e.3's 0.002021 by the fix (not measured at `-ub 1` since): about 0.0013-0.0018 | under 0.012145: about 0.002-0.004 |
+| greedy text | the provider's as before (its prompt's few rows now on path B: the same bytes) | the same |
+| pp128 | about 105-108 t/s (step 3's session: `split` 92.16, `fit,staged` 106.34; the fix -0.6%) | about 690-715 (653.34 and 695.23 there; the fix -0.3%; the script read 2% above the runner at M2e.3) |
+| tg128 | about 11.0 (the fix's 11.03); the change moves no 1-row matmul | about 55.0-55.8 |
+| tg32 at depths 0 / 1024 / 4096 | about 11.1 / 9.7 / 7.7 (M2e.3's 11.30 / 9.93 / 7.83 less the fix's 1-2%), not moved by the change | not run |
+| pp512 at depth 4096 | about 34.4 (M2e.3's 34.63 less the fix's 0.6%), path A under both settings | not run |
+
+- The script's benchmark (Qwen3-4B's shapes in both runs) moves where the default takes another path: predicted from
+  `--bench-mm` of 2026-10-25 (`~/bench-mm-fix.out`, `split` against `fit,staged` at the same shapes). Q4_0 2560x9728
+  (gate, up) at 4, 16, 64 and 128 rows -17, -26, -44 and -28% (128 rows about 6,960 us against `split`'s
+  9,640-9,720). Q4_0 9728x2560 (down) +6% at 4 rows (path B without the turns at few rows), -31% at 16, -26% at 64,
+  unchanged at 128. The Q4_1 down +6% at 4 rows, -15% at 64, unchanged at 16 (path C under both) and 128. The Q6_K
+  head at 4 and 16 rows on path B (path C before): between -17% and +6% at 4 rows (the range of 4B's other shapes
+  there), faster at 16.
+- The IME path's and the CPU's rows as in the earlier runs (code not changed): on 4B about 79 and 21 t/s at pp128.
+
+Rule (proposed with the change; the user fixes it before the runs):
+- The change stands if both runs pass every check and the provider's perplexity at 512-token batches is the fix's to
+  the last digit on both models (the default's outputs are `split`'s bytes, and at 512 rows both take path A).
+- Speeds are reported against the predictions, without a bar: generation, the depth runs and pp512 take the paths
+  they took before, so their differences are the session's (tg128 moves by about 4-5% between sessions, `build.md`
+  §7). A pp128 more than 5% under its prediction is examined before the change is called accepted.
+- If a check fails, the default goes back to `split` (one line in `mm_setting_from_env`) until the failure is
+  understood.
+
+How to run (on the K3, inside tmux, after a bundle of the commit; about two hours for both, an estimate):
+
+```bash
+cd /root/llama.cpp-flagos && git -c safe.directory=$PWD pull --ff-only ~/sx-default.bundle feature/flagos-spacemit
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2e --build --depth --model ~/models/Qwen3-4B-Q4_0.gguf > ~/acc-default-q4b.log 2>&1; cp -r build-flagos/m2e-logs ~/acc-default-q4b-logs
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone m2e > ~/acc-default-q06b.log 2>&1; cp -r build-flagos/m2e-logs ~/acc-default-q06b-logs
+grep -H "Final estimate" ~/kld/fix-*.txt
+```
+
+- The fix's perplexity values for the comparison are in `~/kld/fix-*.txt` (the last command lists them).
+- Then on the Mac: `scp -q k3:/root/acc-default-q4b.log k3:/root/acc-default-q06b.log ~/`.
 
 ### 7.4 Still proposed
 
@@ -2637,3 +2808,20 @@ day, not yet run on the K3).**
   calls counted; two mutations are caught; ThreadSanitizer is clean; test-backend-ops is unchanged; an exhaustive
   simulation of the rule (25,088 cases) is clean. Predictions for 8B at the lengths the fix changes and for 14B's
   session (now on the fix) fixed; the dealing's rule unchanged. Not yet run on the K3.
+- 2026-10-25: the fix on the K3 (§7.3; build `f0e0549`): Qwen3-8B at the 9 lengths it changes and Qwen3-14B's dealing
+  session at its 26. Outputs identical on both; the rule is met on both (no length more than 0.39% slower than
+  one-tile but `split`'s pp512 on 14B, -0.73% with the same calls; pp62 -0.12% on 8B and +0.04% on 14B); step 3's
+  criterion met on 14B at every length; step 4 done. Against the first dealing on 8B (cross-session, each against
+  one-tile): m % 32 = 30 +1.2 points as predicted, 31 +0.8-1.0 (predicted unchanged: tile 0 stays the slowest but runs
+  faster), 27 -0.6 (predicted +1.6: two rows in one call next to tile 7's single row take 1.59-1.60 rounds against
+  the two calls' 1.55; cause not isolated). With the measured last rounds the formula reproduces every 8B length
+  within 0.3 points; 14B within 3 points but pp51 (the one-tile share taken for the dealt one), pp59 and pp63 (8B's
+  two costs). Proposed: keep the fix and go to the default change, or the previous rule in the fix's loop (about +0.5%
+  at m % 32 = 27, to be checked in one session).
+- 2026-10-25: the default change (§7.3; the user's decision, the fix kept as it is): `fit,staged` with the dealing is
+  the unset `FLAGOS_SPACEMIT_MM`; `split` (the default until then), `rows`, `spacemit`, `fit` and `fit,mixed` remain,
+  test-only, for comparisons; the runner gains `EXPS=split`. On the Mac all checks pass, the path check running `split`
+  by name and the default as an eighth setting (64/64), three mutations of the default caught. Predictions and rule
+  for the acceptance runs fixed (Qwen3-4B with `--build --depth`, Qwen3-0.6B): every check passing, perplexity the
+  fix's to the last digit, pp128 about +15% on 4B and +6% on 0.6B, generation and the depth runs unchanged. Not yet
+  run on the K3.

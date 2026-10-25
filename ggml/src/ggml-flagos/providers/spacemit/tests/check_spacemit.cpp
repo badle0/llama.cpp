@@ -9,15 +9,16 @@
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
 //                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-8192, 128 tokens at n_kv 128
 //                    and 4096, 512 at n_kv 512 and 4608) against the CPU, the 1-row strategies of
-//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes, and paths A and B against the split
+//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes, and paths A and B against split
 //                    (--bench-mm)
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under FLAGOS_SPACEMIT_MM=rows
 //                    (path A), spacemit (path B), fit (path B where TCM holds the activations), fit,staged (fit
-//                    without path B's turns), fit,mixed (the turns for few rows only) and rows with
-//                    FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m % 4 rows on one tile) against the default split
+//                    without path B's turns, the default), fit,mixed (the turns for few rows only) and rows with
+//                    FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m % 4 rows on one tile) against split (the default
+//                    until 2026-10-25)
 //   --bench-grid     only path B's turns, independent of any model: fit, fit,staged and fit,mixed for Q4_0, Q4_1 and
 //                    Q8_0 weights of 1,024-9,728 values per row and 256-9,728 columns at 2-48 rows (not in --bench)
 //   --e3b[=runs]     only structural-experiments.md E3b-diag: why launches ordered in the cores differ (default 20 runs
@@ -956,8 +957,10 @@ static std::pair<double, double> q4_1_zero_point_probe(ggml_backend_dev_t dev, g
     return { e[0], e[1] };
 }
 
-// the provider against the CPU backend for shapes and row counts that take every path: 1 row (GEMV), 113 and more
-// rows with n <= 64 rows (path A), the rest (path C); 4-row blocks with partial tails. Q6_K and Q4_1 (stored as Q8_0)
+// the provider against the CPU backend for shapes and row counts that take every path: 1 row (GEMV) and, by the
+// default rule, path B where TCM holds the activations next to a 32-column slab, else path A from 32 rows, else path C
+// (on the K3 Qwen3-4B's Q4_1 down at 7 rows, with --full; without TCM every case); 4-row blocks with partial tails.
+// split's paths give the same bytes (check_mm_paths). Q6_K and Q4_1 (stored as Q8_0)
 // are compared with the GGUF weights and with ggml's Q8_0 of them, Q4_1 in the zero-point layout with its converted
 // weights (mm_weight)
 static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
@@ -1182,18 +1185,20 @@ static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
 // fusion-and-splitting.md §7.3: FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B
 // where the split gives no path A, as ime.cpp), fit (path B where TCM holds the activations next to a slab, else
 // path A from 32 rows, else path C), fit,staged (fit's paths, path B without the pair turns) and fit,mixed (fit's
-// paths, path B with the turns while the activations take fewer bytes than a slab) against the default split: the same
-// bytes, as all six run the same kernels on the same groups of 4 rows and blocks of 32 columns. The paths taken are
-// counted (spacemit_mm_paths_take) and compared with what the rules give, worked out here again, and so are the path B
-// steps without the turns: fit,staged's all, fit,mixed's from its threshold (16 rows for Q4_0 and for Q4_1 in the
-// zero-point layout, 29 for Q8_0, Q6_K and Q4_1 stored as Q8_0 at rows of 512 values), no other setting's; the output is
-// filled with NaN before every run, so columns a path skips show, and split's
+// paths, path B with the turns while the activations take fewer bytes than a slab) against split (the default until
+// 2026-10-25): the same bytes, as all six run the same kernels on the same groups of 4 rows and blocks of 32 columns.
+// The paths taken are counted (spacemit_mm_paths_take) and compared with what the rules give, worked out here again,
+// and so are the path B steps without the turns: fit,staged's all, fit,mixed's from its threshold (16 rows for Q4_0
+// and for Q4_1 in the zero-point layout, 29 for Q8_0, Q6_K and Q4_1 stored as Q8_0 at rows of 512 values), no other
+// setting's; the output is filled with NaN before every run, so columns a path skips show, and split's
 // must come out finite. Path A's last m % 4 rows are counted by the tile that multiplied them, with its calls
 // (spacemit_mm_tail_take: one per tile that has any, as a tile's rows are consecutive and two rows in two calls
 // stream the weights twice), and compared with their dealing, worked out here again, and with
 // FLAGOS_SPACEMIT_TAIL=one-tile (ime.cpp's: all on the tile after the last group), run as a seventh setting with
-// rows' paths. Paths A and B need TCM: as check_gemv_strategies, a stand-in of the K3's 384 KiB on a host without the
-// AI cores, there also with tiles on threads, where path B's pair waits wait
+// rows' paths. The eighth leaves FLAGOS_SPACEMIT_MM and FLAGOS_SPACEMIT_TAIL unset: the default must take fit,staged's
+// paths, its path B without the turns, and deal the leftover rows. Paths A and B need TCM: as check_gemv_strategies, a
+// stand-in of the K3's 384 KiB on a host without the AI cores, there also with tiles on threads, where path B's pair
+// waits wait
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
     env_override                tail("FLAGOS_SPACEMIT_TAIL", nullptr);
@@ -1247,11 +1252,12 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         { GGML_TYPE_Q4_0, 9728, 512, 35 },   // fit's path A (the activations do not fit next to a slab): tiles 0-2
         { GGML_TYPE_Q4_0, 512, 1024, 115 },  // the split's path A: tiles 4, 5 and 6
     };
-    constexpr int      n_set           = 7;
-    const char * const settings[n_set] = { nullptr, "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows" };
-    const char * const tails[n_set]    = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile" };
-    const char * const names[n_set]    = { "split",      "rows",      "spacemit",     "fit",
-                                           "fit,staged", "fit,mixed", "rows,one-tile" };
+    constexpr int      n_set           = 8;
+    const char * const settings[n_set] = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows",
+                                           nullptr };
+    const char * const tails[n_set]    = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile", nullptr };
+    const char * const names[n_set]    = { "split",      "rows",      "spacemit",      "fit",
+                                           "fit,staged", "fit,mixed", "rows,one-tile", "the default" };
     int                n_same = 0, n_runs = 0;
     for (const mm_case & c : cases) {
         mm_weight w;
@@ -1261,9 +1267,9 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         const std::vector<float> nan(ggml_nelements(run.y), NAN);
         // the path each setting must take with 8 tiles and 384 KiB of TCM (spacemit_mul_mat_gemm): split path A where
         // ime.cpp's split gives every tile all columns, else path C; rows path A also from 32 rows; spacemit path B
-        // in place of path C; fit, fit,staged and fit,mixed path B where TCM holds the activations next to a 32-column
-        // slab, else path A from 32 rows, else path C. Path B without the turns: fit,staged always, fit,mixed once the
-        // activations take at least a slab's bytes
+        // in place of path C; fit, fit,staged, fit,mixed and the default path B where TCM holds the activations next
+        // to a 32-column slab, else path A from 32 rows, else path C. Path B without the turns: fit,staged and the
+        // default always, fit,mixed once the activations take at least a slab's bytes
         const int64_t m_stride = c.n / c.m > 64 ? c.m : 16;
         const bool    split_a  = (c.n * ((c.m + m_stride - 1) / m_stride) + 7) / 8 >= c.n;
         const bool    fit_b    = (int64_t) GGML_PAD(c.m * ime_act_row_bytes(c.type, c.k), 64) +
@@ -1273,8 +1279,8 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
         const char    fit_path      = fit_b ? 'B' : c.m >= 32 ? 'A' : 'C';
         const char    rows_path     = split_a || c.m >= 32 ? 'A' : 'C';
         const char    expect[n_set] = { split_a ? 'A' : 'C', rows_path, split_a ? 'A' : 'B', fit_path, fit_path,
-                                        fit_path,            rows_path };
-        const bool    no_turns[n_set] = { false, false, false, false, true, mixed_staged, false };
+                                        fit_path,            rows_path, fit_path };
+        const bool    no_turns[n_set] = { false, false, false, false, true, mixed_staged, false, true };
         // path A's last m % 4 rows by tile: dealt, one to each tile from g, the tile after the last group, to tile 7,
         // then once more over those tiles, then to tile 0 onwards; one-tile, all on tile g
         constexpr int tiles = 8;
@@ -1382,10 +1388,11 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     }
     std::printf("mm       FLAGOS_SPACEMIT_MM=rows (path A whenever every tile gets 4 rows), spacemit (path B where the "
                 "split gives no path A), fit (path B where TCM holds the activations, else A or C), fit,staged (fit's "
-                "paths, path B without the turns), fit,mixed (the turns below a slab's bytes of activations) and rows "
-                "with FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m %% 4 rows on one tile, as ime.cpp) against the "
-                "default split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, paths, turns and "
-                "path A's leftover rows by tile, a tile's in one call, as expected%s\n",
+                "paths, path B without the turns), fit,mixed (the turns below a slab's bytes of activations), rows "
+                "with FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m %% 4 rows on one tile, as ime.cpp) and the "
+                "default (fit,staged's paths) against split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: "
+                "%d/%d identical, paths, turns and path A's leftover rows by tile, a tile's in one call, as "
+                "expected%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
     return 0;
@@ -2591,7 +2598,7 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 // fusion-and-splitting.md §7.3: the matmuls of a Qwen3-4B batch under FLAGOS_SPACEMIT_MM=rows (path A whenever every
 // tile gets 4 rows), spacemit (path B where the split gives no path A), fit (path B where TCM holds the activations,
 // else A or C), fit,staged (fit without path B's turns), fit,mixed (the turns for few rows only) and rows with
-// FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m % 4 rows all on one tile, as ime.cpp) against the default split, at
+// FLAGOS_SPACEMIT_TAIL=one-tile (path A's last m % 4 rows all on one tile, as ime.cpp) against split, at
 // the row counts of short prompts, of a prompt's last batch, of llama-bench's batches and with 2 or 3 rows left over
 // after the groups of 4: each shape alone with the path each setting took, and per batch the shapes weighted by how
 // often a batch runs them (36 q and attention outputs, 72 k and v, 72 gate and up, 32 + 4 down; the head runs on one
@@ -3002,9 +3009,11 @@ static int bench(ggml_backend_dev_t dev) {
     ggml_free(ctx);
 
     // Q4_0 matmul at Qwen3-4B's FFN shapes, and Q4_1 at its ffn_down shape (its first 4 layers): 1 row (the 1-row path),
-    // small batches (path C), 128 rows (path A for the down projection; the split keeps gate and up on path C there,
-    // fusion-and-splitting.md §7.3, bench_mm). Q6_K (run as Q8_0, against the CPU's Q6_K) at its output head, whose 1
-    // row is a generated token's: up to 16 rows and fewer iterations, as the head holds 15x an FFN matrix's weights
+    // small batches and 64 rows (by default path B where TCM holds the activations next to a slab, here at 4-64 rows
+    // for gate and up, 4 and 16 for down, 4 for the Q4_1 down; else path A from 32 rows, else path C), 128 rows (path
+    // A; split, the default until 2026-10-25, kept gate and up on path C there, fusion-and-splitting.md §7.3,
+    // bench_mm). Q6_K (run as Q8_0, against the CPU's Q6_K) at its output head, whose 1 row is a generated token's: up
+    // to 16 rows (path B) and fewer iterations, as the head holds 15x an FFN matrix's weights
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu8    = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu8 != nullptr);

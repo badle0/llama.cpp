@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Fusion measurements on the K3 (docs/flagos-k3/fusion-and-splitting.md §7), one candidate at a time. Every mode runs
 # today's build (build A, as structural-experiments.sh) with test-only switches, against the reference (the defaults) in
-# the same session, the modes interleaved in every repetition. Experiments:
+# the same session, the modes interleaved in every repetition. Since 2026-10-25 the defaults take FLAGOS_SPACEMIT_MM's
+# fit,staged (§7.3), so ref is what fit-staged measures and the runs before compared with split. Experiments:
 #   base the baseline: only ref and ops, where every op's time per token or batch is measured on the defaults (§7.1)
+#   split
+#        the matmul paths that were the default until 2026-10-25, ime.cpp's split with path C for path B (§7.3):
+#        FLAGOS_SPACEMIT_MM=split; the same prompts as pb
 #   q6   one quantization for Q, K and V and one for gate and up (§5, #6): FLAGOS_SPACEMIT_QUANTIZE=shared
 #   mm   path A for every batch that gives each tile 4 rows (§7.3, not fusion): FLAGOS_SPACEMIT_MM=rows; adds prompts
 #        of 32, 64 and 96 tokens (one batch each)
@@ -17,7 +21,8 @@
 #        fit with path B's pair turns only while the batch's activations take fewer bytes than a slab (16 rows for
 #        Q4_0 and Q4_1, 29 for Q8_0; §7.3): FLAGOS_SPACEMIT_MM=fit,mixed; the same prompts as fit-staged
 #   tail the defaults with path A's last m % 4 rows all on one tile, as ime.cpp, where the build deals them to the
-#        tiles idle in path A's last round (§7.3): FLAGOS_SPACEMIT_TAIL=one-tile; the same prompts as pb
+#        tiles idle in path A's last round (§7.3): FLAGOS_SPACEMIT_TAIL=one-tile; the same prompts as pb (since the
+#        default change of 2026-10-25 the same paths as fs-tail)
 #   fs-tail
 #        fit,staged with them on one tile: FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile, to compare
 #        with fit-staged; the same prompts as pb
@@ -29,14 +34,14 @@
 #        fusion-experiments.sh summary <out>            the summary again from the logs
 # Env:   EXPS      experiments (default "q6"; ref and ops always run)
 #        REPS      llama-bench repetitions per mode (default 5; 0 skips llama-bench)
-#        PPODD     the prompt lengths pb, fit, fit-staged, fit-mixed, tail and fs-tail add, in llama-bench's -p form (a
-#                  list; ranges first-last[+step]); default 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129
+#        PPODD     the prompt lengths split, pb, fit, fit-staged, fit-mixed, tail and fs-tail add, in llama-bench's -p
+#                  form (a list; ranges first-last[+step]); default 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 0)
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
 #        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
 #                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ, pb's with 64
-#                  and 16 rows, fit's and fit-staged's with 128, 64 and 16, fit-mixed's also with 8 (the turns' side),
-#                  tail's with 131 (the split's path A, 3 rows left over), fs-tail's with 79 and 131
+#                  and 16 rows, split's, fit's and fit-staged's with 128, 64 and 16, fit-mixed's also with 8 (the
+#                  turns' side), tail's with 131 (the split's path A, 3 rows left over), fs-tail's with 79 and 131
 #        KLD_SETS  the logits check's ubatch sets instead of the experiments' (batch, ub1, ub128, ub64, ub16, ub8,
 #                  ub79, ub131, ub59, ub63; e.g. "ub79 ub131" for fit-staged, tail and fs-tail together); every set runs
 #                  every mode
@@ -46,6 +51,8 @@
 # from the same clock reads, when it ends):
 #   ref      the defaults
 #   ops      FLAGOS_SPACEMIT_TEST_OP_STATS and FLAGOS_SPACEMIT_TEST_STATS: the op counters and E3c's, on the defaults
+#   split    FLAGOS_SPACEMIT_MM=split
+#   split-ops       split with the op counters
 #   q6       FLAGOS_SPACEMIT_QUANTIZE=shared
 #   q6-ops   q6 with the op counters
 #   mm       FLAGOS_SPACEMIT_MM=rows
@@ -89,6 +96,7 @@ unset FLAGOS_SPACEMIT_TEST_OP_STATS FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_Q
 
 mode_env() {
     case $1 in
+        split | split-ops) echo "FLAGOS_SPACEMIT_MM=split" ;;
         q6 | q6-ops) echo "FLAGOS_SPACEMIT_QUANTIZE=shared" ;;
         mm | mm-ops) echo "FLAGOS_SPACEMIT_MM=rows" ;;
         pb | pb-ops) echo "FLAGOS_SPACEMIT_MM=spacemit" ;;
@@ -320,6 +328,7 @@ run_all() {
     # the logits check's settings: q6's at 512-token batches and one token per ubatch, mm's at 128 and 64 rows, pb's at
     # 64 and 16 rows, fit's and fit-staged's at all three, fit-mixed's also at 8 rows (each set once)
     modes="ref ops" kld_modes="" kld_sets=""
+    if has split; then modes+=" split split-ops" kld_modes+=" split" kld_sets+=" ub128 ub64 ub16"; fi
     if has q6; then
         modes+=" q6 q6-ops" kld_modes+=" q6" kld_sets+=" batch"
         if [ "$KLD_UB1" = 1 ]; then kld_sets+=" ub1"; fi
@@ -357,7 +366,7 @@ run_all() {
             for m in $modes; do
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
-                if has pb || has fit || has fit-staged || has fit-mixed || has tail || has fs-tail; then
+                if has split || has pb || has fit || has fit-staged || has fit-mixed || has tail || has fs-tail; then
                     bench "$m" "ppodd-$i" -p "$PPODD" -n 0
                 elif has mm; then
                     bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
@@ -420,5 +429,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,63p' "$0"; exit 1 ;;
+    *) sed -n '2,71p' "$0"; exit 1 ;;
 esac
