@@ -675,6 +675,20 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
   - At n_kv 512 every tile has one block, and the default is slower than the one-chunk kernels: 262 against 252 us (+3.9%; 260 against 253 in the run before). The split without the turns takes 210 (-20%). That breaks round 2's "no one-token shape slower"; it costs about 2% of a token, at depths 256-511 only. Left as it is (user decision 2026-10-14); the remedy would be no turns when no tile has more than one block (`plan.md`).
   - The split without the turns varies between runs where the turns do not. At n_kv 4096 it took 1303, 1093 and 1172 us in three runs; the turns 1132, 1108 and 1109; the one-chunk kernels 1743, 1753 and 1771. So at depth the turns are the robust choice.
 
+**Acceptance run after the default change, 2026-10-26** (build `65280e5`: the matmuls of several rows take `fit,staged`, path B without the pair turns where TCM holds the activations next to a slab, else path A from 32 rows with its leftover rows dealt, else path C, `fusion-and-splitting.md` §7.3; Q4_1 requantized to Q8_0 at load since 2026-10-23; `spacemit_check.py --milestone m2e --build --depth` on Qwen3-4B Q4_0: 37/37; with its default model, Qwen3-0.6B, without `--build` or `--depth`: 34/34; runs of 2026-10-25 to 26):
+
+| Qwen3-4B Q4_0 | provider | `ime` | `cpu` | provider after M2e.3 round 2 |
+|---|---|---|---|---|
+| pp128 | 106.70 | 79.26 | 20.98 | 92.53 |
+| tg128 | 11.00 | 10.98 | 5.51 | 11.25 |
+| tg32 at depth 0 / 1024 / 4096 | 11.08 / 9.64 / 7.72 | 11.09 / 9.30 / 6.35 | 5.48 / 4.46 / 1.57 | 11.30 / 9.93 / 7.83 |
+| pp512 at depth 4096 | 34.68 | 25.11 | 11.72 | 34.63 |
+
+- pp128 +34.6% against the IME path in the same session (+16.7% after M2e.3 round 2): at 128 rows gate and up leave path C for path A. Generation and the depth runs within 3% of M2e.3's (the 1-row matmuls and pp512 keep their paths; the Q4_1 fix took tg128 2.0% in its session). At depth 4096 generation +21.6% and pp512 +38.1% against the IME path.
+- Accuracy (4B): perplexity 9.7736 against the CPU's 9.774 (-0.00%), with `-fa on` and `-fa auto`, the Q4_1 fix's to the last digit. Mean KLD 0.002489 ± 0.000156 (512-token batches) and 0.001229 ± 0.000058 (`-ub 1 -b 512`). Greedy text leaves the CPU's after 143 characters, as before.
+- Qwen3-0.6B (34/34): pp128 705.50 and tg128 55.16 against the IME path's 542.13 and 54.34 (+30.1%, +1.5%; after M2e.3 round 2 667.19 and 55.78). Perplexity 14.4471 against the CPU's 14.3706 (+0.53%): the provider's is the fix's, the CPU's moved (14.3598 on 2026-10-24). Mean KLD 0.004722 ± 0.000221 and 0.002533 ± 0.000089. Greedy text identical to the CPU's (after 88 characters before; not attributed, `fusion-and-splitting.md` §7.3).
+- Placement unchanged: C5a keeps flash attention on the provider, 2 graph splits per token, no TCM block left held. `llama-completion` 11.13 t/s against 5.54 with the provider off (0.6B: 55.19 against 27.39).
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

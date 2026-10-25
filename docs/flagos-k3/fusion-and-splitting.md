@@ -2544,7 +2544,7 @@ block above: `ref` (`split`) and `fit-staged` deal the rows, `tail` and `fs-tail
     same-session run at 59, 91 and 123 tokens on 8B.
 
 **The default change (the user's decision, 2026-10-25: the fix kept as it is; made and checked on the Mac the same
-day, its acceptance runs on the K3 pending).** The unset `FLAGOS_SPACEMIT_MM` (and an empty or unknown value) now
+day, accepted on the K3 2026-10-26, below).** The unset `FLAGOS_SPACEMIT_MM` (and an empty or unknown value) now
 selects `fit,staged`: path B without the pair turns where TCM holds the batch's activations next to a 32-column slab,
 else path A from 32 rows, else path C, with path A's leftover rows dealt to the idle tiles, a tile's in one call
 (`mm_setting_from_env`, flagos-spacemit-ime.cpp). `split`, the default until then, and `rows`, `spacemit`, `fit` and
@@ -2611,6 +2611,69 @@ grep -H "Final estimate" ~/kld/fix-*.txt
 
 - The fix's perplexity values for the comparison are in `~/kld/fix-*.txt` (the last command lists them).
 - Then on the Mac: `scp -q k3:/root/acc-default-q4b.log k3:/root/acc-default-q06b.log ~/`.
+
+**The acceptance runs on the K3 (2026-10-25 to 26, build `65280e5`; `~/acc-default-q4b.log` and
+`~/acc-default-q06b.log` on the Mac, the fix's values from `~/kld/fix-*.txt`).** Both runs pass every check, and the
+provider's perplexity at 512-token batches is the fix's to the last digit on both models; no pp128 is under its
+prediction. So by its rule the change stands: `fit,staged` with the dealing is the accepted default for the matmuls of
+several rows, `split` and the other settings stay test-only for comparisons.
+
+| | Qwen3-4B Q4_0, `--build --depth`: predicted | measured | Qwen3-0.6B Q4_0: predicted | measured |
+|---|---|---|---|---|
+| checks | 37/37 | 37/37 | 34/34 | 34/34 |
+| perplexity at 512-token batches, `-fa on` and `-fa auto` | the fix's, 9.7736 | 9.7736 in both, against the CPU's 9.774 (-0.00%) | the fix's, 14.4471 | 14.4471 in both, against the CPU's 14.3706 (+0.53%) |
+| mean KLD at 512-token batches | 0.00249 within 0.0002 | 0.002489 ± 0.000156, the fix's to the last digit | 0.00472 within 0.0002 | 0.004722 ± 0.000221 (the fix's 0.004720) |
+| mean KLD at `-ub 1 -b 512` | about 0.0013-0.0018 | 0.001229 ± 0.000058 | about 0.002-0.004 | 0.002533 ± 0.000089 |
+| greedy text | as before | leaves the CPU's after 143 characters, as at M2e.1 and M2e.3 | as before | identical to the CPU's (M2e.3: after 88 characters) |
+| pp128 | about 105-108 | 106.70 | about 690-715 | 705.50 |
+| tg128 | about 11.0 | 11.00 | about 55.0-55.8 | 55.16 |
+| tg32 at depths 0 / 1024 / 4096 | about 11.1 / 9.7 / 7.7 | 11.08 / 9.64 / 7.72 | not run | not run |
+| pp512 at depth 4096 | about 34.4 | 34.68 | not run | not run |
+| the IME path's and the CPU's pp128 | about 79 and 21 | 79.26 and 20.98 | not predicted | 542.13 and 151.83 |
+
+- Perplexity: the fix's files hold 9.773559 and 14.447111, which both runs print as 9.7736 and 14.4471 (512-token
+  batches take path A under both settings). The CPU's run on 4B gave the fix's 9.7740 again, and with it the KLD to the
+  last digit. On 0.6B it moved (14.3598 on 2026-10-24, now 14.3706; 14.3795, 14.3786 and 14.3816 in earlier sessions),
+  so the ratio reads +0.53% against +0.61% and the KLD 0.004722 against 0.004720: the reference's change, not the
+  provider's.
+- `-ub 1 -b 512` gives one-token ubatches, so every matmul takes the 1-row path, which the change does not touch (it is
+  taken before the setting is read, flagos-spacemit-ime.cpp:509-511 against :528). These are the first such runs on
+  the two models since the Q4_1 fix: 4B 0.002021 -> 0.001229 (-39%), 0.6B 0.012145 -> 0.002533 (-79%), against CPU
+  runs of other sessions; at 512-token batches the fix removed 26% and 68%. 4B lands under its predicted range, which
+  scaled M2e.3's value by the 26%; why the fix removes more at one-token ubatches was not examined.
+- Greedy text: on 0.6B the provider's text now matches the CPU's in full. Not the change's doing: the prompt's few rows
+  take path B instead of path C, and the path check (next item) shows the same bytes. This is the first script run on
+  0.6B since the Q4_1 fix, and the CPU's runs move between sessions, so it is not attributed (the test: the model run
+  with and without `FLAGOS_SPACEMIT_Q4_1=zero-point`, in one session).
+- The path check passed on the board in each session's three runs of flagos-check-spacemit (with `--full`, with the
+  reference kernels, and before the benchmark; a difference or a wrong path fails the program, check_spacemit.cpp:1379
+  and :3140): the default takes `fit,staged`'s paths without the turns and gives `split`'s bytes at 2-128 rows of Q4_0,
+  Q4_1, Q8_0 and Q6_K, here with the board's TCM.
+- Speed in the same session against the IME path: on 4B pp128 +34.6% (+16.7% in M2e.3's acceptance run), tg128
+  +0.2%, tg32 at depths 0 / 1024 / 4096 -0.1 / +3.7 / +21.6%, pp512 at depth 4096 +38.1%; on 0.6B pp128 +30.1%
+  (+21.1%), tg128 +1.5%. Against M2e.3's run (across sessions, the Q4_1 fix in between): pp128 +15.3% on 4B and +5.7%
+  on 0.6B, while the IME path read 79.29 -> 79.26 and 550.78 -> 542.13; tg128 -2.2% and -1.1% (the fix's -2.0% and
+  -1.0% in its own session). tg32 at depth 1024 is 2.9% under M2e.3's where the fix's 1-2% was predicted, within the
+  4-5% that generation moves between sessions (`build.md` §7). M0's targets on 4B: pp128 82 met; tg128 11.00 under
+  11.1, as since the fix, the IME path reading 10.98 in this session.
+
+The script's benchmark at Qwen3-4B's shapes, this session's 4B and 0.6B runs against the last two sessions under
+`split` (Qwen3-8B's and Qwen3-14B's acceptance runs of 2026-10-24 and 25; the same code at these row counts, which are
+multiples of 4 and so leave no rows over), the predictions in brackets:
+
+| matmul | 4 rows | 16 rows | 64 rows | 128 rows |
+|---|---|---|---|---|
+| Q4_0 2560x9728 (gate, up) | -18.9 / -13.8% (-17%) | -25.3 / -25.6% (-26%) | -44.2 / -44.1% (-44%) | -27.3 / -27.4% (-28%: 7,010 and 6,995 us against about 6,960) |
+| Q4_0 9728x2560 (down) | -1.9 / +2.9% (+6%) | -35.4 / -34.8% (-31%) | -25.1 / -25.2% (-26%) | +1.5 / -0.9% (unchanged) |
+| Q4_1 9728x2560 (stored as Q8_0) | +4.2 / +4.8% (+6%) | -1.0 / -0.0% (unchanged: path C under both) | -13.3 / -13.3% (-15%) | +0.1 / +1.5% (unchanged) |
+| Q6_K 2560x151936 (stored as Q8_0) | -5.6 / -7.5% (-17 to +6%) | -20.4 / -18.5% (faster) | not run | not run |
+
+- Every move lies within 4.4 points of its prediction (down at 16 rows the furthest, faster than predicted), but down
+  at 4 rows in the 4B session (7.9 points). That shape varies between sessions under both settings: `fit,staged` took
+  629, 660 and 680 us in three sessions (the last `--bench-mm` of 2026-10-25, the prediction's source) and `split`
+  622-644 in four, so the predicted +6% was one session's difference.
+- At 1 row (the 1-row path, not touched) the times lie within 1.8% of the `split` sessions', but down in the 0.6B
+  session: 520 us against 460-466 in the other three sessions, on the same code path.
 
 ### 7.4 Still proposed
 
@@ -2825,3 +2888,10 @@ grep -H "Final estimate" ~/kld/fix-*.txt
   for the acceptance runs fixed (Qwen3-4B with `--build --depth`, Qwen3-0.6B): every check passing, perplexity the
   fix's to the last digit, pp128 about +15% on 4B and +6% on 0.6B, generation and the depth runs unchanged. Not yet
   run on the K3.
+- 2026-10-26: the default change on the K3 (§7.3; build `65280e5`, runs of 2026-10-25 to 26): Qwen3-4B 37/37 with
+  `--build --depth` and Qwen3-0.6B 34/34; the provider's perplexity the fix's to the last digit on both (9.7736 and
+  14.4471); mean KLD 0.002489 and 0.004722 at 512-token batches, 0.001229 and 0.002533 at `-ub 1 -b 512` (on these
+  models the first since the Q4_1 fix); pp128 106.70 and 705.50 (predicted 105-108 and 690-715; the IME path 79.26
+  and 542.13 in the same sessions), tg128 11.00 and 55.16, the depth runs as predicted; the script's benchmark within
+  4.4 points of its predictions but down at 4 rows (a spread between sessions). The change stands by its rule:
+  accepted. Next: graph splitting, with fusion later (user).
