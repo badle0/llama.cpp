@@ -37,12 +37,6 @@ Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edi
 - Commit: `4389005` (M1, 2026-10-08).
 - What: builds the SpacemiT provider; off by default, no effect when off.
 
-### U4. Claude Code project context
-
-- Where: `CLAUDE.md`, 3 lines that import `docs/flagos-k3/PROJECT.md`.
-- Commit: `213bbf7` (2026-09-24).
-- What: tooling only, no effect on any build. Fork-only: leave it out of anything proposed upstream.
-
 ## The mentor's FlagOS code (outside `providers/spacemit`)
 
 ### M1. `ggml_backend_flagos_reg_devices()` no longer registers the backend (macOS link fix)
@@ -63,9 +57,9 @@ Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edi
 - Where: `ggml/src/ggml-flagos/CMakeLists.txt:42-44` (includes `providers/spacemit/provider.cmake`), `:46` (the "no provider" message also checks the option), `:156-160` (target `flagos-check-spacemit`: not built by default, builds without `GGML_BACKEND_DL` only).
 - Commits: `4389005` (M1); `72e0666` (M2c.2) links the check program with `Threads::Threads`, for the 8 threads that quantize the output head's reference weights.
 
-## Local and uncommitted
+## Fork-only tooling (new files, no upstream file changed)
 
-- `AGENTS.md` (repository root): the user's 6 lines pointing agents to `docs/flagos-k3/PROJECT.md` and `docs/flagos-k3/AGENTS.md`. Kept out of commits by the user.
+- `.claude/CLAUDE.md`: imports `docs/flagos-k3/PROJECT.md` and `docs/flagos-k3/CLAUDE.md`, so Claude Code loads them at every session; `.claude/agents/coder.md`: the `coder` subagent; `.claude/settings.json`: denies Claude Code's edits to the root `CLAUDE.md` and `AGENTS.md`. Upstream has no `.claude/` (2026-10-26). Tooling only, no effect on any build; leave it out of anything proposed upstream.
 
 ## Proposed, not made
 
@@ -75,5 +69,6 @@ Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edi
 
 ## Not changed
 
+- `CLAUDE.md` and `AGENTS.md` (repository root): upstream's, byte for byte, since 2026-10-26 (user). The import of `PROJECT.md` that `CLAUDE.md` carried from `213bbf7` (formerly U4) moved to `.claude/CLAUDE.md`; the user's uncommitted pointer in `AGENTS.md` was removed. Check: `git diff --stat ba360ef -- AGENTS.md CLAUDE.md` prints nothing.
 - `ggml/src/ggml-cpu/spacemit/` (the in-tree IME path): copied from, never modified.
 - `tests/test-backend-ops.cpp`: untouched; its Qwen3-4B one-token attention case is in the baseline.

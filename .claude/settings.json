@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(/AGENTS.md)",
+      "Edit(/CLAUDE.md)"
+    ]
+  }
+}

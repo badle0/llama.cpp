@@ -1,6 +1,6 @@
 # FlagOS × SpacemiT K3 — project context
 
-Loaded at every Claude Code session. Details live in sibling files; read them when the task touches their topic:
+Loaded at every Claude Code session, with `CLAUDE.md` beside it, through `.claude/CLAUDE.md` (the root `CLAUDE.md` and `AGENTS.md` stay upstream's). Details live in sibling files; read them when the task touches their topic:
 
 - `docs/flagos-k3/build.md` — step-by-step builds (Mac, K3), verification, benchmarks, troubleshooting
 - `docs/flagos-k3/k3-hardware.md` — board facts, AI cores, TCM investigation and its evidence
@@ -69,6 +69,8 @@ grep -nE 'error:|FAILED' build.log | head                  # after: cmake --buil
 ```
 
 ## 6. Working rules for Claude Code
+
+The delegation workflow (the `coder` subagent) and the rule that the root `CLAUDE.md` and `AGENTS.md` stay upstream's are in `CLAUDE.md` beside this file.
 
 Before any code change:
 1. Prefer the **smallest change** that achieves the goal; avoid touching upstream/mentor files unless required.
