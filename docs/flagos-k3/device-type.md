@@ -1,6 +1,6 @@
 # Choosing the ggml device type for the K3: GPU, IGPU or ACCEL
 
-Written 2026-10-07. **Decision (mentor, 2026-10-08): ACCEL.** This note keeps the reasoning and measurements behind it. It defines what "right" means, what each type predicts, and the experiments (X0-X6) that test the predictions. Scripts: `scripts/patch-spacemit.py`, `scripts/e1-device-type.sh`.
+Written 2026-10-07. **Decision (mentor, 2026-10-08): ACCEL.** **Updated 2026-10-26: the mentor agreed to IGPU** (reported by the user); ACCEL stood from 2026-10-08 to 2026-10-26, and the code still reports it until the provider closes the two gaps of a KV cache in its own buffer (`structural-experiments.md` F8; the IGPU evidence is E2, E2-0.6B and E4 there). This note keeps the reasoning and measurements behind the first decision. It defines what "right" means, what each type predicts, and the experiments (X0-X6) that test the predictions. Scripts: `scripts/patch-spacemit.py`, `scripts/e1-device-type.sh`.
 
 ## 1. What the device type controls in llama.cpp
 

@@ -61,7 +61,7 @@ llama.cpp   ACCEL device: backend created automatically, no -ngl
 | `identity` | fixed non-zero id, name `SpacemiT`, version 1 | Design §5.1 rule 7 |
 | `probe` | true only on riscv64 Linux with A100 cores (arch id `0xA064` / marchid `0x8000000041000002`) and `/proc/set_ai_thread` present | no runtime start-up here; ggml-spacemit starts spert in a static constructor, which must not be copied |
 | devices | 1, ggml name `FlagOS:SpacemiT:0` | name from mentor design line 170 |
-| ggml type | `ACCEL` | D3, adopted (mentor, 2026-10-08); §2.8 |
+| ggml type | `IGPU` (today's build still reports `ACCEL`) | D3: ACCEL adopted 2026-10-08, changed to IGPU 2026-10-26 (mentor); §2.8; the switch waits on F8's two gaps (`structural-experiments.md`) |
 | `caps.kind` | `cpu_accelerator` | *proposed* (D8), independent of the ggml device type. Kinds: `gpu`, `ai_accelerator`, `cpu_accelerator`, `dsp`, `matrix`, `other` (`flagos-provider.h:9-19`); `ai_accelerator` maps to engine `npu`, `cpu_accelerator` to `cpu` (`flagos-provider.cpp:54-69`). No real provider uses either yet |
 | `caps.memory` | `HOST_VISIBLE` and `UNIFIED_COHERENT` | `flagos-provider.h:21-26` |
 | `caps.execution` | 0 (synchronous, no events); `AOT_MODULE` from M3 | `flagos-provider.h:28-34` |
@@ -152,7 +152,9 @@ Common files touched (C1, required, about 10 lines): `ggml/CMakeLists.txt` (opti
 
 The skeleton compiles on the Mac (probe returns false there). IME and RVV kernels compile only on riscv64 with GCC 15; from M2b the scalar reference kernels compile everywhere.
 
-### 2.8 Device type (D3: ACCEL, decided 2026-10-08)
+### 2.8 Device type (D3: ACCEL, decided 2026-10-08; changed to IGPU 2026-10-26)
+
+**Updated 2026-10-26: D3 is now IGPU** (agreed by the mentor, reported by the user). What follows describes ACCEL, the decision in force from 2026-10-08 to 2026-10-26, and stays as the record of why the provider reads CPU buffers and carries C5a and C5b. Under IGPU the KV cache lives in the provider's buffer, `-fa auto` keeps flash attention on and norm pinning does no harm without C5a and C5b (E2 measured today's speed and identical logits as IGPU on Qwen3-4B and Qwen3-0.6B, also from stock upstream, E4; `structural-experiments.md` §6), and the device is dropped next to a discrete GPU. Before the default flips the provider must close F8's two gaps (a quantized KV cache, a context shift; E2-neg). Nothing in the code has changed yet.
 
 The mentor decided on ACCEL. This section records what the types change and what E1 measured (`device-type.md` §5). Consequences for the provider: read CPU buffers directly (§2.3); ship correct non-flash attention (§2.4); no per-layer control with `-ngl`; do not name the device with `--device` (two backend instances, see the code check below).
 
@@ -182,7 +184,7 @@ A new ggml device type is possible (upstream added `IGPU` in PR #15797 and `META
 |---|---|---|---|
 | D1 | Full ggml device/buffer/backend via FlagOS, not a ggml-cpu extra buffer type | adopted | - |
 | D2 | In-tree provider in the mentor's fork | adopted | - |
-| D3 | ggml device type `ACCEL` | **adopted** (mentor, 2026-10-08) | - |
+| D3 | ggml device type `IGPU` (ACCEL from 2026-10-08 to 2026-10-26) | **changed to IGPU** (mentor; recorded 2026-10-26); the code still reports ACCEL until F8's two gaps are closed | §2.8 |
 | D4 | Weights in an IME-repacked buffer, stored once (A2); the provider reads CPU buffers for all other operands (§2.3) | *proposed*; building on it from M2b (user, 2026-10-09), mentor confirmation pending | A1: host buffer plus a private repacked copy (twice the quantized-weight memory) |
 | D5 | spine-runtime executor, one launch per split, barrier per step (an op may take several steps) | *proposed*; implemented in M2a | own pinned pool + libspine_tcm behind the same executor interface |
 | D6 | Copy, per milestone, only the IME kernel, quantizer and repack functions used from in-tree `ggml-cpu/spacemit` (bodies unchanged, origin noted); port ggml-spacemit tiling and RVV ops, fixing them as needed (the mentor allows changing that code, 2026-10-08) | **decided** (user, 2026-10-09; §2.5) | compile the in-tree sources in place (depends on ggml-cpu internal headers; clashes with `GGML_CPU_RISCV64_SPACEMIT`) |
@@ -1055,7 +1057,7 @@ Outside FlagOS (approved by the mentor as fork patches, 2026-10-14; `upstream-ch
 
 ## 7. Questions for the mentor
 
-1. ~~Device type~~ decided: ACCEL (2026-10-08). Still open: FlagOS `caps.kind`, `cpu_accelerator` (proposed) or `ai_accelerator`?
+1. ~~Device type~~ decided: ACCEL (2026-10-08), changed to IGPU (agreed by the mentor, recorded 2026-10-26; §2.8). Still open: FlagOS `caps.kind`, `cpu_accelerator` (proposed) or `ai_accelerator`?
 2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, with the provider reading CPU buffers for everything else (A2, §2.3). We are building M2b on A2 (2026-10-09); please confirm. The alternative (A1) doubles quantized-weight memory and would change only the buffer part.
 3. Is spine-runtime (closed `libspert`) acceptable as a hard dependency of the provider?
 4. Kernel reuse: decided 2026-10-09 to copy, per milestone, only the functions used into `providers/spacemit/` (§2.5), following the mentor design's "reference, not boundary" (§14.1) and SpacemiT's own ggml-spacemit. Objections? The alternative is compiling the in-tree sources in place.

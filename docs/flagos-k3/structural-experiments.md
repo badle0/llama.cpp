@@ -134,6 +134,7 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   logits (pp512 at depth 4096 3.8-3.9% faster, as on 4B). Two models of one family and one quantization so far; F8's
   two gaps were not rerun on 0.6B.
 - Answered by: E1, E2, E2-hp, E2-neg, E4.
+- **Decided 2026-10-26 (the mentor, reported by the user): (b) IGPU.** Recorded in `PROJECT.md` D3 and item 22, `plan.md` D3 and §2.8, `device-type.md`. The code still reports ACCEL until F8's two gaps are closed.
 
 **Q6. During the transition, do native RVV/IME kernels go in the package or in the plugin?** The deck says both: the
 architecture slide keeps them in the plugin (R7); the flow slide lists "HSACO / ELF / 厂商格式" (vendor format) as package
@@ -991,3 +992,4 @@ Reading, by the rules fixed in §4:
 - 2026-10-21: correction to the deck's ABI slide (user): the vendor's plugin is not binary-only; the vendor provides its
   source implementation, which may call a closed SDK underneath (R3). Q8 partly answered: a closed `libspert` under the
   plugin is acceptable. No plan changes: our provider is already source that links `libspert` underneath.
+- 2026-10-26: Q5 decided by the mentor: IGPU (reported by the user); recorded here, in `PROJECT.md` (D3, question 1, item 22), `plan.md` (D3, §2.8) and `device-type.md`; the code unchanged until F8's two gaps close.
