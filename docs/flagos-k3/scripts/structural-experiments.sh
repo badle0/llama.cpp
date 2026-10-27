@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Structural experiments on the K3 (docs/flagos-k3/structural-experiments.md): E2, the provider as an IGPU or GPU device
 # on stock llama.cpp; E1, ACCEL on stock llama.cpp (without C5a and C5b); E3, one launch per step; E2-hp, the KV cache
-# on huge pages; E2-neg, the two settings expected to fail with the KV cache in the provider's buffer; E4, stock upstream
+# on huge pages; E2-neg, the two settings that failed with the KV cache in the provider's buffer (F8); E4, stock upstream
 # llama.cpp loading the provider as a run-time module (no upstream change at all); E3c, test-only counters of where a
 # token's time goes; R12-hw, upstream's branch of the 1-row Q4_1 kernel on the board (prepare only). Every mode runs
 # against the reference (today's build, defaults) in the same session, the modes interleaved in every repetition.
@@ -36,10 +36,11 @@
 #                  TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (build A: today's, with C5a and C5b; build B: upstream's llama-context.cpp; build S: stock upstream with backends
-# as run-time modules, the provider loaded from build M; -fa is llama.cpp's default, auto, unless named):
-#   ref           A  ACCEL                                   today's state
-#   e1-auto       B  ACCEL                                   E1: -fa auto turns flash attention off
-#   e1-on         B  ACCEL, -fa on                           E1: the norms pinned to the CPU
+# as run-time modules, the provider loaded from build M; -fa is llama.cpp's default, auto, unless named; the provider
+# reports IGPU unless FLAGOS_SPACEMIT_TEST_DEVICE_TYPE names another type, D3):
+#   ref           A  IGPU                                    today's state
+#   e1-auto       B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel  E1: ACCEL; -fa auto turns flash attention off
+#   e1-on         B  as e1-auto, -fa on                      E1: ACCEL; the norms pinned to the CPU
 #   e2-igpu       B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
 #   e2-gpu        B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu, -ngl 99
 #   e2-igpu-auto  B  as e2-igpu with llama.cpp's default -ngl (its automatic fit); placement only
@@ -48,7 +49,7 @@
 #   e3c           A  FLAGOS_SPACEMIT_TEST_STATS=<log>.stats       E3c: the counters, written when each run ends
 #   e3c-a         A  as e3c, with FLAGOS_SPACEMIT_TEST_LAUNCH=per-step: E3c on E3a, what a launch costs inside a run
 #   ref-nohp      A  FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1    E2-hp, with e2-igpu-nohp (B, igpu, no huge pages)
-#   neg-{q8,shift}-{igpu,ref}  E2-neg: a Q8_0 KV cache and a context shift, as e2-igpu (B) and as ref (A)
+#   neg-{q8,shift}-{igpu,ref}  E2-neg: a Q8_0 KV cache and a context shift, as e2-igpu (B) and as ref (A, IGPU)
 #   e4-igpu       S  GGML_BACKEND_PATH=<M's libggml-flagos.so>, FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
 set -uo pipefail
 
@@ -96,6 +97,7 @@ mode_build() {
 mode_env() {
     case $1 in
         ref-nohp) echo "FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1" ;;
+        e1-*) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel" ;;
         e2-igpu | e2-igpu-auto | neg-*-igpu) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu" ;;
         e2-gpu) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu" ;;
         e2-igpu-nohp) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1" ;;
@@ -329,8 +331,9 @@ summary() {
         # comes while the fit turns messages into debug ones. The offloaded layers and the KV cache show the effect
         case $(mode_env "$m") in
             *DEVICE_TYPE=igpu*) type=IGPU ;;
+            *DEVICE_TYPE=accel*) type=ACCEL ;;
             *DEVICE_TYPE=gpu*) type=GPU ;;
-            *) type=ACCEL ;;
+            *) type=IGPU ;;
         esac
         kv=$(grep -oE '[A-Za-z0-9:_]+ KV buffer size = +[0-9.]+ MiB' "$f" | sed -E 's/ KV buffer size = +/ /' | sort -u |
             paste -sd, -)
@@ -441,8 +444,9 @@ EOF
     fi
     if compgen -G "$OUT/neg-*.err" > /dev/null; then
         echo
-        echo "== E2-neg (expected: the igpu runs abort with \"cannot run the operation\", the ref runs end with rc 0; the"
-        echo "   shift runs have a 256-token context, so more tokens generated than that means the context was shifted)"
+        echo "== E2-neg (expected since the provider writes the cache: all four runs end with rc 0, none with \"cannot run"
+        echo "   the operation\"; the shift runs have a 256-token context, so more tokens generated than that means the"
+        echo "   context was shifted)"
         for f in "$OUT"/neg-*.err; do
             m=$(basename "$f" .err)
             # tokens generated: llama-completion's "eval time = ... / N runs"; its "context full" line is a debug one,

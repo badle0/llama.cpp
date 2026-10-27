@@ -108,7 +108,8 @@ void rms_norm_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     }
 }
 
-// ops.cpp rope_yarn_ramp, rope_yarn, ggml_rope_cache_init and rotate_pairs (F32), copied
+// ops.cpp rope_yarn_ramp, rope_yarn, ggml_rope_cache_init and rotate_pairs, copied; rotate_pairs converts as ops.cpp
+// does with common.h's type_conversion_table (rope_elem)
 float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / MAX(0.001f, high - low);
     return 1 - MIN(1, MAX(0, y));
@@ -142,7 +143,24 @@ void ggml_rope_cache_init(float theta_base, float freq_scale, const float * freq
     }
 }
 
-void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, const float * src_data, float * dst_data,
+// the element types ROPE takes, read as float and written back
+template <typename T> struct rope_elem;
+
+template <> struct rope_elem<float> {
+    static float to_f32(float x) { return x; }
+
+    static float from_f32(float x) { return x; }
+};
+
+template <> struct rope_elem<ggml_fp16_t> {
+    static float to_f32(ggml_fp16_t x) { return GGML_FP16_TO_FP32(x); }
+
+    static ggml_fp16_t from_f32(float x) { return GGML_FP32_TO_FP16(x); }
+};
+
+// each pair is read before it is written, so src_data may be dst_data (ROPE in place)
+template <typename T>
+void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, const T * src_data, T * dst_data,
                   const int scale = 2) {
     for (int64_t i0 = 0; i0 < n; i0 += 2) {
         const int64_t ic = i0 / scale;  // hack for GGML_ROPE_TYPE_NORMAL, where we need ic = i0; for all other cases, ic = i0/2
@@ -150,14 +168,14 @@ void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, 
         const float cos_theta = cache[i0 + 0];
         const float sin_theta = cache[i0 + 1];
 
-        const float * const src = src_data + ic;
-        float *             dst = dst_data + ic;
+        const T * const src = src_data + ic;
+        T *             dst = dst_data + ic;
 
-        const float x0 = src[0];
-        const float x1 = src[n_offset];
+        const float x0 = rope_elem<T>::to_f32(src[0]);
+        const float x1 = rope_elem<T>::to_f32(src[n_offset]);
 
-        dst[0]        = x0 * cos_theta - x1 * sin_theta;
-        dst[n_offset] = x0 * sin_theta + x1 * cos_theta;
+        dst[0]        = rope_elem<T>::from_f32(x0 * cos_theta - x1 * sin_theta);
+        dst[n_offset] = rope_elem<T>::from_f32(x0 * sin_theta + x1 * cos_theta);
     }
 }
 
@@ -166,8 +184,8 @@ int64_t rope_cache_floats(const ggml_tensor * node) {
     return node->ne[0] + 64 / (int64_t) sizeof(float);
 }
 
-// ops.cpp ggml_compute_forward_rope_flt<float>, forward, modes NORMAL and NEOX
-void rope_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+// ops.cpp ggml_compute_forward_rope_flt<T> (float or ggml_fp16_t), forward, modes NORMAL and NEOX
+template <typename T> void rope_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
@@ -212,12 +230,12 @@ void rope_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
             last_i2 = i2;
         }
 
-        const float * src      = (const float *) ((const char *) src0->data + i3 * nb03 + i2 * nb02 + i1 * nb01);
-        float *       dst_data = (float *) ((char *) dst->data + i3 * nb3 + i2 * nb2 + i1 * nb1);
+        const T * src      = (const T *) ((const char *) src0->data + i3 * nb03 + i2 * nb02 + i1 * nb01);
+        T *       dst_data = (T *) ((char *) dst->data + i3 * nb3 + i2 * nb2 + i1 * nb1);
         if (mode == GGML_ROPE_TYPE_NORMAL) {
-            rotate_pairs(n_dims, 1, cache, src, dst_data, 1);
+            rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
         } else {
-            rotate_pairs(n_dims, n_dims / 2, cache, src, dst_data);
+            rotate_pairs<T>(n_dims, n_dims / 2, cache, src, dst_data);
         }
         // the remaining channels are copied from the source
         for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
@@ -256,6 +274,42 @@ bool set_rows_ref(const spacemit_tile & tile, ggml_tensor * dst) {
                     } else {
                         ((ggml_fp16_t *) d)[c] = GGML_FP32_TO_FP16(v);
                     }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// SET_ROWS of F32 rows into rows of a quantized or BF16 type (spacemit_set_rows_supported): set_rows_ref's loops, each
+// row converted by ggml's reference quantizer (from_float_ref; ggml-cpu runs the same code for Q4_0, Q4_1, Q5_0, Q5_1
+// and IQ4_NL). Tiles split each row's blocks, which those quantizers convert one by one, so repeated indices (last row
+// wins) cannot make two tiles write the same bytes; every tile checks every index
+bool set_rows_quant_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const ggml_from_float_t quantize   = ggml_get_type_traits(dst->type)->from_float_ref;
+    const int64_t           blck       = ggml_blck_size(dst->type);
+    const size_t            blck_bytes = ggml_type_size(dst->type);
+
+    int64_t b0, b1;
+    tile_range(ne00 / blck, tile, b0, b1);
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            const int64_t i12 = i03 % ne12;
+            const int64_t i11 = i02 % ne11;
+            for (int64_t i = 0; i < ne01; ++i) {
+                const char *  p  = (const char *) src1->data + i * nb10 + i11 * nb11 + i12 * nb12;
+                const int64_t i1 = src1->type == GGML_TYPE_I64 ? *(const int64_t *) p : *(const int32_t *) p;
+                if (i1 < 0 || i1 >= ne1) {
+                    return false;
+                }
+                if (b1 > b0) {
+                    const float * s = (const float *) ((const char *) src0->data + i * nb01 + i02 * nb02 + i03 * nb03);
+                    char *        d = (char *) dst->data + i1 * nb1 + i02 * nb2 + i03 * nb3;
+                    quantize(s + b0 * blck, d + b0 * blck_bytes, (b1 - b0) * blck);
                 }
             }
         }
@@ -376,19 +430,28 @@ bool spacemit_kernel_rms_norm_f32(const spacemit_tile & tile, ggml_tensor * dst)
     return true;
 }
 
-bool spacemit_kernel_rope_f32(const spacemit_tile & tile, ggml_tensor * dst) {
+// forward_rope_f32 takes F32 only (its branch for other types converts with casts, wrong for ggml_fp16_t)
+bool spacemit_kernel_rope(const spacemit_tile & tile, ggml_tensor * dst) {
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-    if (!spacemit_use_reference()) {
+    if (dst->type == GGML_TYPE_F32 && !spacemit_use_reference()) {
         auto ctx = rvv_context(tile);
         spacemit_rvv::forward_rope_f32(ctx, dst);
         return true;
     }
 #endif
-    rope_f32_ref(tile, dst);
+    if (dst->type == GGML_TYPE_F16) {
+        rope_ref<ggml_fp16_t>(tile, dst);
+    } else {
+        rope_ref<float>(tile, dst);
+    }
     return true;
 }
 
+// forward_set_rows takes F32 and F16 rows into F32 and F16 rows only; the quantized and BF16 types on every build
 bool spacemit_kernel_set_rows(const spacemit_tile & tile, ggml_tensor * dst) {
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
+        return set_rows_quant_ref(tile, dst);
+    }
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference()) {
         auto ctx = rvv_context(tile);
@@ -396,6 +459,26 @@ bool spacemit_kernel_set_rows(const spacemit_tile & tile, ggml_tensor * dst) {
     }
 #endif
     return set_rows_ref(tile, dst);
+}
+
+// CPY of F32 rows into a quantized or BF16 tensor of the same shape (spacemit_cpy_quant_supported): each row converted
+// whole by ggml's reference quantizer, the rows split over the tiles
+bool spacemit_kernel_cpy_quant(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const ggml_from_float_t quantize = ggml_get_type_traits(dst->type)->from_float_ref;
+
+    int64_t ir0, ir1;
+    tile_range(ggml_nrows(dst), tile, ir0, ir1);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir / (ne2 * ne1);
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i1 = ir % ne1;
+        quantize((const float *) ((const char *) src0->data + i1 * nb01 + i2 * nb02 + i3 * nb03),
+                 (char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3, ne0);
+    }
+    return true;
 }
 
 bool spacemit_kernel_get_rows_f32(const spacemit_tile & tile, ggml_tensor * dst) {

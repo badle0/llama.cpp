@@ -33,9 +33,15 @@
 #         within 1% of the CPU; mean KLD against the CPU's logits with 512-token batches (tiled kernel) and -ub 1 -b
 #         512 (one token per ubatch: from n_kv 512 the split over the tiles), to compare by hand with build.md §7
 #         (Qwen3-4B at M2e.3 round 2: 0.003354 and 0.002001)
+#   igpu: as m2e, with the device reported as IGPU (D3, 2026-10-26), so llama.cpp puts the KV cache in the provider's
+#         buffer: it claims CPY too (F32 into the quantized and BF16 cache types), whose test-backend-ops cases pass
+#         with the RVV and with the reference kernels; flagos-check-spacemit adds the cache's writes in our buffer
+#         against the CPU (its "cache" line) and runs once more with FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel, which must
+#         report ACCEL; the model run puts every layer and the KV cache on the provider; a Q8_0 KV cache and a context
+#         shift run with the provider as with FLAGOS_SPACEMIT_DISABLE=1 (structural-experiments.md E2-neg, F8)
 #   --depth (m2b and later): after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth
 #         4096 for the provider, the CPU and (if built) the upstream IME build; FAIL if the provider's runs miss one
-# Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c|m2c2|m2e] [--build] [--build-dir DIR] [--model GGUF]
+# Usage: spacemit_check.py [--milestone m1|m2a|m2b|m2d|m2c|m2c2|m2e|igpu] [--build] [--build-dir DIR] [--model GGUF]
 #                          [--ppl-text FILE] [--ime-build DIR] [--skip-support] [--depth] [--segv SO]
 import argparse
 import csv
@@ -119,7 +125,7 @@ def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
                        env_extra=env_extra, timeout=timeout)
     detail = "; ".join(ln for ln in out.splitlines()
                        if ln.startswith(("device", "flagos ", "ops ", "matmul   Q4_0", "matmul   Q4_1", "matmul   Q8_0",
-                                         "matmul   Q6_K", "gemv ", "rows ", "attn ", "layer")))
+                                         "matmul   Q6_K", "gemv ", "rows ", "cache ", "attn ", "layer")))
     fails = [ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln]
     report(name, rc == 0, detail if rc == 0 else "; ".join(fails[:3]) or last_line(err))
     for ln in out.splitlines():
@@ -131,12 +137,21 @@ def check_tools(bdir, logs, milestone):
     for tool in ["provider", "target", "graph-plan", "registry"]:
         rc, out, err = run([str(bdir / "bin" / f"flagos-check-{tool}")], logs / f"check-{tool}")
         report(f"flagos-check-{tool}", rc == 0, last_line(out) if rc == 0 else f"{last_line(err or out)} (rc={rc})")
-    if milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
+    if milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"):
         check_spacemit(bdir, logs, "flagos-check-spacemit (device present, Qwen3-4B shapes)", "check-spacemit", ["--full"],
                        timeout=900)
         # the same with the reference kernels on the AI cores: tells a kernel error from a tiling error
         check_spacemit(bdir, logs, "flagos-check-spacemit (reference kernels)", "check-spacemit-reference", [],
                        env_extra={"FLAGOS_SPACEMIT_TEST_REFERENCE": "1"}, timeout=900)
+        if milestone == "igpu":
+            # the test-only switch back to ACCEL, the type until 2026-10-26: the checks pass and the device says so
+            rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device"],
+                               logs / "check-spacemit-accel", env_extra={"FLAGOS_SPACEMIT_TEST_DEVICE_TYPE": "accel"},
+                               timeout=900)
+            device = next((ln for ln in out.splitlines() if ln.startswith("device")), "") or "no device line"
+            fails = "; ".join(ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln)
+            report("flagos-check-spacemit (FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel)", rc == 0 and "type ACCEL" in device,
+                   device + ("" if rc == 0 else f"; rc={rc}: {fails[:300] or last_line(err)}"))
     else:
         check_spacemit(bdir, logs, "flagos-check-spacemit (device present)", "check-spacemit", [])
     rc, out, _ = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-none"], logs / "check-spacemit-disabled",
@@ -166,9 +181,11 @@ def support(bdir, logs, milestone):
     elif milestone == "m2c2":
         # Q8_0 and Q6_K MUL_MAT cases with rows a multiple of 32 fit the q8_0 32x32 layout
         ok = rc == 0 and set(ops) == set(M2D_OPS) | {"MUL_MAT"}
-    elif milestone == "m2e":
-        # as m2c2, plus the FLASH_ATTN_EXT cases with F16 K and V and head sizes up to 128
-        ok = rc == 0 and set(ops) == set(M2D_OPS) | {"MUL_MAT", "FLASH_ATTN_EXT"}
+    elif milestone in ("m2e", "igpu"):
+        # as m2c2, plus the FLASH_ATTN_EXT cases with F16 K and V and head sizes up to 128; igpu: the CPY cases of F32
+        # into the quantized and BF16 cache types too
+        extra = {"CPY"} if milestone == "igpu" else set()
+        ok = rc == 0 and set(ops) == set(M2D_OPS) | {"MUL_MAT", "FLASH_ATTN_EXT"} | extra
     else:
         # no MUL_MAT case of test-backend-ops fits the IME layout (plan.md §1), so MUL_MAT may show 0 claims
         ok = rc == 0 and "ADD" in ops and set(ops) <= {"ADD", "MUL_MAT"}
@@ -187,13 +204,14 @@ def op_test(bdir, logs, op, env_extra=None, tag=""):
 
 
 def op_correctness(bdir, logs, milestone):
-    if milestone not in ("m2d", "m2c", "m2c2", "m2e"):
+    if milestone not in ("m2d", "m2c", "m2c2", "m2e", "igpu"):
         report("test-backend-ops ADD", *op_test(bdir, logs, "ADD"))
         return
     # from M2c.2 test-backend-ops has MUL_MAT cases the provider claims (op_test needs at least one to run), from M2e.1
-    # FLASH_ATTN_EXT cases
-    ops = (M2D_OPS + (["MUL_MAT"] if milestone in ("m2c2", "m2e") else []) +
-           (["FLASH_ATTN_EXT"] if milestone == "m2e" else []) + M2D_GRAPHS)
+    # FLASH_ATTN_EXT cases, with igpu CPY cases
+    ops = (M2D_OPS + (["MUL_MAT"] if milestone in ("m2c2", "m2e", "igpu") else []) +
+           (["FLASH_ATTN_EXT"] if milestone in ("m2e", "igpu") else []) + (["CPY"] if milestone == "igpu" else []) +
+           M2D_GRAPHS)
     for op in ops:
         report(f"test-backend-ops {op}", *op_test(bdir, logs, op))
     # the same with the reference kernels on the AI cores, in one line
@@ -278,7 +296,7 @@ def model_run(bdir, logs, model, milestone):
     rc_on, text_on, log_on = run(cmd, logs / "model-enabled", env_extra=preload, env_drop=("FLAGOS_SPACEMIT_DISABLE",))
     rc_off, text_off, log_off = run(cmd, logs / "model-disabled", env_extra={"FLAGOS_SPACEMIT_DISABLE": "1", **preload})
     report("model runs", rc_on == 0 and rc_off == 0, f"rc enabled={rc_on}, disabled={rc_off}")
-    if milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
+    if milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"):
         # the IME kernels quantize activations differently from the CPU, so greedy text may drift; perplexity decides
         same = next((i for i, (a, b) in enumerate(zip(text_on, text_off)) if a != b), min(len(text_on), len(text_off)))
         info("model output", "identical to the CPU" if text_on == text_off else f"differs from the CPU after {same} characters")
@@ -294,11 +312,19 @@ def model_run(bdir, logs, model, milestone):
     if milestone == "m1":
         report("nothing placed on the provider", not placed, "no provider buffers in use" if not placed else ", ".join(placed))
         report("graph splits unchanged", splits[0] == splits[1] and bool(splits[0]), f"enabled {splits[0]}, disabled {splits[1]}")
-    elif milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
+    elif milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"):
         report("weights placed on the provider", any(p.startswith("model") for p in placed), ", ".join(placed) or "none in use")
-        if milestone == "m2e":
-            # the run leaves -fa at its default, auto; with C5a llama.cpp keeps flash attention on the provider
-            report("-fa auto keeps flash attention on the provider (C5a)", *attention_on_provider(log_on, rc_on))
+        if milestone == "igpu":
+            # IGPU (D3): llama.cpp offloads every layer and puts their KV cache in the provider's buffer
+            off = re.findall(r"offloaded (\d+)/(\d+) layers", ANSI.sub("", log_on))
+            kv = any(p.startswith("KV") for p in placed)
+            report("every layer and the KV cache on the provider", bool(off) and off[-1][0] == off[-1][1] and kv,
+                   (f"offloaded {off[-1][0]}/{off[-1][1]} layers" if off else "no offload line") +
+                   f"; {', '.join(placed) or 'no provider buffers in use'}")
+        if milestone in ("m2e", "igpu"):
+            # the run leaves -fa at its default, auto; llama.cpp keeps flash attention on the provider (as an ACCEL
+            # device only with C5a)
+            report("-fa auto keeps flash attention on the provider", *attention_on_provider(log_on, rc_on))
             # exit M2e.1 (plan.md): only the token embedding stays on the CPU
             n_split = splits_per_token(log_on)
             report("a token takes 2 graph splits", n_split == 2,
@@ -309,6 +335,43 @@ def model_run(bdir, logs, model, milestone):
         info("provider buffers", ", ".join(placed) or "none in use")
         info("graph splits", f"enabled {splits[0]}, disabled {splits[1]}")
     info("generation speed", f"enabled {speed[0]} t/s, disabled {speed[1]} t/s")
+
+
+def generated_tokens(log):
+    """Tokens llama-completion generated after the first: its "eval time = ... / N runs" (not "prompt eval time")."""
+    found = re.findall(r"(?<!prompt )eval time =\s+[0-9.]+ ms /\s+(\d+) runs", log)
+    return int(found[-1]) if found else None
+
+
+def cache_runs(bdir, logs, model):
+    """igpu: the two settings that aborted with the KV cache in the provider's buffer before the provider wrote it
+    (structural-experiments.md E2-neg, F8), each with the provider and with FLAGOS_SPACEMIT_DISABLE=1: a Q8_0 KV cache
+    (its SET_ROWS on the provider, the attention over it on the CPU) and a context shift (the K cache rotated in place,
+    ROPE on F16). -c 256 with 400 tokens to generate makes llama-completion shift the context; it reports 399 evals."""
+    if not Path(model).is_file():
+        report("KV cache runs", False, f"model not found: {model}")
+        return
+    cmd = [str(bdir / "bin" / "llama-completion"), "-m", model, "-p", "The capital of France is", "--temp", "0",
+           "-no-cnv", "-t", "8", "-lv", "4"]
+    for tag, label, args in (
+            ("q8", "Q8_0 KV cache", ["-n", "32", "-c", "512", "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on"]),
+            ("shift", "context shift", ["-n", "400", "--ignore-eos", "-c", "256", "--context-shift"])):
+        rc_on, text_on, log_on = run([*cmd, *args], logs / f"cache-{tag}-enabled", env_extra=preload,
+                                     env_drop=("FLAGOS_SPACEMIT_DISABLE",))
+        rc_off, text_off, log_off = run([*cmd, *args], logs / f"cache-{tag}-disabled",
+                                        env_extra={"FLAGOS_SPACEMIT_DISABLE": "1", **preload})
+        if tag == "q8":
+            report(f"{label} runs", rc_on == 0 and rc_off == 0, f"rc enabled={rc_on}, disabled={rc_off}")
+            info(f"{label} generation speed",
+                 f"enabled {tokens_per_second(log_on)} t/s, disabled {tokens_per_second(log_off)} t/s")
+        else:
+            n_on, n_off = generated_tokens(log_on), generated_tokens(log_off)
+            report(f"{label} runs", rc_on == 0 and n_on == 399,
+                   f"rc enabled={rc_on}, disabled={rc_off}; evals after the first token: enabled {n_on}, "
+                   f"disabled {n_off}")
+        same = next((i for i, (a, b) in enumerate(zip(text_on, text_off)) if a != b), min(len(text_on), len(text_off)))
+        info(f"{label} output",
+             "identical to the CPU" if text_on == text_off else f"differs from the CPU after {same} characters")
 
 
 def perplexity(bdir, logs, model, text, milestone):
@@ -322,9 +385,10 @@ def perplexity(bdir, logs, model, text, milestone):
     # from M2e.1 the CPU run also saves its logits for the KLD runs (about 600 MB at Qwen3's vocabulary)
     kld_base = logs / "kld-base.bin"
     runs = [("enabled", ["-fa", "on"], {}, ("FLAGOS_SPACEMIT_DISABLE",)),
-            ("disabled", ["-fa", "on"] + (["--kl-divergence-base", str(kld_base)] if milestone == "m2e" else []),
+            ("disabled",
+             ["-fa", "on"] + (["--kl-divergence-base", str(kld_base)] if milestone in ("m2e", "igpu") else []),
              {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]
-    if milestone == "m2e":
+    if milestone in ("m2e", "igpu"):
         kld_base.unlink(missing_ok=True)
         runs.append(("enabled-fa-auto", [], {}, ("FLAGOS_SPACEMIT_DISABLE",)))
     ppl, problems, fa_auto = {}, {}, None
@@ -342,7 +406,7 @@ def perplexity(bdir, logs, model, text, milestone):
             fa_auto = attention_on_provider(err, rc)
     cpu = ppl["disabled"]
     checks = [("enabled", "")]
-    if milestone == "m2e":
+    if milestone in ("m2e", "igpu"):
         checks = [("enabled", " (-fa on)"), ("enabled-fa-auto", " (-fa auto)")]
     for name, label in checks:
         both = None not in (ppl[name], cpu)
@@ -353,7 +417,7 @@ def perplexity(bdir, logs, model, text, milestone):
     if fa_auto is not None:
         # the -fa auto run measures the provider's attention only if it ran there
         report("perplexity -fa auto: flash attention on the provider", *fa_auto)
-    if milestone == "m2e":
+    if milestone in ("m2e", "igpu"):
         kl_divergence(bdir, logs, model, text, kld_base)
 
 
@@ -434,7 +498,7 @@ def llama_bench(bdir, logs, model, ime_build, tcm_dir, depth):
 
 def main():
     ap = argparse.ArgumentParser(description="acceptance run for the FlagOS SpacemiT provider (run on the K3)")
-    ap.add_argument("--milestone", choices=["m1", "m2a", "m2b", "m2d", "m2c", "m2c2", "m2e"], default="m2e",
+    ap.add_argument("--milestone", choices=["m1", "m2a", "m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"], default="igpu",
                     help="expectations to check (default: %(default)s)")
     ap.add_argument("--build", action="store_true", help="configure and build before checking")
     ap.add_argument("--build-dir", default=str(REPO / "build-flagos"), help="FlagOS build directory (default: %(default)s)")
@@ -469,14 +533,16 @@ def main():
     list_devices(bdir, logs)
     if not args.skip_support:
         support(bdir, logs, args.milestone)
-    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2", "m2e"):
+    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"):
         op_correctness(bdir, logs, args.milestone)
         bench(bdir, logs)
     model_run(bdir, logs, args.model, args.milestone)
-    if args.milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e"):
+    if args.milestone == "igpu":
+        cache_runs(bdir, logs, args.model)
+    if args.milestone in ("m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"):
         perplexity(bdir, logs, args.model, args.ppl_text, args.milestone)
         llama_bench(bdir, logs, args.model, args.ime_build, args.tcm_dir, args.depth)
-    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2", "m2e"):
+    if args.milestone in ("m2a", "m2b", "m2d", "m2c", "m2c2", "m2e", "igpu"):
         tcm_hygiene(args.tcm_dir, logs)
 
     n_fail = results.count(False)

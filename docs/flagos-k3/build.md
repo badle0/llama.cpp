@@ -689,6 +689,16 @@ Generation against context depth (2026-10-12, `llama-bench -p 0 -n 32 -d 0,1024,
 - Qwen3-0.6B (34/34): pp128 705.50 and tg128 55.16 against the IME path's 542.13 and 54.34 (+30.1%, +1.5%; after M2e.3 round 2 667.19 and 55.78). Perplexity 14.4471 against the CPU's 14.3706 (+0.53%): the provider's is the fix's, the CPU's moved (14.3598 on 2026-10-24). Mean KLD 0.004722 ± 0.000221 and 0.002533 ± 0.000089. Greedy text identical to the CPU's (after 88 characters before; not attributed, `fusion-and-splitting.md` §7.3).
 - Placement unchanged: C5a keeps flash attention on the provider, 2 graph splits per token, no TCM block left held. `llama-completion` 11.13 t/s against 5.54 with the provider off (0.6B: 55.19 against 27.39).
 
+**The IGPU switch, 2026-10-27** (D3; `PROJECT.md` item 22, `plan.md` §2.3 and §2.8; checked on the Mac's simulated device, the K3 run pending): the provider reports IGPU by default, so llama.cpp offloads every layer and puts the KV cache in the provider's buffer; the cache ops that needs are in: the layout rule keeps `cache_k_*`, `cache_v_*`, `cache_r_*` and `cache_s_*` plain, `SET_ROWS` writes F32 rows into Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL and BF16 caches, `ROPE` runs in place on F16 (the context shift), `CPY` writes F32 rows into those types (a quantized cache's shift; its Hadamard matmuls and attention over a quantized cache stay on the CPU with copies, so `-fa on` is the supported form with `-ctk`/`-ctv`). Mac: `flagos-check-spacemit --expect-device` passes every check (its `cache` line: SET_ROWS, CPY, ROPE and a Q8_0 shift through the scheduler within NMSE 1e-6 of the CPU, the quantized bytes those of ggml's reference quantizers), as does the same with `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` (the device reports ACCEL) and with `FLAGOS_SPACEMIT_TEST_THREADS=1`; `test-backend-ops` SET_ROWS 180/180, ROPE 273/273, CPY 15/15, ROPE_SET_ROWS 24/24, FLASH_ATTN_EXT 1324/1324, MUL_MAT 3/3; ThreadSanitizer clean. On the K3 (inside tmux; the runner's default milestone is `igpu` now):
+
+```bash
+~/tcmtest/tcmrelease --apply
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone igpu --build --depth --model ~/models/Qwen3-4B-Q4_0.gguf
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone igpu
+```
+
+Pass when every check passes (the new ones: every layer and the KV cache on the provider, the accel switch reporting ACCEL, the Q8_0-cache and context-shift runs completing with and without the provider), the perplexity at 512-token batches is 2026-10-26's to the last digit, tg128 and pp128 are within 1% of 2026-10-26 (4B 11.00 / 106.70, 0.6B 55.16 / 705.50), pp512 at depth 4096 up to 4% faster allowed (E2). Recorded, not gated: the Q8_0-cache run's speed. The results go here when the run is done.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
@@ -699,6 +709,7 @@ Experiment switches of the provider (environment variables; test-only unless not
 
 | Variable | Applies to | Effect |
 |---|---|---|
+| `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` or `gpu` | the device's ggml type at registration (`plan.md` §2.8) | the provider reports that type instead of IGPU (the default since 2026-10-27), with a warning, for comparisons: ACCEL was the type until 2026-10-26, GPU is E2's other value |
 | `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
 | `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
 | `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |

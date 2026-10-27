@@ -19,10 +19,12 @@ enum class spacemit_layout {
                       // 34 bytes per 32 weights, not 26.25; reads are approximate)
 };
 
-// decided from the tensor's type and shape alone, never from how the buffer is used: test-backend-ops places
+// decided from the tensor's type, shape and name alone, never from how the buffer is used: test-backend-ops places
 // weights in ordinary buffers. supports_op, the buffer functions and the kernels all ask this one function.
-// A view is stored the way its view_src is; it never has a layout of its own. For Q4_1 also from
-// FLAGOS_SPACEMIT_Q4_1, read once per process, as a weight must keep the layout it was stored in.
+// A view is stored the way its view_src is; it never has a layout of its own. llama.cpp's cache tensors (named
+// cache_k_, cache_v_, cache_r_ and cache_s_ before allocation) always keep ggml's layout, whatever their type and shape,
+// as they are written row by row (SET_ROWS, CPY, the context shift's ROPE). For Q4_1 also from FLAGOS_SPACEMIT_Q4_1,
+// read once per process, as a weight must keep the layout it was stored in.
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t);
 
 // bytes the tensor takes in the provider's buffer (the buffer type's get_alloc_size): ggml_nbytes, except for the

@@ -27,9 +27,20 @@ static bool spacemit_q4_1_zero_point() {
     return zero_point;
 }
 
+// llama.cpp's KV cache and recurrent state, named before they are allocated (src/llama-kv-cache.cpp:231-235,
+// src/llama-memory-recurrent.cpp:102-103)
+static bool spacemit_is_cache_name(const char * name) {
+    for (const char * prefix : { "cache_k_", "cache_v_", "cache_r_", "cache_s_" }) {
+        if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[2] != 1 || t->ne[3] != 1 ||
-        !ggml_is_contiguous(t)) {
+        !ggml_is_contiguous(t) || spacemit_is_cache_name(t->name)) {
         return spacemit_layout::plain;
     }
     if (t->type == GGML_TYPE_Q4_0 && t->ne[0] % spacemit_ime::q4_0_k_block == 0) {

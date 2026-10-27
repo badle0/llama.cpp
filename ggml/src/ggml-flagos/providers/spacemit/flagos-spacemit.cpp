@@ -1,7 +1,7 @@
 // FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15).
-// One ACCEL device with a buffer type and a backend; ops run on the AI cores through spine-runtime
-// (M2a: ADD; M2b, M2c: Q4_0, Q4_1, Q8_0 and Q6_K MUL_MAT on the IME, weights repacked in the buffer, Q6_K requantized
-// to Q8_0; M2d: the other ops of a layer except attention).
+// One IGPU device (D3, 2026-10-26; ACCEL before) with a buffer type and a backend; ops run on the AI cores through
+// spine-runtime (M2a: ADD; M2b, M2c: Q4_0, Q4_1, Q8_0 and Q6_K MUL_MAT on the IME, weights repacked in the buffer, Q6_K
+// requantized to Q8_0; M2d: the other ops of a layer except attention).
 
 #include "flagos-spacemit-api.h"
 #include "flagos-spacemit-attn.h"
@@ -824,22 +824,24 @@ void spacemit_device_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
 #endif
 }
 
-// ACCEL (D3). test-only: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu or igpu reports that type instead, so llama.cpp gives the
-// device whole layers and their KV cache, without C5a and C5b (structural-experiments.md E2); read once, reported once
-// when it changes the type, anything else reported and ignored
+// IGPU (D3, 2026-10-26): llama.cpp gives the device whole layers and their KV cache, which lives in our buffer.
+// test-only: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel or gpu reports that type instead, for comparisons (ACCEL: the type
+// until 2026-10-26, the KV cache in a CPU buffer; structural-experiments.md E1, E2); igpu names the default. Read once,
+// reported once when it changes the type, anything else reported and ignored
 enum ggml_backend_dev_type spacemit_device_type(ggml_backend_dev_t) {
     static const enum ggml_backend_dev_type type = [] {
         const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_DEVICE_TYPE");
-        if (v == nullptr || *v == '\0' || std::strcmp(v, "accel") == 0) {
-            return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+        if (v == nullptr || *v == '\0' || std::strcmp(v, "igpu") == 0) {
+            return GGML_BACKEND_DEVICE_TYPE_IGPU;
         }
-        if (std::strcmp(v, "gpu") == 0 || std::strcmp(v, "igpu") == 0) {
-            GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: reporting %s instead of ACCEL\n", v,
-                          v[0] == 'g' ? "GPU" : "IGPU");
-            return v[0] == 'g' ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (std::strcmp(v, "accel") == 0 || std::strcmp(v, "gpu") == 0) {
+            const bool accel = v[0] == 'a';
+            GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: reporting %s instead of IGPU\n", v,
+                          accel ? "ACCEL" : "GPU");
+            return accel ? GGML_BACKEND_DEVICE_TYPE_ACCEL : GGML_BACKEND_DEVICE_TYPE_GPU;
         }
         GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: unknown setting ignored\n", v);
-        return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+        return GGML_BACKEND_DEVICE_TYPE_IGPU;
     }();
     return type;
 }
@@ -887,7 +889,8 @@ bool spacemit_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op)
     return ggml_op_is_empty(op->op) || spacemit_find_op(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
 }
 
-// operands may also live in CPU buffers: under ACCEL the KV cache and activations stay there
+// operands may also live in CPU buffers: the activations of the CPU's splits, and under ACCEL (test-only) the KV cache;
+// under IGPU, the default, the KV cache lives in our buffer
 bool spacemit_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     return buft == &spacemit_device_from_dev(dev)->buffer_type || ggml_backend_buft_is_host(buft);
 }

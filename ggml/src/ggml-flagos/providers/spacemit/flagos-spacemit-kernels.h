@@ -13,8 +13,9 @@ bool spacemit_use_reference();
 bool spacemit_kernel_add_f32(const spacemit_tile & tile, ggml_tensor * dst);
 bool spacemit_kernel_mul_f32(const spacemit_tile & tile, ggml_tensor * dst);
 bool spacemit_kernel_rms_norm_f32(const spacemit_tile & tile, ggml_tensor * dst);
-bool spacemit_kernel_rope_f32(const spacemit_tile & tile, ggml_tensor * dst);
-bool spacemit_kernel_set_rows(const spacemit_tile & tile, ggml_tensor * dst);
+bool spacemit_kernel_rope(const spacemit_tile & tile, ggml_tensor * dst);       // F32 or F16
+bool spacemit_kernel_set_rows(const spacemit_tile & tile, ggml_tensor * dst);   // into F32, F16, quantized or BF16 rows
+bool spacemit_kernel_cpy_quant(const spacemit_tile & tile, ggml_tensor * dst);  // F32 into quantized or BF16 rows
 bool spacemit_kernel_get_rows_f32(const spacemit_tile & tile, ggml_tensor * dst);
 bool spacemit_kernel_swiglu_f32(const spacemit_tile & tile, ggml_tensor * dst);
 

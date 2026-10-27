@@ -24,6 +24,11 @@ static bool spacemit_f32_rows(const ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float);
 }
 
+// F32 or F16 with contiguous elements in each row; rows may have any stride
+static bool spacemit_f32_f16_rows(const ggml_tensor * t) {
+    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && t->nb[0] == ggml_type_size(t->type);
+}
+
 // ADD, MUL: src1 repeats over src0 in every dimension, as in ggml-cpu's binary-ops.cpp
 static bool spacemit_binary_f32_supported(const ggml_tensor * op) {
     const ggml_tensor * a = op->src[0];
@@ -39,29 +44,65 @@ static bool spacemit_rms_norm_f32_supported(const ggml_tensor * op) {
     return spacemit_f32_rows(op) && spacemit_f32_rows(op->src[0]) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f;
 }
 
-// ROPE (forward): modes NORMAL and NEOX; I32 positions, one per token; optional F32 frequency factors; the channels
-// past n_dims are copied in pairs, so ne0 is even
-static bool spacemit_rope_f32_supported(const ggml_tensor * op) {
+// ROPE (forward): F32 or F16 rows into rows of the same type (F16: the context shift's ROPE in place on the KV cache,
+// src/llama-kv-cache.cpp:1878-1883); modes NORMAL and NEOX; I32 positions, one per token; optional F32 frequency
+// factors; the channels past n_dims are copied in pairs, so ne0 is even
+static bool spacemit_rope_supported(const ggml_tensor * op) {
     const ggml_tensor * src0   = op->src[0];
     const ggml_tensor * pos    = op->src[1];
     const ggml_tensor * ff     = op->src[2];
     const int           n_dims = ggml_get_op_params_i32(op, 1);
     const int           mode   = ggml_get_op_params_i32(op, 2);
-    return spacemit_f32_rows(op) && spacemit_f32_rows(src0) && ggml_are_same_shape(src0, op) &&
+    return spacemit_f32_f16_rows(op) && spacemit_f32_f16_rows(src0) && op->type == src0->type &&
+           ggml_are_same_shape(src0, op) &&
            (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) && n_dims > 0 && n_dims % 2 == 0 &&
            n_dims <= src0->ne[0] && src0->ne[0] % 2 == 0 && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) &&
            pos->ne[0] >= src0->ne[2] &&
            (ff == nullptr || (ff->type == GGML_TYPE_F32 && ggml_is_contiguous(ff) && ff->ne[0] >= n_dims / 2));
 }
 
-// SET_ROWS: F32 or F16 rows into F32 or F16 rows (the KV cache types), I64 or I32 indices
+// the KV cache's types besides F32 and F16 (-ctk, -ctv) that the provider writes from F32 rows, with ggml's reference
+// quantizers (from_float_ref): whole blocks, ggml's layout
+static bool spacemit_cache_block_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_BF16:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// SET_ROWS (the KV cache writes, src/llama-kv-cache.cpp:1333, :1368): F32 or F16 rows into F32 or F16 rows, or F32 rows
+// into rows of a block type above in whole blocks (an F16 source there stays unclaimed); I64 or I32 indices; never
+// into a tensor in an IME layout (op is a view of the destination; the layout rule resolves its view_src)
 static bool spacemit_set_rows_supported(const ggml_tensor * op) {
-    const auto rows = [](const ggml_tensor * t) {
-        return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && t->nb[0] == ggml_type_size(t->type);
-    };
+    const ggml_tensor * src = op->src[0];
     const ggml_tensor * idx = op->src[1];
-    return rows(op) && rows(op->src[0]) && op->ne[0] == op->src[0]->ne[0] &&
-           (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32);
+    if (op->ne[0] != src->ne[0] || (idx->type != GGML_TYPE_I64 && idx->type != GGML_TYPE_I32) ||
+        spacemit_tensor_is_repacked(op)) {
+        return false;
+    }
+    if (spacemit_f32_f16_rows(op)) {
+        return spacemit_f32_f16_rows(src);
+    }
+    return spacemit_cache_block_type(op->type) && spacemit_f32_rows(src) && op->nb[0] == ggml_type_size(op->type) &&
+           op->ne[0] % ggml_blck_size(op->type) == 0;
+}
+
+// CPY: F32 rows into a contiguous tensor of a block type above, of the same shape, in whole blocks (the context shift's
+// write-back into a quantized KV cache, src/llama-kv-cache.cpp:1863-1877); op is ggml_cpy's view of the destination,
+// with its ne and nb (ggml.c:3526-3535), never in an IME layout. No other CPY: no same-type copies, no other source
+// types, no non-contiguous destinations
+static bool spacemit_cpy_quant_supported(const ggml_tensor * op) {
+    const ggml_tensor * src = op->src[0];
+    return spacemit_cache_block_type(op->type) && spacemit_f32_rows(src) && ggml_are_same_shape(src, op) &&
+           ggml_is_contiguous(op) && op->ne[0] % ggml_blck_size(op->type) == 0 && !spacemit_tensor_is_repacked(op);
 }
 
 // GET_ROWS: F32 rows by I32 indices
@@ -85,8 +126,10 @@ static bool spacemit_swiglu_f32_supported(const ggml_tensor * op) {
 }
 
 // a weight in an IME layout (Q4_0 32x256, Q4_1 32x32, Q8_0 and Q6_K in q8_0 32x32), read in that layout: so it must
-// sit in our buffer (or be unallocated at placement time), never in a host buffer. The answer must not depend on the
-// row count: llama.cpp asks once per weight, at load, with 512 rows (plan.md M2b design).
+// sit in our buffer (or be unallocated at placement time), never in a host buffer. The layout comes from the weight's
+// type, shape and name (spacemit_weight_layout): llama.cpp's cache tensors never have one, so a MUL_MAT never reads a
+// quantized KV cache as a weight. The answer must not depend on the row count: llama.cpp asks once per weight, at load,
+// with 512 rows (plan.md M2b design).
 static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
@@ -106,8 +149,9 @@ static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, ggml_backend_
 SPACEMIT_ONE_STEP_OP(k_add_f32, spacemit_kernel_add_f32, nullptr);
 SPACEMIT_ONE_STEP_OP(k_mul_f32, spacemit_kernel_mul_f32, nullptr);
 SPACEMIT_ONE_STEP_OP(k_rms_norm_f32, spacemit_kernel_rms_norm_f32, nullptr);
-SPACEMIT_ONE_STEP_OP(k_rope_f32, spacemit_kernel_rope_f32, spacemit_rope_workspace);
+SPACEMIT_ONE_STEP_OP(k_rope, spacemit_kernel_rope, spacemit_rope_workspace);
 SPACEMIT_ONE_STEP_OP(k_set_rows, spacemit_kernel_set_rows, nullptr);
+SPACEMIT_ONE_STEP_OP(k_cpy_quant, spacemit_kernel_cpy_quant, nullptr);
 SPACEMIT_ONE_STEP_OP(k_get_rows_f32, spacemit_kernel_get_rows_f32, nullptr);
 SPACEMIT_ONE_STEP_OP(k_swiglu_f32, spacemit_kernel_swiglu_f32, nullptr);
 SPACEMIT_ONE_STEP_OP(k_flash_attn, spacemit_kernel_flash_attn, nullptr);
@@ -139,10 +183,13 @@ const spacemit_op * spacemit_find_op(const ggml_tensor * op, ggml_backend_buffer
             impl = spacemit_rms_norm_f32_supported(op) ? &k_rms_norm_f32 : nullptr;
             break;
         case GGML_OP_ROPE:
-            impl = spacemit_rope_f32_supported(op) ? &k_rope_f32 : nullptr;
+            impl = spacemit_rope_supported(op) ? &k_rope : nullptr;
             break;
         case GGML_OP_SET_ROWS:
             impl = spacemit_set_rows_supported(op) ? &k_set_rows : nullptr;
+            break;
+        case GGML_OP_CPY:
+            impl = spacemit_cpy_quant_supported(op) ? &k_cpy_quant : nullptr;
             break;
         case GGML_OP_GET_ROWS:
             impl = spacemit_get_rows_f32_supported(op) ? &k_get_rows_f32 : nullptr;

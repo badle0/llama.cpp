@@ -73,6 +73,8 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   split; one failure flag. It costs every step's wait for its slowest tile. In the deck's terms it is the K3's form of
   Tier-2 "图录制 · 逐 token 重放", with the step list rebuilt each graph instead of captured once.
 - Answered by: E3a, E3b (E3c splits today's overhead the deck's way).
+- 2026-10-26: the core's capture policy is ours to set (D10): the core records the steps once per structure (S1), the
+  plugin replays them (S2).
 
 **Q2. How does a plugin keep weights in a vendor layout?** (`PROJECT.md` question 2, D4)
 - Problem: the IME kernels need weights repacked (Q4_0 interleaved 32 rows x 256; Q4_1 with an integer zero point,
@@ -89,6 +91,9 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
 - Recommendation: (a) while native IME kernels stay; (d) if E5 and the Triton kernel of the M3.0 spike read GGUF's
   layout fast enough.
 - Answered by: E6, E5, M3.0's extra kernel.
+- Decided (user and mentor, 2026-10-26): the layout and its repack belong to the plugin (`flagos-spacemit-weights.{h,cpp}`
+  is part of it; `PROJECT.md` D10): option (c)'s shape, the plugin repacking inside its buffer's set and get while the
+  core sees ggml's layout. The requantization choice stays as `PROJECT.md` question 2 records it.
 
 **Q3. What does a kernel get per tile, and who sets the K3's grid?**
 - Problem: our kernels use the tile number and count, one TCM size all tiles agreed on, the shared workspace, pair waits
@@ -99,6 +104,7 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   its own state between tiles; (c) native kernels stay inside the plugin during the transition (but then the plugin
   dispatches, against R5).
 - Recommendation: (a); also confirm I64 as an argument type (byte strides, large offsets).
+- Closed as an ask 2026-10-26: with the interface ours (D10), (a) is S1's design input (`plan.md` S1).
 
 **Q4. Can `when` express the K3's kernel choices?**
 - Known from the flow slide: `when` is checked every token against "facts" (⑤), variants the device cannot run are
@@ -134,7 +140,7 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   logits (pp512 at depth 4096 3.8-3.9% faster, as on 4B). Two models of one family and one quantization so far; F8's
   two gaps were not rerun on 0.6B.
 - Answered by: E1, E2, E2-hp, E2-neg, E4.
-- **Decided 2026-10-26 (the mentor, reported by the user): (b) IGPU.** Recorded in `PROJECT.md` D3 and item 22, `plan.md` D3 and §2.8, `device-type.md`. The code still reports ACCEL until F8's two gaps are closed.
+- **Decided 2026-10-26 (the mentor, reported by the user): (b) IGPU.** Recorded in `PROJECT.md` D3 and item 22, `plan.md` D3 and §2.8, `device-type.md`. In the code since 2026-10-27: F8's two gaps closed and the default flipped (F8; `PROJECT.md` item 22), checked on the Mac's simulated device, the K3 run pending.
 
 **Q6. During the transition, do native RVV/IME kernels go in the package or in the plugin?** The deck says both: the
 architecture slide keeps them in the plugin (R7); the flow slide lists "HSACO / ELF / 厂商格式" (vendor format) as package
@@ -148,11 +154,17 @@ any variant and Triton versions replace them one by one.
   run-time override `FLAGOS_KERNEL_DIR`, `flagos-denglin.cpp:301-302`), AMD takes `FLAGOS_AMD_AOT_KERNEL_DIR` at build
   time (a `manifest.json` required, `providers/amd/provider.cmake:18-22`) and installs to `share/ggml/flagos/amd`
   (`CMakeLists.txt:172`); the deck's variable is `GGML_FLAGOS_KERNEL_DIR`.
+- Decided (user, 2026-10-26; D9): M3 is in scope, with FlagGems' kernels through FlagTree for the ops they have
+  and the native IME and RVV kernels kept as they are for the rest: the package and the plugin's native kernels side
+  by side, the deck's transition state (R7). The consequences (which ops qualify, the launch model, one contract with
+  two sources, the speed rule) and Q11-Q14 for the mentor are in `structural-review.md` §6-§7. Deferred with M3 (user
+  and mentor, 2026-10-26) until the structural work on the backend is done; the pending questions ranked for the mentor
+  in `structural-review.md` §7.1.
 
 **Q7. How does a kernel report a failure?** Today `GET_ROWS` and `SET_ROWS` with a bad index make the graph return
 `GGML_STATUS_FAILED` instead of aborting; the deck shows only `SYNC_LAUNCH` and `TRACE_LAUNCH`. Options: (a) `launch`
 returns a status; (b) an error word in a buffer the core provides, checked at synchronization; (c) no reporting.
-Recommendation: (b), which works for Triton kernels too.
+Recommendation: (b), which works for Triton kernels too. Closed as an ask 2026-10-26: S1's interface (D10).
 
 **Q8. Where does the plugin live, and is a closed `libspert` acceptable?** (`PROJECT.md` questions 3 and 7)
 - Partly answered by R3's correction (user, 2026-10-21): the plugin is delivered as source and may call a closed SDK
@@ -161,12 +173,17 @@ Recommendation: (b), which works for Triton kernels too.
   tree; `PROJECT.md` question 7).
 
 **Q9. Where is the plugin-split code?** `flagos-runtime.h`, the core's loader and `amd-rt` are in none of the branches we
-have (F1).
+have (F1). Closed 2026-10-26 (the mentor): no separate `flagos-runtime.h`; the split is done K3-only in our tree (D10), the
+loader ours to write (`plan.md` S1).
 
 **Q10. Where does each part of our code go under the deck's split?** R8 sends the executor and runner to llama.cpp, but
 the deck keeps llama.cpp unchanged and puts the core in `libggml-flagos`, the runtime in the vendor's plugin and the
 kernels in the package. Our executor (`flagos-spacemit-exec.cpp`) maps to the plugin's Tier-2 capture; the acceptance
 runner to the plugin's tests.
+
+Q11-Q14, added by the structural review of 2026-10-26 (the plugin split and the deck's K3 row, the core's capture
+policy for a plugin with per-tile services, the matmuls under the M3 decision, the speed rule for AOT kernels), are in
+`structural-review.md` §7.
 
 ## 3. Findings so far
 
@@ -174,6 +191,16 @@ runner to the plugin's tests.
 `flagos_provider_get_entry_v1` in any local branch, including `kevin/*` (newest 2026-09-22), in `~/flagos-kernels`, or
 in Downloads, Documents and Desktop. The AMD provider in this tree is still compiled in (6,201 lines), not the deck's
 488-line `amd-rt`.
+Rechecked 2026-10-26 with the mentor's newest branch fetched read-only (`kevin/feature/flagos-amd-890-audit-20261010`,
+2026-10-10, 94 files and +10,852 lines over `5794e12`): no `flagos_runtime_v1`, `flagos-runtime.h`,
+`flagos_provider_get_entry_v1`, `flagos-providers/`, `GGML_FLAGOS_KERNEL_DIR` or `GGML_FLAGOS_PROVIDER_PATH` there either;
+the providers are still compiled in, and the AMD manifest loader still reads format 2 without `contract`, `when` or
+`priority`. New on that branch: a C compile check of the public header (`tests/check_public_header.c`), a device
+interface check (`flagos_device_interface_is_valid`), provider-side op geometry helpers
+(`providers/amd/flagos-amd-op-contracts.h`) and many AMD tests; `ggml_backend_flagos_reg_devices()` is removed
+(`upstream-changes.md` M1). The header's name therefore has one source, the deck's page 8 ("纯 C 接口
+flagos-runtime.h"; page 6: `flagos_runtime_v1`). Closed 2026-10-26: no separate `flagos-runtime.h` is needed (the
+mentor); the split is K3-only in our tree (D10).
 
 **F2. Tiers.** Tier-1 is the 17 required functions; events are optional; Tier-2 is graph capture, zero-copy and the
 fusion switch. There is no Tier-1 graph capture: without Tier-2, the core calls `launch` for every kernel every token.
@@ -237,6 +264,14 @@ on 2026-10-19, §6).
 - Huge pages: the cache would be on 2 MiB pages. L1 measured 2.1-2.2x slower attention when 8 tiles stream from
   addresses 2 MiB apart (`k3-hardware.md` §2); llama.cpp's layout keeps all heads in a row and the split hands tiles
   64-position blocks 128 KiB apart (Qwen3-4B), below that spacing. M2e.3 listed the cache on huge pages as candidate (c).
+- **Closed 2026-10-27** (the IGPU switch, `PROJECT.md` item 22): the layout rule keeps the cache tensors plain by name
+  (`cache_k_`, `cache_v_`, `cache_r_`, `cache_s_`: llama.cpp names them before allocation, `src/llama-kv-cache.cpp:234-235`);
+  `SET_ROWS` writes F32 rows into Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL and BF16 caches (ggml's reference quantizers,
+  each tile its own blocks of every row); `ROPE` runs in place on F16; a quantized cache's shift (`ggml_cast`, the
+  Hadamard matmuls, `ROPE`, `ggml_cpy` into the cache view, `src/llama-kv-cache.cpp:1865-1877`) runs its `CPY` on the
+  provider and the rest on the CPU with copies, as attention over a quantized cache does (stores only, user decision).
+  Checked on the Mac's simulated device, a Q8_0 shift through the scheduler against a CPU-only one included; E2-neg's
+  four runs are expected to complete on the K3 (not yet rerun).
   Unmeasured.
 - Under ACCEL all of these run on the CPU, because the cache stays in a CPU buffer.
 
@@ -363,7 +398,7 @@ with the modes interleaved in each repetition: the board drifts between sessions
 |---|---|---|---|---|---|
 | E2 | Q5 | Build B (upstream's `llama-context.cpp`), `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu` and `gpu`, `-ngl 99`; once with the default `-ngl` (placement only) | 2 splits per token; flash attention enabled under `-fa auto`; logits identical to the reference (KLD 0, same top p 100%; the same kernels run the same nodes); speed within 1-2%; GPU = IGPU; the default `-ngl` offloads every layer | agreed (user, 2026-10-19): "IGPU is viable with no llama.cpp change" if logits are identical at both batch settings, a token takes 2 splits, and pp128, tg128, tg32 at depths 0/1024/4096 and pp512 at depth 4096 are within 2% of the reference | done 2026-10-19 (§6): passes; pp512 at depth 4096 +3.6% |
 | E2-hp | Q5 | E2's IGPU and the reference, each with and without `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1`, depth runs | unknown; the 128 KiB block spacing suggests no 2.2x slowdown | KV cache on huge pages "hurts" if IGPU's tg32 at depth 4096 loses at least 2% more from huge pages than the reference does, "helps" if it gains at least 2% more | done 2026-10-19 (§6): neither in generation; mixed in prompt processing at depth |
-| E2-neg | F8 | Build B as IGPU, and the reference: a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0 -fa on -c 512`), and a context shift (`-c 256 -n 400 --ignore-eos --context-shift`) | IGPU aborts in both ("pre-allocated tensor ... cannot run the operation": `SET_ROWS`, then `ROPE`); the reference runs both (the shift logs "context full, swapping") | confirms or refutes F8's two gaps | done 2026-10-19 (§6): both confirmed |
+| E2-neg | F8 | Build B as IGPU, and the reference: a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0 -fa on -c 512`), and a context shift (`-c 256 -n 400 --ignore-eos --context-shift`) | IGPU aborts in both ("pre-allocated tensor ... cannot run the operation": `SET_ROWS`, then `ROPE`); the reference runs both (the shift logs "context full, swapping") | confirms or refutes F8's two gaps | done 2026-10-19 (§6): both confirmed; the gaps closed 2026-10-27 (F8), so the runner's `neg-*` modes now expect all four runs to complete (not rerun yet) |
 | E1 | Q5 | Build B as ACCEL: `-fa auto` (llama.cpp's default) and `-fa on` | `-fa auto`: flash attention turned off with llama.cpp's warning, attention on the X100 cores, generation at depth far below the reference (before M2e.1: tg32 at depth 4096 1.80). `-fa on`: 288 splits per token (36 layers x 4 norms x 2), tg128 about -30% (X3b: 7.52 against 10.75), prompt processing unchanged | descriptive: what ACCEL costs without the patches | done 2026-10-19 (§6): -24 to -95%; not repeated (user, 2026-10-20: M0's X3/X3b and run 1 cover it; out of the default `EXPS`) |
 | E3a | Q1 | Build A, `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one spine-runtime launch per step, the host waiting for each (the order spine-runtime's documentation prescribes for dependent kernels, F14): a Tier-1 plugin without in-core ordering | tg128 about -12% (about 11.5 µs more per step at about 1,060 steps per token); pp128 about -1%; logits identical (checked on the K3: 4/4 layer and 8/8 split cases byte-identical) | agreed (user, 2026-10-20), anchored to R12: Tier-1 is enough for the K3 if its cheapest correct form (E3b, as E3a fails) keeps tg128 within 1% of `ref` (whose framework cost is already about 1.1%); Tier-2 graph capture is required at a tg128 loss of 5% or more; in between, report the numbers | done 2026-10-20 (§6, run 3): tg128 -14.2%, about 14.6 ms per token; identical logits |
 | E3b | Q1 | One launch per step queued without host waits, each launch's tiles first waiting inside the cores for the previous launch (`Context::join`, if the board's spine-runtime has it): one launch per kernel on an ordered stream, as we read the ABI (F15) | unknown: between the reference and E3a | as E3a | implemented 2026-10-20 (`FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join`, below); **fails its checks on the K3** (2026-10-20, 5 of 5 runs): the 1-token layer cases differ from one launch (once failed), while E3a passes everything and E3b passes the 8 split-attention and the 7-token layer cases; spine-runtime ran two tiles of one launch on one core. Not measured: a computation that is not reliably correct. Not fixed (user, 2026-10-20; Q1). Cause found by E3b-diag (run 5, F16) |
@@ -612,7 +647,7 @@ Reading:
   opposite sign, not explained: candidates are address collisions of the batch matmuls' weights on huge pages and fewer
   TLB misses when the tiled kernel reads the cache; not measured.
 - **E2-neg:** F8's two gaps are real: a quantized KV cache and a context shift both abort as IGPU, and both run as
-  ACCEL.
+  ACCEL. Closed 2026-10-27 (F8).
 
 **E2 in full** (from the run's `info.txt`, `bench.jsonl`, `load-*.err` and `kld-*.out`):
 - Started 2026-10-19 07:52 UTC. `ref`: build A, `~/llama.cpp-flagos/build-flagos`, its binaries built by `prepare` from
@@ -685,7 +720,7 @@ Reading: E4 passes E2's rule as E2 did: identical logits at both batch settings,
 reporting IGPU, the K3 runs Qwen3-4B Q4_0 at today's speed and with identical results with no change at all to upstream
 llama.cpp or ggml: neither C5a and C5b nor the mentor's ggml lines are needed at run time. What this does not settle:
 - F8's two gaps hold here too (the KV cache is in the provider's buffer), so IGPU needs that provider fix before it can
-  be the default.
+  be the default (closed 2026-10-27, F8).
 - The type came from a test switch; making IGPU the provider's type is D3's question for the mentor.
 - Delivery: the module still builds inside this repository (the mentor's CMake lines are needed to build it, not to run
   it), it must match the host's ggml version (`ba360ef` here), and stock programs find it only through
@@ -993,3 +1028,22 @@ Reading, by the rules fixed in §4:
   source implementation, which may call a closed SDK underneath (R3). Q8 partly answered: a closed `libspert` under the
   plugin is acceptable. No plan changes: our provider is already source that links `libspert` underneath.
 - 2026-10-26: Q5 decided by the mentor: IGPU (reported by the user); recorded here, in `PROJECT.md` (D3, question 1, item 22), `plan.md` (D3, §2.8) and `device-type.md`; the code unchanged until F8's two gaps close.
+- 2026-10-26: structural review of the provider against the deck's pages 6-8 (`structural-review.md`; user request):
+  the deck's design in one table, our files mapped to its layers, gaps G1-G10 with evidence from this file's
+  findings, the M3 decision (D9) recorded in Q6, questions Q11-Q14 for the mentor, proposed next steps (no code).
+- 2026-10-26: M3 and the FlagGems kernel work deferred until the structural work on the backend is done (user and
+  mentor); the pending questions ranked for the mentor (`structural-review.md` §7.1), the plugin ABI package first.
+- 2026-10-26: the design document V2.0 read against the ranked questions (`structural-review.md` §7.2): the order stands;
+  the plugin ABI confirmed as Common's roadmap item (V2.0 §15.1 P2, §17.3); rank 2's sub-question on waiting without
+  events answered by V2.0 §6.4 and the deck; ranks 1, 2, 3 and 5 sharpened.
+- 2026-10-26: F1 rechecked against the mentor's newest branch (`feature/flagos-amd-890-audit-20261010`, 2026-10-10,
+  fetched read-only): still no plugin ABI, loader or package vocabulary; the deck's `flagos-runtime.h` has the deck as
+  its only source. Rank 1 of `structural-review.md` §7.1 reworded to ask first whether the K3 is to be delivered as a
+  plugin at all; nothing that runs today needs the ABI.
+- 2026-10-26, evening: decided with the mentor (D10): no separate `flagos-runtime.h`; the core / plugin split is done
+  K3-only in our tree, the core first (a draft of L1, the plugin loader, the rest completed), the plugin after it with
+  `flagos-spacemit-weights.{h,cpp}` in it. Q2 (ownership), Q9 and Q11 closed; Q1's core side, Q3 and Q7 turned into
+  S1's design inputs (`plan.md` S1, S2).
+- 2026-10-27: the IGPU switch in the code (F8 closed; Q5, E2-neg and §6 annotated; `PROJECT.md` item 22):
+  `scripts/structural-experiments.sh` gives E1's modes `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel`, takes IGPU as the
+  summary's default type and expects E2-neg's four runs to complete; nothing rerun on the K3 yet.
