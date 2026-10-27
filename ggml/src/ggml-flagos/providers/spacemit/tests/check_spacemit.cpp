@@ -9,8 +9,9 @@
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
 //                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-8192, 128 tokens at n_kv 128
 //                    and 4096, 512 at n_kv 512 and 4608) against the CPU, the 1-row strategies of
-//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes, and paths A and B against split
-//                    (--bench-mm)
+//                    FLAGOS_SPACEMIT_GEMV at a Qwen3-4B token's shapes, and the default matmul setting (fit,staged)
+//                    against split at the row counts of --bench-mm (its other settings, decided and recorded, are
+//                    left to --bench-mm so the acceptance runner's benchmark stays short)
 //   --bench-gemv     of the benchmarks only the 1-row strategies
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default)
@@ -3112,8 +3113,8 @@ static int bench_gemv(ggml_backend_dev_t dev) {
 // after the groups of 4: each shape alone with the path each setting took, and per batch the shapes weighted by how
 // often a batch runs them (36 q and attention outputs, 72 k and v, 72 gate and up, 32 + 4 down; the head runs on one
 // row). As in bench_gemv every run reads its weights from DRAM: it takes the next of enough copies of the weight (32 MB
-// together)
-static int bench_mm(ggml_backend_dev_t dev) {
+// together). With all_settings false (--bench, the acceptance runner) only split and the default, fit,staged, run
+static int bench_mm(ggml_backend_dev_t dev, bool all_settings) {
     env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
     env_override   tail("FLAGOS_SPACEMIT_TAIL", nullptr);
     ggml_backend_t backend = nullptr;
@@ -3130,14 +3131,16 @@ static int bench_mm(ggml_backend_dev_t dev) {
     };
     const std::vector<int64_t> rows = { 2,  4,  8,  16,  17,  24,  31,  32,  33,  34,  35,  36,  40,  44,  48,  51, 59,
                                         62, 63, 64, 65, 79, 96, 100, 112, 113, 115, 128, 129, 131, 149, 160, 256, 512 };
-    const char * const  settings[] = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows,one-tile" };
-    const char * const  mm_of[]    = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows" };
-    const char * const  tail_of[]  = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile" };
-    constexpr int       n_set      = 7;
-    std::vector<double> batch[n_set];
-    for (std::vector<double> & b : batch) {
-        b.assign(rows.size(), 0.0);
-    }
+    const char * const  settings_all[] = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows,one-tile" };
+    const char * const  mm_all[]       = { "split", "rows", "spacemit", "fit", "fit,staged", "fit,mixed", "rows" };
+    const char * const  tail_all[]     = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "one-tile" };
+    const char * const  settings_two[] = { "split", "fit,staged" };
+    const char * const  tail_two[]     = { nullptr, nullptr };
+    const char * const * settings      = all_settings ? settings_all : settings_two;
+    const char * const * mm_of         = all_settings ? mm_all : settings_two;
+    const char * const * tail_of       = all_settings ? tail_all : tail_two;
+    const int           n_set          = all_settings ? 7 : 2;
+    std::vector<std::vector<double>> batch(n_set, std::vector<double>(rows.size(), 0.0));
     for (const mm_shape & s : shapes) {
         const double               bytes  = (double) s.n * ime_row_bytes(s.type, s.k);
         const size_t               copies = (size_t) std::min(32.0, std::ceil(32e6 / bytes));
@@ -3156,8 +3159,8 @@ static int bench_mm(ggml_backend_dev_t dev) {
                 CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
             }
             const int   iters    = m <= 64 ? 10 : m <= 160 ? 5 : 3;
-            double      t[n_set] = {};
-            std::string path[n_set];
+            std::vector<double>      t(n_set, 0.0);
+            std::vector<std::string> path(n_set);
             for (int k = 0; k < n_set; k++) {
                 set_env("FLAGOS_SPACEMIT_MM", mm_of[k]);
                 set_env("FLAGOS_SPACEMIT_TAIL", tail_of[k]);
@@ -3552,7 +3555,7 @@ static int bench(ggml_backend_dev_t dev) {
     }
     ggml_backend_free(backend);
     ggml_backend_free(cpu8);
-    return bench_attn(dev) != 0 || bench_gemv(dev) != 0 ? 1 : bench_mm(dev);
+    return bench_attn(dev) != 0 || bench_gemv(dev) != 0 ? 1 : bench_mm(dev, false);
 }
 
 int main(int argc, char ** argv) {
@@ -3640,7 +3643,7 @@ int main(int argc, char ** argv) {
     }
     if (run_bench ? bench(dev) != 0 :
                     (run_gemv && bench_gemv(dev) != 0) || (run_attn && bench_attn(dev) != 0) ||
-                        (run_mm && bench_mm(dev) != 0)) {
+                        (run_mm && bench_mm(dev, true) != 0)) {
         return 1;
     }
     if (run_grid && bench_mm_grid(dev) != 0) {

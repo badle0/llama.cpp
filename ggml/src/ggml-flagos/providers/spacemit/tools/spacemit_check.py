@@ -60,15 +60,23 @@ M2D_OPS = ["ADD", "MUL", "RMS_NORM", "ROPE", "SET_ROWS", "GET_ROWS", "SWIGLU"]
 M2D_GRAPHS = ["RMS_NORM_MUL_ADD", "ADD_RMS_NORM", "RMS_NORM_MUL_ROPE", "ROPE_SET_ROWS"]
 results = []
 preload = {}  # LD_PRELOAD for the model runs (--segv)
+summary = None  # <logs>/summary.txt: every line printed by report and info (the terminal's scrollback is short)
+
+
+def say(line):
+    print(line, flush=True)
+    if summary is not None:
+        summary.write(line + "\n")
+        summary.flush()
 
 
 def report(name, ok, detail):
     results.append(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}", flush=True)
+    say(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
 
 
 def info(name, detail):
-    print(f"[INFO] {name}: {detail}", flush=True)
+    say(f"[INFO] {name}: {detail}")
 
 
 def run(cmd, log, env_extra=None, env_drop=(), timeout=900):
@@ -519,10 +527,13 @@ def main():
         preload["LD_PRELOAD"] = str(Path(args.segv).resolve())
 
     bdir = Path(args.build_dir).resolve()
-    logs = bdir / f"{args.milestone}-logs"
+    # a log directory per milestone and model, so one model's run does not overwrite another's logs
+    logs = bdir / f"{args.milestone}-logs-{Path(args.model).stem}"
     logs.mkdir(parents=True, exist_ok=True)
-    print(f"milestone {args.milestone}\nrepo {REPO}\nbuild {bdir}\nlogs {logs}" +
-          (f"\ncrash reporter {preload['LD_PRELOAD']}" if preload else "") + "\n", flush=True)
+    global summary
+    summary = open(logs / "summary.txt", "w")
+    say(f"milestone {args.milestone}\nrepo {REPO}\nbuild {bdir}\nlogs {logs}" +
+        (f"\ncrash reporter {preload['LD_PRELOAD']}" if preload else "") + "\n")
 
     if args.build and not build(bdir, logs, args.spert_dir):
         sys.exit(1)
@@ -546,7 +557,8 @@ def main():
         tcm_hygiene(args.tcm_dir, logs)
 
     n_fail = results.count(False)
-    print(f"\n{args.milestone.upper()}: {len(results) - n_fail}/{len(results)} checks passed" + ("" if n_fail == 0 else f", see {logs}"))
+    say(f"\n{args.milestone.upper()}: {len(results) - n_fail}/{len(results)} checks passed" + ("" if n_fail == 0 else f", see {logs}"))
+    summary.close()
     sys.exit(1 if n_fail else 0)
 
 

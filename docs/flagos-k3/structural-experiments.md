@@ -140,7 +140,7 @@ Q3 and Q6-Q10 are design questions only. Related numbering in `PROJECT.md` §7 i
   logits (pp512 at depth 4096 3.8-3.9% faster, as on 4B). Two models of one family and one quantization so far; F8's
   two gaps were not rerun on 0.6B.
 - Answered by: E1, E2, E2-hp, E2-neg, E4.
-- **Decided 2026-10-26 (the mentor, reported by the user): (b) IGPU.** Recorded in `PROJECT.md` D3 and item 22, `plan.md` D3 and §2.8, `device-type.md`. In the code since 2026-10-27: F8's two gaps closed and the default flipped (F8; `PROJECT.md` item 22), checked on the Mac's simulated device, the K3 run pending.
+- **Decided 2026-10-26 (the mentor, reported by the user): (b) IGPU.** Recorded in `PROJECT.md` D3 and item 22, `plan.md` D3 and §2.8, `device-type.md`. In the code since 2026-10-27: F8's two gaps closed and the default flipped (F8; `PROJECT.md` item 22), checked on the Mac's simulated device and accepted on the K3 the same day (`build.md` §7: identical logits on both Qwen3 models, speed within 1%, a Q8_0 cache and a context shift running with the provider).
 
 **Q6. During the transition, do native RVV/IME kernels go in the package or in the plugin?** The deck says both: the
 architecture slide keeps them in the plugin (R7); the flow slide lists "HSACO / ELF / 厂商格式" (vendor format) as package
