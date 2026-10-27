@@ -61,7 +61,7 @@ llama.cpp   ACCEL device: backend created automatically, no -ngl
 | `identity` | fixed non-zero id, name `SpacemiT`, version 1 | Design §5.1 rule 7 |
 | `probe` | true only on riscv64 Linux with A100 cores (arch id `0xA064` / marchid `0x8000000041000002`) and `/proc/set_ai_thread` present | no runtime start-up here; ggml-spacemit starts spert in a static constructor, which must not be copied |
 | devices | 1, ggml name `FlagOS:SpacemiT:0` | name from mentor design line 170 |
-| ggml type | `IGPU` (today's build still reports `ACCEL`) | D3: ACCEL adopted 2026-10-08, changed to IGPU 2026-10-26 (mentor); §2.8; the switch waits on F8's two gaps (`structural-experiments.md`) |
+| ggml type | `IGPU` (in the code since 2026-10-27; `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` or `gpu` test-only) | D3: ACCEL adopted 2026-10-08, changed to IGPU 2026-10-26 (mentor), in the code 2026-10-27 with F8's two gaps closed (§2.3's update; `structural-experiments.md` F8); §2.8 |
 | `caps.kind` | `cpu_accelerator` | *proposed* (D8), independent of the ggml device type. Kinds: `gpu`, `ai_accelerator`, `cpu_accelerator`, `dsp`, `matrix`, `other` (`flagos-provider.h:9-19`); `ai_accelerator` maps to engine `npu`, `cpu_accelerator` to `cpu` (`flagos-provider.cpp:54-69`). No real provider uses either yet |
 | `caps.memory` | `HOST_VISIBLE` and `UNIFIED_COHERENT` | `flagos-provider.h:21-26` |
 | `caps.execution` | 0 (synchronous, no events); `AOT_MODULE` from M3 | `flagos-provider.h:28-34` |
@@ -74,6 +74,8 @@ llama.cpp   ACCEL device: backend created automatically, no -ngl
 
 Under ACCEL, llama.cpp puts a weight into the provider's buffer type only when the provider supports the op that uses it (`src/llama-model.cpp:903-917`), and the KV cache always goes to CPU buffers (`src/llama-kv-cache.cpp:211-217`). The scheduler also allocates the provider's compute tensors from its default buffer type.
 
+**Updated 2026-10-27 (IGPU in the code, D3):** llama.cpp now offloads whole layers to the provider (`-ngl`, by default all of them through common's fit) and allocates their weights from the provider's buffer type first, the CPU's list as the fallback for a weight whose op the provider does not claim (`src/llama-model.cpp:1297-1299`); the input layer's list is the CPU's (`:1357`), so the token embedding stays there; the KV cache of offloaded layers lives in the provider's buffer (`src/llama-kv-cache.cpp:211-217`; `-nkvo` puts it back on the CPU). A2 stands as it is: the weights repacked once, every other operand read where it is. Two consequences for the cache: the layout rule keeps llama.cpp's cache tensors plain by name (`cache_k_`, `cache_v_`, `cache_r_`, `cache_s_`), and an op whose output is a view of the cache must be ours, since the scheduler aborts otherwise (`ggml-backend.cpp:927-930`): hence the cache ops added 2026-10-27 (`SET_ROWS` of F32 rows into the quantized and BF16 cache types, `ROPE` in place on F16, `CPY` of F32 rows into those types for a quantized cache's shift). What we do not claim on a cache view (attention over a quantized cache, the shift's Hadamard matmuls) the scheduler copies out to the CPU and back.
+
 | Option | How | For | Against |
 |---|---|---|---|
 | **A2 (proposed)** | Default buffer type holds weights in IME-repacked layout, `is_host = false` (like ggml-spacemit and ggml-cpu's repack buffers). The provider accepts CPU buffers for every non-weight operand | weights stored once; the CPU never needs provider weights, since a weight only lands there when the provider claims its op | provider outputs read by CPU ops are copied (one `memcpy` per split boundary); `get_tensor` must undo the repack |
@@ -85,7 +87,7 @@ A2 rules:
 - `supports_buft`: own buffer type, or any host buffer type.
 - `supports_op` judges a tensor by `t->view_src ? t->view_src->buffer : t->buffer`. ggml-spacemit checks only `t->buffer`; views have none before allocation, so it claimed attention on CPU-resident KV views, which started the E1 failure chain (`device-type.md` §5). A weight operand that the kernel reads in repacked layout must be in the provider's buffer (or not yet allocated, at placement time), never in a host buffer; every other operand may be in the provider's buffer or any host buffer.
 - Claims for weight ops must not depend on batch size: llama.cpp picks each weight's buffer once, at load time. If a later graph's op were refused, the scheduler would copy the repacked weight for the CPU.
-- Whether a tensor is stored repacked is a pure function of its type and shape (one layout function, used by `supports_op`, `set_tensor`, `get_tensor` and the kernel), not of the buffer's usage flag: `test-backend-ops` allocates weights in an ordinary buffer (it sets `WEIGHTS` usage only for its separate weight context, `tests/test-backend-ops.cpp:1384-1393`). No `init_tensor` state is needed. (Corrected 2026-10-09; the earlier rule "repack only in weight buffers" would have left test weights unrepacked.)
+- Whether a tensor is stored repacked is a pure function of its type, shape and (since 2026-10-27) name, llama.cpp's cache tensors staying plain (one layout function, used by `supports_op`, `set_tensor`, `get_tensor` and the kernel), not of the buffer's usage flag: `test-backend-ops` allocates weights in an ordinary buffer (it sets `WEIGHTS` usage only for its separate weight context, `tests/test-backend-ops.cpp:1384-1393`). No `init_tensor` state is needed. (Corrected 2026-10-09; the earlier rule "repack only in weight buffers" would have left test weights unrepacked.)
 - `set_tensor` repacks whole-tensor writes; partial access to a repacked tensor goes through a temporary copy of the whole tensor (llama.cpp writes weights whole on this device, §1; changed during M2b from aborting). `get_tensor` returns ggml's layout (lossless layouts: the original bytes; lossy ones: the converted tensor, next rule); this is needed for correctness, not only for the memory check in M2f: if the provider ever refuses an op on a weight it holds, the scheduler copies the weight out through `get_tensor` (§1). The in-tree buffer has no `get_tensor` (`ggml-cpu/spacemit/ime.cpp:1468`). `cpy_tensor` returns false for repacked tensors, so ggml falls back to `set_tensor` instead of copying raw bytes.
 - Lossy repacks (Q4_1, Q4_K, Q6_K) cannot be inverted. Decided 2026-10-10 (M2c design; earlier rule: keep the original bytes as well, or do not claim them): `get_tensor` returns the converted tensor in ggml's type, the weights the kernels compute with, and repacking it gives the same layout again; the weight is stored once. A partial write must cover whole blocks (it re-converts the blocks it touches), else it aborts. A layout requantized to another type (Q6_K -> Q8_0, M2c.2) cannot be read back exactly in its own type: reads return the nearest tensor of that type to the stored values, and partial writes abort. Claimed only with model-level accuracy evidence (R4). The Q4_0 repack is a byte permutation (same size, lossless).
 
@@ -152,9 +154,9 @@ Common files touched (C1, required, about 10 lines): `ggml/CMakeLists.txt` (opti
 
 The skeleton compiles on the Mac (probe returns false there). IME and RVV kernels compile only on riscv64 with GCC 15; from M2b the scalar reference kernels compile everywhere.
 
-### 2.8 Device type (D3: ACCEL, decided 2026-10-08; changed to IGPU 2026-10-26)
+### 2.8 Device type (D3: ACCEL, decided 2026-10-08; changed to IGPU 2026-10-26, in the code 2026-10-27)
 
-**Updated 2026-10-26: D3 is now IGPU** (agreed by the mentor, reported by the user). What follows describes ACCEL, the decision in force from 2026-10-08 to 2026-10-26, and stays as the record of why the provider reads CPU buffers and carries C5a and C5b. Under IGPU the KV cache lives in the provider's buffer, `-fa auto` keeps flash attention on and norm pinning does no harm without C5a and C5b (E2 measured today's speed and identical logits as IGPU on Qwen3-4B and Qwen3-0.6B, also from stock upstream, E4; `structural-experiments.md` §6), and the device is dropped next to a discrete GPU. Before the default flips the provider must close F8's two gaps (a quantized KV cache, a context shift; E2-neg). Nothing in the code has changed yet.
+**Updated 2026-10-26: D3 is now IGPU** (agreed by the mentor, reported by the user). What follows describes ACCEL, the decision in force from 2026-10-08 to 2026-10-26, and stays as the record of why the provider reads CPU buffers and carries C5a and C5b. Under IGPU the KV cache lives in the provider's buffer, `-fa auto` keeps flash attention on and norm pinning does no harm without C5a and C5b (E2 measured today's speed and identical logits as IGPU on Qwen3-4B and Qwen3-0.6B, also from stock upstream, E4; `structural-experiments.md` §6), and the device is dropped next to a discrete GPU. The provider closed F8's two gaps and flipped the default on 2026-10-27 (the cache ops it claims: §2.3's update; checked on the Mac's simulated device, the K3 acceptance run pending; `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` and `gpu` remain as test-only comparison values).
 
 The mentor decided on ACCEL. This section records what the types change and what E1 measured (`device-type.md` §5). Consequences for the provider: read CPU buffers directly (§2.3); ship correct non-flash attention (§2.4); no per-layer control with `-ngl`; do not name the device with `--device` (two backend instances, see the code check below).
 
@@ -184,13 +186,14 @@ A new ggml device type is possible (upstream added `IGPU` in PR #15797 and `META
 |---|---|---|---|
 | D1 | Full ggml device/buffer/backend via FlagOS, not a ggml-cpu extra buffer type | adopted | - |
 | D2 | In-tree provider in the mentor's fork | adopted | - |
-| D3 | ggml device type `IGPU` (ACCEL from 2026-10-08 to 2026-10-26) | **changed to IGPU** (mentor; recorded 2026-10-26); the code still reports ACCEL until F8's two gaps are closed | §2.8 |
+| D3 | ggml device type `IGPU` (ACCEL from 2026-10-08 to 2026-10-26) | **changed to IGPU** (mentor; recorded 2026-10-26); in the code since 2026-10-27 (F8's two gaps closed; Mac checks pass, the K3 run pending) | §2.8 |
 | D4 | Weights in an IME-repacked buffer, stored once (A2); the provider reads CPU buffers for all other operands (§2.3) | *proposed*; building on it from M2b (user, 2026-10-09), mentor confirmation pending | A1: host buffer plus a private repacked copy (twice the quantized-weight memory) |
 | D5 | spine-runtime executor, one launch per split, barrier per step (an op may take several steps) | *proposed*; implemented in M2a | own pinned pool + libspine_tcm behind the same executor interface |
 | D6 | Copy, per milestone, only the IME kernel, quantizer and repack functions used from in-tree `ggml-cpu/spacemit` (bodies unchanged, origin noted); port ggml-spacemit tiling and RVV ops, fixing them as needed (the mentor allows changing that code, 2026-10-08) | **decided** (user, 2026-10-09; §2.5) | compile the in-tree sources in place (depends on ggml-cpu internal headers; clashes with `GGML_CPU_RISCV64_SPACEMIT`) |
 | D7 | First target Qwen3-0.6B / Qwen3-4B Q4_0, then the AMD target Qwen3.5-4B Q4_K_M | *proposed* | start with Qwen3.5: needs Q4_K/Q6_K (lossy repack) and `GATED_DELTA_NET`/`SSM_CONV` early |
 | D8 | FlagOS `caps.kind = cpu_accelerator` (engine `cpu`): the A100 cores execute RISC-V code with RVV/IME. Independent of D3 (a provider can report ggml `GPU` and FlagOS `cpu_accelerator`) | *proposed*, open for the mentor | `ai_accelerator` makes FlagOS classify the K3 as an NPU (engine `npu`), matching the v0.3 "AI chip provider" wording. The kind changes no execution: only validation, the default profile labels and engine-filtered kernel variants (`flagos-target.cpp:87-89`), so there is nothing to benchmark |
-| D9 | FlagTree AOT (M3) only if the mentor puts it in scope | *proposed* | hand-written kernels only |
+| D9 | FlagTree AOT (M3): FlagGems' kernels through FlagTree for the ops they have; the IME and RVV kernels, as they are today, for every other op | **decided** (user, 2026-10-26); question 6's other parts open; the consequences in `structural-review.md` §6; **deferred** (user and mentor, 2026-10-26) until the structural work on the backend is done |
+| D10 | The core / plugin split, K3-only, no separate `flagos-runtime.h`: the core (L0, a draft of L1, L2, the plugin loader, workspace and capture driver, diagnostics) as a SpacemiT-only version without the AMD part, its interface to the plugin defined in our tree; then the plugin, with `flagos-spacemit-weights.{h,cpp}` as part of it (§4, S1 and S2) | **decided** (user and mentor, 2026-10-26) | keep the compiled-in provider on the source ABI (today's shape) | hand-written kernels only |
 
 ## 4. Milestones
 
@@ -930,11 +933,11 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 - (a) is the largest change: a second step per attention call (about 1 us per layer), a 133 KB workspace, new strided helpers, and changed rounding.
 - The benchmark rotates copies of the cache so that reads come from DRAM; at small n_kv the model's cache may partly stay in the caches.
 
-### M3 - AOT package (Design Phase 3, only if D9 is accepted)
+### M3 - AOT package (Design Phase 3; D9 decided 2026-10-26)
 
-**Status:** designed 2026-10-14 (user: "plan for m3?") from reading, not from runs: the AMD provider's AOT pipeline in this tree, FlagTree's SpacemiT backend and spine-runtime on GitHub, and the design documents (Design §9, §13, §15; mentor design §14, §17, §19). Not started. M3.0 is a spike without provider code; M3.1 waits for the mentor's answer to question 6.
+**Status:** designed 2026-10-14 (user: "plan for m3?") from reading, not from runs: the AMD provider's AOT pipeline in this tree, FlagTree's SpacemiT backend and spine-runtime on GitHub, and the design documents (Design §9, §13, §15; mentor design §14, §17, §19). Not started. M3.0 is a spike without provider code; M3.1 waits for the mentor's answer to question 6. **Decided 2026-10-26 (user, D9):** M3 is in scope: for the ops FlagGems has a kernel for (and FlagTree's SpacemiT backend compiles), the provider uses that kernel; every other op keeps today's IME and RVV kernels as they are. The structural consequences are in `structural-review.md` §6: of the ops we claim, FlagGems covers `ADD`, `MUL`, `RMS_NORM`, `ROPE` (NEOX), `SET_ROWS` (F32 into F16), `GET_ROWS` (F32, and the Q6_K token embedding), SwiGLU (split form) and one-token attention; its quantized matmuls read GGUF's layout, not the IME layouts, so the matmuls stay on the IME (to confirm, Q13 there); an AOT op as a launch of its own costs 13.4-15.0 µs in a model run (E3a, E3c), so M3.0 first checks whether a FlagTree kernel can run as a step inside the split's launch; the speed rule below is to confirm (Q14 there). Question 6's remaining parts (which compiler copy, the manifest schema, x86 or K3 builds, the success criterion) stay with the mentor. **Deferred (user and mentor, 2026-10-26):** M3 and the FlagGems kernel work start after the structural work on the backend (the IGPU switch, the plugin split and what the mentor's answers require; `structural-review.md` §8) is done.
 
-**Goal:** kernels from FlagOS's shared Triton sources, compiled ahead of time by FlagTree's SpacemiT backend, run on the AI cores inside the provider. They are loaded and launched under the Design's package contract (§9: manifest, exact profile, fail closed), as the AMD provider runs its HSACO packages. M3 shows that FlagOS's compiler path works on the K3; it is not expected to beat the hand-written kernels, and an AOT kernel enters the default path only where it is at least as fast.
+**Goal:** kernels from FlagOS's shared Triton sources, compiled ahead of time by FlagTree's SpacemiT backend, run on the AI cores inside the provider. They are loaded and launched under the Design's package contract (§9: manifest, exact profile, fail closed), as the AMD provider runs its HSACO packages. M3 shows that FlagOS's compiler path works on the K3; it is not expected to beat the hand-written kernels, and an AOT kernel enters the default path only where it is at least as fast (the speed rule; whether it stands under the decision of 2026-10-26, which says to use FlagGems' kernels where they exist, is `structural-review.md` Q14).
 
 **Facts** (read 2026-10-14; nothing compiled or run yet):
 - FlagTree's SpacemiT backend (`flagos-ai/FlagTree` @ `a134c5c`, `third_party/spacemit`, Triton 3.6.0):
@@ -1011,6 +1014,123 @@ Expected (estimate): attention at n_kv 4096 from about 66 to 25-30 ms per token,
 - Gate (Design §15.6): stable local gain, positive end-to-end, exact shape guards, required-output, alias and state tests.
 - K3-specific fusions such as dequant + GEMM + epilogue tiled in TCM do not fit Common's fixed catalog (`upstream-review.md` A1). Raise them with the mentor instead of editing Common.
 
+### S1 - The K3 core (decided 2026-10-26; the structural work, part 1)
+
+**Status:** decided with the mentor 2026-10-26 (D10); nothing coded. The design note for the core–plugin interface, S1's first deliverable, is written (2026-10-27, "S1 design" below) and waits for the user's review; then each S1 code step gets its spec from it (the workflow in `CLAUDE.md`: a spec, then the coder, then the checks on the Mac's simulated device before the K3).
+
+**Scope (the user's words, 2026-10-26):** a SpacemiT K3-only version of the deck's core (figure 2 of the split map; `structural-review.md` §3), without the AMD part; a draft version of Common planning; the plugin loader implemented; whatever else the core lacks completed. No separate `flagos-runtime.h`: the interface between the core and the plugin is defined in our tree.
+
+**Content (proposed, from the mapping in `structural-review.md` §2-§3):**
+1. The interface, first, as a design note: the required functions (device; memory, with the repack inside the buffer's set and get; copy; stream; launch), the capture replay (a split's steps recorded once per structure and replayed as one launch with barriers between the steps: today's executor), and the per-tile services the kernels use inside one launch (tile index and count, the agreed TCM, the workspace, the pair waits, the failure flag). `structural-review.md` §7.1 rank 2's requirements are its inputs. A header of ours, C-clean where that is cheap; no FlagOS-wide standard is awaited (the mentor, 2026-10-26).
+2. L2 completed behind the interface: the contract check (`spacemit_find_op`, `flagos-spacemit-ops.cpp:129-176`), the op-to-steps expansion and the workspace sizing (`flagos-spacemit.cpp:662-723`), and the path and kernel choice now inside `flagos-spacemit-ime.cpp`, `-attn.cpp` and `-kernels.cpp` as the core's variant choice; the Q4 table (ranges, equality, strides, layout, TCM) becomes its vocabulary, in code, since there is no manifest yet.
+3. L1, a draft: a plan cache keyed by the split's structure (as Common's `flagos_graph_plan` fingerprints a split; the step list and the workspace sizes reused when the structure repeats; the ceiling is the 0.55 ms of host work per token E3c measured), and the required-output and alias checks the two-step ops need (the matmul's quantize step, the split attention's merge). The fusion scan stays deferred (M4).
+4. The plugin loader: `dlopen` of `libflagos-provider-spacemit.so` from the core's directory or a path variable, the entry symbol, an ABI version check, a host table (logging, the plugin directory); the package check only when a package exists (M3, deferred), with its negative tests then.
+5. Workspace and capture driver: the core owns the workspace and records the split's steps once per structure; the plugin replays them; the per-token arguments (the KV length) updated in place.
+6. Diagnostics under the deck's names: `GGML_FLAGOS_STATS` (today's counters), `KERNEL_VARIANTS` (today's per-op settings), `DISABLE_OPS` (new: named ops back to the CPU), `TRACE_LAUNCH` (new: the steps by name), `SYNC_LAUNCH` (today's one launch per step).
+
+**Exit (proposed):** `flagos-check-spacemit`, `test-backend-ops` and the acceptance runner pass on Qwen3-4B and Qwen3-0.6B with logits identical to today's; tg128 and pp128 within 1% of today (the plan cache may gain up to 0.6%); the core builds without `libspert` and without the IME toolchain; the Mac's simulated device still runs everything (the hostsim role).
+
+**Not in S1:** the AMD provider (untouched), fusion kernels (M4), the package and the FlagGems kernels (M3, deferred), the pre-placement partition (never).
+
+### S2 - The K3 plugin (decided 2026-10-26; the structural work, part 2, after S1)
+
+**Scope:** `libflagos-provider-spacemit.so`, ours, source over the closed `libspert` (R3): device, probe and props (`flagos-spacemit.cpp:786-1101`); the buffer type on huge pages with the repack inside set and get (`flagos-spacemit-weights.{h,cpp}`, confirmed part of the plugin by the mentor 2026-10-26, with the buffer code of `flagos-spacemit.cpp:102-226`); copy; the persistent stream and the launch; the capture replay (`flagos-spacemit-exec.{h,cpp}`); the native IME and RVV kernels during the transition (the three kernel files and their orchestration in `-ime.cpp`, `-attn.cpp`, `-kernels.cpp`); `provider.cmake`; the tests and the acceptance runner.
+
+**Exit (proposed):** the plugin loads through S1's loader and the same checks and acceptance runs pass with identical logits and speed within 1%; the plugin alone links `libspert` and needs the IME2 toolchain; TCM hygiene unchanged (nothing held after a run, failures included); unloading releases the stream (the core grant) and TCM.
+
+**Order (proposed, for the user):** the IGPU switch (D3; `PROJECT.md` item 22) before S1, since it is small, independent and touches code S1 and S2 move; the interface note first in S1; M3 and fusion after S2.
+
+### S1 design: the core–plugin interface (2026-10-27)
+
+**Status:** S1's first deliverable (S1 item 1), a design note for the user's review; no S1 code yet. The decisions it rests on (user, 2026-10-27): the interface is a pure C function table with opaque handles and a version, exported by the plugin's shared library through one entry symbol and loaded with `dlopen`; the core goes under `providers/spacemit/core/`, the plugin under `providers/spacemit/plugin/`; the mentor's Common is not changed. The rest is proposed and marked so. Line numbers are today's (after the IGPU switch).
+
+**1. The boundary.** The core (compiled into `libggml-flagos`, built without `libspert` and without the IME2 toolchain) keeps: the ggml vtables (buffer type, buffer, backend and device: `flagos-spacemit.cpp:124-236`, `:793-900`) and the `flagos_provider_v1` table (`:1001-1104`); the contract check (`spacemit_find_op`, `flagos-spacemit-ops.cpp`) as a table of contracts; the op-to-steps expansion, the workspace sizing and the capture driver (`graph_compute`, `flagos-spacemit.cpp:644-790`); the plan cache (new, the L1 draft); the loader (new); the diagnostics (`:241-642`, renamed in S1 item 6). The plugin (`libflagos-provider-spacemit.so`, ours, source over the closed `libspert`) keeps: the probe and the device facts (`:943-1000`, memory `:802`, props `:849`, the profile `:1039-1066`); the buffers on huge pages (`:102-122`, `:189-226`) with the repack inside set, get and fill (`flagos-spacemit-weights.{h,cpp}`; D10); the stream and the launch (`flagos-spacemit-exec.cpp:388-395`, `:280-305`); the tile loop with its services (TCM taken once and agreed, the barriers, the pair waits, the failure flag); the kernels with their path choice (`flagos-spacemit-ime.cpp`, `-attn.cpp`, `-kernels.cpp` and the three kernel files); the test-only counters, through one test-only table entry. What the contract check needs from the plugin's side today, read in `flagos-spacemit-ops.cpp`: the layout rule (`spacemit_weight_layout`, `spacemit_tensor_is_repacked`), three shape predicates that are kernel facts (`spacemit_mul_mat_ime_supported`, `spacemit_flash_attn_supported`, `spacemit_flash_attn_split`, which reads shapes only: `flagos-spacemit-attn.cpp:195-207`), three workspace rules (`spacemit_mul_mat_workspace`, `spacemit_rope_workspace`, `spacemit_flash_attn_split_workspace`) and the kernel entries; the placement predicate (`spacemit_buffer_usable`: our buffer or a host one) is the core's own. So in S1 the core's contract table holds the structural part of each contract (the ggml op, the operand types and placement, the step names in order) and the plugin's kernel table carries, next to each entry, its `supports` (the shape facts) and `workspace_size`; moving the shape facts into the core's table in the Q4 vocabulary is a later step, when the manifest's `when` exists (M3).
+
+**2. The function table** (`providers/spacemit/core/flagos-spacemit-plugin.h`, C11, included by both sides; the sketch below compiles as C11 with `<stdint.h>`, `<stdbool.h>` and `<stddef.h>` in front, checked on the Mac 2026-10-27 with `cc -std=c11 -Wall -Wextra -Werror -fsyntax-only`; the exit's one-file check repeats this in the build):
+
+```c
+#define FLAGOS_SPACEMIT_PLUGIN_ABI 1
+typedef struct spacemit_plugin_device spacemit_plugin_device;   // opaque to the core
+typedef struct spacemit_plugin_stream spacemit_plugin_stream;
+typedef struct spacemit_plugin_buffer spacemit_plugin_buffer;
+struct ggml_tensor;                                              // crosses as a pointer (in-tree plugin, one build)
+
+typedef struct { uint32_t size; void (*log)(int level, const char * text); const char * plugin_dir; } spacemit_host_v1;
+typedef struct { uint32_t size, n_tiles, vector_bits; size_t tcm_bytes_per_tile;
+                 const char * target, * runtime, * description; } spacemit_plugin_device_props;
+typedef struct { uint32_t ith, nth; void * tcm; size_t tcm_size; void * workspace; size_t workspace_size;
+                 void * pairs; } spacemit_tile;                  // today's struct (flagos-spacemit-ops.h:17-25)
+typedef bool (*spacemit_step_fn)(const spacemit_tile * tile, struct ggml_tensor * node);
+typedef struct { const char * name;                              // the step's contract name, "mul_mat.gemm"
+                 spacemit_step_fn fn;
+                 bool (*supports)(const struct ggml_tensor * op);       // the kernel's shape facts, or NULL
+                 size_t (*workspace_size)(const struct ggml_tensor * node); } spacemit_plugin_kernel;  // or NULL
+typedef struct { spacemit_step_fn fn; struct ggml_tensor * node; size_t workspace_offset; } spacemit_plugin_step;
+enum { SPACEMIT_OK = 0, SPACEMIT_E_KERNEL = 1, SPACEMIT_E_RUNTIME = 2, SPACEMIT_E_UNSUPPORTED = 3, SPACEMIT_E_MEMORY = 4 };
+
+typedef struct {
+    uint32_t abi_version, size;
+    /* device */
+    uint32_t (*device_count)(void);
+    int  (*device_open)(uint32_t index, spacemit_plugin_device ** dev);     // the probe; no runtime start here
+    void (*device_close)(spacemit_plugin_device * dev);
+    int  (*device_props)(spacemit_plugin_device * dev, spacemit_plugin_device_props * out);
+    int  (*device_memory)(spacemit_plugin_device * dev, size_t * free, size_t * total);
+    /* memory: buffers on huge pages from 2 MiB, 64-byte alignment, size 0 allowed */
+    int  (*buffer_alloc)(spacemit_plugin_device * dev, size_t size, spacemit_plugin_buffer ** buf);
+    void (*buffer_free)(spacemit_plugin_buffer * buf);
+    void * (*buffer_base)(spacemit_plugin_buffer * buf);
+    /* tensors: the layout rule and the repack inside (flagos-spacemit-weights.h:28-44) */
+    uint32_t (*tensor_layout)(const struct ggml_tensor * t);                 // 0 plain, else a layout id
+    size_t (*tensor_alloc_size)(const struct ggml_tensor * t);
+    int  (*tensor_set)(struct ggml_tensor * t, const void * data, size_t offset, size_t size);
+    int  (*tensor_get)(const struct ggml_tensor * t, void * data, size_t offset, size_t size);
+    int  (*tensor_fill)(struct ggml_tensor * t, uint8_t value, size_t offset, size_t size);
+    /* stream: one per backend context, the core grant held until destroyed */
+    int  (*stream_create)(spacemit_plugin_device * dev, uint32_t n_tiles, spacemit_plugin_stream ** stream);
+    void (*stream_destroy)(spacemit_plugin_stream * stream);
+    int  (*stream_synchronize)(spacemit_plugin_stream * stream);
+    /* kernels and the capture replay */
+    const spacemit_plugin_kernel * (*kernels)(uint32_t * count);
+    int  (*replay)(spacemit_plugin_stream * stream, const spacemit_plugin_step * steps, uint32_t n_steps,
+                   void * workspace, size_t workspace_size, uint32_t flags);  // flags: SYNC_LAUNCH (one step per launch)
+    /* test-only: the counters and the host executor's switches; NULL in a release plugin */
+    int  (*test_control)(const char * name, void * arg);
+} spacemit_plugin_v1;
+
+const spacemit_plugin_v1 * flagos_spacemit_plugin_v1(const spacemit_host_v1 * host);   // the entry symbol
+```
+
+Not in the table: `memcpy`/`memset` (the buffer is host memory; the core copies with `memcpy` and refuses raw copies of repacked tensors as `cpy_tensor` does today, `flagos-spacemit.cpp:155-161`); events (the deck's optional group, none on the K3); `update` of per-token arguments (the steps carry the node pointers and the kernels read the node at run time, so a reused plan needs no update; added only if the plan cache keys by structure and rebinds nodes, §3). The pair wait (`spacemit_pair_wait`) is called by kernels only, both inside the plugin, so it stays a plugin function, not a table entry.
+
+**3. The capture protocol** (today's `graph_compute` with the plan cache in front): (i) the core checks every node of the split against its contract table before any write (the same predicates as `supports_op`; a miss returns `GGML_STATUS_FAILED` with nothing written); (ii) it looks the split up in the plan cache by the split's structure (the nodes' ops, types, shapes, strides and operand placement, in order; a hash first, then a full compare), and on a miss expands each op into its steps with their workspace offsets and the workspace size (today `:661-709`); (iii) it grows the workspace if needed (`:713-720`, `SPACEMIT_E_MEMORY` with nothing written); (iv) under the device's mutex (`:725`) it calls `replay(stream, steps, n, workspace, size, flags)`; the plugin launches one grid of `n_tiles` tiles; each tile takes its TCM once, the tiles agree one TCM size at the first barrier, each step runs on every tile and a barrier follows it, a tile that fails sets the shared flag and every tile then skips its remaining kernels but reaches every barrier (today's protocol, §2.4); the plugin waits for the launch and returns the status; (v) the core maps the status (`GGML_STATUS_SUCCESS` or `GGML_STATUS_FAILED`). With `SYNC_LAUNCH` (S1 item 6) the core passes the flag and the plugin runs one step per launch with a host wait between them (today's `run_ordered`, test-only, E3a). The plan cache's ceiling is the host work E3c measured, 0.55 ms per token; it is kept only if measured (S1's exit allows up to 0.6%).
+
+**4. The per-tile services** stay as today and inside the plugin: `spacemit_tile` (tile index and count, the agreed TCM, the shared workspace, the pairs for `spacemit_pair_wait`), the barrier after every step, the failure flag. The TCM-dependent path choice (the matmuls' 1-row path, A, B and C; attention's tiled or one-chunk kernels; the split's block count from the TCM size) stays inside the kernels for S1 (decision recorded here); the core may take it later from `device_props.tcm_bytes_per_tile`, once the choices are in the Q4 vocabulary.
+
+**5. Lifetimes, threads, errors.** `device_open` at registration (the probe; no runtime start), `device_close` when the registry is torn down; `stream_create` in the backend's `init` (today `:871`), `stream_destroy` in its `free` (`:236`); one stream per backend context, every run of the device serialized by the core's mutex. No exception crosses the boundary: the plugin catches spine-runtime's and returns `SPACEMIT_E_RUNTIME`; every failure is a status; nothing is written after a failed check; a failed replay leaves the workspace and TCM released (today's protocol). ggml tensors cross as pointers: the plugin is in-tree and built with the core, so the ggml struct is shared; this is not a long-term ABI (V2.0 §11.8's caveat), and the day the plugin is built elsewhere the tensor fields the kernels read become a descriptor.
+
+**6. Loading.** The core finds the plugin next to its own library (`dladdr` on a core symbol, then `libflagos-provider-spacemit.so` in that directory) or at `FLAGOS_SPACEMIT_PLUGIN=<path>` (test-only), `dlopen`s it with `RTLD_NOW | RTLD_LOCAL`, resolves `flagos_spacemit_plugin_v1`, calls it with the host table and checks the returned table: `abi_version == 1`, `size >= sizeof(spacemit_plugin_v1)`, every required pointer non-null (`test_control` may be null), and every step name of the core's contract table present in `kernels()`. Any failure logs a warning and registers no device (as a probe failure today). Negative tests: no library, a wrong version, a missing entry symbol, a missing step name, a plugin whose `device_count` is 0. The package check (manifest, sha256) waits for M3. Build: `provider.cmake` builds the core into `libggml-flagos` and the plugin as its own target; on riscv64 the plugin alone links `libspert` and gets the IME2 flags; on the Mac `FLAGOS_SPACEMIT_HOST_TEST_DEVICE=ON` builds the plugin with the host executor and the references, so the same loader loads it there and the checks run before the K3 (the hostsim role, `provider.cmake:73-84`).
+
+**7. Where today's files go** (the review's §2 rows; S1 moves the core's parts behind the table with the plugin still in the same build, S2 separates the plugin's build):
+
+| Today | Lines | Goes to | Step |
+|---|---|---|---|
+| `flagos-spacemit.cpp` :124-236 (buffer and backend vtables), :793-900 (device vtable), :1001-1104 (registry table) | about 330 | core | S1 (the vtables call the table) |
+| `flagos-spacemit.cpp` :644-790 (`graph_compute`) | 150 | core: the capture driver and the workspace | S1 |
+| `flagos-spacemit.cpp` :241-642 (test switches, the two counter classes) | 400 | core diagnostics; the per-tile clock reads stay in the plugin behind `test_control` | S1 item 6 |
+| `flagos-spacemit.cpp` :102-122, :189-226 (huge pages, allocation), :802-870 (memory, props, type), :943-1000 (probe), :1011-1066 (identity, caps, profile data) | about 300 | plugin: device and memory | S2 (S1 calls them through the table from the same build) |
+| `flagos-spacemit-ops.{h,cpp}` | 49 + 223 | core: the contract table and `spacemit_find_op`; `spacemit_tile` and `spacemit_kernel_fn` move to the header | S1 |
+| `flagos-spacemit-weights.{h,cpp}` | 44 + 201 | plugin (D10): `tensor_layout`, `tensor_alloc_size`, `tensor_set/get/fill` | S2 |
+| `flagos-spacemit-exec.{h,cpp}` | 96 + 567 | plugin: `stream_*`, `replay`, the tile loop, the pair waits, the host executor | S2 |
+| `flagos-spacemit-ime.{h,cpp}`, `-attn.{h,cpp}`, `-kernels.{h,cpp}` | 31 + 612, 24 + 528, 23 + 504 | plugin: the kernel table's entries with their `supports` and `workspace_size` | S2 |
+| `flagos-spacemit-ime-kernels`, `-rvv-kernels`, `-rvv-attn` | 106 + 3,195, 41 + 771, 51 + 1,786 | plugin (the package's contents from M3) | S2 |
+| `flagos-spacemit-api.h`, `provider.cmake` | 7, 85 | core (the FlagOS entry); the build file splits into the two targets | S1, S2 |
+| `tests/check_spacemit.cpp`, `tools/spacemit_check.py` | 3,655, 554 | with the plugin; the loader's negative tests new in the check program | S1 (the new tests), S2 |
+
+**8. Out of scope:** the package and the manifest (M3), fusion (M4), events, zero-copy of repacked weights (G6: the CPU never reads them), the AMD provider, `update`.
+
+**Exit of the note (proposed):** reviewed by the user; the header sketch compiles as C on the Mac (`tests/check_plugin_header.c`: includes the header and takes the address of the entry, built with `-std=c11 -Wall -Werror`); every file of the review's §2 has a destination (§7 above). Then S1's code, one coder pass each, specified from this note and checked on the Mac's simulated device before the K3: (1) the header and the loader, with today's code behind the table in one build (the loader's negative tests); (2) L2 behind the interface: the contract table and the binding of step names at load; (3) the L1 draft: the plan cache, kept only if measured within S1's exit; (4) the workspace and capture driver as the core's; (5) the diagnostics under the deck's names. Each step's exit is S1's: all checks pass with logits identical to today's and tg128 and pp128 within 1%.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
@@ -1058,7 +1178,7 @@ Outside FlagOS (approved by the mentor as fork patches, 2026-10-14; `upstream-ch
 ## 7. Questions for the mentor
 
 1. ~~Device type~~ decided: ACCEL (2026-10-08), changed to IGPU (agreed by the mentor, recorded 2026-10-26; §2.8). Still open: FlagOS `caps.kind`, `cpu_accelerator` (proposed) or `ai_accelerator`?
-2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, with the provider reading CPU buffers for everything else (A2, §2.3). We are building M2b on A2 (2026-10-09); please confirm. The alternative (A1) doubles quantized-weight memory and would change only the buffer part.
+2. Memory under ACCEL: weights in an IME-repacked buffer, stored once, with the provider reading CPU buffers for everything else (A2, §2.3). We are building M2b on A2 (2026-10-09); please confirm. The alternative (A1) doubles quantized-weight memory and would change only the buffer part. Ownership decided 2026-10-26 (with the mentor): the layout and its repack are the plugin's (`flagos-spacemit-weights.{h,cpp}` part of the plugin, D10), so A2's shape stands as the plugin's choice; what remains of this question is the requantization's accuracy trade-off.
 3. Is spine-runtime (closed `libspert`) acceptable as a hard dependency of the provider?
 4. Kernel reuse: decided 2026-10-09 to copy, per milestone, only the functions used into `providers/spacemit/` (§2.5), following the mentor design's "reference, not boundary" (§14.1) and SpacemiT's own ggml-spacemit. Objections? The alternative is compiling the in-tree sources in place.
 5. Target for Phase 0: Qwen3-4B Q4_0 (SpacemiT has reference numbers) or Qwen3.5-4B Q4_K_M (comparable with AMD, but needs lossy Q4_K/Q6_K repacks and gated-delta-net ops early)?
