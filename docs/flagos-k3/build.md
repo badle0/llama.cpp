@@ -719,6 +719,27 @@ Results on the K3, 2026-10-27 (build `695ad6d`, the switch's commit; spine-runti
 - The Q8_0 cache runs attention on the CPU with copies of the cache views, as designed: 37% slower than the F16 cache on 4B (6.95 against 11.08 in the same runner), 48% on 0.6B (28.92 against 55.3); a measurement of the stores-only design, not a target.
 - Found on the way: the runner's log directory was per milestone, so the 0.6B run overwrote the 4B run's logs but the depth ones, and its summary went to the terminal only; changed after the run: a log directory per milestone and model, the summary also in its `summary.txt`. The runner's `--bench` now runs the matmul benchmark with `split` and the default only (`--bench-mm` keeps all seven settings; the five others are decided and recorded in `fusion-and-splitting.md` §7.3), so the acceptance run is shorter; the runs above still had all seven.
 
+**SpacemiT's Q4_0 scale fix, 2026-10-28** (`PROJECT.md` item 26, `plan.md` R11; checked on the Mac, the K3 run pending): the three Q4_0 activation quantizers (`quantize_a_nrow_i8_hp_ref`, `quantize_a_row_i8_hp`, `quantize_a_4row_i8_hp` in `flagos-spacemit-ime-kernels.cpp`) take SpacemiT's stable factor, from the fork's in-tree copy (`spacemit-com/llama.cpp` `mtmd-backend` `27acf9d`, PR #30, "fix qwen2.5-3b q4_0 hp scale overflow", 2026-08-05; not in upstream llama.cpp, nor in `ggml-spacemit`'s own copy at `855a53b`). A block of 256 activations has one F16 scale and, per sub-block of 32, an F16 ratio to it, and the IME kernels sum a block's sub-block products in F16 (`gemm_kernel_i8i4_hp_*`); the fix stores the ratios times the factor and the block scale divided by it, the same product with 1/factor times the headroom in those sums. SpacemiT's factor is 0.1; ours is 0.125 (marked "flagos"): a power of two scales every F16 intermediate exactly, so outputs stay bit-identical to before wherever the old sums stayed in range, while 0.1 rounds every stored scale anew. On the Mac's simulated device (reference kernels):
+
+| check | before | SpacemiT's 0.1 | ours, 0.125 | bound |
+|---|---|---|---|---|
+| Q4_0 matmul, one large activation sub-block against seven tiny ones (weights of scale 0.5, every nibble 15; new probe), 1 / 4 / 5 rows | inf / inf / inf | 2.17e-05 each | 3.63e-07 each | 5e-4 |
+| Q4_0 matmul, 24 random cases, max NMSE | 2.56e-05 | 2.61e-05 | 2.56e-05 | 5e-4 |
+| Qwen3-like layer, max NMSE | 5.40e-04 | 5.44e-04 | 5.40e-04 | 1e-3 |
+| every other number of the check program | | | unchanged | |
+
+`test-backend-ops -o MUL_MAT` 3/3 as before (its claimed cases are Q8_0 and Q6_K; its Q4_0 shapes have output sizes the IME layout refuses, so the check program is the Q4_0 coverage).
+
+On the K3 (inside tmux; the bundle from `695ad6d`, the board's build):
+
+```bash
+~/tcmtest/tcmrelease --apply
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone igpu --build --depth --model ~/models/Qwen3-4B-Q4_0.gguf
+python3 ggml/src/ggml-flagos/providers/spacemit/tools/spacemit_check.py --milestone igpu
+```
+
+Pass rule, fixed before the run: every check passes, the probe included (on the K3 it runs the RVV quantizers and the IME kernels; question 8's CPU-only crash, if it recurs, is redone by hand as on 2026-10-27); identical logits, i.e. the perplexity at 512-token batches and both mean KLDs 2026-10-27's to the last digit (4B 9.7736, 0.002489 / 0.001229; 0.6B 14.4471, 0.004722 / 0.002533); tg128 and pp128 within 1% of 2026-10-27's (4B 10.99 / 106.26, 0.6B 55.37 / 703.67). Predicted: all three hold (by the code, only an intermediate falling below F16's normal range, eight times sooner than before, can change a digit; the real models' sums do not overflow, or 2026-10-27's runs would have shown inf). If the digits differ, the difference is examined before adoption; a KLD within 2% of 2026-10-27's would then be the fallback rule.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).

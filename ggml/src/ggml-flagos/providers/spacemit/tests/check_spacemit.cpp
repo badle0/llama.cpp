@@ -959,6 +959,46 @@ static std::pair<double, double> q4_1_zero_point_probe(ggml_backend_dev_t dev, g
     return { e[0], e[1] };
 }
 
+// Q4_0's activations are quantized per block of 256 values with one F16 scale and, per sub-block of 32, an F16 ratio to
+// it; the IME kernels sum the sub-blocks' products in F16 (gemm_kernel_i8i4_hp_*). One large sub-block against seven
+// tiny ones puts its ratio near 8, and with weights of scale 0.5 and every nibble 15 its product, about 121,000, passes
+// F16's 65,504; SpacemiT's stable factor (spacemit-com/llama.cpp 27acf9d, PR #30; ours 0.125 on the ratios and 8 on the
+// block scale, theirs 0.1 and 10) keeps it near 15,100. 1 row takes q4_0_quantize_row, 4 rows q4_0_quantize_4rows, 5
+// rows both.
+static std::array<double, 3> q4_0_scale_range_probe(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu) {
+    const int64_t        k = 256, n = 32;
+    const size_t         bs = ggml_type_size(GGML_TYPE_Q4_0);  // 18 bytes: the F16 scale, then 16 bytes of nibbles
+    const ggml_fp16_t    d  = ggml_fp32_to_fp16(0.5f);
+    std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q4_0, k) * n);
+    for (size_t off = 0; off < q.size(); off += bs) {
+        std::memcpy(q.data() + off, &d, sizeof(d));
+        std::memset(q.data() + off + sizeof(d), 0xFF, bs - sizeof(d));  // every nibble 15: each weight (15 - 8) * 0.5
+    }
+    mm_weight w;
+    if (!w.init_with(dev, GGML_TYPE_Q4_0, k, n, q)) {
+        return { -1.0, -1.0, -1.0 };
+    }
+    std::array<double, 3> e    = { -1.0, -1.0, -1.0 };
+    const int64_t         rows[3] = { 1, 4, 5 };
+    for (int i = 0; i < 3; i++) {
+        const int64_t m = rows[i];
+        mm_run        run;
+        if (run.init(dev, w, m, 1)) {
+            std::vector<float> x(k * m, 0.0f);
+            for (int64_t r = 0; r < m; r++) {
+                for (int64_t s = 0; s < k / 32; s++) {
+                    for (int64_t j = 0; j < 16; j++) {
+                        x[r * k + s * 32 + j] = s == 0 ? 1.0f : 1e-3f;  // per sub-block: 16 equal values, 16 zeros
+                    }
+                }
+            }
+            ggml_backend_tensor_set(run.x, x.data(), 0, ggml_nbytes(run.x));
+            e[i] = run.compare(dev, backend, cpu);
+        }
+    }
+    return e;
+}
+
 // the provider against the CPU backend for shapes and row counts that take every path: 1 row (GEMV) and, by the
 // default rule, path B where TCM holds the activations next to a 32-column slab, else path A from 32 rows, else path C
 // (on the K3 Qwen3-4B's Q4_1 down at 7 rows, with --full; without TCM every case); 4-row blocks with partial tails.
@@ -1044,12 +1084,24 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
             g_failures++;
         }
     }
+    const std::array<double, 3> range = q4_0_scale_range_probe(dev, backend, cpu);
+    for (int i = 0; i < 3; i++) {
+        if (range[i] < 0.0 || range[i] > k_mul_mat_max_nmse) {
+            std::fprintf(stderr, "FAIL: Q4_0 matmul, one large activation sub-block against seven tiny ones (F16 range "
+                         "of the IME sums): rows %d: %s %.3e\n",
+                         i == 0 ? 1 : (i == 1 ? 4 : 5), range[i] < 0.0 ? "refused or failed" : "NMSE", range[i]);
+            g_failures++;
+        }
+    }
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     const char * kernels = std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "";
     std::printf("matmul   Q4_0 (IME layout 32x256) vs CPU: %d cases, rows 1-%d, max NMSE %.2e (bound %.0e)%s\n",
                 n_cases[0], (int) max_rows[0], max_nmse[0], k_mul_mat_max_nmse, kernels);
+    std::printf("matmul   Q4_0, one large activation sub-block against seven tiny ones (F16 range of the IME sums, "
+                "SpacemiT's stable factor): NMSE 1 row %.2e, 4 rows %.2e, 5 rows %.2e (bound %.0e)%s\n",
+                range[0], range[1], range[2], k_mul_mat_max_nmse, kernels);
     if (g_q4_1_q8_0) {
         std::printf("matmul   Q4_1 (requantized to Q8_0, IME layout 32x32) vs CPU's Q4_1: %d cases, rows 1-%d, max NMSE "
                     "%.2e (bound %.0e); vs CPU's Q8_0 of the same values (the requantization): max NMSE %.2e (bound "

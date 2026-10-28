@@ -2,7 +2,8 @@
 // layout q4_0 32x256 (M2b), Q4_1 in the layout q4_1 32x32 (M2c.1), Q8_0 and Q6_K in the layout q8_0 32x32 (M2c.2).
 //
 // Copied from ggml/src/ggml-cpu/spacemit @ ba360ef; identical in ggml-spacemit (spacemit-com/llama.cpp 4e782bc and
-// mtmd-backend 64316cd) and in upstream llama.cpp master (Q4_0: 2026-10-08; Q4_1, Q8_0 and Q6_K: 2026-10-10):
+// mtmd-backend 64316cd; again at mtmd-backend 855a53b, 2026-10-28) and in upstream llama.cpp master (Q4_0: 2026-10-08;
+// Q4_1, Q8_0 and Q6_K: 2026-10-10; all again at 8ca4060b, 2026-10-28), but for the Q4_0 quantizers' fix below:
 //   ime2_kernels.cpp  Q4_0: gemm_kernel_i8i4_hp_mrow_ref (324-436), gemm_kernel_i8i4_hp_m1 (2883-3005),
 //                     gemm_kernel_i8i4_hp_m4 (3360-3741)
 //                     Q4_1: gemm_kernel_i8i4_mrow_ref (217-322), gemm_kernel_i8i4_m1 (2430-2881),
@@ -27,6 +28,15 @@
 // gemm_kernel_i8i4_m1 the exact zero-point branch upstream disables with #if 0, instead of its 16-bit one (upstream's
 // again with FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1 defined, a test-only build). Everything
 // below the copies (dispatch, unpack) is new. When upstream changes these functions, take the fix by hand (plan.md R11).
+// Taken by hand on 2026-10-28, marked "SpacemiT's fix": the stable factor of the Q4_0 quantizers (quantize_a_nrow_i8_hp
+// _ref, quantize_a_row_i8_hp, quantize_a_4row_i8_hp) from SpacemiT's own in-tree copy (spacemit-com/llama.cpp
+// mtmd-backend 27acf9d, PR #30, "fix qwen2.5-3b q4_0 hp scale overflow", 2026-08-05; not in upstream llama.cpp nor in
+// ggml-spacemit's copy at 855a53b). The sub-block ratios to the block scale are stored times the factor and the block
+// scale divided by it: the same product, with 1/factor times the headroom in the kernels' F16 sums of the sub-blocks
+// (gemm_kernel_i8i4_hp_*), which a ratio near 8 against weights of scale 0.5 overflowed (flagos-check-spacemit's Q4_0
+// probe). flagos: the factor is 0.125, not SpacemiT's 0.1. A power of two scales every F16 intermediate exactly, so the
+// outputs are ba360ef's bit for bit wherever its sums stayed in range (measured on the Mac: every check's number
+// unchanged, the probe 3.63e-07 where 0.1 gives 2.17e-05 and ba360ef inf); 0.1 rounds each stored scale anew.
 //
 // The IME and RVV code is built only with GGML_FLAGOS_SPACEMIT_IME2 (riscv64, GCC >= 15); the scalar references
 // (*_ref, plain C++) are built everywhere, so hosts without the AI cores can run the whole path.
@@ -507,6 +517,7 @@ template <size_t MB_ROWS>
 void quantize_a_nrow_i8_hp_ref(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     const size_t     subblk_count = blk_len / k_subblk_len;
+    const float      stable_factor = 0.125f;  // SpacemiT's fix (27acf9d, #30), flagos: 0.125 for 0.1; see the header
 
     GGML_ASSERT(blk_len == 256);
 
@@ -531,11 +542,11 @@ void quantize_a_nrow_i8_hp_ref(size_t blk_len, const float * a_ptr, size_t count
         }
 
         scale_avg /= subblk_count;
-        float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;  // flagos: zero guard from the RVV version
+        float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;  // flagos: zero guard from the RVV version
 
         _Float16 * scale_avg_ptr =
             reinterpret_cast<_Float16 *>(quant_a_ptr + a_nrow_block_stride - sizeof(_Float16) * MB_ROWS);
-        scale_avg_ptr[0] = scale_avg;
+        scale_avg_ptr[0] = static_cast<_Float16>(scale_avg / stable_factor);
 
         for (size_t kk = 0; kk < subblk_count; kk++) {
             uint8_t *  a_subblk_base = quant_a_ptr + kk * a_subblk_stride;
@@ -1387,6 +1398,7 @@ void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, u
     int64_t          a_subblk_stride          = q8_hp_blk_size(k_subblk_len, false, false);
     size_t           vlenb                    = __riscv_vlenb();
     float            scale_temp[subblk_count] = { 0.0f };
+    const float      stable_factor            = 0.125f;  // SpacemiT's fix (27acf9d, #30), flagos: 0.125; see the header
 
     if (vlenb == 128) {
         for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_blk_stride) {
@@ -1410,8 +1422,8 @@ void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, u
             }
 
             scale_avg /= subblk_count;
-            const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
-            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg);
+            const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
+            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg / stable_factor);
 
             for (size_t kk = 0; kk < subblk_count; ++kk) {
                 uint8_t *     a_subblk_base = quant_a_ptr + kk * a_subblk_stride;
@@ -1458,8 +1470,8 @@ void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, u
             }
 
             scale_avg /= subblk_count;
-            const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
-            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg);
+            const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
+            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg / stable_factor);
 
             for (size_t kk = 0; kk < subblk_count; ++kk) {
                 uint8_t *     a_subblk_base = quant_a_ptr + kk * a_subblk_stride;
@@ -1499,6 +1511,7 @@ void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, 
     int64_t          a_subblk_stride          = q8_hp_blk_size(k_subblk_len, false, false) * 4;
     size_t           vlenb                    = __riscv_vlenb();
     float            scale_temp[subblk_count] = { 0.0f };
+    const float      stable_factor            = 0.125f;  // SpacemiT's fix (27acf9d, #30), flagos: 0.125; see the header
 
     if (vlenb == 128) {
         for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_nrow_block_stride) {
@@ -1536,8 +1549,8 @@ void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, 
             }
 
             scale_avg /= subblk_count;
-            const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
-            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg);
+            const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
+            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg / stable_factor);
 
             for (size_t kk = 0; kk < subblk_count; ++kk) {
                 uint8_t *     a_subblk_base = quant_a_ptr + kk * a_subblk_stride;
@@ -1631,8 +1644,8 @@ void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, 
             }
 
             scale_avg /= subblk_count;
-            const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
-            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg);
+            const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
+            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg / stable_factor);
 
             for (size_t kk = 0; kk < subblk_count; ++kk) {
                 uint8_t *     a_subblk_base = quant_a_ptr + kk * a_subblk_stride;
