@@ -27,7 +27,8 @@
 #   m2e:  as m2c2, with attention (M2e.1): it claims FLASH_ATTN_EXT too (F16 K and V, head sizes up to 128), whose
 #         test-backend-ops cases pass with the RVV and with the reference kernels; flagos-check-spacemit adds attention
 #         against the CPU with the KV cache's layout and the probes for the three faults of the copied kernels; the
-#         model run's default -fa auto keeps flash attention on the provider (C5a; FAIL with llama.cpp's warning if it
+#         model run's default -fa auto keeps flash attention on the provider (under IGPU the layer's device is the
+#         provider; as ACCEL this needed C5a, reverted 2026-10-28; FAIL with llama.cpp's warning if it
 #         turns it off, or if the graphs take as many splits as the model has layers, as when the CPU runs attention)
 #         and a token takes 2 graph splits; perplexity with -fa on and with -fa auto (attention on the provider), each
 #         within 1% of the CPU; mean KLD against the CPU's logits with 512-token batches (tiled kernel) and -ub 1 -b
@@ -330,8 +331,8 @@ def model_run(bdir, logs, model, milestone):
                    (f"offloaded {off[-1][0]}/{off[-1][1]} layers" if off else "no offload line") +
                    f"; {', '.join(placed) or 'no provider buffers in use'}")
         if milestone in ("m2e", "igpu"):
-            # the run leaves -fa at its default, auto; llama.cpp keeps flash attention on the provider (as an ACCEL
-            # device only with C5a)
+            # the run leaves -fa at its default, auto; llama.cpp keeps flash attention on the provider, whose device
+            # is the layer's under IGPU (as an ACCEL device this needed C5a, reverted 2026-10-28)
             report("-fa auto keeps flash attention on the provider", *attention_on_provider(log_on, rc_on))
             # exit M2e.1 (plan.md): only the token embedding stays on the CPU
             n_split = splits_per_token(log_on)
@@ -387,7 +388,7 @@ def perplexity(bdir, logs, model, text, milestone):
         report("perplexity", False, f"text not found: {text}")
         return
     # as M0.6 (build.md §7): 8 x 512 tokens, flash attention on; from M2e.1 also the provider with the default -fa auto,
-    # which keeps flash attention on it with C5a (the CPU alone always keeps it, so one CPU run serves both)
+    # which keeps flash attention on it under IGPU (the CPU alone always keeps it, so one CPU run serves both)
     cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-t", "8",
            "-lv", "4"]
     # from M2e.1 the CPU run also saves its logits for the KLD runs (about 600 MB at Qwen3's vocabulary)

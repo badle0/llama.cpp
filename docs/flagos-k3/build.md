@@ -750,7 +750,7 @@ Experiment switches of the provider (environment variables; test-only unless not
 
 | Variable | Applies to | Effect |
 |---|---|---|
-| `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` or `gpu` | the device's ggml type at registration (`plan.md` §2.8) | the provider reports that type instead of IGPU (the default since 2026-10-27), with a warning, for comparisons: ACCEL was the type until 2026-10-26, GPU is E2's other value |
+| `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` or `gpu` | the device's ggml type at registration (`plan.md` §2.8) | the provider reports that type instead of IGPU (the default since 2026-10-27), with a warning, for comparisons: ACCEL was the type until 2026-10-26, GPU is E2's other value; since the revert of C5a and C5b (2026-10-28, `upstream-changes.md` U1, U2) `accel` runs as stock llama.cpp runs an ACCEL device: norms pinned to the CPU and flash attention off under `-fa auto`, so it no longer reproduces the ACCEL numbers of 2026-10-26; a type comparison only, with `-fa on` for speed |
 | `FLAGOS_SPACEMIT_DISABLE=1` | everything | no SpacemiT device: llama.cpp runs on the X100 cores (the runner's `cpu` mode) |
 | `FLAGOS_SPACEMIT_GEMV=<s>[:<c>][@<t>]` | 1-row matmuls, read at every call | `<s>`: `paired` (default), `staged` (no turns), `direct` (from DRAM, c = 128), `copy` (copies only, wrong results); `<c>`: columns per slab, a multiple of 32 (shrinks to fit the TCM); `@<t>`: only the first t tiles work |
 | `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1` | buffers (Linux) | the default 4 KiB pages; otherwise buffers from 2 MiB lie on huge pages |

@@ -388,12 +388,6 @@ int ggml_backend_flagos_get_device() {
     return -1;
 }
 
-void ggml_backend_flagos_reg_devices() {
-    // Registration is done by ggml-backend-reg.cpp (GGML_USE_FLAGOS) or by the
-    // dynamic loader. Calling ggml_backend_register() from here would make this
-    // backend library depend on libggml, which links it (undefined on macOS).
-}
-
 static int ggml_backend_flagos_score() {
     int score = 0;
     for (const flagos_provider_v1 * provider : flagos_all_providers()) {

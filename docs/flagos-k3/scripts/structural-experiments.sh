@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Structural experiments on the K3 (docs/flagos-k3/structural-experiments.md): E2, the provider as an IGPU or GPU device
-# on stock llama.cpp; E1, ACCEL on stock llama.cpp (without C5a and C5b); E3, one launch per step; E2-hp, the KV cache
+# on stock llama.cpp; E1, ACCEL on stock llama.cpp (without C5a and C5b, which HEAD itself no longer carries since their
+# revert of 2026-10-28, upstream-changes.md U1 and U2); E3, one launch per step; E2-hp, the KV cache
 # on huge pages; E2-neg, the two settings that failed with the KV cache in the provider's buffer (F8); E4, stock upstream
 # llama.cpp loading the provider as a run-time module (no upstream change at all); E3c, test-only counters of where a
 # token's time goes; R12-hw, upstream's branch of the 1-row Q4_1 kernel on the board (prepare only). Every mode runs
@@ -8,7 +9,8 @@
 #
 # Usage: structural-experiments.sh prepare                  the builds $EXPS needs. B (e1, e2, e2hp, e2neg): a worktree
 #                                                           of the repository's HEAD at $WT_B whose src/llama-context.cpp
-#                                                           has C5a and C5b reverse-applied (upstream's file), built in
+#                                                           has C5a and C5b reverse-applied when HEAD still carries them
+#                                                           (upstream's file either way), built in
 #                                                           $BUILD_B. S and M (e4): S, a worktree of upstream $UPSTREAM_BASE
 #                                                           at $WT_S built with backends as run-time modules in $BUILD_S;
 #                                                           M, this repository's provider built as such a module in
@@ -35,7 +37,8 @@
 #                  <repo>/build-flagos-dl); BUILD_R12 (default <repo>/build-r12); SPERT_DIR (default ~/spine-runtime);
 #                  TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
-# Modes (build A: today's, with C5a and C5b; build B: upstream's llama-context.cpp; build S: stock upstream with backends
+# Modes (build A: today's; build B: upstream's llama-context.cpp, the same as A's since the revert of C5a and C5b; build S:
+# stock upstream with backends
 # as run-time modules, the provider loaded from build M; -fa is llama.cpp's default, auto, unless named; the provider
 # reports IGPU unless FLAGOS_SPACEMIT_TEST_DEVICE_TYPE names another type, D3):
 #   ref           A  IGPU                                    today's state
@@ -74,7 +77,8 @@ CHUNKS=${CHUNKS:-8}
 KLD_UB1=${KLD_UB1:-1}
 TIMEOUT=${TIMEOUT:-3600}
 DRY=${DRY:-}
-# C5a and C5b (upstream-changes.md U1, U2) and the upstream commit the fork is based on
+# C5a and C5b (upstream-changes.md U1, U2; reverted from HEAD 2026-10-28, so prepare_b reverse-applies them only when
+# src/llama-context.cpp still differs from upstream's) and the upstream commit the fork is based on
 C5_COMMITS="64e6cbd f1cf809"
 UPSTREAM_BASE=ba360ef
 TOOLS="llama-completion llama-bench llama-perplexity"
@@ -174,12 +178,16 @@ prepare_b() {
     else
         g -C "$REPO" worktree add -q --detach "$WT_B" "$head" || exit 1
     fi
-    for c in $C5_COMMITS; do
-        g -C "$WT_B" diff "$c^" "$c" -- src/llama-context.cpp | g -C "$WT_B" apply -R || {
-            echo "reverse-applying $c failed"
-            exit 1
-        }
-    done
+    if g -C "$WT_B" diff --quiet "$UPSTREAM_BASE" -- src/llama-context.cpp; then
+        echo "   src/llama-context.cpp is upstream's already (C5a and C5b reverted from HEAD); nothing to reverse-apply"
+    else
+        for c in $C5_COMMITS; do
+            g -C "$WT_B" diff "$c^" "$c" -- src/llama-context.cpp | g -C "$WT_B" apply -R || {
+                echo "reverse-applying $c failed"
+                exit 1
+            }
+        done
+    fi
     if g -C "$WT_B" diff --quiet "$UPSTREAM_BASE" -- src; then
         echo "   src/ is upstream's ($UPSTREAM_BASE)"
     else

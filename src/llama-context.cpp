@@ -530,15 +530,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            // under default device selection ACCEL devices hold no layers, so a layer not on a GPU has the CPU as its
-            // device; an ACCEL backend that runs the fused op for such a layer and can use the layer's buffer type (the
-            // KV cache's) reads those tensors in place, which is what this check is for, so it is no mismatch
-            const bool accel_for_cpu_layer = device_fused != nullptr && device_layer != nullptr &&
-                ggml_backend_dev_type(device_layer) == GGML_BACKEND_DEVICE_TYPE_CPU &&
-                ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
-                ggml_backend_dev_supports_buft(device_fused, ggml_backend_dev_buffer_type(device_layer));
-
-            if (device_fused != device_layer && !accel_for_cpu_layer) {
+            if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
@@ -2519,18 +2511,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
-                // under default device selection ACCEL devices hold no layers, so every layer's device is the CPU, and
-                // pinning there would split each norm off from the ops an ACCEL backend runs around it: for layers on the
-                // CPU, leave the norm to the scheduler when an ACCEL backend supports it
-                if (ggml_backend_dev_type(dev_layer) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    for (const auto & backend : backends) {
-                        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-                        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
-                            ggml_backend_supports_op(backend.get(), cur)) {
-                            return;
-                        }
-                    }
-                }
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {

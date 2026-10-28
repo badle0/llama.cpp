@@ -10,26 +10,26 @@ Check the list against the tree:
 git diff --stat 5794e12..HEAD -- . ':(exclude)ggml/src/ggml-flagos/providers/spacemit' ':(exclude)docs/flagos-k3'
 ```
 
-Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edit was made and later undone: every file touched shows its net change.
+Last checked 2026-10-28 after U1 and U2 were reverted and M1's function deleted: 7 files, 38 lines added, 8 removed; of these the four code files (U3, M1-M3: `ggml/CMakeLists.txt`, `ggml-flagos/CMakeLists.txt`, `flagos-registry.cpp`, `ggml-flagos.h`) 19 added and 8 removed, the three `.claude/` files 19 added (fork-only tooling); `src/llama-context.cpp` is the mentor's byte for byte again, and M1's hunks are his own commit's. No edit was made and later undone: every file touched shows its net change. The mentor's providers (`providers/amd`, `providers/denglin`), Common (`flagos-provider.*`, `flagos-target.*`, `flagos-graph-plan.*`, `ggml-flagos.cpp`) and the FlagOS check programs are untouched.
 
 ## Upstream llama.cpp and ggml
 
-### U1. Norms of CPU layers left to the scheduler when an ACCEL backend runs them (C5b)
+### U1. Norms of CPU layers left to the scheduler when an ACCEL backend runs them (C5b): reverted 2026-10-28
 
 - Where: `src/llama-context.cpp`, `llama_context::graph_get_cb()`, lines 2522-2533 (12 lines added).
 - Commit: `f1cf809` (2026-10-09), on its own.
 - What: for batches under 32 tokens (and with full offload), llama.cpp pins every `norm` and `l_last` node to its layer's device. Under ACCEL's default device selection, a layer not on a GPU has the CPU as its device, so each norm was pinned to the CPU although the provider runs the ops around it. The change returns before pinning when the layer's device is the CPU and an ACCEL backend supports the node.
 - Why: whole layers on the AI cores (M2d). Without it ACCEL generates 30-39% slower (Qwen3-4B / 0.6B, X3b, `device-type.md` §5).
 - Status: approved by the user 2026-10-09 and by the mentor 2026-10-14 (`PROJECT.md` question 9). With D3 changed to IGPU (2026-10-26) and the provider reporting IGPU since 2026-10-27 (`PROJECT.md` item 22; the K3 run pending), the change is inert for this provider: the layer's device is the provider, so the condition (an ACCEL backend) no longer matches. It stays in the fork, its value for other ACCEL providers unchanged; keep or revert is the mentor's call.
-- Known issue: its comment says "every layer's device is the CPU", true only without a GPU. The code checks the layer's device type, so it is right. C5a's comment had the same overstatement and was corrected (U2); this one is not yet (comment only).
+- Reverted 2026-10-28 (user): with the device type IGPU, an ACCEL-only change has no reason to stay in the fork; `src/llama-context.cpp` restored to the mentor's `5794e12` with `git checkout`, the Mac build and `flagos-check-spacemit` unchanged. Consequence: the test-only `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel` mode runs as stock llama.cpp runs an ACCEL device (norms pinned to the CPU, flash attention off under `-fa auto`), so it no longer reproduces 2026-10-26's ACCEL numbers; it remains a device-type comparison, with `-fa on` for speed. The known comment overstatement went with it.
 
-### U2. A fused op that an ACCEL backend runs for a CPU layer is no mismatch (C5a)
+### U2. A fused op that an ACCEL backend runs for a CPU layer is no mismatch (C5a): reverted 2026-10-28
 
 - Where: `src/llama-context.cpp`, `llama_context::resolve_fused_ops()`, lines 533-541 (9 lines added, 1 changed).
 - Commit: `64e6cbd` (2026-10-13), on its own, with the buffer-type check.
 - What: under `-fa auto`, llama.cpp turns a fused op (flash attention) off when the device the scheduler gave it differs from its layer's device. With ACCEL the layer is on the CPU and the op on the ACCEL device, so flash attention was turned off. The change treats that case as no mismatch when the ACCEL device supports the layer's buffer type (the KV cache's), that is, reads those tensors in place.
 - Why: flash attention on the provider under default flags (M2e.1): 2 graph splits per token instead of 74. Without it `-fa auto` would need M2e.2 (the graph without flash attention on the provider), or every run `-fa on`.
-- Status: decided by the user 2026-10-12, as a commit of its own; approved by the mentor 2026-10-14 (question 9). As U1: inert for this provider since it reports IGPU (D3; in the code 2026-10-27); kept, its fate the mentor's call.
+- Status: decided by the user 2026-10-12, as a commit of its own; approved by the mentor 2026-10-14 (question 9). Inert for this provider since it reports IGPU (D3; in the code 2026-10-27, accepted on the K3 the same day). Reverted 2026-10-28 (user) with U1, in the same `git checkout`; the mentor hears of both reverts with question 9's update.
 
 ### U3. Build option `GGML_FLAGOS_SPACEMIT`
 
@@ -39,12 +39,13 @@ Last checked 2026-10-13 at `fc1240a`: 5 files, 46 lines added, 5 removed. No edi
 
 ## The mentor's FlagOS code (outside `providers/spacemit`)
 
-### M1. `ggml_backend_flagos_reg_devices()` no longer registers the backend (macOS link fix)
+### M1. `ggml_backend_flagos_reg_devices()` removed (the macOS link fix, now the mentor's own removal)
 
-- Where: `ggml/src/ggml-flagos/flagos-registry.cpp:391-395`; the body is now a comment.
-- Commit: `eaa25ff` (2026-09-24), the fix this fork's base adds to `5794e12`.
+- Where: `ggml/src/ggml-flagos/flagos-registry.cpp` (the 6-line function deleted) and `ggml/src/ggml-flagos/ggml-flagos.h` (its declaration deleted). From `eaa25ff` (2026-09-24) to 2026-10-28 the fork kept the function with an empty body; since 2026-10-28 (user) it is deleted exactly as the mentor's `f324584c8` deletes it: our diff against `5794e12` for the two files equals his commit's hunks, line for line, the only other lines in that file being M2's two hooks, so the rebase onto his audit branch merges cleanly.
+- Commit: `eaa25ff` (2026-09-24), the fix this fork's base adds to `5794e12`; the deletion in the commit of 2026-10-28 with the revert of U1 and U2.
 - What: in builds without `GGML_BACKEND_DL` the function called `ggml_backend_register(ggml_backend_flagos_reg())`, which made the backend library depend on libggml, the library that links it: an undefined symbol on macOS. `ggml-backend-reg.cpp` (`GGML_USE_FLAGOS`) or the dynamic loader registers the backend instead.
 - Status: to report to the mentor. The function is public (`ggml-flagos.h:20`, `GGML_BACKEND_API`) and now does nothing on every platform. Nothing in this tree calls it; a program outside that relied on it to register the backend would no longer get it. The mentor's newer branch `feature/flagos-amd-890-audit-20261010` (2026-10-10; fetched read-only 2026-10-26) removes the function and its declaration altogether, so this fix converges with the mentor's own change at the next rebase.
+- Verified 2026-10-28, both directions, on the Mac (`build-host`, Apple clang, arm64): with the mentor's original body restored, linking `libggml-flagos.dylib` fails with `Undefined symbols for architecture arm64: "_ggml_backend_register", referenced from: _ggml_backend_flagos_reg_devices in flagos-registry.cpp.o`; with the fork's body it links. The mechanism, read in the build files: `ggml_backend_register` lives in `ggml-backend-reg.cpp`, a source of the `ggml` library (`ggml/src/CMakeLists.txt:242-244`), and in a build without `GGML_BACKEND_DL` the `ggml` library links the backend library (`ggml_add_backend_library`, `:279`), so the call made the backend depend on the library that links it. macOS's linker rejects an undefined symbol in a dylib at link time; Linux's defers it to load time, where the executable's `libggml.so` satisfies it, which is why the mentor's build passed on Linux and the K3. So the cause is certain for the link failure; a runtime effect on Linux was never observed and is not claimed. The mentor's own removal: commit `f324584c8` on `kevin/feature/flagos-amd-890-audit-20261010` (2026-10-07, "flagos: use core registration and portable plugin test backends") deletes the function from `flagos-registry.cpp` and its declaration from `ggml-flagos.h`, and changes the two AMD check programs that called it (`tests/check_amd_gdn_value_tile.cpp`, `tests/check_amd_strided_rms.cpp`) and `CMakeLists.txt`; our fix keeps the empty function, so a rebase onto that branch drops it without conflict.
 
 ### M2. The SpacemiT provider in the registry
 

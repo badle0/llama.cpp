@@ -197,6 +197,16 @@ The alterations, proposed for the user's review before the first S1 spec (the he
   `int api_version`, compared for exact equality (`U ggml-backend-reg.cpp:246`); the `size` field goes, since
   extension happens through A2. The negative tests stay: no library, a wrong version, a missing entry, a missing
   step name, zero devices.
+  **Decided (user, 2026-10-28): not adopted; the S1 note's §2 and §6 stand.** The deck's overall structure is kept and
+  followed (the entry `flagos_spacemit_plugin_v1(host)` with the host table, the version in the symbol), and `size`
+  stays: it is the mentor's own convention (`flagos_provider_v1 { api_version, struct_size }`,
+  `ggml/src/ggml-flagos/flagos-provider.h:65-67`, validated as exact version plus `struct_size >= required`,
+  `flagos-provider.cpp:5-8`, with one optional tail already in use, `:81-85`), not an addition of this note as §4 first
+  said. Upstream is followed where it costs nothing and conflicts with neither the deck nor the mentor: the exact
+  version equality and the `dlopen` flags, both already in the note. The host table's `log` is implemented by the core
+  as a forward to ggml's logger, so a plugin message reaches `ggml_log_set`'s callback either way; the mentor's AMD
+  code itself has no host table (its entry `flagos_amd_provider()` takes no argument and returns a static table,
+  `providers/amd/flagos-amd.cpp:6184`), so the host table is the deck's, kept by the user's choice.
 - **A2. Optional functions through `get_proc_address(const char * name)`.** The table holds the required functions
   only; the test counters, the host executor's switches and later M3's `module_load` and `kernel_get` are resolved by
   name, as `ggml_backend_reg_i.get_proc_address` does it (`U ggml-backend-impl.h:238`) and as llama.cpp finds

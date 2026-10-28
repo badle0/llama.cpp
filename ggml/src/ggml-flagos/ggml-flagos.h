@@ -17,7 +17,6 @@ GGML_BACKEND_API void ggml_backend_flagos_set_device(int device);
 GGML_BACKEND_API int ggml_backend_flagos_get_device(void);
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_flagos_buffer_type(int device);
-GGML_BACKEND_API void ggml_backend_flagos_reg_devices(void);
 
 #ifdef __cplusplus
 }
