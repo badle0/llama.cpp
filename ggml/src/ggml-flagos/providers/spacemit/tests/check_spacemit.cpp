@@ -34,6 +34,7 @@
 #include "ggml.h"
 #include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
 #include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
+#include "providers/spacemit/flagos-spacemit-ime-kernels.h"  // the Q4_0 scale policy (test-only switch)
 
 #include <algorithm>
 #include <array>
@@ -959,6 +960,63 @@ static std::pair<double, double> q4_1_zero_point_probe(ggml_backend_dev_t dev, g
     return { e[0], e[1] };
 }
 
+// the Q4_0 quantizers' stable factor in force (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE, flagos-spacemit-ime-kernels.cpp): a
+// flat block (every sub-block at the same scale) and a dominant one (one sub-block of 1.0 and 0, seven of 1e-3)
+// quantized by the reference quantizer; the stored block scale and the first sub-block's ratio must be what the
+// policy's factor gives, bit for bit, and an adaptive policy must leave the flat block at 1 and scale the dominant one
+static int check_q4_0_scale_policy() {
+    float pf = 0.0f, pt = 0.0f;
+    spacemit_ime::q4_0_scale_policy_get(&pf, &pt);
+    const size_t k      = spacemit_ime::q4_0_k_block;  // one block of 256
+    const size_t stride = spacemit_ime::q8_hp_blk_size(k, true, true);
+    float        factors[2] = { 0.0f, 0.0f };
+    for (int which = 0; which < 2; which++) {
+        std::vector<float> a(k, 0.0f);
+        for (size_t sb = 0; sb < 8; sb++) {
+            for (size_t j = 0; j < 32; j++) {
+                a[sb * 32 + j] = which == 0 ? 1.0f : (sb == 0 ? (j < 16 ? 1.0f : 0.0f) : 1e-3f);
+            }
+        }
+        float scale_temp[8];  // the quantizer's own arithmetic: max / 127 per sub-block, then their mean
+        float scale_avg = 0.0f;
+        for (size_t sb = 0; sb < 8; sb++) {
+            float m = 0.0f;
+            for (size_t j = 0; j < 32; j++) {
+                m = std::max(m, std::fabs(a[sb * 32 + j]));
+            }
+            scale_temp[sb] = m / ((1 << 7) - 1);
+            scale_avg += scale_temp[sb];
+        }
+        scale_avg /= 8;
+        const float f  = spacemit_ime::q4_0_block_factor(scale_temp, 8, scale_avg);
+        factors[which] = f;
+        std::vector<uint8_t> qa(stride, 0);
+        spacemit_ime::q4_0_quantize_row(a.data(), k, qa.data(), true);
+        uint16_t stored_block = 0, stored_sub = 0;
+        std::memcpy(&stored_block, qa.data() + stride - sizeof(uint16_t), sizeof(uint16_t));
+        std::memcpy(&stored_sub, qa.data(), sizeof(uint16_t));
+        const float    sf        = f / scale_avg;
+        const uint16_t exp_block = ggml_fp32_to_fp16(scale_avg / f);
+        const uint16_t exp_sub   = ggml_fp32_to_fp16(scale_temp[0] * sf);
+        if (stored_block != exp_block || stored_sub != exp_sub) {
+            std::fprintf(stderr, "FAIL: Q4_0 scale policy %s, %s block: stored block scale %04x (expected %04x), "
+                         "sub-block ratio %04x (expected %04x)\n", spacemit_ime::q4_0_scale_policy_text(),
+                         which == 0 ? "flat" : "dominant", stored_block, exp_block, stored_sub, exp_sub);
+            g_failures++;
+        }
+    }
+    const bool rule = pt > 0.0f ? (factors[0] == 1.0f && factors[1] == pf) : (factors[0] == pf && factors[1] == pf);
+    if (!rule) {
+        std::fprintf(stderr, "FAIL: Q4_0 scale policy %s: factors %g (flat) and %g (dominant), policy factor %g, "
+                     "threshold %g\n", spacemit_ime::q4_0_scale_policy_text(), factors[0], factors[1], pf, pt);
+        g_failures++;
+    }
+    std::printf("matmul   Q4_0 activation scale policy %s (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE): factor %g on a flat block, "
+                "%g on a dominant one; the stored block scale and sub-block ratio as the policy gives, bit for bit: "
+                "checked\n", spacemit_ime::q4_0_scale_policy_text(), factors[0], factors[1]);
+    return 0;
+}
+
 // Q4_0's activations are quantized per block of 256 values with one F16 scale and, per sub-block of 32, an F16 ratio to
 // it; the IME kernels sum the sub-blocks' products in F16 (gemm_kernel_i8i4_hp_*). One large sub-block against seven
 // tiny ones puts its ratio near 8, and with weights of scale 0.5 and every nibble 15 its product, about 121,000, passes
@@ -1084,8 +1142,12 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
             g_failures++;
         }
     }
+    check_q4_0_scale_policy();
+    float policy_factor = 0.0f, policy_threshold = 0.0f;
+    spacemit_ime::q4_0_scale_policy_get(&policy_factor, &policy_threshold);
+    const bool old_quantizer = policy_threshold <= 0.0f && policy_factor == 1.0f;  // the fix off: the probe overflows
     const std::array<double, 3> range = q4_0_scale_range_probe(dev, backend, cpu);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3 && !old_quantizer; i++) {
         if (range[i] < 0.0 || range[i] > k_mul_mat_max_nmse) {
             std::fprintf(stderr, "FAIL: Q4_0 matmul, one large activation sub-block against seven tiny ones (F16 range "
                          "of the IME sums): rows %d: %s %.3e\n",
@@ -1100,8 +1162,9 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     std::printf("matmul   Q4_0 (IME layout 32x256) vs CPU: %d cases, rows 1-%d, max NMSE %.2e (bound %.0e)%s\n",
                 n_cases[0], (int) max_rows[0], max_nmse[0], k_mul_mat_max_nmse, kernels);
     std::printf("matmul   Q4_0, one large activation sub-block against seven tiny ones (F16 range of the IME sums, "
-                "SpacemiT's stable factor): NMSE 1 row %.2e, 4 rows %.2e, 5 rows %.2e (bound %.0e)%s\n",
-                range[0], range[1], range[2], k_mul_mat_max_nmse, kernels);
+                "SpacemiT's stable factor, policy %s): NMSE 1 row %.2e, 4 rows %.2e, 5 rows %.2e (%s)%s\n",
+                spacemit_ime::q4_0_scale_policy_text(), range[0], range[1], range[2],
+                old_quantizer ? "the quantizer before the fix: inf expected, not a failure" : "bound 5e-04", kernels);
     if (g_q4_1_q8_0) {
         std::printf("matmul   Q4_1 (requantized to Q8_0, IME layout 32x32) vs CPU's Q4_1: %d cases, rows 1-%d, max NMSE "
                     "%.2e (bound %.0e); vs CPU's Q8_0 of the same values (the requantization): max NMSE %.2e (bound "
