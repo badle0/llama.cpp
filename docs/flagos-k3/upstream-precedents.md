@@ -212,9 +212,27 @@ The alterations, proposed for the user's review before the first S1 spec (the he
   name, as `ggml_backend_reg_i.get_proc_address` does it (`U ggml-backend-impl.h:238`) and as llama.cpp finds
   `ggml_backend_dev_get_extra_bufts`. The loader's check "every required pointer non-null" then has no exceptions,
   and `test_control` leaves the table.
+  **Decided (user, 2026-10-28): adopted for what is not contract; the M3 part dropped.** `test_control` becomes
+  `get_proc_address(name)`, serving the four counter functions and the host executor's switches under their
+  current names with typedefs in the plugin header, NULL in a release plugin; every table pointer is then required.
+  M3's `module_load` and `kernel_get` are Tier-1 in the deck and join the table as members when M3 comes (a version
+  bump, or a tail under `size` in the mentor's convention), not the lookup. Environment switches stay environment
+  switches. The precedents: upstream's hook and its test-only use (`ggml_backend_cpu_set_use_ref`,
+  `U ggml-cpu.cpp:658-680`); the mentor's registry serving five FlagOS names the same way
+  (`flagos-registry.cpp:112-128`); the deck's nullable Tier-2 members kept for the contract's optional groups.
+  Scope, as the user put it: not structural, the test side; the execution model, the memory model and the contract
+  are untouched, and the one production-side effect is a lookup that returns NULL. A later option, not for S1: an
+  optional `get_proc_address` tail on `flagos_provider_v1` so the mentor's registry falls through to the active
+  provider and the check program needs no provider header (an M-entry, his call).
 - **A3. Names after `ggml-backend-impl.h`.** The table is `spacemit_plugin_i`; the handles keep their typed opaque
   structs (better than a `void * context`); the step and kernel structs keep their names. Cosmetic, for the reader
   who knows upstream.
+  **Decided (user, 2026-10-28): the `_i` rename withdrawn after A1; the mentor's spellings taken, the exact names
+  fixed with the S1 header spec.** The table stays `spacemit_plugin_v1` and the entry `flagos_spacemit_plugin_v1`;
+  the version fields become `api_version` and `struct_size` (`flagos-provider.h:66-67`, also upstream's
+  `api_version`); the status codes take his `..._STATUS_...` pattern with our meanings; typed opaque handles, `_fn`
+  typedefs, the deck's function names, `spacemit_` for the interface's types and `flagos_spacemit_` for exported
+  symbols stay as they are. Cosmetic; nothing structural.
 - **A4. The plan cache keyed by the split's `uid` first.** The scheduler stamps every split's graph
   (`ggml-backend.cpp:1538` in our base; `U :1751`), and llama.cpp keeps the split when it reuses the graph
   (`src/llama-context.cpp:1347`: no reset or re-allocation on reuse), so in generation a split keeps its `uid` from
@@ -223,16 +241,40 @@ The alterations, proposed for the user's review before the first S1 spec (the he
   a hash and a full compare every graph, becomes: `uid` lookup first; on a new `uid`, the structural compare against
   the cached entries, and a rebuild on a miss. E3c's 0.55 ms per token (the host work the cache was to remove) is then
   bounded by the lookup, and the "kept only if measured" rule stays.
+  **Reviewed 2026-10-28 and refined; left open (user).** The refined form: the uid first; behind it one entry,
+  the last plan, compared with an exhaustive key in CUDA's manner (each node's struct whole, the pointer fields
+  canonicalized: `data` and `buffer` to placement, `src` and `view_src` to node indices; `U ggml-cuda.cu:2819-2836`),
+  a rebind of the node pointers on a hit, a rebuild on a miss; the mentor's 32 entries only if alternating shapes
+  ever show. Found while reviewing: in llama.cpp's own loops a rebuild nearly always carries a shape change (graph
+  reuse fails when the mask's `n_kv` changes, `src/llama-graph.cpp:47-58`, and `n_kv` is padded to 256,
+  `src/llama-kv-cache.cpp:1238-1243`), so the uid alone captures nearly all of the per-token saving and the
+  structural layer serves callers without reuse (uid 0: test-backend-ops, the check program; `ggml.c:7372`). The
+  uid is the core's, stamped only by the scheduler and the meta device (`U ggml-backend.cpp:1233, :1751`,
+  `ggml-backend-meta.cpp:2317`), and keyed on by CUDA, SYCL, RPC and Hexagon (a one-entry `cached_uid`,
+  `U ggml-hexagon.cpp:337, :2376, :2416-2417`): general, not a GPU mechanism.
 - **A5. The entry symbol usable with `dlopen` or linked in.** Upstream's plugin unit is the backend; an inner
   `dlopen` is the deck's requirement (D10), not an upstream pattern, and a reviewer there would ask why the plugin is
   not simply part of the backend, as Metal's device layer is. So `provider.cmake` gets a switch
   (`FLAGOS_SPACEMIT_STATIC_PLUGIN`): the same header, the same table, the loader calling the entry directly when the
   plugin is linked in and `dlopen`ing it otherwise. The Mac's host plugin and the K3's real one both build either way.
   Cost: a few lines in the loader; benefit: the upstream-shaped form exists from day one.
+  **Decided (user, 2026-10-28): not adopted; `dlopen` only, the deck's plan.** The plugin stays a separately loaded
+  library, one core binary serving every chip; the linked-in form, upstream's default for its own backends
+  (`U ggml/src/CMakeLists.txt:381-397`), is not built. Consequences noted, not blockers: a statically linked
+  executable cannot use the plugin (ggml's own DL needs shared libraries, `U ggml/CMakeLists.txt:86`), and the
+  check program, ThreadSanitizer and a debugger run through the loader.
 - **A6. Two memory entries reserved for zero copy** (§5.4): `buffer_wrap(dev, ptr, size, &buf)`, the deck's
   `register_host_ptr`, behind `ggml_backend_device_i.buffer_from_host_ptr`; and `tensor_prepare(t)`, the repack from a
   tensor's own bytes into plugin memory recorded in `t->extra`, behind `init_tensor`. In S1 they are declared and the
   core's `buffer_from_host_ptr` stays null; S2's memory part implements them with the mapped buffer type.
+  **Decided (user, 2026-10-28): adopted as written.** Both entries are the deck's Tier-2 zero-copy group, so
+  nullable members under A2's rule; `register_host_ptr` is the deck's name for the first, fixed with the header
+  spec under A3; `is_host` stays false on every type, as Metal, Hexagon and the mentor's AMD. Noted from the AMD
+  code while reviewing: it has no zero copy (`hipMalloc` buffers, every weight copied at `set_tensor`, a private
+  F16 dequantized arena for prompt processing) and turns `mmap_support` off for its integrated device
+  (`providers/amd/flagos-amd.cpp:5751-5767`), the opposite direction from the deck's stage ②; the user's remark:
+  the AMD code is a reference only, and the mentor will reframe it after our core and plugin are complete and
+  tested.
 - **A7. Precedents recorded, nothing changed.** (i) The step's `ggml_tensor *` stays for S1: Hexagon's 128-byte
   kernel-parameter blob and ET's parameter blob are the shape it takes when M3's typed launch arrives. (ii) The path
   choice stays in the kernels for S1 as decided; Hexagon's solvers show the later move into the core has an upstream
@@ -240,6 +282,16 @@ The alterations, proposed for the user's review before the first S1 spec (the he
   before scheduling; it is the hook for the dependency-placed barriers of `fusion-and-splitting.md` when M4 comes.
   (iv) Upstream records an op-coverage CSV per backend under `docs/ops/` (Hexagon's lists 25 ops fully and 45 partly
   supported); an upstream submission would carry one for FlagOS.
+  **Reviewed 2026-10-28, each item against the four sources; nothing changes.** (i) The pointer: Hexagon, ET and
+  Metal pass descriptors because their device is another processor, CUDA and the CPU read the tensor as we do;
+  the deck's `launch` takes typed arguments and the mentor's AMD launches with a typed argument vector whose
+  layout the HSACO metadata declares (`providers/amd/flagos-amd-aot.cpp:897-901`, `flagos-amd-hsaco.cpp:419`).
+  (ii) The path choice: Hexagon's host-side solvers and the deck's `when` are the two forms of a core-side
+  choice; the mentor's AMD chooses in code, its AOT manifest having no `when` or `priority`
+  (`flagos-amd-aot.h:69-101`). (iii) `graph_optimize`: null in our provider (`flagos-spacemit.cpp:782`) and in
+  the mentor's (`flagos-amd.cpp:5728`); Metal and Hexagon implement it; the deck has no reorder hook. (iv)
+  Coverage: `test-backend-ops --show-coverage` and `docs/ops/` exist in our base; the deck's acceptance is
+  test-backend-ops entire, KLD below 0.01, a llama-bench baseline; the mentor's AMD has no CSV.
 
 What this does not change: the deck's five stages map as `structural-review.md` §4 found; the capture replay stays
 the K3's main path (E3a, E3b, F16); D4's storage model stands as the plugin's choice, now with the upstream rule behind
