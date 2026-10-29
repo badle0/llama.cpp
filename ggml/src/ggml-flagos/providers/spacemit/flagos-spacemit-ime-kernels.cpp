@@ -34,12 +34,16 @@
 // ggml-spacemit's copy at 855a53b). The sub-block ratios to the block scale are stored times the factor and the block
 // scale divided by it: the same product, with 1/factor times the headroom in the kernels' F16 sums of the sub-blocks
 // (gemm_kernel_i8i4_hp_*), which a ratio near 8 against weights of scale 0.5 overflowed (flagos-check-spacemit's Q4_0
-// probe). flagos: the factor is 0.125, not SpacemiT's 0.1, and since 2026-10-28 a test-only switch sets it
-// (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE, q4_0_scale_policy_read below): 1 is the quantizer before the fix, bit for bit. A
-// power of two scales every F16 intermediate exactly where the values stay normal, but the kernels' F16 scale products
-// become 8 times smaller and the small ones fall into F16's subnormals; on the K3 (build.md §7, 2026-10-28) the factor
-// 0.125 costs Qwen3-0.6B 3.9x in one-token KLD and +19% at 512-token batches against a verified CPU base, so the fix is
-// not accepted as it stands; the switch's curve (1, 0.5, 0.25, 0.125, 0.1, adaptive:<T>) decides what stays.
+// probe). flagos: not adopted. The factor is a test-only switch (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE,
+// q4_0_scale_policy_read below) whose default, 1, is the quantizer before the fix bit for bit. The K3's curve of
+// 2026-10-28 on Qwen3-0.6B against a verified CPU base (build.md §7): the one-token KLD rises monotonically as the factor
+// falls (1: 0.002533; 0.5: +14%; 0.25: +66%; 0.125: 3.9x; SpacemiT's 0.1: 5.5x; adaptive:4 3.2x, so most blocks have a
+// dominant sub-block), the batched KLD holds to 0.25 and rises from 0.125; mechanism, read from the arithmetic and not
+// isolated: the kernels' F16 scale products shrink with the factor and the small ones fall into F16's subnormals. The
+// overflow the fix guards against needs a large weight scale with a dominant sub-block (by the reference's arithmetic,
+// from d about 0.13 at the worst alignment), met by SpacemiT on Qwen2.5-3B and by none of our runs; the probe in
+// flagos-check-spacemit records it (inf under the default, expected). The proper fix is F32 for those products in the
+// kernels, SpacemiT's assembly; for a model that overflows, 0.5 gives 2x headroom at +14% one-token KLD.
 //
 // The IME and RVV code is built only with GGML_FLAGOS_SPACEMIT_IME2 (riscv64, GCC >= 15); the scalar references
 // (*_ref, plain C++) are built everywhere, so hosts without the AI cores can run the whole path.
@@ -519,14 +523,14 @@ void gemm_kernel_i8i4_hp_mrow_ref(size_t          blk_len,
 }
 
 // flagos, test-only: the stable factor of the Q4_0 activation quantizers (SpacemiT's fix, the header). Read once from
-// FLAGOS_SPACEMIT_TEST_Q4_0_SCALE: unset, the default 0.125; a number in (0, 1], that factor on every block (1 is the
-// quantizer before the fix, bit for bit); "adaptive:<T>", the factor 0.125 only on blocks whose largest sub-block
-// scale exceeds T times the block's average, every other block as before the fix. The kernels only multiply the
+// FLAGOS_SPACEMIT_TEST_Q4_0_SCALE: unset, the default 1, the quantizer before the fix bit for bit (the K3's curve of
+// 2026-10-28 chose it, build.md §7); a number in (0, 1], that factor on every block; "adaptive:<T>", the factor 0.125
+// only on blocks whose largest sub-block scale exceeds T times the block's average. The kernels only multiply the
 // stored scales, so a block's factor is the quantizer's choice alone. An unknown value warns and keeps the default.
 struct q4_0_scale_policy {
-    float factor    = 0.125f;
+    float factor    = 1.0f;
     float threshold = 0.0f;  // 0: the factor on every block
-    char  text[32]  = "0.125";
+    char  text[32]  = "1";
 };
 
 static q4_0_scale_policy q4_0_scale_policy_read() {
@@ -551,7 +555,7 @@ static q4_0_scale_policy q4_0_scale_policy_read() {
             return p;
         }
     }
-    GGML_LOG_WARN("FLAGOS_SPACEMIT_TEST_Q4_0_SCALE=%s: expected a number in (0, 1] or adaptive:<T>; using 0.125\n", v);
+    GGML_LOG_WARN("FLAGOS_SPACEMIT_TEST_Q4_0_SCALE=%s: expected a number in (0, 1] or adaptive:<T>; using 1\n", v);
     return p;
 }
 

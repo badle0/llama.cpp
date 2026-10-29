@@ -389,17 +389,19 @@ def perplexity(bdir, logs, model, text, milestone):
         return
     # as M0.6 (build.md §7): 8 x 512 tokens, flash attention on; from M2e.1 also the provider with the default -fa auto,
     # which keeps flash attention on it under IGPU (the CPU alone always keeps it, so one CPU run serves both)
-    cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-t", "8",
-           "-lv", "4"]
-    # from M2e.1 the CPU run also saves its logits for the KLD runs (about 600 MB at Qwen3's vocabulary)
+    cmd = [str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "8", "-lv", "4"]
+    # from M2e.1 the CPU run also saves its logits for the KLD runs (about 600 MB at Qwen3's vocabulary).
+    # The CPU run is single-threaded since 2026-10-29 (PROJECT.md §6, item 28): with several threads on the X100 cores
+    # the CPU path is wrong at random for models with Q4_1 tensors, and a wrong base reads as a provider regression.
+    # It takes longer (about 5 minutes on Qwen3-0.6B, about half an hour on 4B); the provider's run keeps 8 threads.
     kld_base = logs / "kld-base.bin"
-    runs = [("enabled", ["-fa", "on"], {}, ("FLAGOS_SPACEMIT_DISABLE",)),
+    runs = [("enabled", ["-t", "8", "-fa", "on"], {}, ("FLAGOS_SPACEMIT_DISABLE",)),
             ("disabled",
-             ["-fa", "on"] + (["--kl-divergence-base", str(kld_base)] if milestone in ("m2e", "igpu") else []),
+             ["-t", "1", "-fa", "on"] + (["--kl-divergence-base", str(kld_base)] if milestone in ("m2e", "igpu") else []),
              {"FLAGOS_SPACEMIT_DISABLE": "1"}, ())]
     if milestone in ("m2e", "igpu"):
         kld_base.unlink(missing_ok=True)
-        runs.append(("enabled-fa-auto", [], {}, ("FLAGOS_SPACEMIT_DISABLE",)))
+        runs.append(("enabled-fa-auto", ["-t", "8"], {}, ("FLAGOS_SPACEMIT_DISABLE",)))
     ppl, problems, fa_auto = {}, {}, None
     for name, fa, extra, drop in runs:
         rc, out, err = run([*cmd, *fa], logs / f"ppl-{name}", env_extra={**extra, **preload}, env_drop=drop,
