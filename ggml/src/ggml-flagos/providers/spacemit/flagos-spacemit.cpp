@@ -8,7 +8,7 @@
 #include "flagos-spacemit-exec.h"
 #include "flagos-spacemit-ime.h"
 #include "flagos-spacemit-ops.h"
-#include "flagos-spacemit-weights.h"
+#include "core/flagos-spacemit-loader.h"
 
 #include "../../../ggml-backend-impl.h"
 #include "../../../ggml-impl.h"
@@ -16,29 +16,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <tuple>
 #include <vector>
-
-#if defined(__linux__)
-#    include <unistd.h>
-#endif
-#if !defined(_WIN32)
-#    include <sys/mman.h>
-#endif
-#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE) && defined(__APPLE__)
-#    include <sys/sysctl.h>
-#endif
 
 namespace {
 
@@ -51,27 +38,37 @@ constexpr uint32_t SPACEMIT_A100_VECTOR_BITS  = 1024;
 
 struct spacemit_device_context {
     std::string                name;
-    std::string                description;
+    std::string                description;  // from the plugin's props
+    std::string                runtime;      // from the plugin's props (the FlagOS profile)
     uint32_t                   n_ai_cores = 0;
+    spacemit_plugin *          plugin     = nullptr;  // kept for the process lifetime, as ggml keeps its backends
+    const spacemit_plugin_v1 * table      = nullptr;
+    spacemit_plugin_device *   dev        = nullptr;
     ggml_backend_device        device     = {};
     ggml_backend_buffer_type   buffer_type = {};
     std::mutex                 run_mutex;  // backends of this device share the same AI cores
 };
 
 struct spacemit_buffer_context {
-    void * data   = nullptr;
-    size_t size   = 0;
-    size_t mapped = 0;  // > 0: data is a mapping of this many bytes (spacemit_map_huge), else from ggml_aligned_malloc
+    const spacemit_plugin_v1 * table = nullptr;
+    spacemit_plugin_buffer *   buf   = nullptr;  // the plugin's buffer
+    void *                     data  = nullptr;  // its base
+    size_t                     size  = 0;
 };
 
 struct spacemit_backend_context {
-    std::unique_ptr<spacemit_executor> executor;
-    std::vector<spacemit_step>         steps;
-    void *                             workspace      = nullptr;  // shared by the tiles; grows to the largest split
-    size_t                             workspace_size = 0;
-    spacemit_run_stats                 run_stats;  // test-only (E3c): the current graph's, with FLAGOS_SPACEMIT_TEST_STATS
+    const spacemit_plugin_v1 *        table  = nullptr;
+    spacemit_plugin_stream *          stream = nullptr;
+    spacemit_run_stats_attach_fn      attach = nullptr;  // test-only (E3c), nullptr when the plugin has no counters
+    std::vector<spacemit_plugin_step> steps;
+    void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
+    size_t                            workspace_size = 0;
+    spacemit_run_stats                run_stats;  // test-only (E3c): the current graph's, with FLAGOS_SPACEMIT_TEST_STATS
 
     ~spacemit_backend_context() {
+        if (stream != nullptr) {
+            table->stream_destroy(stream);
+        }
         if (workspace != nullptr) {
             ggml_aligned_free(workspace, workspace_size);
         }
@@ -86,50 +83,22 @@ spacemit_device_context g_device;
 ggml_guid g_backend_guid = { 0x46, 0x6c, 0x61, 0x67, 0x4f, 0x53, 0x2d, 0x53, 0x50, 0x4d, 0x54, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 //
-// buffer: host memory on huge pages where the system has them (spacemit_map_huge), else 64-byte aligned; Q4_0, Q4_1,
+// buffer: the plugin's memory (host memory on huge pages where the system has them, else 64-byte aligned); Q4_0, Q4_1,
 // Q8_0 and Q6_K matmul weights are stored in IME layouts (flagos-spacemit-weights.h), a Q6_K weight in more than
 // ggml_nbytes (get_alloc_size). set, get, memset and cpy work in ggml's layout within ggml_nbytes; only the repack and
 // its inverse touch the stored bytes beyond it, and clear covers the whole buffer.
 //
 
-#if defined(MADV_HUGEPAGE)
-constexpr size_t SPACEMIT_HUGE_PAGE = size_t(2) << 20;
-
-// memory on 2 MiB transparent huge pages, as the in-tree path keeps its weights (ggml-cpu/spacemit/spine_mem_pool.cpp,
-// HPAGE): the K3 gives them only on request (madvise). Measured on the K3 (plan.md, "1-row matmul bandwidth"): with the
-// weights on huge pages, Qwen3-4B generates about 1% faster (the in-tree path: 2%). Whole huge pages from a huge page
-// boundary; nullptr if the mapping fails. If madvise is refused, the memory keeps the default pages.
-void * spacemit_map_huge(size_t size, size_t & mapped) {
-    constexpr size_t huge = SPACEMIT_HUGE_PAGE;
-    const size_t     len  = GGML_PAD(size, huge);
-    void *           raw  = mmap(nullptr, len + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED) {
-        return nullptr;
+// a status the buffer functions cannot report to ggml, which expects them to succeed
+void spacemit_buffer_status(const char * what, enum spacemit_status status) {
+    if (status != SPACEMIT_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("FlagOS SpacemiT: %s failed: %s\n", what, spacemit_status_name(status));
     }
-    // one huge page more than needed, trimmed at both ends to start on a huge page boundary
-    uint8_t * base = static_cast<uint8_t *>(raw);
-    uint8_t * data = reinterpret_cast<uint8_t *>(GGML_PAD(reinterpret_cast<uintptr_t>(base), huge));
-    if (data > base) {
-        munmap(base, (size_t) (data - base));
-    }
-    munmap(data + len, huge - (size_t) (data - base));
-    if (madvise(data, len, MADV_HUGEPAGE) != 0) {
-        GGML_LOG_DEBUG("FlagOS SpacemiT: madvise(MADV_HUGEPAGE) failed (errno %d); default pages\n", errno);
-    }
-    mapped = len;
-    return data;
 }
-#endif
 
 void spacemit_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<spacemit_buffer_context *>(buffer->context);
-    if (ctx->mapped > 0) {
-#if defined(MADV_HUGEPAGE)
-        munmap(ctx->data, ctx->mapped);
-#endif
-    } else {
-        ggml_aligned_free(ctx->data, ctx->size);
-    }
+    ctx->table->buffer_free(ctx->buf);
     delete ctx;
 }
 
@@ -137,23 +106,30 @@ void * spacemit_buffer_base(ggml_backend_buffer_t buffer) {
     return static_cast<spacemit_buffer_context *>(buffer->context)->data;
 }
 
-void spacemit_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    spacemit_tensor_fill(tensor, value, offset, size);
+void spacemit_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset,
+                                   size_t size) {
+    auto * ctx = static_cast<spacemit_buffer_context *>(buffer->context);
+    spacemit_buffer_status("memset_tensor", ctx->table->tensor_fill(tensor, value, offset, size));
 }
 
 // repacks; reads undo the repack (Q4_1: the converted weights; Q6_K: the nearest Q6_K), so the scheduler can still copy
 // a weight out if the provider refuses an op on it
-void spacemit_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    spacemit_tensor_write(tensor, data, offset, size);
+void spacemit_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
+                                size_t size) {
+    auto * ctx = static_cast<spacemit_buffer_context *>(buffer->context);
+    spacemit_buffer_status("set_tensor", ctx->table->tensor_set(tensor, data, offset, size));
 }
 
-void spacemit_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    spacemit_tensor_read(tensor, data, offset, size);
+void spacemit_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset,
+                                size_t size) {
+    auto * ctx = static_cast<spacemit_buffer_context *>(buffer->context);
+    spacemit_buffer_status("get_tensor", ctx->table->tensor_get(tensor, data, offset, size));
 }
 
 // a raw copy would skip the repack; returning false makes ggml use set_tensor instead
-bool spacemit_buffer_cpy_tensor(ggml_backend_buffer_t, const ggml_tensor * src, ggml_tensor * dst) {
-    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) || spacemit_tensor_is_repacked(dst)) {
+bool spacemit_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    auto * ctx = static_cast<spacemit_buffer_context *>(buffer->context);
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) || ctx->table->tensor_layout(dst) != 0) {
         return false;
     }
     std::memcpy(dst->data, src->data, ggml_nbytes(src));
@@ -183,26 +159,17 @@ const char * spacemit_buffer_type_name(ggml_backend_buffer_type_t) {
     return "FlagOS:SpacemiT";
 }
 
-// ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it. Buffers of at least one huge page
-// go on huge pages; a smaller one would gain nothing and still take a whole one (about 0.75 ms to fault in on the K3).
-// test-only: FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1 keeps the default pages, for comparison
+// ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it. The plugin decides the pages
+// (huge pages from 2 MiB; test-only: FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1 keeps the default pages, for comparison)
 ggml_backend_buffer_t spacemit_buffer_type_alloc(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data   = nullptr;
-    size_t mapped = 0;
-#if defined(MADV_HUGEPAGE)
-    const char * no_huge = std::getenv("FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES");
-    if (size >= SPACEMIT_HUGE_PAGE && (no_huge == nullptr || std::strcmp(no_huge, "0") == 0)) {
-        data = spacemit_map_huge(size, mapped);
-    }
-#endif
-    if (data == nullptr) {
-        data = ggml_aligned_malloc(size);
-    }
-    if (data == nullptr) {
-        GGML_LOG_ERROR("FlagOS SpacemiT: failed to allocate a %zu-byte buffer\n", size);
+    auto *                   dev = static_cast<spacemit_device_context *>(buft->context);
+    spacemit_plugin_buffer * buf = nullptr;
+    const enum spacemit_status status = dev->table->buffer_alloc(dev->dev, size, &buf);
+    if (status != SPACEMIT_STATUS_SUCCESS) {
+        spacemit_buffer_status("alloc_buffer", status);
         return nullptr;
     }
-    auto * ctx = new spacemit_buffer_context{ data, size, mapped };
+    auto * ctx = new spacemit_buffer_context{ dev->table, buf, dev->table->buffer_base(buf), size };
     return ggml_backend_buffer_init(buft, g_buffer_iface, ctx, size);
 }
 
@@ -211,8 +178,8 @@ size_t spacemit_buffer_type_alignment(ggml_backend_buffer_type_t) {
 }
 
 // a Q6_K weight is stored requantized to Q8_0: 34 bytes per 32 weights instead of 26.25
-size_t spacemit_buffer_type_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
-    return spacemit_weight_alloc_size(tensor);
+size_t spacemit_buffer_type_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    return static_cast<spacemit_device_context *>(buft->context)->table->tensor_alloc_size(tensor);
 }
 
 const ggml_backend_buffer_type_i g_buffer_type_iface = {
@@ -412,15 +379,15 @@ std::string spacemit_role(const ggml_tensor * t) {
 
 // a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention), the role its tensors'
 // names give, and its rows (r: the output's; m: a matmul's activations', after its weight type)
-std::string spacemit_step_label(const std::vector<spacemit_step> & steps, size_t i) {
-    const spacemit_step & step = steps[i];
-    const ggml_tensor *   n    = step.node;
-    const long long       r    = static_cast<long long>(ggml_nrows(n));
-    char                  buf[192];
+std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps, size_t i) {
+    const spacemit_plugin_step & step = steps[i];
+    const ggml_tensor *          n    = step.node;
+    const long long              r    = static_cast<long long>(ggml_nrows(n));
+    char                         buf[192];
     switch (n->op) {
         case GGML_OP_MUL_MAT:
             std::snprintf(buf, sizeof(buf), "MUL_MAT.%s %s %s m%lld",
-                          step.kernel == spacemit_mul_mat_quantize ? "quantize" : "gemm", spacemit_role(n->src[0]).c_str(),
+                          step.fn == spacemit_mul_mat_quantize ? "quantize" : "gemm", spacemit_role(n->src[0]).c_str(),
                           ggml_type_name(n->src[0]->type), static_cast<long long>(ggml_nrows(n->src[1])));
             break;
         case GGML_OP_RMS_NORM:
@@ -466,8 +433,8 @@ std::string spacemit_step_label(const std::vector<spacemit_step> & steps, size_t
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             std::snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT.%s q%lld kv%lld",
-                          step.kernel == spacemit_kernel_flash_attn       ? "one-step" :
-                          step.kernel == spacemit_kernel_flash_attn_split_merge ? "merge" :
+                          step.fn == spacemit_kernel_flash_attn                 ? "one-step" :
+                          step.fn == spacemit_kernel_flash_attn_split_merge     ? "merge" :
                                                                                   "partial",
                           static_cast<long long>(n->src[0]->ne[1]), static_cast<long long>(n->src[1]->ne[1]));
             break;
@@ -494,7 +461,7 @@ class spacemit_op_stats_file {
         return file.path.empty() ? nullptr : &file;
     }
 
-    void add(const char * launch, int64_t rows, int64_t n_kv, const std::vector<spacemit_step> & steps,
+    void add(const char * launch, int64_t rows, int64_t n_kv, const std::vector<spacemit_plugin_step> & steps,
              const spacemit_run_stats & run) {
         const size_t   n     = steps.size();
         const uint32_t tiles = run.n_tiles;
@@ -607,11 +574,11 @@ class spacemit_op_stats_file {
 
     // what tells two graphs' steps apart: kernels, ops and shapes, not addresses, which may change when llama.cpp
     // builds the same graph again
-    static uint64_t structure_of(const std::vector<spacemit_step> & steps) {
+    static uint64_t structure_of(const std::vector<spacemit_plugin_step> & steps) {
         uint64_t   h   = 0xcbf29ce484222325ULL;
         const auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001b3ULL; };
-        for (const spacemit_step & s : steps) {
-            mix(reinterpret_cast<uintptr_t>(s.kernel));
+        for (const spacemit_plugin_step & s : steps) {
+            mix(reinterpret_cast<uintptr_t>(s.fn));
             mix(static_cast<uint64_t>(s.node->op));
             for (int d = 0; d < GGML_MAX_DIMS; d++) {
                 mix(static_cast<uint64_t>(s.node->ne[d]));
@@ -695,7 +662,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             }
         }
         for (uint32_t s = first; s < op->n_steps; s++) {
-            ctx->steps.push_back({ op->steps[s], node });
+            ctx->steps.push_back({ op->steps[s], node, 0 });
         }
         if (op->workspace_size != nullptr) {
             size_t & size = node->op == GGML_OP_MUL_MAT ? act_size : scratch_size;
@@ -707,7 +674,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
     const size_t act_offset     = GGML_PAD(scratch_size, 64);
     const size_t workspace_size = act_offset + act_size;
-    for (spacemit_step & step : ctx->steps) {
+    for (spacemit_plugin_step & step : ctx->steps) {
         step.workspace_offset = step.node->op == GGML_OP_MUL_MAT ? act_offset : 0;
     }
     if (workspace_size > ctx->workspace_size) {
@@ -723,33 +690,32 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
 
     std::lock_guard<std::mutex> lock(dev->run_mutex);
-    const spacemit_launch_kind  mode    = spacemit_launch_mode();
-    const bool                  counted = timed && mode != spacemit_launch_kind::per_step_join;
+    const spacemit_launch_kind  mode = spacemit_launch_mode();
+    if (timed && ctx->attach == nullptr) {
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("FlagOS SpacemiT: the plugin has no step counters; the test statistics stay off\n");
+        }
+    }
+    const bool counted = timed && mode != spacemit_launch_kind::per_step_join && ctx->attach != nullptr;
     if (counted) {
         ctx->run_stats.reset(ctx->steps.size());
     }
-    ctx->executor->stats = counted ? &ctx->run_stats : nullptr;
-    bool ok              = true;
-    switch (mode) {
-        case spacemit_launch_kind::per_step:
-            {
-                // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every
-                // tile before the next starts, as the barrier after a step does inside one launch
-                std::vector<spacemit_step> one(1);
-                for (size_t i = 0; i < ctx->steps.size() && ok; i++) {
-                    one[0] = ctx->steps[i];
-                    ok     = ctx->executor->run(one, ctx->workspace, ctx->workspace_size);
-                }
-                break;
-            }
-        case spacemit_launch_kind::per_step_join:
-            ok = ctx->executor->run_ordered(ctx->steps, ctx->workspace, ctx->workspace_size);
-            break;
-        case spacemit_launch_kind::per_split:
-            ok = ctx->executor->run(ctx->steps, ctx->workspace, ctx->workspace_size);
-            break;
+    if (ctx->attach != nullptr) {
+        ctx->attach(ctx->stream, counted ? &ctx->run_stats : nullptr);
     }
-    ctx->executor->stats = nullptr;
+    // test-only: the two launch modes of E3a and E3b, one launch per step, are flags of the replay
+    uint32_t flags = 0;
+    if (mode == spacemit_launch_kind::per_step) {
+        flags |= SPACEMIT_REPLAY_SYNC_LAUNCH;
+    } else if (mode == spacemit_launch_kind::per_step_join) {
+        flags |= SPACEMIT_REPLAY_ORDERED_LAUNCHES;
+    }
+    const bool ok = ctx->table->replay(ctx->stream, ctx->steps.data(), static_cast<uint32_t>(ctx->steps.size()),
+                                       ctx->workspace, ctx->workspace_size, flags) == SPACEMIT_STATUS_SUCCESS;
+    if (ctx->attach != nullptr) {
+        ctx->attach(ctx->stream, nullptr);
+    }
     if (ok && counted) {
         const char * launch   = mode == spacemit_launch_kind::per_step ? "per-step" : "per-split";
         const double graph_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
@@ -798,30 +764,12 @@ const char * spacemit_device_description(ggml_backend_dev_t dev) {
     return spacemit_device_from_dev(dev)->description.c_str();
 }
 
-// the AI cores use the same DRAM as the CPU cores
-void spacemit_device_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
-#if defined(__linux__)
-    std::ifstream meminfo("/proc/meminfo");
-    std::string   line;
-    while (std::getline(meminfo, line)) {
-        const size_t value_kib = std::strtoull(line.c_str() + line.find(':') + 1, nullptr, 10);
-        if (line.rfind("MemTotal:", 0) == 0) {
-            *total = value_kib * 1024;
-        } else if (line.rfind("MemAvailable:", 0) == 0) {
-            *free = value_kib * 1024;
-        }
-    }
-#elif defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE) && defined(__APPLE__)
-    // simulated device on a Mac: the host's memory size; free memory is not tracked
-    uint64_t bytes = 0;
-    size_t   len   = sizeof(bytes);
-    if (sysctlbyname("hw.memsize", &bytes, &len, nullptr, 0) == 0) {
-        *free  = bytes;
-        *total = bytes;
-    }
-#endif
+// the AI cores use the same DRAM as the CPU cores (the plugin reads it)
+void spacemit_device_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    auto * ctx = spacemit_device_from_dev(dev);
+    *free      = 0;
+    *total     = 0;
+    spacemit_buffer_status("get_memory", ctx->table->device_memory(ctx->dev, free, total));
 }
 
 // IGPU (D3, 2026-10-26): llama.cpp gives the device whole layers and their KV cache, which lives in our buffer.
@@ -861,17 +809,21 @@ void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
     };
 }
 
-// experiment switch: FLAGOS_SPACEMIT_STREAM=per-call releases the AI cores after every graph (M2a measures both)
-spacemit_stream_policy spacemit_stream_policy_from_env() {
-    const char * value = std::getenv("FLAGOS_SPACEMIT_STREAM");
-    return value != nullptr && std::strcmp(value, "per-call") == 0 ? spacemit_stream_policy::per_call
-                                                                    : spacemit_stream_policy::persistent;
-}
-
+// one stream per backend context; the plugin holds the core grant until it is destroyed (FLAGOS_SPACEMIT_STREAM is the
+// plugin's switch now)
 ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
-    auto * ctx     = new spacemit_backend_context;
-    ctx->executor  = spacemit_executor_create(spacemit_stream_policy_from_env(), spacemit_device_from_dev(dev)->n_ai_cores);
-    GGML_LOG_DEBUG("FlagOS SpacemiT: backend uses %s\n", ctx->executor->name());
+    auto *                   dctx   = spacemit_device_from_dev(dev);
+    spacemit_plugin_stream * stream = nullptr;
+    const enum spacemit_status status = dctx->table->stream_create(dctx->dev, dctx->n_ai_cores, &stream);
+    if (status != SPACEMIT_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("FlagOS SpacemiT: the plugin could not create a stream: %s\n", spacemit_status_name(status));
+        return nullptr;
+    }
+    auto * ctx  = new spacemit_backend_context;
+    ctx->table  = dctx->table;
+    ctx->stream = stream;
+    // test-only (E3c): the per-tile clock reads are not contract, so they come by name (plan.md "S1 design" A2)
+    ctx->attach = reinterpret_cast<spacemit_run_stats_attach_fn>(dctx->table->get_proc_address("spacemit_run_stats_attach"));
     return new ggml_backend{
         /* .guid    = */ &g_backend_guid,
         /* .iface   = */ g_backend_iface,
@@ -914,40 +866,12 @@ const ggml_backend_device_i g_device_iface = {
 };
 
 //
-// probe: a K3 is detected by its A100 cores in /proc/cpuinfo and the AI-thread gate
+// probe: the plugin is loaded, checked and asked for its device; the K3 itself is detected inside the plugin (its A100
+// cores in /proc/cpuinfo and the AI-thread gate)
 //
 
-uint32_t spacemit_count_ai_cores() {
-#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
-    return 8;  // simulated device (tests only, non-riscv64 builds): the K3's 8 AI cores
-#elif defined(__linux__) && defined(__riscv)
-    constexpr uint64_t a100_marchid = 0x8000000041000002ULL;
-    std::ifstream      cpuinfo("/proc/cpuinfo");
-    std::string   line;
-    uint32_t      count = 0;
-    while (std::getline(cpuinfo, line)) {
-        if (line.rfind("marchid", 0) != 0) {
-            continue;
-        }
-        const size_t colon = line.find(':');
-        if (colon != std::string::npos && std::strtoull(line.c_str() + colon + 1, nullptr, 16) == a100_marchid) {
-            count++;
-        }
-    }
-    return count;
-#else
-    return 0;
-#endif
-}
-
-bool spacemit_ai_gate_available() {
-#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
-    return true;
-#elif defined(__linux__)
-    return access("/proc/set_ai_thread", W_OK) == 0;
-#else
-    return false;
-#endif
+void spacemit_host_log(int level, const char * text) {
+    ggml_log_internal((enum ggml_log_level) level, "%s\n", text);
 }
 
 bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
@@ -964,22 +888,61 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
         return false;
     }
 
-    const uint32_t n_ai_cores = spacemit_count_ai_cores();
-    if (n_ai_cores == 0) {
+    // the host table the loader hands to the entry, with the directory the plugin came from; static so the strings
+    // outlive the call whatever a plugin does with them (ours copies what it keeps)
+    static std::string      plugin_dir;
+    static spacemit_host_v1 host;
+    bool                    self = false;                               // the path is the core's own image (A5)
+    const std::string       path = spacemit_plugin_default_path(&self);  // the same path the loader resolves
+    const size_t            cut  = path.find_last_of('/');
+    plugin_dir                   = cut != std::string::npos ? path.substr(0, cut) : std::string(".");
+    host.struct_size             = sizeof(spacemit_host_v1);
+    host.log                     = spacemit_host_log;
+    host.plugin_dir              = plugin_dir.c_str();
+
+    spacemit_plugin * plugin = nullptr;
+    std::string       detail;
+    const spacemit_load_result loaded = spacemit_plugin_load(nullptr, host, spacemit_required_kernels,
+                                                             spacemit_n_required_kernels, &plugin, &detail);
+    if (loaded != spacemit_load_result::ok) {
+        if (loaded == spacemit_load_result::no_device) {
+            // the ordinary case on a host without the AI cores
+            GGML_LOG_DEBUG("FlagOS SpacemiT: no device: %s (%s)\n", detail.c_str(), path.c_str());
+        } else if (loaded == spacemit_load_result::not_found && self) {
+            // a statically linked executable cannot be dlopened: A5's documented consequence, not a fault
+            GGML_LOG_DEBUG("FlagOS SpacemiT: no plugin in this image: %s (%s)\n", detail.c_str(), path.c_str());
+        } else {
+            GGML_LOG_WARN("FlagOS SpacemiT: the plugin %s was not loaded: %s\n", path.c_str(), detail.c_str());
+        }
         return false;
     }
-    if (!spacemit_ai_gate_available()) {
-        GGML_LOG_WARN("FlagOS SpacemiT: %u A100 cores found but /proc/set_ai_thread is not writable\n", n_ai_cores);
+
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(plugin);
+    spacemit_plugin_device *   pdev  = nullptr;
+    enum spacemit_status       status = table->device_open(0, &pdev);
+    if (status != SPACEMIT_STATUS_SUCCESS) {
+        GGML_LOG_WARN("FlagOS SpacemiT: the plugin's device 0 did not open: %s\n", spacemit_status_name(status));
+        spacemit_plugin_unload(plugin);
+        return false;
+    }
+    spacemit_plugin_device_props props = {};
+    props.struct_size                  = sizeof(props);
+    status                             = table->device_props(pdev, &props);
+    if (status != SPACEMIT_STATUS_SUCCESS) {
+        GGML_LOG_WARN("FlagOS SpacemiT: the plugin's device properties are not available: %s\n",
+                      spacemit_status_name(status));
+        table->device_close(pdev);
+        spacemit_plugin_unload(plugin);
         return false;
     }
 
     g_device.name                 = "FlagOS:SpacemiT:0";
-#if defined(GGML_FLAGOS_SPACEMIT_HOST_TEST_DEVICE)
-    g_device.description          = "simulated SpacemiT K3 device for tests (" + std::to_string(n_ai_cores) + " tiles, serial)";
-#else
-    g_device.description          = "SpacemiT K3 A100 AI cores (" + std::to_string(n_ai_cores) + ")";
-#endif
-    g_device.n_ai_cores           = n_ai_cores;
+    g_device.description          = props.description != nullptr ? props.description : "";
+    g_device.runtime              = props.runtime != nullptr ? props.runtime : "none";
+    g_device.n_ai_cores           = props.n_tiles;
+    g_device.plugin               = plugin;
+    g_device.table                = table;
+    g_device.dev                  = pdev;
     g_device.device.iface         = g_device_iface;
     g_device.device.reg           = owner_reg;
     g_device.device.context       = &g_device;
@@ -1055,11 +1018,7 @@ bool spacemit_device_profile(size_t index, flagos_device_profile * profile) {
     profile->architecture      = "a100";
     profile->microarchitecture = "rvv1024-ime2";
     profile->target            = "riscv64-a100-ime2";
-#if defined(GGML_FLAGOS_SPACEMIT_SPERT)
-    profile->runtime           = "spine-runtime";
-#else
-    profile->runtime           = "none";
-#endif
+    profile->runtime           = g_device.runtime.c_str();  // the plugin's props
     profile->aot_format        = nullptr;
     return flagos_device_profile_is_valid(profile);
 }
@@ -1083,6 +1042,11 @@ int spacemit_score() {
 }
 
 }  // namespace
+
+const spacemit_plugin * spacemit_device_plugin(ggml_backend_dev_t dev) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return dev != nullptr && dev->context == &g_device ? g_device.plugin : nullptr;
+}
 
 const flagos_provider_v1 * flagos_spacemit_provider() {
     static const flagos_provider_v1 provider = {

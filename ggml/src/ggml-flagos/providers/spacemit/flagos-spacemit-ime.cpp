@@ -429,11 +429,11 @@ size_t spacemit_mul_mat_workspace(const ggml_tensor * node) {
     return GGML_PAD((size_t) (d.m * d.a_row_bytes), 64);
 }
 
-void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_b, uint64_t & path_c, uint64_t & path_b_staged) {
-    path_a        = g_path_a.exchange(0);
-    path_b        = g_path_b.exchange(0);
-    path_c        = g_path_c.exchange(0);
-    path_b_staged = g_path_b_staged.exchange(0);
+void spacemit_mm_paths_take(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c, uint64_t * path_b_staged) {
+    *path_a        = g_path_a.exchange(0);
+    *path_b        = g_path_b.exchange(0);
+    *path_c        = g_path_c.exchange(0);
+    *path_b_staged = g_path_b_staged.exchange(0);
 }
 
 void spacemit_mm_tail_take(uint64_t * rows, uint64_t * calls, uint32_t n_tiles) {
@@ -460,7 +460,8 @@ bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor 
 
 // step 1: quantize the activations into the workspace. One row: the tiles split its K blocks. Several rows: the tiles
 // split blocks of 4 rows; full blocks are stored interleaved for the 4-row kernel, the last partial block row by row.
-bool spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node) {
+bool spacemit_mul_mat_quantize(const spacemit_tile * tile_p, ggml_tensor * node) {
+    const spacemit_tile & tile = *tile_p;
     const mm_dims d         = mm_dims_of(node);
     const bool    reference = use_reference();
     const float * x         = static_cast<const float *>(node->src[1]->data);
@@ -495,7 +496,8 @@ bool spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node) {
 }
 
 // step 2: multiply. The path depends only on the shape and the TCM size, which all tiles agree on.
-bool spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node) {
+bool spacemit_mul_mat_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
+    const spacemit_tile & tile = *tile_p;
     const mm_dims   d         = mm_dims_of(node);
     const bool      reference = use_reference();
     const uint8_t * qa        = static_cast<const uint8_t *>(tile.workspace);

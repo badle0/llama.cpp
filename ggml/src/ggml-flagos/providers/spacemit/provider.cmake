@@ -8,6 +8,10 @@ set(FLAGOS_SPACEMIT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 list(APPEND FLAGOS_SOURCES
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-api.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plugin.h"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-loader.h"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-loader.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-plugin.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-exec.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-exec.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ops.h"
@@ -27,6 +31,8 @@ list(APPEND FLAGOS_SOURCES
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.cpp")
 list(APPEND FLAGOS_PRIVATE_DEFINITIONS GGML_FLAGOS_HAVE_SPACEMIT)
+# the core's loader calls dlopen itself (ggml's dl_load_library lives in libggml, which a backend must not depend on)
+list(APPEND FLAGOS_PRIVATE_LIBRARIES ${CMAKE_DL_LIBS})
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     # the CPU backend's SpacemiT path would be a second TCM user in the same process

@@ -32,6 +32,8 @@
 #include "ggml-cpu.h"
 #include "ggml-flagos.h"
 #include "ggml.h"
+#include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
+#include "providers/spacemit/flagos-spacemit-api.h"   // spacemit_device_plugin
 #include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
 #include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
 #include "providers/spacemit/flagos-spacemit-ime-kernels.h"  // the Q4_0 scale policy (test-only switch)
@@ -153,6 +155,148 @@ static int check_registry(ggml_backend_dev_t dev, size_t global_index) {
     std::printf("flagos   provider %s (id 0x%016llx), engine cpu, %u AI cores, VLEN %u, target %s, runtime %s\n",
                 info.provider.name, (unsigned long long) info.provider.id, info.profile.concurrency,
                 info.profile.vector_bits, info.profile.target, info.profile.runtime);
+    return 0;
+}
+
+static bool readable_file(const char * path) {
+    FILE * f = std::fopen(path, "rb");
+    if (f == nullptr) {
+        return false;
+    }
+    std::fclose(f);
+    return true;
+}
+
+static void loader_log(int level, const char * text) {  // the plugin logs through GGML_LOG_* in this build
+    (void) level;
+    (void) text;
+}
+
+// S1 step 1 (plan.md "S1 step 1 spec" §7): the plugin the core loaded through the loader, its table, the names that
+// are not contract, and the loader's negative matrix on the fake plugins of tests/plugins
+static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
+    const spacemit_plugin * loaded = spacemit_device_plugin(dev);
+    REQUIRE(loaded != nullptr);
+    const char * path = spacemit_plugin_path(loaded);
+    REQUIRE(path != nullptr && *path != '\0');
+    CHECK(readable_file(path));
+
+    spacemit_host_v1 host = {};
+    host.struct_size      = sizeof(host);
+    host.log              = loader_log;
+    host.plugin_dir       = FLAGOS_SPACEMIT_TEST_PLUGIN_DIR;
+
+    // the same library loads again: one dlopen more on an already loaded library
+    spacemit_plugin * again  = nullptr;
+    std::string       detail;
+    REQUIRE(spacemit_plugin_load(path, host, spacemit_required_kernels, spacemit_n_required_kernels, &again,
+                                 &detail) == spacemit_load_result::ok);
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(again);
+    REQUIRE(table != nullptr);
+    CHECK(table->api_version == FLAGOS_SPACEMIT_PLUGIN_API_VERSION);
+    CHECK(table->struct_size == sizeof(spacemit_plugin_v1));
+    CHECK(table->register_host_ptr == nullptr && table->tensor_prepare == nullptr);  // zero copy: S2
+
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    REQUIRE(kernels != nullptr);
+    CHECK(n_kernels == spacemit_n_required_kernels);
+    for (size_t i = 0; i < spacemit_n_required_kernels; i++) {
+        bool found = false;
+        for (uint32_t k = 0; k < n_kernels; k++) {
+            found = found || (kernels[k].name != nullptr && kernels[k].fn != nullptr &&
+                              std::strcmp(kernels[k].name, spacemit_required_kernels[i]) == 0);
+        }
+        CHECK(found);
+    }
+
+    // what is not contract comes by name (plan.md "S1 design" A2); this build is one library, so the four names the
+    // check program can call itself must answer with those very functions
+    const char * names[] = { "spacemit_steps_take", "spacemit_ordered_counts_take", "spacemit_mm_paths_take",
+                             "spacemit_mm_tail_take", "spacemit_run_stats_attach" };
+    size_t       n_names = 0;
+    for (const char * name : names) {
+        n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
+    }
+    CHECK(n_names == sizeof(names) / sizeof(names[0]));
+    CHECK(table->get_proc_address("spacemit_steps_take") ==
+          reinterpret_cast<void *>(static_cast<spacemit_steps_take_fn>(spacemit_steps_take)));
+    CHECK(table->get_proc_address("spacemit_ordered_counts_take") ==
+          reinterpret_cast<void *>(static_cast<spacemit_ordered_counts_take_fn>(spacemit_ordered_counts_take)));
+    CHECK(table->get_proc_address("spacemit_mm_paths_take") ==
+          reinterpret_cast<void *>(static_cast<spacemit_mm_paths_take_fn>(spacemit_mm_paths_take)));
+    CHECK(table->get_proc_address("spacemit_mm_tail_take") ==
+          reinterpret_cast<void *>(static_cast<spacemit_mm_tail_take_fn>(spacemit_mm_tail_take)));
+    CHECK(table->get_proc_address("nonexistent") == nullptr);
+
+    // the device facts the core reports come from the plugin's props
+    size_t                   tcm  = 0;
+    spacemit_plugin_device * pdev = nullptr;
+    spacemit_plugin_device * second = nullptr;
+    CHECK(table->device_open(0, &pdev) == SPACEMIT_STATUS_SUCCESS);
+    CHECK(table->device_open(1, &second) == SPACEMIT_STATUS_INVALID_ARGUMENT);
+    CHECK(second == nullptr);
+    if (pdev != nullptr) {
+        spacemit_plugin_device_props props = {};
+        props.struct_size                  = sizeof(props);
+        CHECK(table->device_props(pdev, &props) == SPACEMIT_STATUS_SUCCESS);
+        CHECK(props.n_tiles > 0 && props.vector_bits == 1024);
+        CHECK(props.target != nullptr && props.runtime != nullptr && props.description != nullptr);
+        tcm = props.tcm_bytes_per_tile;
+        flagos_device_info info;
+        CHECK(flagos_registry_get_device_info(global_index, &info) && info.profile.runtime != nullptr &&
+              std::strcmp(info.profile.runtime, props.runtime) == 0);
+        CHECK(info.profile.concurrency == props.n_tiles);
+        props.struct_size = sizeof(props) - 1;  // a props struct the plugin cannot fill
+        CHECK(table->device_props(pdev, &props) == SPACEMIT_STATUS_INVALID_ARGUMENT);
+        table->device_close(pdev);
+    }
+    const uint32_t api = table->api_version, struct_size = table->struct_size;
+    spacemit_plugin_unload(again);
+
+    // the negative matrix: each fake plugin's one fault, and a path that is not there
+    const struct {
+        const char *         name;
+        spacemit_load_result want;
+    } cases[] = {
+        { "bad-version",    spacemit_load_result::bad_version    },
+        { "short-struct",   spacemit_load_result::short_struct   },
+        { "null-member",    spacemit_load_result::null_member    },
+        { "missing-kernel", spacemit_load_result::missing_kernel },
+        { "no-device",      spacemit_load_result::no_device      },
+        { "no-entry",       spacemit_load_result::no_entry       },
+        { "absent",         spacemit_load_result::not_found      },
+    };
+    for (const auto & c : cases) {
+        const std::string     bad_path = std::string(FLAGOS_SPACEMIT_TEST_PLUGIN_DIR) + "/" + c.name +
+                                     FLAGOS_SPACEMIT_TEST_PLUGIN_SUFFIX;
+        spacemit_plugin *    bad = nullptr;
+        std::string          why;
+        const spacemit_load_result got =
+            spacemit_plugin_load(bad_path.c_str(), host, spacemit_required_kernels, spacemit_n_required_kernels, &bad,
+                                 &why);
+        if (got != c.want) {
+            std::fprintf(stderr, "FAIL: %s gave result %d, expected %d (%s)\n", c.name, (int) got, (int) c.want,
+                         why.c_str());
+            g_failures++;
+        }
+        CHECK(bad == nullptr);
+        CHECK(!why.empty());
+        if (bad != nullptr) {
+            spacemit_plugin_unload(bad);
+        }
+    }
+
+    // FLAGOS_SPACEMIT_PLUGIN names the path and has no fallback; it is read at every call
+    {
+        const std::string wanted = std::string(FLAGOS_SPACEMIT_TEST_PLUGIN_DIR) + "/absent" +
+                                   FLAGOS_SPACEMIT_TEST_PLUGIN_SUFFIX;
+        env_override      override_path("FLAGOS_SPACEMIT_PLUGIN", wanted.c_str());
+        CHECK(spacemit_plugin_default_path() == wanted);
+    }
+
+    std::printf("loader   %s: api %u, struct_size %u, %u kernels, %zu names by get_proc_address, tcm %zu per tile\n",
+                path, api, struct_size, n_kernels, n_names, tcm);
     return 0;
 }
 
@@ -1425,10 +1569,10 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[s]);
                 set_env("FLAGOS_SPACEMIT_TAIL", tails[s]);
                 ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
-                spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
+                spacemit_mm_paths_take(&path_a[s], &path_b[s], &path_c[s], &path_s[s]);
                 spacemit_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
                 ok = ok && ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
-                spacemit_mm_paths_take(path_a[s], path_b[s], path_c[s], path_s[s]);
+                spacemit_mm_paths_take(&path_a[s], &path_b[s], &path_c[s], &path_s[s]);
                 spacemit_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
                 out[s].resize(ggml_nelements(run.y));
                 ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
@@ -3073,7 +3217,7 @@ static int diagnose_e3b(ggml_backend_dev_t dev, int runs) {
             }
             int                     same = 0, differ = 0, failed = 0;
             double                  worst = 0.0;
-            spacemit_ordered_counts all, in_differing;
+            spacemit_ordered_counts all{}, in_differing{};
             spacemit_ordered_counts_take();
             for (int r = 0; r < runs; r++) {
                 bool ok;
@@ -3282,11 +3426,11 @@ static int bench_mm(ggml_backend_dev_t dev, bool all_settings) {
                 bool     ok   = true;
                 size_t   next = 0;
                 uint64_t path_a, path_b, path_c, path_s;
-                spacemit_mm_paths_take(path_a, path_b, path_c, path_s);
+                spacemit_mm_paths_take(&path_a, &path_b, &path_c, &path_s);
                 t[k] = time_us(
                     [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
                     iters);
-                spacemit_mm_paths_take(path_a, path_b, path_c, path_s);
+                spacemit_mm_paths_take(&path_a, &path_b, &path_c, &path_s);
                 const std::pair<uint64_t, const char *> taken[] = { { path_a, "A" }, { path_b, "B" }, { path_c, "C" } };
                 for (const auto & [count, name] : taken) {
                     if (count > 0) {
@@ -3436,11 +3580,11 @@ static int bench_mm_grid(ggml_backend_dev_t dev) {
                             set_env("FLAGOS_SPACEMIT_MM", settings[s]);
                             bool     ok = true;
                             uint64_t pa, pb, pc, ps;
-                            spacemit_mm_paths_take(pa, pb, pc, ps);
+                            spacemit_mm_paths_take(&pa, &pb, &pc, &ps);
                             const double us = time_us(
                                 [&] { ok &= ggml_backend_graph_compute(backend, chain.g) == GGML_STATUS_SUCCESS; },
                                 iters);
-                            spacemit_mm_paths_take(pa, pb, pc, ps);
+                            spacemit_mm_paths_take(&pa, &pb, &pc, &ps);
                             CHECK(ok);
                             t[s]    = std::min(t[s], us / (double) copies);
                             path[s] = pb > 0 ? (ps > 0 ? "B, no turns" : "B, turns") :
@@ -3751,7 +3895,8 @@ int main(int argc, char ** argv) {
     flagos_device_info info;
     const bool         host = flagos_registry_get_device_info(global_index, &info) && info.profile.runtime != nullptr &&
                       std::strcmp(info.profile.runtime, "none") == 0;
-    if (check_registry(dev, global_index) != 0 || check_buffer(dev) != 0 || check_ops(dev) != 0 ||
+    if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_buffer(dev) != 0 ||
+        check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
         return 1;

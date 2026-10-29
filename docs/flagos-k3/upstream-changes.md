@@ -55,8 +55,8 @@ Last checked 2026-10-28 after U1 and U2 were reverted and M1's function deleted:
 
 ### M3. The provider's build and its check program
 
-- Where: `ggml/src/ggml-flagos/CMakeLists.txt:42-44` (includes `providers/spacemit/provider.cmake`), `:46` (the "no provider" message also checks the option), `:156-160` (target `flagos-check-spacemit`: not built by default, builds without `GGML_BACKEND_DL` only).
-- Commits: `4389005` (M1); `72e0666` (M2c.2) links the check program with `Threads::Threads`, for the 8 threads that quantize the output head's reference weights.
+- Where: `ggml/src/ggml-flagos/CMakeLists.txt:42-44` (includes `providers/spacemit/provider.cmake`), `:46` (the "no provider" message also checks the option), `:156-161` (target `flagos-check-spacemit`: not built by default, builds without `GGML_BACKEND_DL` only; `:160` includes `providers/spacemit/tests.cmake`).
+- Commits: `4389005` (M1); `72e0666` (M2c.2) links the check program with `Threads::Threads`, for the 8 threads that quantize the output head's reference weights; S1 step 1 adds `:160`, one line, so the fake plugins of the loader's negative matrix (`providers/spacemit/tests/plugins/`) are built beside the check program and their directory reaches it as a compile definition. Everything that line adds lives in the provider's own `tests.cmake`.
 
 ## Fork-only tooling (new files, no upstream file changed)
 

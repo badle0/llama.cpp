@@ -104,6 +104,14 @@ def last_line(text):
     return lines[-1] if lines else "no output"
 
 
+def read_log(log):
+    """The stdout lines run() wrote for this log, or none if the file is not there."""
+    try:
+        return Path(f"{log}.out").read_text().splitlines()
+    except OSError:
+        return []
+
+
 def build(bdir, logs, spert_dir):
     cfg = ["cmake", "-S", str(REPO), "-B", str(bdir), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DGGML_FLAGOS=ON",
            "-DGGML_FLAGOS_DENGLIN=OFF", "-DGGML_FLAGOS_AMD=OFF", "-DGGML_FLAGOS_SPACEMIT=ON"]
@@ -133,8 +141,9 @@ def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
     rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device", *args], logs / log,
                        env_extra=env_extra, timeout=timeout)
     detail = "; ".join(ln for ln in out.splitlines()
-                       if ln.startswith(("device", "flagos ", "ops ", "matmul   Q4_0", "matmul   Q4_1", "matmul   Q8_0",
-                                         "matmul   Q6_K", "gemv ", "rows ", "cache ", "attn ", "layer")))
+                       if ln.startswith(("device", "flagos ", "loader ", "ops ", "matmul   Q4_0", "matmul   Q4_1",
+                                         "matmul   Q8_0", "matmul   Q6_K", "gemv ", "rows ", "cache ", "attn ",
+                                         "layer")))
     fails = [ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln]
     report(name, rc == 0, detail if rc == 0 else "; ".join(fails[:3]) or last_line(err))
     for ln in out.splitlines():
@@ -153,6 +162,11 @@ def check_tools(bdir, logs, milestone):
         check_spacemit(bdir, logs, "flagos-check-spacemit (reference kernels)", "check-spacemit-reference", [],
                        env_extra={"FLAGOS_SPACEMIT_TEST_REFERENCE": "1"}, timeout=900)
         if milestone == "igpu":
+            # S1 step 1: the core reaches the device through a plugin table it loaded with dlopen; the check program's
+            # loader line names the library it came from
+            loader = next((ln for ln in read_log(logs / "check-spacemit") if ln.startswith("loader ")), "")
+            path = loader[len("loader "):].split(": api ", 1)[0].strip()
+            report("plugin loaded through the loader", bool(path) and Path(path).is_file(), loader or "no loader line")
             # the test-only switch back to ACCEL, the type until 2026-10-26: the checks pass and the device says so
             rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device"],
                                logs / "check-spacemit-accel", env_extra={"FLAGOS_SPACEMIT_TEST_DEVICE_TYPE": "accel"},

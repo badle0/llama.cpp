@@ -11,8 +11,8 @@
 // leaving them all on one.
 
 size_t spacemit_mul_mat_workspace(const ggml_tensor * node);
-bool   spacemit_mul_mat_quantize(const spacemit_tile & tile, ggml_tensor * node);
-bool   spacemit_mul_mat_gemm(const spacemit_tile & tile, ggml_tensor * node);
+bool   spacemit_mul_mat_quantize(const spacemit_tile * tile, ggml_tensor * node);
+bool   spacemit_mul_mat_gemm(const spacemit_tile * tile, ggml_tensor * node);
 
 // whether MUL_MAT b quantizes the same activations as MUL_MAT a into the same layout, so that b can multiply what a's
 // quantize step wrote (FLAGOS_SPACEMIT_QUANTIZE=shared, spacemit_backend_graph_compute)
@@ -22,7 +22,7 @@ bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor 
 // step, and of path B's those without the pair turns; the 1-row path is not counted (flagos-check-spacemit checks that
 // the default and FLAGOS_SPACEMIT_MM=split, rows, spacemit, fit, fit,staged and fit,mixed switch the path, and which
 // of them drop the turns)
-void spacemit_mm_paths_take(uint64_t & path_a, uint64_t & path_b, uint64_t & path_c, uint64_t & path_b_staged);
+void spacemit_mm_paths_take(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c, uint64_t * path_b_staged);
 
 // test-only: of path A's last m % 4 rows since the last call, how many each tile multiplied and in how many calls
 // (rows[i] and calls[i] for tile i < n_tiles; all tiles' counts reset). flagos-check-spacemit checks that they are

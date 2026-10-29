@@ -143,9 +143,13 @@ static void spacemit_check_partial(const ggml_tensor * base, size_t offset, size
                 "a partial write to a Q4_1 or Q6_K weight must cover the whole tensor");
 }
 
-bool spacemit_tensor_is_repacked(const ggml_tensor * t) {
+spacemit_layout spacemit_storage_layout(const ggml_tensor * t) {
     size_t offset = 0;
-    return spacemit_weight_layout(spacemit_storage(t, offset)) != spacemit_layout::plain;
+    return spacemit_weight_layout(spacemit_storage(t, offset));
+}
+
+bool spacemit_tensor_is_repacked(const ggml_tensor * t) {
+    return spacemit_storage_layout(t) != spacemit_layout::plain;
 }
 
 void spacemit_tensor_write(ggml_tensor * t, const void * data, size_t offset, size_t size) {

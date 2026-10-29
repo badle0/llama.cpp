@@ -394,7 +394,8 @@ size_t spacemit_rope_workspace(const ggml_tensor * node) {
 // kernels: the ported RVV version where it applies, else the reference
 //
 
-bool spacemit_kernel_add_f32(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_add_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference() && spacemit_rvv::binary_applies(dst)) {
         auto ctx = rvv_context(tile);
@@ -406,7 +407,8 @@ bool spacemit_kernel_add_f32(const spacemit_tile & tile, ggml_tensor * dst) {
     return true;
 }
 
-bool spacemit_kernel_mul_f32(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_mul_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference() && spacemit_rvv::binary_applies(dst)) {
         auto ctx = rvv_context(tile);
@@ -418,7 +420,8 @@ bool spacemit_kernel_mul_f32(const spacemit_tile & tile, ggml_tensor * dst) {
     return true;
 }
 
-bool spacemit_kernel_rms_norm_f32(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_rms_norm_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference()) {
         auto ctx = rvv_context(tile);
@@ -431,7 +434,8 @@ bool spacemit_kernel_rms_norm_f32(const spacemit_tile & tile, ggml_tensor * dst)
 }
 
 // forward_rope_f32 takes F32 only (its branch for other types converts with casts, wrong for ggml_fp16_t)
-bool spacemit_kernel_rope(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_rope(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (dst->type == GGML_TYPE_F32 && !spacemit_use_reference()) {
         auto ctx = rvv_context(tile);
@@ -448,7 +452,8 @@ bool spacemit_kernel_rope(const spacemit_tile & tile, ggml_tensor * dst) {
 }
 
 // forward_set_rows takes F32 and F16 rows into F32 and F16 rows only; the quantized and BF16 types on every build
-bool spacemit_kernel_set_rows(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_set_rows(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
     if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
         return set_rows_quant_ref(tile, dst);
     }
@@ -463,8 +468,9 @@ bool spacemit_kernel_set_rows(const spacemit_tile & tile, ggml_tensor * dst) {
 
 // CPY of F32 rows into a quantized or BF16 tensor of the same shape (spacemit_cpy_quant_supported): each row converted
 // whole by ggml's reference quantizer, the rows split over the tiles
-bool spacemit_kernel_cpy_quant(const spacemit_tile & tile, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
+bool spacemit_kernel_cpy_quant(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
+    const ggml_tensor *   src0 = dst->src[0];
     GGML_TENSOR_UNARY_OP_LOCALS
 
     const ggml_from_float_t quantize = ggml_get_type_traits(dst->type)->from_float_ref;
@@ -481,7 +487,8 @@ bool spacemit_kernel_cpy_quant(const spacemit_tile & tile, ggml_tensor * dst) {
     return true;
 }
 
-bool spacemit_kernel_get_rows_f32(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_get_rows_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference()) {
         auto ctx = rvv_context(tile);
@@ -491,7 +498,8 @@ bool spacemit_kernel_get_rows_f32(const spacemit_tile & tile, ggml_tensor * dst)
     return get_rows_f32_ref(tile, dst);
 }
 
-bool spacemit_kernel_swiglu_f32(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_swiglu_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference()) {
         auto ctx = rvv_context(tile);

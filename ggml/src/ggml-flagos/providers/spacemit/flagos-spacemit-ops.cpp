@@ -170,6 +170,15 @@ static const spacemit_kernel_fn k_flash_attn_split_paired_steps[] = { spacemit_k
 static const spacemit_op        k_flash_attn_split_paired         = { k_flash_attn_split_paired_steps, 2,
                                                                       spacemit_flash_attn_split_workspace };
 
+// the contract names of the 14 kernels above, in the order of the plugin's kernel table (plan.md "S1 step 1 spec" §3)
+const char * const spacemit_required_kernels[] = {
+    "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
+    "set_rows",         "cpy.quant",        "get_rows.f32",             "swiglu.f32",
+    "mul_mat.quantize", "mul_mat.gemm",     "flash_attn",               "flash_attn.split.partial",
+    "flash_attn.split.partial_paired",      "flash_attn.split.merge",
+};
+const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
+
 const spacemit_op * spacemit_find_op(const ggml_tensor * op, ggml_backend_buffer_type_t own_buft) {
     const spacemit_op * impl = nullptr;
     switch (op->op) {

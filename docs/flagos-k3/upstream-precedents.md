@@ -251,7 +251,7 @@ The alterations, proposed for the user's review before the first S1 spec (the he
   structural layer serves callers without reuse (uid 0: test-backend-ops, the check program; `ggml.c:7372`). The
   uid is the core's, stamped only by the scheduler and the meta device (`U ggml-backend.cpp:1233, :1751`,
   `ggml-backend-meta.cpp:2317`), and keyed on by CUDA, SYCL, RPC and Hexagon (a one-entry `cached_uid`,
-  `U ggml-hexagon.cpp:337, :2376, :2416-2417`): general, not a GPU mechanism.
+  `U ggml-hexagon.cpp:337, :2376, :2416-2417`): general, not a GPU mechanism. **2026-10-29 (user): left open with both candidates, decided by experiment.** The S1 note (`plan.md` "S1 design" §3) now carries the uid-first form (candidate U) beside the structural form of 2026-10-27 (candidate S: Common's canonical key, `flagos-graph-plan.cpp:194-356`), with predictions and the decision rule (agreed by the user 2026-10-29); the deck names no key (R5), so S is the deck's and the mentor's form, U llama.cpp's. Common's own cache rejects the uid on purpose ("scheduler UIDs do not identify shapes or edges", `flagos-graph-plan.cpp:1616`), which holds for the uid alone; U keeps the structural compare behind it.
 - **A5. The entry symbol usable with `dlopen` or linked in.** Upstream's plugin unit is the backend; an inner
   `dlopen` is the deck's requirement (D10), not an upstream pattern, and a reviewer there would ask why the plugin is
   not simply part of the backend, as Metal's device layer is. So `provider.cmake` gets a switch

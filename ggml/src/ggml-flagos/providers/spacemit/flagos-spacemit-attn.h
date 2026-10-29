@@ -9,7 +9,7 @@
 // exactly the FLASH_ATTN_EXT nodes the kernels handle (buffers are checked by spacemit_find_op)
 bool spacemit_flash_attn_supported(const ggml_tensor * op);
 
-bool spacemit_kernel_flash_attn(const spacemit_tile & tile, ggml_tensor * dst);
+bool spacemit_kernel_flash_attn(const spacemit_tile * tile, ggml_tensor * dst);
 
 // M2e.3 round 2, candidate (a) (plan.md "M2e.3 design"; the default since 2026-10-14): one-token calls from n_kv 512
 // (one stream, llama.cpp's cache layout, no ALiBi or softcap) with the KV positions split over the tiles. Step 1
@@ -19,6 +19,6 @@ bool spacemit_kernel_flash_attn(const spacemit_tile & tile, ggml_tensor * dst);
 // them, 0 the one-step op above (other calls, or FLAGOS_SPACEMIT_ATTN=one-chunk)
 int    spacemit_flash_attn_split(const ggml_tensor * op);
 size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node);
-bool   spacemit_kernel_flash_attn_split_partial(const spacemit_tile & tile, ggml_tensor * dst);
-bool   spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile & tile, ggml_tensor * dst);
-bool   spacemit_kernel_flash_attn_split_merge(const spacemit_tile & tile, ggml_tensor * dst);
+bool   spacemit_kernel_flash_attn_split_partial(const spacemit_tile * tile, ggml_tensor * dst);
+bool   spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile * tile, ggml_tensor * dst);
+bool   spacemit_kernel_flash_attn_split_merge(const spacemit_tile * tile, ggml_tensor * dst);

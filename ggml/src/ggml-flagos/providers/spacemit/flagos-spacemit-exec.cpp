@@ -72,16 +72,16 @@ struct spacemit_tile_trace {
 };
 
 std::mutex              g_ordered_mutex;
-spacemit_ordered_counts g_ordered;
+spacemit_ordered_counts g_ordered{};
 std::atomic<uint64_t>   g_steps_launched{ 0 };  // test-only (spacemit_steps_take)
 
 struct spacemit_launch {
-    const spacemit_step * steps          = nullptr;
-    size_t                n_steps        = 0;
-    void *                workspace      = nullptr;
-    size_t                workspace_size = 0;
-    int64_t               fail_step      = -1;
-    std::atomic<bool>     failed{ false };
+    const spacemit_plugin_step * steps          = nullptr;
+    size_t                       n_steps        = 0;
+    void *                       workspace      = nullptr;
+    size_t                       workspace_size = 0;
+    int64_t                      fail_step      = -1;
+    std::atomic<bool>            failed{ false };
     size_t                tcm_sizes[SPACEMIT_MAX_TILES] = {};  // each tile's TCM, so all can agree on one size
     spacemit_pairs        pairs;
     spacemit_run_stats *  stats      = nullptr;  // test-only (E3c): where the tiles note their times, if anywhere
@@ -92,11 +92,11 @@ struct spacemit_launch {
 };
 
 bool spacemit_run_step(const spacemit_launch & launch, size_t i, const spacemit_tile & tile) {
-    const spacemit_step & step = launch.steps[i];
-    spacemit_tile         part = tile;  // the step's part of the workspace
-    part.workspace             = static_cast<uint8_t *>(tile.workspace) + step.workspace_offset;
-    part.workspace_size        = tile.workspace_size - step.workspace_offset;
-    const bool ok              = step.kernel(part, step.node);
+    const spacemit_plugin_step & step = launch.steps[i];
+    spacemit_tile                part = tile;  // the step's part of the workspace
+    part.workspace                    = static_cast<uint8_t *>(tile.workspace) + step.workspace_offset;
+    part.workspace_size               = tile.workspace_size - step.workspace_offset;
+    const bool ok                     = step.fn(&part, step.node);
     return ok && !(static_cast<int64_t>(i) == launch.fail_step && tile.ith == 0);
 }
 
@@ -236,7 +236,7 @@ void spacemit_tile_main_ordered(spert::Context * ctx, spacemit_ordered_launch * 
 // what the tiles of each ordered launch noted (spacemit_ordered_counts), added to the counts since the last take;
 // returns the launches with two tiles on one core
 size_t spacemit_count_ordered(const std::vector<std::unique_ptr<spacemit_ordered_launch>> & launches, uint32_t nth) {
-    spacemit_ordered_counts c;
+    spacemit_ordered_counts c{};
     for (const auto & launch : launches) {
         const spacemit_tile_trace & t = launch->tile_trace;
         bool                        shared = false, pair = false, elsewhere = false;
@@ -277,7 +277,7 @@ class spert_executor final : public spacemit_executor {
     spert_executor(spacemit_stream_policy policy, uint32_t n_cores, int64_t fail_step) :
         policy(policy), n_cores(n_cores), fail_step(fail_step) {}
 
-    bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
+    bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size) override {
         std::unique_ptr<spert::Stream> per_call_stream;
         spert::Stream *                stream = stream_for_run(per_call_stream);
         if (stream == nullptr) {
@@ -285,12 +285,12 @@ class spert_executor final : public spacemit_executor {
         }
 
         spacemit_launch launch;
-        launch.steps          = steps.data();
-        launch.n_steps        = steps.size();
+        launch.steps          = steps;
+        launch.n_steps        = n_steps;
         launch.workspace      = workspace;
         launch.workspace_size = workspace_size;
         launch.fail_step      = fail_step;
-        g_steps_launched += steps.size();
+        g_steps_launched += n_steps;
         spacemit_stats_begin(launch, stats, static_cast<uint32_t>(stream->core_count()));
         const spacemit_clock::time_point t      = spacemit_stats_now(launch);
         const spert::Future              future = stream->launch(spert::Grid{ stream->core_count() }, spacemit_tile_main,
@@ -306,7 +306,8 @@ class spert_executor final : public spacemit_executor {
 
     // every step its own launch, queued without the host waiting, each ordered after the previous by its tiles; the
     // host waits once, for all. Each launch's arguments stay alive until then
-    bool run_ordered(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
+    bool run_ordered(const spacemit_plugin_step * steps, size_t n_steps, void * workspace,
+                     size_t workspace_size) override {
         std::unique_ptr<spert::Stream> per_call_stream;
         spert::Stream *                stream = stream_for_run(per_call_stream);
         if (stream == nullptr) {
@@ -318,12 +319,12 @@ class spert_executor final : public spacemit_executor {
 
         std::vector<std::unique_ptr<spacemit_ordered_launch>> launches;
         std::vector<spert::Future>                             futures;
-        launches.reserve(steps.size());
-        futures.reserve(steps.size());
-        g_steps_launched += steps.size();
-        for (const spacemit_step & step : steps) {
+        launches.reserve(n_steps);
+        futures.reserve(n_steps);
+        g_steps_launched += n_steps;
+        for (size_t s = 0; s < n_steps; s++) {
             auto launch            = std::make_unique<spacemit_ordered_launch>();
-            launch->steps          = &step;
+            launch->steps          = steps + s;
             launch->n_steps        = 1;
             launch->workspace      = workspace;
             launch->workspace_size = workspace_size;
@@ -464,12 +465,12 @@ class host_executor final : public spacemit_executor {
         }
     }
 
-    bool run(const std::vector<spacemit_step> & steps, void * workspace, size_t workspace_size) override {
+    bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size) override {
         spacemit_launch launch;
-        launch.steps     = steps.data();
-        launch.n_steps   = steps.size();
+        launch.steps     = steps;
+        launch.n_steps   = n_steps;
         launch.fail_step = fail_step;
-        g_steps_launched += steps.size();
+        g_steps_launched += n_steps;
         spacemit_stats_begin(launch, stats, n_tiles);
         const spacemit_clock::time_point start = spacemit_stats_now(launch);
         if (threaded) {
@@ -504,7 +505,7 @@ class host_executor final : public spacemit_executor {
         }
 
         launch.pairs.concurrent = false;
-        for (size_t i = 0; i < steps.size() && !launch.failed.load(); i++) {
+        for (size_t i = 0; i < n_steps && !launch.failed.load(); i++) {
             for (uint32_t ith = 0; ith < n_tiles; ith++) {
                 const spacemit_clock::time_point t0 = spacemit_stats_now(launch);
                 if (!spacemit_run_step(launch, i,

@@ -428,8 +428,9 @@ bool spacemit_flash_attn_supported(const ggml_tensor * op) {
 
 // one step: each tile takes a contiguous range of rows (query head x token x stream, ggml-cpu's order) and writes
 // their dst rows only, so tiles neither share scratch nor wait for each other
-bool spacemit_kernel_flash_attn(const spacemit_tile & tile, ggml_tensor * dst) {
-    const ggml_tensor * q = dst->src[0];
+bool spacemit_kernel_flash_attn(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
+    const ggml_tensor *   q    = dst->src[0];
     int64_t             ir0, ir1;
     tile_range(q->ne[1] * q->ne[2] * q->ne[3], tile, ir0, ir1);
     if (ir0 >= ir1) {
@@ -465,17 +466,20 @@ size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node) {
            sizeof(float);
 }
 
-bool spacemit_kernel_flash_attn_split_partial(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_flash_attn_split_partial(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
     return split_partial(tile, dst, false);
 }
 
-bool spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
     return split_partial(tile, dst, true);
 }
 
 // step 2 of the split: each tile merges the partial results of its query heads, the tiles' maxima brought to the
 // largest, adds the sinks as ggml-cpu does after its positions, and writes dst (one token: query head h's row at h)
-bool spacemit_kernel_flash_attn_split_merge(const spacemit_tile & tile, ggml_tensor * dst) {
+bool spacemit_kernel_flash_attn_split_merge(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * sinks = dst->src[4];
     const int64_t       n_head = q->ne[2];

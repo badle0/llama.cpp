@@ -27,6 +27,9 @@ enum class spacemit_layout {
 // read once per process, as a weight must keep the layout it was stored in.
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t);
 
+// the layout of the storage behind t: a view answers for its source
+spacemit_layout spacemit_storage_layout(const ggml_tensor * t);
+
 // bytes the tensor takes in the provider's buffer (the buffer type's get_alloc_size): ggml_nbytes, except for the
 // layouts requantized to Q8_0 (Q4_1 by default, Q6_K)
 size_t spacemit_weight_alloc_size(const ggml_tensor * t);
