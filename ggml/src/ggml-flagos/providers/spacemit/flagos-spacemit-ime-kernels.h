@@ -69,11 +69,9 @@ constexpr size_t q8_0_weight_row_bytes(size_t k) {
 
 bool have_ime();
 
-// test-only (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE, the .cpp): the Q4_0 quantizers' stable factor in force, its text, and
-// the factor a block with these sub-block scales (max / 127 each) and their average gets
-void         q4_0_scale_policy_get(float * factor, float * threshold);
+// test-only (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE, the .cpp): the Q4_0 quantizers' stable factor in force and its text
+float        q4_0_scale_factor();
 const char * q4_0_scale_policy_text();
-float        q4_0_block_factor(const float * scale_temp, size_t n, float scale_avg);
 
 // quantize 1 row, or 4 rows (row stride count_k) interleaved for the 4-row kernel, for the q4_0 layout or for both
 // 32x32 layouts (i8); reference: scalar code.

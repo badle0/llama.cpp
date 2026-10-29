@@ -1107,13 +1107,11 @@ static std::pair<double, double> q4_1_zero_point_probe(ggml_backend_dev_t dev, g
 // the Q4_0 quantizers' stable factor in force (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE, flagos-spacemit-ime-kernels.cpp): a
 // flat block (every sub-block at the same scale) and a dominant one (one sub-block of 1.0 and 0, seven of 1e-3)
 // quantized by the reference quantizer; the stored block scale and the first sub-block's ratio must be what the
-// policy's factor gives, bit for bit, and an adaptive policy must leave the flat block at 1 and scale the dominant one
+// factor gives, bit for bit, on both blocks
 static int check_q4_0_scale_policy() {
-    float pf = 0.0f, pt = 0.0f;
-    spacemit_ime::q4_0_scale_policy_get(&pf, &pt);
+    const float  f      = spacemit_ime::q4_0_scale_factor();
     const size_t k      = spacemit_ime::q4_0_k_block;  // one block of 256
     const size_t stride = spacemit_ime::q8_hp_blk_size(k, true, true);
-    float        factors[2] = { 0.0f, 0.0f };
     for (int which = 0; which < 2; which++) {
         std::vector<float> a(k, 0.0f);
         for (size_t sb = 0; sb < 8; sb++) {
@@ -1132,8 +1130,6 @@ static int check_q4_0_scale_policy() {
             scale_avg += scale_temp[sb];
         }
         scale_avg /= 8;
-        const float f  = spacemit_ime::q4_0_block_factor(scale_temp, 8, scale_avg);
-        factors[which] = f;
         std::vector<uint8_t> qa(stride, 0);
         spacemit_ime::q4_0_quantize_row(a.data(), k, qa.data(), true);
         uint16_t stored_block = 0, stored_sub = 0;
@@ -1149,15 +1145,9 @@ static int check_q4_0_scale_policy() {
             g_failures++;
         }
     }
-    const bool rule = pt > 0.0f ? (factors[0] == 1.0f && factors[1] == pf) : (factors[0] == pf && factors[1] == pf);
-    if (!rule) {
-        std::fprintf(stderr, "FAIL: Q4_0 scale policy %s: factors %g (flat) and %g (dominant), policy factor %g, "
-                     "threshold %g\n", spacemit_ime::q4_0_scale_policy_text(), factors[0], factors[1], pf, pt);
-        g_failures++;
-    }
-    std::printf("matmul   Q4_0 activation scale policy %s (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE): factor %g on a flat block, "
-                "%g on a dominant one; the stored block scale and sub-block ratio as the policy gives, bit for bit: "
-                "checked\n", spacemit_ime::q4_0_scale_policy_text(), factors[0], factors[1]);
+    std::printf("matmul   Q4_0 activation scale policy %s (FLAGOS_SPACEMIT_TEST_Q4_0_SCALE): factor %g on a flat block "
+                "and on a dominant one; the stored block scale and sub-block ratio as the factor gives, bit for bit: "
+                "checked\n", spacemit_ime::q4_0_scale_policy_text(), f);
     return 0;
 }
 
@@ -1287,9 +1277,7 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
         }
     }
     check_q4_0_scale_policy();
-    float policy_factor = 0.0f, policy_threshold = 0.0f;
-    spacemit_ime::q4_0_scale_policy_get(&policy_factor, &policy_threshold);
-    const bool old_quantizer = policy_threshold <= 0.0f && policy_factor == 1.0f;  // the fix off: the probe overflows
+    const bool old_quantizer = spacemit_ime::q4_0_scale_factor() == 1.0f;  // the fix off: the probe overflows
     const std::array<double, 3> range = q4_0_scale_range_probe(dev, backend, cpu);
     for (int i = 0; i < 3 && !old_quantizer; i++) {
         if (range[i] < 0.0 || range[i] > k_mul_mat_max_nmse) {
