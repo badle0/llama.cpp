@@ -169,9 +169,9 @@ constexpr int64_t split_min_kv = 512;
 // how the calls the split takes run (plan.md M2e.3, round 2, adopted 2026-10-14): 2 the split with the turns of the two
 // tiles of a pair (the default; tg32 at depth 4096 +20%), 1 the split without the turns (the same outputs), 0 the
 // one-chunk kernels as before. test-only: FLAGOS_SPACEMIT_ATTN=split or one-chunk, for comparisons (paired names the
-// default), read whenever spacemit_find_op looks at a node, so a benchmark can switch; anything else is reported once
-// and ignored
-int split_setting_from_env() {
+// default), parsed once (spacemit_cached_switch; the check program resets between its settings); anything else is
+// reported once and ignored
+int parse_split_setting() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "paired") == 0) {
         return 2;
@@ -187,6 +187,12 @@ int split_setting_from_env() {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN=%s: unknown setting ignored\n", __func__, v);
     }
     return 2;
+}
+
+int split_setting_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_split_setting);
 }
 
 // the shapes the split takes: one token and one stream, from split_min_kv positions, F16 K and V in llama.cpp's cache

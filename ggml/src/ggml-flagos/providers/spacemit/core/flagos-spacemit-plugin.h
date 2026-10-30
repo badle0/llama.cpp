@@ -119,6 +119,9 @@ typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, st
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
 // as MUL_MAT a, so that b can multiply what a's quantize step wrote
 typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
+// test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_GEMV, MM, TAIL, ATTN) once; a test that changes
+// them inside one process calls this so the next read parses again
+typedef void (*spacemit_switches_reset_fn)(void);
 
 typedef struct {
     uint32_t api_version;  // the mentor's fields (flagos-provider.h:66-67)

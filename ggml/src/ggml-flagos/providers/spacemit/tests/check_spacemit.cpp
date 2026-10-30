@@ -37,6 +37,7 @@
 #include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
 #include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
 #include "providers/spacemit/flagos-spacemit-ime-kernels.h"  // the Q4_0 scale policy (test-only switch)
+#include "providers/spacemit/flagos-spacemit-kernels.h"      // spacemit_switches_reset (env_override)
 
 #include <algorithm>
 #include <array>
@@ -73,6 +74,9 @@ static int g_failures = 0;
 
 static const char * k_device_name = "FlagOS:SpacemiT:0";
 
+// sets or unsets a switch for this process. The kernels parse their switches once (spacemit_cached_switch), so every
+// change tells them to parse again (spacemit_switches_reset; the same function the plugin serves by name). Every switch
+// change in this program goes through here, directly or through env_override
 static void set_env(const char * name, const char * value) {
 #if defined(_WIN32)
     _putenv_s(name, value != nullptr ? value : "");
@@ -83,10 +87,12 @@ static void set_env(const char * name, const char * value) {
         unsetenv(name);
     }
 #endif
+    spacemit_switches_reset();
 }
 
 // sets an environment variable (nullptr: unsets it) and restores the caller's value when it goes out of scope, so that
 // a setting given to the whole run (FLAGOS_SPACEMIT_TEST_TCM, FLAGOS_SPACEMIT_TEST_THREADS) holds for the later checks
+// sets a switch for a scope and restores it after (set_env resets the kernels' cached switches both times)
 class env_override {
   public:
     env_override(const char * name, const char * value) : name(name) {
@@ -214,7 +220,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     // program can call itself must answer with those very functions
     const char * names[] = { "spacemit_steps_take",   "spacemit_ordered_counts_take",
                              "spacemit_mm_paths_take", "spacemit_mm_tail_take",
-                             "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations" };
+                             "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
+                             "spacemit_switches_reset" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -231,6 +238,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     CHECK(table->get_proc_address("spacemit_mul_mat_same_activations") ==
           reinterpret_cast<void *>(
               static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations)));
+    CHECK(table->get_proc_address("spacemit_switches_reset") ==
+          reinterpret_cast<void *>(static_cast<spacemit_switches_reset_fn>(spacemit_switches_reset)));
     CHECK(table->get_proc_address("nonexistent") == nullptr);
 
     // the device facts the core reports come from the plugin's props

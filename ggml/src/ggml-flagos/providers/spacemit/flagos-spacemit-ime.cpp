@@ -98,10 +98,11 @@ bool use_reference() {
 // that gives each tile at least one group of 4 rows; spacemit takes path B there instead of path C whenever TCM holds
 // a slab, as ime.cpp and ggml-spacemit do; fit takes fit,staged's paths with the turns on path B; fit,mixed takes them
 // with the turns only while the batch's activations take fewer bytes than a slab (slabs_paired). The same bytes in all
-// six. Read at every call with several rows, so a benchmark can switch; anything else is reported once and ignored
+// six. Parsed once (spacemit_cached_switch; the check program resets between its settings); anything else is reported
+// once and ignored
 enum class mm_setting { split, rows, spacemit, fit, fit_staged, fit_mixed };
 
-mm_setting mm_setting_from_env() {
+mm_setting parse_mm_setting() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_MM");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "fit,staged") == 0) {
         return mm_setting::fit_staged;
@@ -128,6 +129,13 @@ mm_setting mm_setting_from_env() {
     return mm_setting::fit_staged;
 }
 
+mm_setting mm_setting_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return static_cast<mm_setting>(
+        spacemit_cached_switch(value, seen, [] { return static_cast<int>(parse_mm_setting()); }));
+}
+
 // Path A's last m % 4 rows, which the quantize step stores one by one and the kernels multiply one call each
 // (gemm_rows): dealt to the tiles that have no group in path A's last round (path_a_tail_tile), a tile's rows in one
 // call of multiply. In ime.cpp (406-433) they all go to the tile after the last group, which multiplies them one after
@@ -135,9 +143,9 @@ mm_setting mm_setting_from_env() {
 // full round of path A, one row 0.68 (Qwen3-8B's op counters, fusion-and-splitting.md §7.3). Two rows in two calls
 // stream the weights twice: with groups on the other tiles 1.58 rounds, in one call 1.47 (the same counters). The
 // rows' bytes and their kernel calls stay the same, so the output does. test-only: FLAGOS_SPACEMIT_TAIL=one-tile keeps
-// ime.cpp's assignment, for comparisons; read at every call with several rows, so a benchmark can switch; anything
-// else is reported once and ignored
-bool path_a_tail_one_tile() {
+// ime.cpp's assignment, for comparisons; parsed once (spacemit_cached_switch); anything else is reported once and
+// ignored
+bool parse_path_a_tail_one_tile() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_TAIL");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "dealt") == 0) {
         return false;
@@ -150,6 +158,12 @@ bool path_a_tail_one_tile() {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_TAIL=%s: unknown setting ignored\n", __func__, v);
     }
     return false;
+}
+
+bool path_a_tail_one_tile() {
+    static std::atomic<bool>     value{ false };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_path_a_tail_one_tile);
 }
 
 // the tile that multiplies leftover row j of path A's r when dealt. g is the tile after the last group, which holds
@@ -189,7 +203,8 @@ void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, 
 // straight from DRAM (memcpy1d reads DRAM faster than the kernels' own loads do; the kernels multiply a slab from TCM
 // about three times faster than DRAM delivers it), and the turns 5% less again (tg128 8.7 -> 9.2), as fast as the
 // in-tree path. Without room in TCM for a 32-column slab the weights are read straight from DRAM.
-// test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>][@<tiles>], read at every call, for comparisons: paired[:c]
+// test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>][@<tiles>], parsed once (spacemit_cached_switch, packed into
+// one word), for comparisons: paired[:c]
 // (c = 32, the default); staged[:c] (c = 32): the same without the turns; direct[:c] (c = 128): straight from DRAM, c
 // columns per kernel call; copy[:c]: staging's copies alone, wrong results (the control of flagos-check-spacemit's
 // strategy check); @t: only the first t tiles take part, the others wait (also gives a tile without a partner)
@@ -200,7 +215,7 @@ struct gemv_strategy {
     int64_t tiles = 0;  // 0: all
 };
 
-gemv_strategy gemv_strategy_from_env() {
+gemv_strategy parse_gemv_strategy() {
     static const struct {
         const char *          name;
         gemv_strategy::kind_t kind;
@@ -232,6 +247,25 @@ gemv_strategy gemv_strategy_from_env() {
         s.tiles = std::atoll(tiles + 1);
     }
     return s;
+}
+
+// the strategy in one word for the cache: the kind in 8 bits, the columns in 32, the tiles in 16
+uint64_t pack_gemv_strategy(const gemv_strategy & s) {
+    return (uint64_t) s.kind | ((uint64_t) (uint32_t) s.cols << 8) | ((uint64_t) (uint16_t) s.tiles << 40);
+}
+
+gemv_strategy unpack_gemv_strategy(uint64_t w) {
+    gemv_strategy s;
+    s.kind  = static_cast<gemv_strategy::kind_t>(w & 0xff);
+    s.cols  = (int64_t) (uint32_t) (w >> 8);
+    s.tiles = (int64_t) (uint16_t) (w >> 40);
+    return s;
+}
+
+gemv_strategy gemv_strategy_from_env() {
+    static std::atomic<uint64_t> value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return unpack_gemv_strategy(spacemit_cached_switch(value, seen, [] { return pack_gemv_strategy(parse_gemv_strategy()); }));
 }
 
 // one activation row, already quantized into the start of the tile's TCM, times all weight rows (gemv_strategy); false

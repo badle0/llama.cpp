@@ -7,6 +7,7 @@
 #include "../../../ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,18 @@ bool spacemit_use_reference() {
 #endif
     }();
     return reference;
+}
+
+namespace {
+std::atomic<uint32_t> g_switches_generation{ 1 };  // the cached switches start at 0, so the first read parses
+}
+
+uint32_t spacemit_switches_generation() {
+    return g_switches_generation.load(std::memory_order_acquire);
+}
+
+void spacemit_switches_reset() {
+    g_switches_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 namespace {

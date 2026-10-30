@@ -679,7 +679,9 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         }
         for (uint32_t s = first; s < op->n_steps; s++) {
             ctx->steps.push_back({ op->steps[s]->fn, node, 0 });
-            ctx->step_names.push_back(op->steps[s]->name);
+            if (op_stats != nullptr) {  // the labels of the op counters, kept parallel to steps only when they are on
+                ctx->step_names.push_back(op->steps[s]->name);
+            }
         }
         const size_t workspace = spacemit_op_workspace(op, node);
         if (workspace != 0) {
@@ -716,11 +718,9 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         }
     }
     const bool counted = timed && mode != spacemit_launch_kind::per_step_join && ctx->attach != nullptr;
-    if (counted) {
+    if (counted) {  // the counters attach to the stream for this graph only; an uncounted graph leaves them detached
         ctx->run_stats.reset(ctx->steps.size());
-    }
-    if (ctx->attach != nullptr) {
-        ctx->attach(ctx->stream, counted ? &ctx->run_stats : nullptr);
+        ctx->attach(ctx->stream, &ctx->run_stats);
     }
     // test-only: the two launch modes of E3a and E3b, one launch per step, are flags of the replay
     uint32_t flags = 0;
@@ -731,7 +731,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
     const bool ok = ctx->table->replay(ctx->stream, ctx->steps.data(), static_cast<uint32_t>(ctx->steps.size()),
                                        ctx->workspace, ctx->workspace_size, flags) == SPACEMIT_STATUS_SUCCESS;
-    if (ctx->attach != nullptr) {
+    if (counted) {
         ctx->attach(ctx->stream, nullptr);
     }
     if (ok && counted) {
