@@ -382,6 +382,10 @@ per kernel) reach the deck's cost of about 1% (R12) and graph capture is an opti
   norms about 2 ms at the measured cost, 1.7 ms at M3.2's, estimates, either over M3.2's 1% rule); AOT kernels called
   as steps inside the
   replayed launch (Q3) would not (neither is built).
+- Re-confirmed 2026-10-30 on today's code (E3r, run 8): one launch per step costs Qwen3-4B 13.9% of tg128 with
+  identical text, 13.79 µs per step, 11.83 µs of launch overhead each, 1,086 steps and 1 launch per token under the
+  replay; and E7b (run 7) corrected the correctness half: ordered launches can be made correct with a slice per tile of
+  at most a pool eighth and yielding pair waits, which strips the kernels of their TCM paths; the cost floor stands.
 
 **F16. With launches ordered by `join`, spine-runtime moves paused tiles, and two can use one TCM at once** (measured
 2026-10-20, E3d and E3b-diag, §6 run 5; spine-runtime 0.6 on the K3, one session). With 8 or 64 launches in flight, each
@@ -410,6 +414,9 @@ tile first joining the previous launch's Future:
   (`flagos-spacemit-attn.cpp:360-366`), and the pair waits spin on an atomic with no runtime call
   (`flagos-spacemit-exec.cpp:34-58`), so the barriers are the only suspension points. Whether a tile may leave its
   worker inside a single launch, and why tiles move, stay SpacemiT's to answer; E7 measures the three forms.
+  Since 2026-10-30 (run 7) the loop takes the view again after every barrier (`FLAGOS_SPACEMIT_TEST_VIEW=once` keeps
+  the old form), at -0.3% of tg128 on Qwen3-4B, so it conforms to the header; and E7b showed ordered launches correct
+  with slices of at most a pool eighth and yielding pair waits, the runtime deadlocking the stream above that size.
 
 ## 4. Experiments
 
@@ -432,6 +439,8 @@ with the modes interleaved in each repetition: the board drifts between sessions
 | E3b-diag | the cause of E3b's differences (Q1; for SpacemiT) | Two parts, both test-only. (a) E3d's `joined+canary`: tiles that only join, take their TCM, pass a barrier and check a pattern of their own in their TCM, across the barrier and with no suspension point in between, noting their core at four points. (b) `flagos-check-spacemit --e3b[=runs]`: the 1-token layers (q4_0, q4_1), the 7-token layer and eight 1-row matmuls alone (q4_0, q4_1), each `runs` times ordered in the cores against one launch, in four variants: the default 1-row strategy (`paired`), `staged` (TCM, no pair turns), `direct` (weights from DRAM, no pair turns) and `paired` with full memory fences after every join and at every tile's end (`FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1`); per run, what the ordered launches' tiles noted: two tiles on one core, tiles that moved, one TCM held on two cores, both tiles of a pair on one core | unknown. Candidates: H1, two tiles use one TCM at the same time (truly at once on one core, or a tile that moved still using its first core's TCM); H2, both tiles of a pair on one core, the first spinning on the second until the 10 s limit (would explain the one failed run, not the differences); H3, a tile reading data the previous launch wrote before it is visible (memory order across `join`); H4, something in the 1-row path itself (pair turns or TCM staging) | fixed before the run. H1: (a) shows a canary changed with no suspension point, or one TCM on two cores, and (b)'s differing runs show tiles that moved or one TCM on two cores. H2: (b)'s failed runs, and only they, show a pair on one core. H3: `paired+fence` has no differing run where `paired` has many. H4: the 1-row matmuls alone differ, and `staged` or `direct` changes how often (pair turns or TCM staging). Differing runs with no shared core, moved tile or shared TCM rule co-location out. If none fits, the cause stays open and the next step is comparing every node's output | done 2026-10-20 (§6 run 5): H1 and H4 by the rules (tiles moved by `join` use one TCM at the same time; only TCM staging of each tile's own weights turns it into wrong results); H2 explains the failed runs; H3 ruled out (F16) |
 | E4 | Q5, F13, R1 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | E2's rule; then "no upstream change needed at all" | done 2026-10-20 (§6, run 2): passes; pp512 at depth 4096 +4.0% |
 | E7 | F16's open point (must a tile take its shared buffer again after a pause?); Q1's correctness side, for SpacemiT | `scripts/spert-view-bench.cpp`: spine-runtime alone, no provider and no ggml. Three forms of TCM use: `hold` (the view taken once, today's loop), `retake` (the view taken again after every barrier, the header's rule, `spert.hpp:474-478`) and `slice` (a tile-private slice from `alloc_shared`, held across the barriers, freed at the end); two shapes: `single` (one launch, 1,000 barriers, 20 launches per form: today's one launch per split) and `joined` (8 and 64 launches ordered by `join`, 4 barriers each: E3b's ordering). Per form and shape: core changes after a barrier, view changes against core changes (`retake`), canaries lost across a barrier through the old pointer and through the fresh view or the slice, canaries torn with no suspension point in between, slice allocation failures and slices outside the current worker's buffer, order violations, launches ending with two tiles on one core or one TCM | (written before the run) `single`: every count 0 for all three forms (E3d: no moved tile, no shared core inside one launch). `joined`: `hold` loses canaries at about E3b-diag's rate (4-14% of tiles) with 67-78% of tiles changing core; `retake`: the view changes exactly when the core does (0 changes without a core change, 0 core changes with the view the same), lost through the old pointer as `hold`, lost through the fresh view at least as often as tiles moved (the data stayed on the old worker); `slice`: lost at about `hold`'s rate, slices outside the current buffer after a move, allocation failures when two tiles of one launch share a worker; torn above 0 only under `joined` | fixed before the run. (1) `single` all zero for every form: today's once-per-launch take holds on 0.6.3 by measurement for one launch per split (not a contract; the header's sentence stays the rule, and the loop may still re-take the view after every barrier as a conformance change, measured apart). (2) `retake` under `joined`, in both batches: view changes only with a core change, and every core change changes the view: the header's sentence is F16's mechanism, confirmed. (3) If `retake` or `slice` loses no canary and tears none under `joined` in both batches: a conforming loop can make ordered single-kernel launches correct, E3b's wrong results were our loop's, and E3b is rerun with that loop (F15's cost conclusion stands either way: the runtime's floor per launch, 7.67 µs, is above the 5% line). Otherwise no form of TCM use survives the migration, ordered launches cannot be made correct with TCM-using kernels on 0.6.3, and that sentence with the counts and the header's line goes to SpacemiT (question 8) | done 2026-10-30 (§6 run 6; three runs, slices of 16, 384 and 192 KiB): rules 1 and 2 hold; rule 3 holds for slices up to half the pool (a held slice also pins the tile to its worker), while the whole buffer as a slice ends in spine-runtime's `Status::Deadlock` and a dead stream |
+| E3r | Q1 again on today's code, and the question SpacemiT's engineer asked (does a launch carry a graph or a kernel?); F15's figures refreshed after IGPU (D3), `fit,staged`, the Q4_1 layers on the Q8_0 kernel and S1's table | The runner with `EXPS="e3a e3c"` on Qwen3-4B (`DEPTH=1`) and Qwen3-0.6B (`DEPTH=0`), `REPS=3`, the modes interleaved: `ref` (one launch per split, today's path), `e3` (`FLAGOS_SPACEMIT_TEST_LAUNCH=per-step`: one launch per step with a host wait each), `e3c` and `e3c-a` (the counters on both: launches, steps, the host's time in `graph_compute` and in the launches, every tile's kernel and barrier time); placement and text, llama-bench, the depth runs, perplexity and the KLD of `e3` against `ref`; then `flagos-check-spacemit --e3b=5` by hand as the demonstration of F16 (ordered launches with today's loop: the 1-token layers differ). E3b is not a candidate any more: by E7 a conforming loop would need the view re-taken per step, pair waits that yield and at most half the pool, which the kernels do not fit | (written before the run) per Qwen3-4B token at depth 0: 2 launches and 1,086 steps under `ref`, 1,086 launches under `e3` (the same steps; by the code neither IGPU nor `fit,staged` nor the Q8_0 kernel changes a one-token graph's step count; 1,122 from n_kv 1024); logits identical (KLD 0, same top p 100%); tg128 under `e3` -12 to -16% on 4B (run 3: -14.2%) and -30 to -38% on 0.6B (run 4: -35.8%); pp128 within -2%; tg32 at depth 4096 loses less in percent (more time per token in attention); E3a's cost per step 13-16 µs, of which the launch's own overhead 11-13 µs; the counters cost tg128 under 1%; idle by the deck's measure 1.3-2% | fixed before the run. F15 is re-confirmed if `e3`'s tg128 loss is at least 5% on Qwen3-4B with identical logits (E3's line of 2026-10-20); it is reopened if the loss falls under 5%, in which case E3a's cost per step is compared with E3d's floor again. Descriptive otherwise: the table for SpacemiT is launches, steps and time per generated token and per pp128 batch under the two forms, with the cost per launch, beside the sentence that a launch carries one split's whole step list, every tile walking it with a barrier per step | Qwen3-4B bench done 2026-10-30 (§6 run 8): 1,086 steps and 1 launch per token under `ref` (the prediction of 2 launches was wrong: 2 splits, one the provider's), 1,086 launches under `e3`; tg128 -13.9%, pp128 -1.3%, text identical; 13.79 µs per step, 11.83 µs of overhead per launch: F15 re-confirmed by the rule. The depth runs and the KLD (session 3) and Qwen3-0.6B (session 4) still to run |
+| E7b | Q1's correctness side: can one launch per kernel ordered by `join` be made correct? (the user, 2026-10-30, after E7) | The ordered tile loop made to conform to the header: `FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>` gives every tile a slice from `alloc_shared` (the tile's own, pinning it to its worker by E7) in place of the whole buffer, in the reference and in the ordered launches alike, and the ordered launches' pair waits yield the core (`spacemit_pairs::yield`) so two tiles of one launch on one worker take turns; `flagos-check-spacemit --e3b=5` (a) with no slice (today's loop, F16's demonstration), (b) 196,608 bytes (half the pool), (c) 131,072, (d) 393,216 (the whole pool) | (written before the run) (a) the 1-token layer cases differ as in run 5; (b) and (c) 5 of 5 same in every case and variant, tiles moved 0, no 10 s pair-wait stall; (d) failed runs with spine-runtime's `Deadlock` in the log, as E7 | fixed before the run. E7b holds, "ordered launches can be made correct with slices up to half the pool", if (b) is 5 of 5 same in every case; it fails if any run differs under (b) or (c); (d) is expected to fail and is reported. If it holds, session 5: `e3b` at model level under the slice (the KLD against `ref` on the same slice 0; the speed descriptive) | done 2026-10-30 (§6 run 7): (a) as run 5; (b) and (c) byte-identical in every ordered run the runtime executed (two tiles of one launch on one worker included), then one `Deadlock` each and the stream dead for the process, so not 5 of 5 in every case and the rule as written fails; (d) `Deadlock` at once; a fifth setting, 49,152 bytes (a pool eighth), added after the deadlocks: 20 of 20 lines 5 of 5 same, 0 failed. Adopted statement: ordered launches can be made correct with slices of at most a pool eighth; session 5 possible only at that size |
 | E6 | Q2 | GGUF's bytes in the buffer ggml sees plus a private repacked copy | about +2.35 GB, the same speed, exact read-back | evidence for option (e) | not implemented |
 | E5 | Q2 | the 1-row path reads GGUF's layout, interleaving 32 rows while copying into TCM | unknown; generation only | how much repacking buys | not implemented |
 | Q4 table | Q4 | on paper: our kernel choices as manifest entries (startup filter for device facts, `when` for per-token shapes, one generic variant per contract), each condition `when` cannot express marked | some inexpressible (ranges, equality, strides, layout) | input for Q4 | to do |
@@ -497,6 +506,22 @@ EXPS="e2 e3a" docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen
   Nine lines, three `single` then six `joined` (8 and 64 at a time, each in the three forms); the arguments, in order,
   are the joined launches per case (4,000), the barriers per joined launch (4) and the slice size in KiB (16). A hang
   in a `joined` case: Ctrl-C, then `~/tcmtest/tcmrelease --apply`, and the lines printed so far are the result.
+- E3r (2026-10-30), on today's build (no worktree is needed: `e3a` and `e3c` use build A only; `prepare` rebuilds A's
+  tools, which are already this code on the board, and runs the provider checks):
+  ```bash
+  EXPS="e3a e3c" docs/flagos-k3/scripts/structural-experiments.sh prepare 2>&1 | tee ~/sx-prepare-e3r.log
+  ~/tcmtest/tcmrelease --apply
+  EXPS="e3a e3c" REPS=3 DEPTH=1 docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen3-4B-Q4_0.gguf ~/sx/e3r-4b 2>&1 | tee ~/sx-e3r-4b.log
+  ~/tcmtest/tcmrelease --apply
+  EXPS="e3a e3c" REPS=3 DEPTH=0 docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen3-0.6B-Q4_0.gguf ~/sx/e3r-06b 2>&1 | tee ~/sx-e3r-06b.log
+  ~/tcmtest/tcmrelease --apply && ./build-flagos/bin/flagos-check-spacemit --e3b=5 2>&1 | tail -30 | tee ~/sx-e3b-demo.log
+  ```
+  About 3 hours for Qwen3-4B with the depth runs and the perplexities (the `e3` perplexity runs at E3a's speed), about
+  1 hour for Qwen3-0.6B. The summary's "E3c" table gives launches and steps per token and E3a's cost per step; the
+  "llama-bench" table gives tg128 and pp128 per mode with the change against `ref`; the KLD block must show `e3` at
+  KLD 0 with the same top p 100%. The `--e3b=5` tail lists, per case, how many of the 5 ordered runs differed from one
+  launch and what the tiles noted (moved tiles, shared cores, one TCM on two cores): F16's demonstration, expected to
+  differ in the 1-token layer cases.
 - R12-hw's result is the `prepare` lines under "build R": the check's last line and the probe's NMSE for 1 row and 4.
 - E3c's summary adds a table per generated token (µs): outside `graph_compute`, host work in it, launch overhead, the
   barriers' own cost, imbalance, kernels, idle (the deck's measure) and its share, steps and launches per token, and
@@ -570,6 +595,8 @@ Test-only; the defaults are unchanged.
 | `FLAGOS_SPACEMIT_TEST_STATS=<file>` | `spacemit_stats_file` and `spacemit_backend_graph_compute` (`flagos-spacemit.cpp`), `spacemit_run_stats` (`flagos-spacemit-exec.h`), the executors' `run` | E3c: per kind of graph (launch mode, the first matmul's rows, the first attention's KV length class: below 1024, below 4096, above), the graphs, steps and launches, the time in `graph_compute`, in the launches (host), in the kernels (summed over the tiles, and per step the slowest tile) and at the barriers; one JSON line per kind appended to `<file>` when the process ends. Read once; the tiles read the clock only with the switch set and write their times into their own rows. E3b's launches are not counted |
 | `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (compile-time) | `gemm_kernel_i8i4_m1`, `flagos-spacemit-ime-kernels.cpp` | R12-hw: compiles upstream's active branch of the 1-row Q4_1 kernel instead of the exact one; only in build R, through `CMAKE_CXX_FLAGS` |
 | `FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1` | `run_ordered` and `spacemit_tile_main_ordered`, `flagos-spacemit-exec.cpp` | E3b-diag: with E3b, a full memory fence after every tile's join and at its end. E3b's launches also always note each tile's core after its join, after taking its TCM, after the TCM agreement and at its end, and its TCM; `spacemit_ordered_counts_take()` (`flagos-spacemit-exec.h`) returns what they showed |
+| `FLAGOS_SPACEMIT_TEST_VIEW=once` | `spert_executor` and `spacemit_tile_main`, `flagos-spacemit-exec.cpp` | the first `shared_buffer()` view kept through every barrier (the loop until 2026-10-30); unset or `step`: the view taken again after every barrier, the header's rule (E7, `spert.hpp:474-478`); the kernels keep nothing in TCM across a barrier, so the outputs are the same; a fresh view smaller than the agreed size fails the launch |
+| `FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>` | the same, and `spacemit_pair_wait` | E7b: each tile takes a slice of that size from its worker's shared buffer (`alloc_shared`, freed at the tile's end) as its TCM instead of the whole buffer, in every launch mode; an empty slice fails the launch; under `per-step-join` the pair waits yield the core (`Context::yield`) instead of spinning, so two tiles of one launch on one worker take turns |
 | `flagos-check-spacemit --e3b[=runs]` | `diagnose_e3b`, `tests/check_spacemit.cpp` | E3b-diag: only the E3b diagnosis (§4), nothing else checked |
 
 The kernels are the same in every mode: the switches change only what llama.cpp is told (E2) or how the steps are
@@ -1014,6 +1041,95 @@ By the rules fixed before the run:
 - For the design: nothing to change in the provider's loop for one launch per split (rule 1). If ordered launches were
   ever wanted (not planned: F15), the conforming form would be `alloc_shared` of the kernels' TCM need, under half the
   pool, with pair waits that yield.
+
+### Run 7 (K3, 2026-10-30): session 1 of the step-by-step plan: the view taken again after every barrier, the check program's hygiene, E7b
+
+Build `c3075078a` with the plan's code applied as a patch (the executor: the view taken again after every barrier,
+`FLAGOS_SPACEMIT_TEST_VIEW=once` for the comparison, `FLAGOS_SPACEMIT_TEST_TCM_SLICE` and the yielding pair waits of the
+ordered launches; the check program's correctness references at one thread; the runner's `--segv` on the check
+program's passes), one board session, spine-runtime 0.6.3. On the Mac before it: the host build clean, the check program
+passing in six settings (the default, the tiles on threads, `per-step`, `per-step-join`, `TEST_VIEW=once`,
+`TEST_TCM_SLICE=196608`), `test-backend-ops` MUL_MAT and FLASH_ATTN_EXT, the executor's spine-runtime branch parsed
+against a stub of the API (the real header lives only on the board).
+
+- **The view A/B** (Qwen3-4B, `llama-bench -p 128 -n 128 -r 1 -t 8`, three runs per setting, interleaved): the view
+  taken again after every barrier 106.24 / 106.76 / 106.66 pp128 and 10.95 / 10.98 / 10.95 tg128; `once` (the loop
+  until this day) 106.21 / 105.85 / 106.19 and 10.99 / 10.98 / 11.00; means 106.55 / 10.96 against 106.08 / 10.99,
+  prompt processing +0.4%, generation -0.3%, the latter lower in all three pairs (one runtime call per step per tile,
+  about 1,086 per token: the size the estimate gave). Within the 1% rule fixed before the run: the re-take stays the
+  default. Outputs unchanged by the code (nothing of ours keeps data in TCM across a barrier, F16).
+- **The check program** with `segv.so` preloaded and the one-thread references: `--full` all checks passed in 141 s,
+  the reference pass (`FLAGOS_SPACEMIT_TEST_REFERENCE=1`) in 221 s, `--bench` passed.
+- **E7b** (`flagos-check-spacemit --e3b=5`: 5 cases x 4 variants, each 5 runs ordered in the cores against one launch,
+  the reference and the ordered runs on the same TCM per tile; the ordered launches' pair waits yield the core):
+
+  | TCM per tile | Of the 20 case-and-variant lines | What happened |
+  |---|---|---|
+  | the worker's whole buffer, today's loop | 4 all-same, 16 with differing runs, 0 failed | F16's demonstration, as run 5 |
+  | 196,608 bytes (half the pool) | 2 all-same, then 18 failed | the first 10 ordered runs byte-identical to one launch, with two tiles of one launch on one worker in 68 and 72 of 155 launches; in the third variant one `Status::Deadlock` (2) after two identical runs, then every launch refused with `InvalidArg` (1; a launch the stream would not admit) 104 times |
+  | 131,072 | 1 all-same, then 19 failed | one `Deadlock`, then refused 111 times |
+  | 393,216 (the whole pool) | 0 all-same, 20 failed | one `Deadlock` at once, then refused 118 times, as predicted |
+  | 49,152 (a pool eighth; run after the three above) | 20 all-same, 0 failed | every ordered run byte-identical to one launch; two tiles of one launch on one worker in 67-74 of 155 launches (the layer cases) and 10-17 of 80 (the 1-row matmuls) |
+
+  Reading. The arithmetic holds: with a slice the tile owns and pair waits that yield, every ordered run the runtime
+  executed matched one launch byte for byte, two tiles of one launch on one worker included, which is what broke E3b
+  with today's loop. Availability is the limit: a tile holds its slice from its start to its end, the runtime may put
+  several tiles of one launch on one worker, and when their slices exceed the pool the last one suspends in
+  `alloc_shared` for space the others free only after a barrier it must reach: the runtime detects the cooperative
+  deadlock, fails the launch, and the stream refuses every later launch of the process. Two slices of 196,608 fill the
+  pool (a third tile deadlocks), three of 131,072 (a fourth), one of 393,216 (a second), eight of 49,152 (never):
+  an inference consistent with the four sizes (the counters record "two tiles on one core", not three or four) and
+  with E7's slice runs, whose tiles were too short to pile up. By the rule as written E7b fails at (b) and (c) (not
+  5 of 5 in every case), and the statement adopted from the fifth setting is: ordered single-kernel launches can be made
+  correct on 0.6.3 with the view's rule respected, pair waits that yield and every tile's TCM at most a pool eighth;
+  the kernels then run their small-TCM paths (the 1-row matmuls without slabs, path C, one-chunk attention), and F15's
+  cost conclusion stands (the runtime's floor per launch above the 5% line). Session 5 (`e3b` at model level) is
+  possible only at 49,152 bytes and only descriptive; not scheduled.
+- For SpacemiT (question 8): the table above, with the questions whether the runtime will keep stacking tiles of one
+  launch on one worker, and whether a launch can reserve a worker's pool for one tile.
+
+### Run 8 (K3, 2026-10-30): session 2, E3r on Qwen3-4B, bench only
+
+Build `c3075078a` with session 1's patch (run 7), `EXPS="e3a e3c" REPS=3 DEPTH=0 PPL_TEXT=""`, the four modes
+interleaved in each of 3 repetitions. Placement: both modes 2 splits per token (one the provider's), flash attention
+enabled under `-fa auto`, 37 of 37 layers offloaded, the KV cache in the provider's buffer; the generated text identical.
+
+| Mode | pp128 | tg128 |
+|---|---|---|
+| `ref` (one launch per split) | 106.13 ± 0.23 | 10.96 ± 0.00 |
+| `e3` (one launch per step, the host waiting for each) | 104.74 ± 0.19 (-1.3%) | 9.44 ± 0.02 (-13.9%) |
+| `e3c` (the counters) | 106.41 ± 0.40 (+0.3%) | 10.87 ± 0.01 (-0.9%) |
+| `e3c-a` (the counters, one launch per step) | 104.77 ± 0.55 (-1.3%) | 9.35 ± 0.03 (-14.7%) |
+
+One generated token (tg128), µs, mean of the repetitions (run 4's columns):
+
+| Mode | Token | Outside | Host | Launch | Barriers | Imbalance | Kernels | Idle | Steps | Launches | Launch each |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `e3c` | 92,015 | 282 | 699 | 557 | 510 | 2,837 | 87,130 | 2,048 (2.23%) | 1,086 | 1 | 557 |
+| `e3c-a` | 106,993 | 281 | 2,012 | 12,842 | 533 | 2,886 | 88,440 | 15,668 (14.64%) | 1,086 | 1,086 | 11.83 |
+
+E3a's cost per step (`e3c-a` less `e3c` over 1,086 steps): 13.79 µs. The view's cost, isolated in the same session
+(llama-bench with the counters, one run per setting, `FLAGOS_SPACEMIT_TEST_VIEW=step` then `once`; the stats' raw
+columns, so "barriers" here is the mean tile's whole wait): host 551 / 553, launch 535 / 248, barriers 3,379 / 3,326,
+kernels 87,134 / 87,119 µs per token; tg128 10.88 / 10.93. The re-take costs 287 µs per token, 0.26 µs per step per
+tile, 0.3% of the token: run 7's A/B figure, now isolated.
+
+Reading:
+- F15 re-confirmed on today's code by E3r's rule: one launch per step loses 13.9% of tg128 with identical text, well
+  above the 5% line; 13.79 µs per step against 14.34 on 2026-10-20, each launch's own overhead 11.83 µs (11.73-12.25
+  then). The steps per token are 1,086 as then: IGPU, `fit,staged`, the Q8_0 kernel for the Q4_1 layers and S1's table
+  changed no one-token step count, now measured.
+- The prediction of 2 launches per token was wrong: a token has 2 splits, of which one is the provider's and holds all
+  1,086 steps in one launch; the other is the CPU's (the embedding lookup, by reading the op table; not verified in
+  this run).
+- For SpacemiT's engineer, the answer to "does a launch carry a graph or a kernel": per generated Qwen3-4B token the
+  provider makes one launch, a tile function over the 8 cores that walks the split's 1,086-step list with a barrier
+  after each step (the graph in sequence form, no dependency edges), 92.0 ms per token; one launch per kernel is 1,086
+  launches, 107.0 ms, 11.8 µs of launch overhead each, with the same outputs.
+- Host work in `graph_compute` outside the launch, A4's ceiling: 551-699 µs per token (the by-hand run 551, the
+  runner's mean 699, run 4's 546): 0.55-0.70 ms, as before. Against run 4 the launch column grew from 190 to 535-557,
+  which is the re-take (isolated above); the kernels' 87.1 ms against 85.2 ms is today's `ref` at 10.96 against 11.25
+  then (the Q4_1 requantization of 2026-10-23, `PROJECT.md` item 21), not this session's.
 
 ## 7. Log
 

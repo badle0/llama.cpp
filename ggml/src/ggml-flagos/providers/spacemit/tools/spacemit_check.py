@@ -139,7 +139,7 @@ def tcm_tool(tcm_dir, name):
 def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
     # a hang here means tiles did not stop together after a failure
     rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device", *args], logs / log,
-                       env_extra=env_extra, timeout=timeout)
+                       env_extra={**(env_extra or {}), **preload}, timeout=timeout)
     detail = "; ".join(ln for ln in out.splitlines()
                        if ln.startswith(("device", "flagos ", "loader ", "ops ", "matmul   Q4_0", "matmul   Q4_1",
                                          "matmul   Q8_0", "matmul   Q6_K", "gemv ", "rows ", "cache ", "attn ",
@@ -169,7 +169,8 @@ def check_tools(bdir, logs, milestone):
             report("plugin loaded through the loader", bool(path) and Path(path).is_file(), loader or "no loader line")
             # the test-only switch back to ACCEL, the type until 2026-10-26: the checks pass and the device says so
             rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device"],
-                               logs / "check-spacemit-accel", env_extra={"FLAGOS_SPACEMIT_TEST_DEVICE_TYPE": "accel"},
+                               logs / "check-spacemit-accel",
+                               env_extra={"FLAGOS_SPACEMIT_TEST_DEVICE_TYPE": "accel", **preload},
                                timeout=900)
             device = next((ln for ln in out.splitlines() if ln.startswith("device")), "") or "no device line"
             fails = "; ".join(ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln)
@@ -178,7 +179,7 @@ def check_tools(bdir, logs, milestone):
     else:
         check_spacemit(bdir, logs, "flagos-check-spacemit (device present)", "check-spacemit", [])
     rc, out, _ = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-none"], logs / "check-spacemit-disabled",
-                     env_extra={"FLAGOS_SPACEMIT_DISABLE": "1"})
+                     env_extra={"FLAGOS_SPACEMIT_DISABLE": "1", **preload})
     report("flagos-check-spacemit (FLAGOS_SPACEMIT_DISABLE=1)", rc == 0, "device absent" if rc == 0 else f"rc={rc}")
 
 
@@ -244,7 +245,8 @@ def op_correctness(bdir, logs, milestone):
 
 
 def bench(bdir, logs):
-    rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device", "--bench"], logs / "bench", timeout=900)
+    rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device", "--bench"], logs / "bench",
+                       env_extra=preload, timeout=900)
     # the 1-row strategy table (one line per shape and strategy) stays in the log; its per-token totals are shown
     lines = [ln.split("bench", 1)[1].strip() for ln in out.splitlines()
              if ln.startswith("bench") and (not ln.startswith("bench    gemv ") or " per Qwen3-4B token " in ln)]
@@ -536,7 +538,7 @@ def main():
     ap.add_argument("--depth", action="store_true",
                     help="llama-bench: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 for each mode "
                          "(m2b and later; long)")
-    ap.add_argument("--segv", default="", help="crash reporter (scripts/segv.c built as .so) to preload into the model runs")
+    ap.add_argument("--segv", default="", help="crash reporter (scripts/segv.c built as .so) to preload into the model runs and the check program's passes")
     args = ap.parse_args()
     if args.segv:
         if not Path(args.segv).is_file():

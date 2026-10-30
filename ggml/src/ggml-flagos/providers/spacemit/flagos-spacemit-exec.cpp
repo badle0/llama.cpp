@@ -29,6 +29,10 @@ struct spacemit_pairs {
     uint32_t                  by_tile[SPACEMIT_MAX_TILES] = {};  // each tile's own calls, written only by that tile
     const std::atomic<bool> * failed     = nullptr;             // the launch's failure flag
     bool                      concurrent = true;                // false: the tiles run one after another; only count
+    // test-only (structural-experiments.md E7b): the waits yield the core instead of spinning, so that two tiles of one
+    // launch on one worker can take turns (ordered launches, where the runtime may put them there); null: spin
+    void (*yield)(void * arg)                        = nullptr;
+    void *                    yield_arg[SPACEMIT_MAX_TILES] = {};  // each tile's spert::Context, set at its entry
 };
 
 bool spacemit_pair_wait(const spacemit_tile & tile) {
@@ -48,6 +52,10 @@ bool spacemit_pair_wait(const spacemit_tile & tile) {
         if (spin % 65536 == 0 && std::chrono::steady_clock::now() - start > std::chrono::seconds(10)) {
             GGML_LOG_ERROR("FlagOS SpacemiT: tile %u waited 10 s for tile %u at pair wait %u\n", tile.ith, tile.ith ^ 1u, n);
             return false;
+        }
+        if (p.yield != nullptr) {
+            p.yield(p.yield_arg[tile.ith]);
+            continue;
         }
 #if defined(__riscv_zihintpause)
         __asm__ __volatile__("pause");
@@ -82,6 +90,8 @@ struct spacemit_launch {
     size_t                       workspace_size = 0;
     int64_t                      fail_step      = -1;
     std::atomic<bool>            failed{ false };
+    bool                         retake_view    = true;  // the view taken again after every barrier (spacemit_tile_main)
+    size_t                       tcm_slice      = 0;     // test-only (E7b): each tile's alloc_shared slice in bytes; 0: the whole buffer
     size_t                tcm_sizes[SPACEMIT_MAX_TILES] = {};  // each tile's TCM, so all can agree on one size
     spacemit_pairs        pairs;
     spacemit_run_stats *  stats      = nullptr;  // test-only (E3c): where the tiles note their times, if anywhere
@@ -158,9 +168,24 @@ int spacemit_cpu_now() {
 // early would leave the others waiting at the next barrier forever. (Leaving when the flag is set after a barrier is
 // not enough: a faster tile may already have failed in the next step, so tiles would disagree.)
 void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept {
-    const uint32_t                ith = ctx->program_id(0);
-    const uint32_t                nth = ctx->grid_dim(0);
-    const spert::SharedBufferView tcm = ctx->shared_buffer();
+    const uint32_t ith = ctx->program_id(0);
+    const uint32_t nth = ctx->grid_dim(0);
+    launch->pairs.yield_arg[ith] = ctx;
+    // the tile's TCM: the worker's whole shared buffer, which the header grants only while the tile runs on that
+    // worker (spert.hpp:474-478), so it is taken again after every barrier below (E7; FLAGOS_SPACEMIT_TEST_VIEW=once
+    // keeps the first view throughout, the loop until 2026-10-30); or, test-only (E7b, FLAGOS_SPACEMIT_TEST_TCM_SLICE),
+    // a slice from alloc_shared, the tile's own until free_shared at its end
+    const bool              slice = launch->tcm_slice != 0;
+    spert::SharedBufferView tcm   = slice ? ctx->alloc_shared(launch->tcm_slice, 64) : ctx->shared_buffer();
+    if (slice && (tcm.data == nullptr || tcm.size == 0)) {
+        launch->failed.store(true);  // no slice: the launch fails; the tile still reaches every barrier
+        tcm = spert::SharedBufferView{};
+    }
+    const auto release = [&] {
+        if (slice && tcm.data != nullptr && tcm.size != 0) {
+            ctx->free_shared(tcm);
+        }
+    };
     if (launch->trace != nullptr) {  // test-only (E3b-diag)
         launch->trace->cpu[1][ith] = spacemit_cpu_now();
         launch->trace->tcm[ith]    = tcm.data;
@@ -170,6 +195,7 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     launch->tcm_sizes[ith] = tcm.data != nullptr ? tcm.size : 0;
     if (ctx->sync() != spert::Status::Ok) {
         launch->failed.store(true);  // spine-runtime's barrier itself failed: nothing can keep the tiles together
+        release();
         return;
     }
     if (launch->trace != nullptr) {
@@ -179,8 +205,8 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
     for (uint32_t i = 1; i < nth; i++) {
         tcm_size = std::min(tcm_size, launch->tcm_sizes[i]);
     }
-    const spacemit_tile tile = { ith, nth, tcm_size != 0 ? tcm.data : nullptr, tcm_size, launch->workspace,
-                                 launch->workspace_size, &launch->pairs };
+    spacemit_tile tile = { ith, nth, tcm_size != 0 ? tcm.data : nullptr, tcm_size, launch->workspace,
+                           launch->workspace_size, &launch->pairs };
 
     uint64_t barrier_ns = 0;  // test-only (E3c)
     for (size_t i = 0; i < launch->n_steps; i++) {
@@ -195,9 +221,26 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
         }
         if (status != spert::Status::Ok) {
             launch->failed.store(true);
+            release();
             return;
         }
+        // the barrier suspended the tile: the view is valid only while the tile runs on the worker it took it from,
+        // so it is taken again (a slice needs no re-take: it is the tile's own). A worker whose buffer is smaller than
+        // the agreed size cannot run the kernels' paths: the launch fails and the tile skips its kernels
+        if (tile.tcm != nullptr && !slice && launch->retake_view) {
+            const spert::SharedBufferView fresh = ctx->shared_buffer();
+            if (fresh.data == nullptr || fresh.size < tcm_size) {
+                if (!launch->failed.exchange(true)) {
+                    GGML_LOG_ERROR("FlagOS SpacemiT: tile %u: the shared buffer after step %zu holds %zu bytes, %zu "
+                                   "agreed at the launch's start\n",
+                                   ith, i, fresh.data != nullptr ? fresh.size : (size_t) 0, tcm_size);
+                }
+            } else {
+                tile.tcm = fresh.data;
+            }
+        }
     }
+    release();
     if (launch->stats != nullptr) {
         launch->stats->barrier_ns[ith] += barrier_ns;
     }
@@ -272,10 +315,32 @@ size_t spacemit_count_ordered(const std::vector<std::unique_ptr<spacemit_ordered
 }
 #    endif
 
+// test-only (E7b): the pair waits of ordered launches yield the core (spacemit_pairs::yield)
+void spacemit_yield_core(void * arg) {
+    static_cast<spert::Context *>(arg)->yield();
+}
+
 class spert_executor final : public spacemit_executor {
   public:
     spert_executor(spacemit_stream_policy policy, uint32_t n_cores, int64_t fail_step) :
-        policy(policy), n_cores(n_cores), fail_step(fail_step) {}
+        policy(policy), n_cores(n_cores), fail_step(fail_step) {
+        // FLAGOS_SPACEMIT_TEST_VIEW=once: the first view kept through every barrier (the loop until 2026-10-30, for the
+        // comparison); step, or unset: the view taken again after every barrier (spacemit_tile_main)
+        const char * view = std::getenv("FLAGOS_SPACEMIT_TEST_VIEW");
+        retake_view       = view == nullptr || std::strcmp(view, "once") != 0;
+        if (view != nullptr && std::strcmp(view, "once") != 0 && std::strcmp(view, "step") != 0) {
+            GGML_LOG_WARN("FlagOS SpacemiT: FLAGOS_SPACEMIT_TEST_VIEW=%s: expected once or step; the view is taken again "
+                          "after every barrier\n", view);
+        }
+        // test-only (E7b): FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>: each tile takes a slice of that size from its worker's
+        // shared buffer (alloc_shared) as its TCM instead of the whole buffer, in every launch mode
+        const char * slice = std::getenv("FLAGOS_SPACEMIT_TEST_TCM_SLICE");
+        tcm_slice          = slice != nullptr ? (size_t) std::max(0LL, std::atoll(slice)) : 0;
+        if (tcm_slice != 0) {
+            GGML_LOG_WARN("FlagOS SpacemiT: test-only: each tile takes a %zu-byte alloc_shared slice as its TCM "
+                          "(FLAGOS_SPACEMIT_TEST_TCM_SLICE)\n", tcm_slice);
+        }
+    }
 
     bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size) override {
         std::unique_ptr<spert::Stream> per_call_stream;
@@ -290,6 +355,8 @@ class spert_executor final : public spacemit_executor {
         launch.workspace      = workspace;
         launch.workspace_size = workspace_size;
         launch.fail_step      = fail_step;
+        launch.retake_view    = retake_view;
+        launch.tcm_slice      = tcm_slice;
         g_steps_launched += n_steps;
         spacemit_stats_begin(launch, stats, static_cast<uint32_t>(stream->core_count()));
         const spacemit_clock::time_point t      = spacemit_stats_now(launch);
@@ -329,6 +396,9 @@ class spert_executor final : public spacemit_executor {
             launch->workspace      = workspace;
             launch->workspace_size = workspace_size;
             launch->fail_step      = fail_step;
+            launch->retake_view    = retake_view;
+            launch->tcm_slice      = tcm_slice;
+            launch->pairs.yield    = spacemit_yield_core;  // E7b: two tiles of one launch on one worker take turns
             launch->trace          = &launch->tile_trace;
             launch->fence          = fence;
             if (!futures.empty()) {
@@ -398,6 +468,8 @@ class spert_executor final : public spacemit_executor {
     spacemit_stream_policy         policy;
     uint32_t                       n_cores;
     int64_t                        fail_step;
+    bool                           retake_view = true;
+    size_t                         tcm_slice   = 0;
     std::unique_ptr<spert::Stream> persistent_stream;
 };
 

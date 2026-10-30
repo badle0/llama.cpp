@@ -1352,7 +1352,7 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 8);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     // the output heads also at 128 rows with --full: a batch that needs every token's logits (perplexity, KLD)
     const std::vector<int64_t> head_rows = full ? std::vector<int64_t>{ 1, 7, 128 } : std::vector<int64_t>{ 1, 7 };
@@ -2022,7 +2022,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 8);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     struct attn_case { const char * what; attn_shape s; float q_scale = 4.0f; };
     const attn_case cases[] = {
@@ -3145,7 +3145,7 @@ static int check_layer(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 8);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     double worst = 0.0;
     for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
@@ -3309,7 +3309,12 @@ static int diagnose_e3b(ggml_backend_dev_t dev, int runs) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 8);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    // E7b: the TCM each tile gets, the same for the reference and the ordered runs (flagos-spacemit-exec.cpp)
+    const char * slice = std::getenv("FLAGOS_SPACEMIT_TEST_TCM_SLICE");
+    std::printf("e3b-diag TCM per tile: %s; the ordered launches' pair waits yield the core\n",
+                slice != nullptr ? (std::string(slice) + " bytes from alloc_shared (FLAGOS_SPACEMIT_TEST_TCM_SLICE)").c_str() :
+                                   "the worker's whole shared buffer");
 
     struct variant {
         const char * name, * gemv, * fence;
