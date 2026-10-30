@@ -460,6 +460,22 @@ int spacemit_flash_attn_split(const ggml_tensor * op) {
     return setting != 0 && split_shape(op) ? setting : 0;
 }
 
+bool spacemit_flash_attn_one_step_supported(const ggml_tensor * op) {
+    return spacemit_flash_attn_supported(op) && spacemit_flash_attn_split(op) == 0;
+}
+
+bool spacemit_flash_attn_split_supported(const ggml_tensor * op) {
+    return spacemit_flash_attn_supported(op) && spacemit_flash_attn_split(op) == 1;
+}
+
+bool spacemit_flash_attn_split_paired_supported(const ggml_tensor * op) {
+    return spacemit_flash_attn_supported(op) && spacemit_flash_attn_split(op) == 2;
+}
+
+bool spacemit_flash_attn_split_any_supported(const ggml_tensor * op) {
+    return spacemit_flash_attn_supported(op) && spacemit_flash_attn_split(op) != 0;
+}
+
 // a slice per tile: per query head the maximum, the sum and DV floats
 size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node) {
     return (size_t) SPACEMIT_MAX_TILES * (size_t) node->src[0]->ne[2] * (size_t) (node->src[2]->ne[0] + 2) *

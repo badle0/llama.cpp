@@ -210,10 +210,11 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
         CHECK(found);
     }
 
-    // what is not contract comes by name (plan.md "S1 design" A2); this build is one library, so the four names the
-    // check program can call itself must answer with those very functions
-    const char * names[] = { "spacemit_steps_take", "spacemit_ordered_counts_take", "spacemit_mm_paths_take",
-                             "spacemit_mm_tail_take", "spacemit_run_stats_attach" };
+    // what is not contract comes by name (plan.md "S1 design" A2); this build is one library, so the names the check
+    // program can call itself must answer with those very functions
+    const char * names[] = { "spacemit_steps_take",   "spacemit_ordered_counts_take",
+                             "spacemit_mm_paths_take", "spacemit_mm_tail_take",
+                             "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -227,6 +228,9 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
           reinterpret_cast<void *>(static_cast<spacemit_mm_paths_take_fn>(spacemit_mm_paths_take)));
     CHECK(table->get_proc_address("spacemit_mm_tail_take") ==
           reinterpret_cast<void *>(static_cast<spacemit_mm_tail_take_fn>(spacemit_mm_tail_take)));
+    CHECK(table->get_proc_address("spacemit_mul_mat_same_activations") ==
+          reinterpret_cast<void *>(
+              static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations)));
     CHECK(table->get_proc_address("nonexistent") == nullptr);
 
     // the device facts the core reports come from the plugin's props
@@ -297,6 +301,150 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
 
     std::printf("loader   %s: api %u, struct_size %u, %u kernels, %zu names by get_proc_address, tcm %zu per tile\n",
                 path, api, struct_size, n_kernels, n_names, tcm);
+    return 0;
+}
+
+// the attention checks' builder, below: check_contracts builds its FLASH_ATTN_EXT nodes the same way
+static ggml_tensor * build_flash_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k_cache, ggml_tensor * v_cache,
+                                      ggml_tensor * mask, int64_t n_head_kv, int64_t n_kv, float max_bias);
+
+// the real table, for the kernels() below: check_contracts sets it before the one call that needs it
+static const spacemit_plugin_v1 * g_real_table = nullptr;
+
+// the real table's kernels except mul_mat.gemm, built once from g_real_table: a kernels() for a copy of the real
+// table that lacks one kernel the core's contracts name
+static const spacemit_plugin_kernel * kernels_without_gemm(uint32_t * count) {
+    static std::vector<spacemit_plugin_kernel> kept;
+    if (kept.empty() && g_real_table != nullptr) {
+        uint32_t                       n   = 0;
+        const spacemit_plugin_kernel * all = g_real_table->kernels(&n);
+        for (uint32_t k = 0; all != nullptr && k < n; k++) {
+            if (all[k].name == nullptr || std::strcmp(all[k].name, "mul_mat.gemm") != 0) {
+                kept.push_back(all[k]);
+            }
+        }
+    }
+    if (count != nullptr) {
+        *count = (uint32_t) kept.size();
+    }
+    return kept.data();
+}
+
+// S1 step 2 (plan.md "S1 step 2 spec" §7): the core's contracts bound to the plugin's kernels by name, and the answers
+// spacemit_find_op gives through them - the variant choice of attention by the kernels' supports, the layout rule by
+// the table, the workspace by the entries
+static int check_contracts(ggml_backend_dev_t dev) {
+    const spacemit_plugin * loaded = spacemit_device_plugin(dev);
+    REQUIRE(loaded != nullptr);
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(loaded);
+    REQUIRE(table != nullptr);
+
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    REQUIRE(kernels != nullptr && n_kernels > 0);
+    const auto entry_named = [&](const char * name) -> const spacemit_plugin_kernel * {
+        for (uint32_t k = 0; k < n_kernels; k++) {
+            if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
+                return &kernels[k];
+            }
+        }
+        return nullptr;
+    };
+
+    // every contract's steps are the entries of their names
+    spacemit_ops ops;
+    std::string  detail;
+    REQUIRE(spacemit_ops_bind(table, &ops, &detail));
+    CHECK(ops.table == table);
+    CHECK(ops.n_ops == 12);
+    for (uint32_t i = 0; i < ops.n_ops; i++) {
+        REQUIRE(ops.ops[i].n_steps >= 1 && ops.ops[i].n_steps <= SPACEMIT_MAX_OP_STEPS);
+        for (uint32_t s = 0; s < ops.ops[i].n_steps; s++) {
+            const spacemit_plugin_kernel * step = ops.ops[i].steps[s];
+            REQUIRE(step != nullptr && step->name != nullptr && step->fn != nullptr);
+            const spacemit_plugin_kernel * want = entry_named(step->name);
+            REQUIRE(want != nullptr);
+            CHECK(want == step && want->fn == step->fn && std::strcmp(want->name, step->name) == 0);
+        }
+    }
+
+    // the core's own guard, tested on a copy of the real table that lacks one kernel (the loader refuses such a
+    // plugin before the core sees it)
+    {
+        g_real_table                   = table;
+        spacemit_plugin_v1 short_table = *table;
+        short_table.kernels            = kernels_without_gemm;
+        uint32_t n_short               = 0;
+        CHECK(short_table.kernels(&n_short) != nullptr && n_short == n_kernels - 1);
+        spacemit_ops fake_ops;
+        std::string  why;
+        CHECK(!spacemit_ops_bind(&short_table, &fake_ops, &why));
+        CHECK(why.find("mul_mat.gemm") != std::string::npos);
+    }
+
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    // attention: three contracts in order, the kernels' supports choosing. One token at n_kv 512 takes the paired
+    // split by default and the other two under FLAGOS_SPACEMIT_ATTN; 64 tokens take the one-step kernel in all three
+    {
+        ggml_init_params params  = { ggml_tensor_overhead() * 32, nullptr, true };
+        ggml_context *   ctx     = ggml_init(params);
+        const int64_t    d = 128, n_head = 8, n_head_kv = 2, n_kv = 512;
+        ggml_tensor *    k_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d * n_head_kv, n_kv + 32);
+        ggml_tensor *    v_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d * n_head_kv, n_kv + 32);
+        ggml_tensor *    one =
+            build_flash_attn(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, 1), k_cache, v_cache, nullptr,
+                             n_head_kv, n_kv, 0.0f);
+        ggml_tensor * batch =
+            build_flash_attn(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, 64), k_cache, v_cache, nullptr,
+                             n_head_kv, n_kv, 0.0f);
+        const struct {
+            const char * setting;
+            const char * first;
+            uint32_t     n_steps;
+        } wanted[] = {
+            { nullptr,     "flash_attn.split.partial_paired", 2 },
+            { "split",     "flash_attn.split.partial",        2 },
+            { "one-chunk", "flash_attn",                      1 },
+        };
+        for (const auto & w : wanted) {
+            env_override        attn_switch("FLAGOS_SPACEMIT_ATTN", w.setting);
+            const spacemit_op * got = spacemit_find_op(ops, one, buft);
+            REQUIRE(got != nullptr);
+            CHECK(got->n_steps == w.n_steps);
+            CHECK(got->steps[0] == entry_named(w.first));
+            if (got->n_steps == 2) {
+                CHECK(got->steps[1] == entry_named("flash_attn.split.merge"));
+            }
+            const spacemit_op * many = spacemit_find_op(ops, batch, buft);
+            REQUIRE(many != nullptr);
+            CHECK(many->n_steps == 1 && many->steps[0] == entry_named("flash_attn"));
+        }
+        ggml_free(ctx);
+    }
+
+    // MUL_MAT: the layout rule through the table, so a view of a repacked weight is not one; the workspace from the
+    // entries, the two steps sharing one rule
+    {
+        ggml_init_params params = { ggml_tensor_overhead() * 8, nullptr, true };
+        ggml_context *   ctx    = ggml_init(params);
+        ggml_tensor *    w      = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 32);
+        ggml_tensor *    x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 4);
+        ggml_tensor *    view   = ggml_view_2d(ctx, w, 256, 32, w->nb[1], 0);
+        CHECK(spacemit_find_op(ops, ggml_mul_mat(ctx, view, x), buft) == nullptr);
+        ggml_tensor *       node = ggml_mul_mat(ctx, w, x);
+        const spacemit_op * mm   = spacemit_find_op(ops, node, buft);
+        REQUIRE(mm != nullptr);
+        CHECK(mm->n_steps == 2);
+        CHECK(mm->steps[0] == entry_named("mul_mat.quantize"));
+        CHECK(mm->steps[1] == entry_named("mul_mat.gemm"));
+        const spacemit_plugin_kernel * gemm = entry_named("mul_mat.gemm");
+        REQUIRE(gemm != nullptr && gemm->workspace_size != nullptr);
+        CHECK(spacemit_op_workspace(mm, node) == gemm->workspace_size(node));
+        ggml_free(ctx);
+    }
+
+    std::printf("contracts %u bound to %u kernels: checked\n", ops.n_ops, n_kernels);
     return 0;
 }
 
@@ -3883,8 +4031,8 @@ int main(int argc, char ** argv) {
     flagos_device_info info;
     const bool         host = flagos_registry_get_device_info(global_index, &info) && info.profile.runtime != nullptr &&
                       std::strcmp(info.profile.runtime, "none") == 0;
-    if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_buffer(dev) != 0 ||
-        check_ops(dev) != 0 ||
+    if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
+        check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
         return 1;

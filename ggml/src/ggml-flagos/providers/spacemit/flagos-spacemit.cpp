@@ -4,9 +4,7 @@
 // requantized to Q8_0; M2d: the other ops of a layer except attention).
 
 #include "flagos-spacemit-api.h"
-#include "flagos-spacemit-attn.h"
-#include "flagos-spacemit-exec.h"
-#include "flagos-spacemit-ime.h"
+#include "flagos-spacemit-exec.h"  // spacemit_run_stats (test-only, E3c)
 #include "flagos-spacemit-ops.h"
 #include "core/flagos-spacemit-loader.h"
 
@@ -44,6 +42,7 @@ struct spacemit_device_context {
     spacemit_plugin *          plugin     = nullptr;  // kept for the process lifetime, as ggml keeps its backends
     const spacemit_plugin_v1 * table      = nullptr;
     spacemit_plugin_device *   dev        = nullptr;
+    spacemit_ops               ops;  // the core's contracts bound to this plugin's kernels (spacemit_ops_bind)
     ggml_backend_device        device     = {};
     ggml_backend_buffer_type   buffer_type = {};
     std::mutex                 run_mutex;  // backends of this device share the same AI cores
@@ -60,7 +59,10 @@ struct spacemit_backend_context {
     const spacemit_plugin_v1 *        table  = nullptr;
     spacemit_plugin_stream *          stream = nullptr;
     spacemit_run_stats_attach_fn      attach = nullptr;  // test-only (E3c), nullptr when the plugin has no counters
+    // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared), nullptr when the plugin does not offer the fact
+    spacemit_mul_mat_same_activations_fn same_activations = nullptr;
     std::vector<spacemit_plugin_step> steps;
+    std::vector<const char *>         step_names;  // the steps' contract names, parallel to steps
     void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                            workspace_size = 0;
     spacemit_run_stats                run_stats;  // test-only (E3c): the current graph's, with FLAGOS_SPACEMIT_TEST_STATS
@@ -377,18 +379,22 @@ std::string spacemit_role(const ggml_tensor * t) {
     return n.empty() ? "-" : n;
 }
 
-// a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention), the role its tensors'
-// names give, and its rows (r: the output's; m: a matmul's activations', after its weight type)
-std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps, size_t i) {
+// a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention, by the step's contract
+// name), the role its tensors' names give, and its rows (r: the output's; m: a matmul's activations', after its weight
+// type)
+std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
+                                const std::vector<const char *> & names, size_t i) {
     const spacemit_plugin_step & step = steps[i];
+    const char * const           name = names[i];
     const ggml_tensor *          n    = step.node;
     const long long              r    = static_cast<long long>(ggml_nrows(n));
     char                         buf[192];
     switch (n->op) {
         case GGML_OP_MUL_MAT:
             std::snprintf(buf, sizeof(buf), "MUL_MAT.%s %s %s m%lld",
-                          step.fn == spacemit_mul_mat_quantize ? "quantize" : "gemm", spacemit_role(n->src[0]).c_str(),
-                          ggml_type_name(n->src[0]->type), static_cast<long long>(ggml_nrows(n->src[1])));
+                          std::strcmp(name, "mul_mat.quantize") == 0 ? "quantize" : "gemm",
+                          spacemit_role(n->src[0]).c_str(), ggml_type_name(n->src[0]->type),
+                          static_cast<long long>(ggml_nrows(n->src[1])));
             break;
         case GGML_OP_RMS_NORM:
             {
@@ -433,9 +439,9 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             std::snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT.%s q%lld kv%lld",
-                          step.fn == spacemit_kernel_flash_attn                 ? "one-step" :
-                          step.fn == spacemit_kernel_flash_attn_split_merge     ? "merge" :
-                                                                                  "partial",
+                          std::strcmp(name, "flash_attn") == 0             ? "one-step" :
+                          std::strcmp(name, "flash_attn.split.merge") == 0 ? "merge" :
+                                                                             "partial",
                           static_cast<long long>(n->src[0]->ne[1]), static_cast<long long>(n->src[1]->ne[1]));
             break;
         default:
@@ -462,19 +468,20 @@ class spacemit_op_stats_file {
     }
 
     void add(const char * launch, int64_t rows, int64_t n_kv, const std::vector<spacemit_plugin_step> & steps,
-             const spacemit_run_stats & run) {
+             const std::vector<const char *> & names, const spacemit_run_stats & run) {
         const size_t   n     = steps.size();
         const uint32_t tiles = run.n_tiles;
         if (run.n_steps != n || tiles == 0) {
             return;
         }
+        GGML_ASSERT(names.size() == n);  // the two vectors are filled together in graph_compute
         const uint64_t              shape = structure_of(steps);
         std::lock_guard<std::mutex> lock(mutex);
         totals &                    k = kinds[std::make_tuple(std::string(launch), rows, n_kv, shape)];
         if (k.labels.empty()) {  // the kind's first graph: its names only
             k.tiles = tiles;
             for (size_t s = 0; s < n; s++) {
-                k.labels.push_back(spacemit_step_label(steps, s));
+                k.labels.push_back(spacemit_step_label(steps, names, s));
             }
             k.kernel_ns.assign(n, 0.0);
             k.busy_ns.assign(n, 0.0);
@@ -622,10 +629,19 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     // a MUL_MAT quantizes its activations in step 0 and multiplies them in step 1 (spacemit_find_op). They have their
     // own part of the workspace, after the other ops' scratch, so that the ops between two matmuls of one input leave
     // them, and with FLAGOS_SPACEMIT_QUANTIZE=shared the second matmul runs only its step 1
-    const bool          share = spacemit_quantize_shared();
-    const ggml_tensor * held  = nullptr;  // the MUL_MAT whose quantized activations that part holds
+    bool share = spacemit_quantize_shared();
+    if (share && ctx->same_activations == nullptr) {  // the fact is not contract, so a plugin may not offer it (A2)
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("FlagOS SpacemiT: the plugin has no activation-sharing fact; "
+                          "FLAGOS_SPACEMIT_QUANTIZE=shared stays off\n");
+        }
+        share = false;
+    }
+    const ggml_tensor * held = nullptr;  // the MUL_MAT whose quantized activations that part holds
     size_t              scratch_size = 0, act_size = 0;
     ctx->steps.clear();
+    ctx->step_names.clear();
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
         ggml_tensor * node = ggml_graph_node(cgraph, i);
         // as ggml-cpu: nothing to do for empty tensors, and nodes without the compute flag are branches the graph
@@ -639,7 +655,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         if (timed && n_kv < 0 && node->op == GGML_OP_FLASH_ATTN_EXT) {
             n_kv = node->src[1]->ne[1];
         }
-        const spacemit_op * op = spacemit_find_op(node, &dev->buffer_type);
+        const spacemit_op * op = spacemit_find_op(dev->ops, node, &dev->buffer_type);
         if (op == nullptr) {
             GGML_LOG_ERROR("FlagOS SpacemiT: no kernel for %s (%s)\n", ggml_op_desc(node), node->name);
             return GGML_STATUS_FAILED;
@@ -654,7 +670,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
                 held = nullptr;  // the node writes over the activations held
             }
             if (node->op == GGML_OP_MUL_MAT) {
-                if (held != nullptr && spacemit_mul_mat_same_activations(held, node)) {
+                if (held != nullptr && ctx->same_activations(held, node)) {
                     first = 1;
                 } else {
                     held = node;
@@ -662,11 +678,13 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             }
         }
         for (uint32_t s = first; s < op->n_steps; s++) {
-            ctx->steps.push_back({ op->steps[s], node, 0 });
+            ctx->steps.push_back({ op->steps[s]->fn, node, 0 });
+            ctx->step_names.push_back(op->steps[s]->name);
         }
-        if (op->workspace_size != nullptr) {
+        const size_t workspace = spacemit_op_workspace(op, node);
+        if (workspace != 0) {
             size_t & size = node->op == GGML_OP_MUL_MAT ? act_size : scratch_size;
-            size          = std::max(size, op->workspace_size(node));
+            size          = std::max(size, workspace);
         }
     }
     if (ctx->steps.empty()) {
@@ -723,7 +741,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             stats->add(launch, rows, n_kv, ctx->run_stats, graph_us);
         }
         if (op_stats != nullptr) {
-            op_stats->add(launch, rows, n_kv, ctx->steps, ctx->run_stats);
+            op_stats->add(launch, rows, n_kv, ctx->steps, ctx->step_names, ctx->run_stats);
         }
     }
     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
@@ -822,8 +840,11 @@ ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
     auto * ctx  = new spacemit_backend_context;
     ctx->table  = dctx->table;
     ctx->stream = stream;
-    // test-only (E3c): the per-tile clock reads are not contract, so they come by name (plan.md "S1 design" A2)
+    // test-only (E3c, FLAGOS_SPACEMIT_QUANTIZE=shared): neither the per-tile clock reads nor the activation-sharing
+    // fact is contract, so both come by name (plan.md "S1 design" A2)
     ctx->attach = reinterpret_cast<spacemit_run_stats_attach_fn>(dctx->table->get_proc_address("spacemit_run_stats_attach"));
+    ctx->same_activations = reinterpret_cast<spacemit_mul_mat_same_activations_fn>(
+        dctx->table->get_proc_address("spacemit_mul_mat_same_activations"));
     return new ggml_backend{
         /* .guid    = */ &g_backend_guid,
         /* .iface   = */ g_backend_iface,
@@ -838,7 +859,8 @@ ggml_backend_buffer_type_t spacemit_device_buffer_type(ggml_backend_dev_t dev) {
 
 // inputs (NONE) and views need no kernel; claiming them lets graphs that contain them run here (design §7.4)
 bool spacemit_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    return ggml_op_is_empty(op->op) || spacemit_find_op(op, &spacemit_device_from_dev(dev)->buffer_type) != nullptr;
+    spacemit_device_context * dctx = spacemit_device_from_dev(dev);
+    return ggml_op_is_empty(op->op) || spacemit_find_op(dctx->ops, op, &dctx->buffer_type) != nullptr;
 }
 
 // operands may also live in CPU buffers: the activations of the CPU's splits, and under ACCEL (test-only) the KV cache;
@@ -931,6 +953,15 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
     if (status != SPACEMIT_STATUS_SUCCESS) {
         GGML_LOG_WARN("FlagOS SpacemiT: the plugin's device properties are not available: %s\n",
                       spacemit_status_name(status));
+        table->device_close(pdev);
+        spacemit_plugin_unload(plugin);
+        return false;
+    }
+
+    // the core's contracts bound to this plugin's kernels, once: a plugin whose kernels do not answer every contract
+    // cannot run a graph, so it registers no device
+    if (!spacemit_ops_bind(table, &g_device.ops, &detail)) {
+        GGML_LOG_WARN("FlagOS SpacemiT: the plugin's kernels do not bind to the core's contracts: %s\n", detail.c_str());
         table->device_close(pdev);
         spacemit_plugin_unload(plugin);
         return false;

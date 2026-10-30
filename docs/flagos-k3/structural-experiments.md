@@ -325,6 +325,15 @@ launches may interleave. The API reference lists `Context::join`, "cooperatively
 The ABI slide states an order on a stream for copies ("在 stream 上排序") and has `stream_synchronize`; that it assumes
 ordered launches too is our reading (F15). On spine-runtime, by its documentation, the plugin must order dependent
 launches itself. Today's executor needs none of it: one launch per split, barriers inside (`Context::sync`).
+Re-read 2026-10-30 (`README.md`, `docs/programming-model.md`, `docs/scheduling.md`, `docs/api-reference.md` on `main`):
+unchanged. No sentence orders the launches of a stream and none allows them to overlap; "`launch` is an asynchronous
+submission interface"; `Stream::launch` starts one Tile-SPMD task over a grid, and no graph, command-buffer or
+multi-kernel launch API is documented. The docs say nothing of tile-to-core binding, migration, or a shared buffer's
+contents across a suspension; the header does (F16, last bullet). The runtime's status words (`spert_engine.hpp:28-40`,
+"part of the engine ABI"): `Ok` 0, `InvalidArg` 1, `Deadlock` 2 ("the stream reached a confirmed cooperative
+deadlock"), `Timeout` 3, `BackendUnavailable` 4, `Unsupported` 5, `NoMem` 6, `Failed` 7, `Cancelled` 8 ("work was
+abandoned during stream teardown"), `CrossStream` 9; so the runtime detects cooperative deadlocks itself (E7 saw it), and
+the plugin's status mapping (today every non-Ok is `SPACEMIT_STATUS_FAILED`) could carry these in S2.
 The board's header (`~/spine-runtime/include/spert.hpp`, read 2026-10-20) has what in-core ordering needs:
 `Stream::launch` returns a `Future` and copies the arguments into storage the launch owns (`:579-590`; the Future is
 invalid if the launch cannot be admitted); `Future` is a shared handle with `sync()` and `sync_all(const
@@ -388,6 +397,19 @@ tile first joining the previous launch's Future:
 - None of it inside a single launch: E3d's 20 launches of 20,000 barriers each had no moved tile and no shared core.
 - Not known: whether spine-runtime expects a tile to take its shared buffer again after every pause, and why tiles move
   (a question for SpacemiT). Our provider takes TCM once per launch, before the TCM agreement's barrier.
+- Answered in part 2026-10-30 by the board's header (`~/spine-runtime/include/spert.hpp:474-478`, 0.6.3), on
+  `Context::shared_buffer()`: "Returns the entire shared scratch buffer of the current worker. The view is non-owning
+  and remains valid only while this tile executes on that worker." So the buffer is the worker's (the core's resident
+  thread), not the tile's, and a tile that resumes on another worker holds an invalid view: what this finding measured
+  is within what the header allows, and a conforming tile takes the view again after every suspension. `alloc_shared`
+  "may suspend cooperatively until space becomes available" and its slice "must be released with `free_shared()` by the
+  same tile": the slice is the tile-owned form. Today's loop (`flagos-spacemit-exec.cpp:160-182`) takes the view once per
+  launch and keeps it through every barrier, which the header does not grant after the first `sync()`; it holds on
+  0.6.3 by measurement (E3d inside one launch; every model run since M2b). Nothing of ours keeps data in TCM across a
+  barrier: each step stages and consumes within itself, the split attention's partial results go to the workspace
+  (`flagos-spacemit-attn.cpp:360-366`), and the pair waits spin on an atomic with no runtime call
+  (`flagos-spacemit-exec.cpp:34-58`), so the barriers are the only suspension points. Whether a tile may leave its
+  worker inside a single launch, and why tiles move, stay SpacemiT's to answer; E7 measures the three forms.
 
 ## 4. Experiments
 
@@ -409,6 +431,7 @@ with the modes interleaved in each repetition: the board drifts between sessions
 | R12-hw | `PROJECT.md` question 8, `plan.md` R12 | Build R (`EXPS=r12 ... prepare`): build A's configuration with `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` defined, which compiles upstream's active branch of the 1-row Q4_1 kernel (16-bit zero-point product, fp16 sums); the provider checks once, the zero-point probe (zero point 15 against 32 equal activations, 1 row and 4) | 1-row NMSE about 4.6 (the reference's emulation of a 16-bit product, `plan.md` M2c design), 4 rows unchanged (3e-7), so the check fails; random-data Q4_1 cases unknown | 1-row NMSE above the matmul bound (5e-4): upstream's branch wraps on the board, R12 becomes a tested finding for question 8; within it: the reading was wrong and R12 is withdrawn | done 2026-10-20 (§6 run 4): 1 row 4.62, 4 rows 3.0e-7: upstream's branch wraps on the board |
 | E3b-diag | the cause of E3b's differences (Q1; for SpacemiT) | Two parts, both test-only. (a) E3d's `joined+canary`: tiles that only join, take their TCM, pass a barrier and check a pattern of their own in their TCM, across the barrier and with no suspension point in between, noting their core at four points. (b) `flagos-check-spacemit --e3b[=runs]`: the 1-token layers (q4_0, q4_1), the 7-token layer and eight 1-row matmuls alone (q4_0, q4_1), each `runs` times ordered in the cores against one launch, in four variants: the default 1-row strategy (`paired`), `staged` (TCM, no pair turns), `direct` (weights from DRAM, no pair turns) and `paired` with full memory fences after every join and at every tile's end (`FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1`); per run, what the ordered launches' tiles noted: two tiles on one core, tiles that moved, one TCM held on two cores, both tiles of a pair on one core | unknown. Candidates: H1, two tiles use one TCM at the same time (truly at once on one core, or a tile that moved still using its first core's TCM); H2, both tiles of a pair on one core, the first spinning on the second until the 10 s limit (would explain the one failed run, not the differences); H3, a tile reading data the previous launch wrote before it is visible (memory order across `join`); H4, something in the 1-row path itself (pair turns or TCM staging) | fixed before the run. H1: (a) shows a canary changed with no suspension point, or one TCM on two cores, and (b)'s differing runs show tiles that moved or one TCM on two cores. H2: (b)'s failed runs, and only they, show a pair on one core. H3: `paired+fence` has no differing run where `paired` has many. H4: the 1-row matmuls alone differ, and `staged` or `direct` changes how often (pair turns or TCM staging). Differing runs with no shared core, moved tile or shared TCM rule co-location out. If none fits, the cause stays open and the next step is comparing every node's output | done 2026-10-20 (§6 run 5): H1 and H4 by the rules (tiles moved by `join` use one TCM at the same time; only TCM staging of each tile's own weights turns it into wrong results); H2 explains the failed runs; H3 ruled out (F16) |
 | E4 | Q5, F13, R1 | Stock `ba360ef` binaries built with `GGML_BACKEND_DL=ON`, `libggml-flagos.so` from this fork loaded through `GGML_BACKEND_PATH`, with E2's IGPU | the same as E2 | E2's rule; then "no upstream change needed at all" | done 2026-10-20 (§6, run 2): passes; pp512 at depth 4096 +4.0% |
+| E7 | F16's open point (must a tile take its shared buffer again after a pause?); Q1's correctness side, for SpacemiT | `scripts/spert-view-bench.cpp`: spine-runtime alone, no provider and no ggml. Three forms of TCM use: `hold` (the view taken once, today's loop), `retake` (the view taken again after every barrier, the header's rule, `spert.hpp:474-478`) and `slice` (a tile-private slice from `alloc_shared`, held across the barriers, freed at the end); two shapes: `single` (one launch, 1,000 barriers, 20 launches per form: today's one launch per split) and `joined` (8 and 64 launches ordered by `join`, 4 barriers each: E3b's ordering). Per form and shape: core changes after a barrier, view changes against core changes (`retake`), canaries lost across a barrier through the old pointer and through the fresh view or the slice, canaries torn with no suspension point in between, slice allocation failures and slices outside the current worker's buffer, order violations, launches ending with two tiles on one core or one TCM | (written before the run) `single`: every count 0 for all three forms (E3d: no moved tile, no shared core inside one launch). `joined`: `hold` loses canaries at about E3b-diag's rate (4-14% of tiles) with 67-78% of tiles changing core; `retake`: the view changes exactly when the core does (0 changes without a core change, 0 core changes with the view the same), lost through the old pointer as `hold`, lost through the fresh view at least as often as tiles moved (the data stayed on the old worker); `slice`: lost at about `hold`'s rate, slices outside the current buffer after a move, allocation failures when two tiles of one launch share a worker; torn above 0 only under `joined` | fixed before the run. (1) `single` all zero for every form: today's once-per-launch take holds on 0.6.3 by measurement for one launch per split (not a contract; the header's sentence stays the rule, and the loop may still re-take the view after every barrier as a conformance change, measured apart). (2) `retake` under `joined`, in both batches: view changes only with a core change, and every core change changes the view: the header's sentence is F16's mechanism, confirmed. (3) If `retake` or `slice` loses no canary and tears none under `joined` in both batches: a conforming loop can make ordered single-kernel launches correct, E3b's wrong results were our loop's, and E3b is rerun with that loop (F15's cost conclusion stands either way: the runtime's floor per launch, 7.67 µs, is above the 5% line). Otherwise no form of TCM use survives the migration, ordered launches cannot be made correct with TCM-using kernels on 0.6.3, and that sentence with the counts and the header's line goes to SpacemiT (question 8) | done 2026-10-30 (§6 run 6; three runs, slices of 16, 384 and 192 KiB): rules 1 and 2 hold; rule 3 holds for slices up to half the pool (a held slice also pins the tile to its worker), while the whole buffer as a slice ends in spine-runtime's `Status::Deadlock` and a dead stream |
 | E6 | Q2 | GGUF's bytes in the buffer ggml sees plus a private repacked copy | about +2.35 GB, the same speed, exact read-back | evidence for option (e) | not implemented |
 | E5 | Q2 | the 1-row path reads GGUF's layout, interleaving 32 rows while copying into TCM | unknown; generation only | how much repacking buys | not implemented |
 | Q4 table | Q4 | on paper: our kernel choices as manifest entries (startup filter for device facts, `when` for per-token shapes, one generic variant per contract), each condition `when` cannot express marked | some inexpressible (ranges, equality, strides, layout) | input for Q4 | to do |
@@ -465,6 +488,15 @@ EXPS="e2 e3a" docs/flagos-k3/scripts/structural-experiments.sh run ~/models/Qwen
 
 - E3d prints one line per case; if a `joined+tcm` line does not come within a minute, the run hangs there (itself a
   result): Ctrl-C, then `~/tcmtest/tcmrelease --apply`.
+- E7 (2026-10-30), the same way, after a `git -c safe.directory=$PWD pull` or a copy of the file:
+  ```bash
+  g++ -O2 -std=c++17 -I$HOME/spine-runtime/include docs/flagos-k3/scripts/spert-view-bench.cpp \
+      -L$HOME/spine-runtime/lib -lspert -o ~/spert-view-bench
+  ~/tcmtest/tcmrelease --apply && LD_LIBRARY_PATH=$HOME/spine-runtime/lib ~/spert-view-bench 2>&1 | tee ~/sx-e7.log
+  ```
+  Nine lines, three `single` then six `joined` (8 and 64 at a time, each in the three forms); the arguments, in order,
+  are the joined launches per case (4,000), the barriers per joined launch (4) and the slice size in KiB (16). A hang
+  in a `joined` case: Ctrl-C, then `~/tcmtest/tcmrelease --apply`, and the lines printed so far are the result.
 - R12-hw's result is the `prepare` lines under "build R": the check's last line and the probe's NMSE for 1 row and 4.
 - E3c's summary adds a table per generated token (µs): outside `graph_compute`, host work in it, launch overhead, the
   barriers' own cost, imbalance, kernels, idle (the deck's measure) and its share, steps and launches per token, and
@@ -929,6 +961,59 @@ Reading, by the rules fixed in §4:
 - Today's provider is not exposed: one launch per split, where E3d saw no moved tile and no shared core; E3a's
   host-waited launches, one at a time, were byte-identical in every check, so `plan.md` M3.1's AOT nodes as host-waited
   launches are not either (inferred from E3a).
+
+### Run 6 (K3, 2026-10-30): E7, the shared-buffer view across suspensions
+
+`spert-view-bench` on spine-runtime 0.6.3, three runs in one session with slices of 16, 384 and 192 KiB (in that
+order), 4,000 joined launches per case with 4 barriers each, `single` 20 launches of 1,000 barriers per form; no run
+hung. The three forms: `hold` (the view taken once, today's loop), `retake` (taken again after every barrier) and
+`slice` (an `alloc_shared` slice held across the barriers).
+
+| Shape | Form | Tiles that changed core | View changes: with the core / without / core without view | Canaries lost: old pointer / fresh view or slice | Torn | Launches with two tiles on one worker at the end | Failed |
+|---|---|---|---|---|---|---|---|
+| single, 1,000 barriers | all three | 0 of 160 (0 of 160,000 barriers) in every form | 0 / 0 / 0 | 0 / 0 | 0 | 0 | 0 |
+| joined, 8 at a time | hold | 27,964-27,973 of 32,000 (84,243-84,316 of 128,000 barriers) | - | 21,474-21,980 / - | 9,529-9,720 | 2,431-2,495 | 0 |
+| joined, 8 | retake | 27,974-27,984 of 32,000 (87,565-87,621 barriers) | 87,565-87,621 / 0 / 0 | 31,811-31,976 / 88,107-88,164 | 0 | 2,561-2,609 | 0 |
+| joined, 8 | slice 16 and 192 KiB | 0 of 32,000 | - | 0 / 0 | 0 | 0 and 1 | 0 |
+| joined, 64 at a time | hold | 31,197-31,199 of 31,744 (93,017-93,200 of 126,976) | - | 31,608-32,259 / - | 13,816-14,096 | 2,580-2,637 | 0 |
+| joined, 64 | retake | 31,220-31,225 of 31,744 (96,190-96,342) | 96,190-96,342 / 0 / 0 | 43,690-43,704 / 97,467-97,471 | 0 | 1,223-1,268 | 0 |
+| joined, 64 | slice 16 and 192 KiB | 0 of 31,744 | - | 0 / 0 | 0 | 2,830 and 2,865 | 0 |
+| joined, 8 | slice 384 KiB (the whole buffer) | 0 (of the launches that ran) | - | 0 / 0 | 0 | 3,221 launches whose tiles never ran | 403 of 500 rounds, `Status::Deadlock` (2) |
+| joined, 64, after that case | all three | nothing ran | - | - | - | - | 62 of 62 rounds, `Deadlock` |
+
+The ranges are the three runs' values (the 16, 384 and 192 KiB runs; the 384 run's 64-at-a-time lines are the failed
+ones). `Status::Deadlock` is spine-runtime's own word (`spert_engine.hpp:31`: "The stream reached a confirmed
+cooperative deadlock"). The per-launch times are dominated by the canaries' scalar TCM accesses (36-43 ms per
+1,000-barrier launch) and say nothing about barrier cost; E3d's 0.9 µs per barrier stands.
+
+By the rules fixed before the run:
+- Rule 1 holds: inside one launch nothing moves, the view never changes, nothing is lost or torn, in every form. Today's
+  once-per-launch take (`spacemit_tile_main`) is correct by measurement on 0.6.3 for one launch per split. Not a
+  contract: the header's sentence (F16) stays the rule.
+- Rule 2 holds exactly: under ordered launches the view changed with the core 87,565-96,342 times and never without it,
+  and the core never changed with the view the same. The header's sentence is F16's mechanism. Two more facts: through
+  the fresh view the canary was lost at least once per core change (the data stays on the old worker, so even a
+  conforming tile keeps nothing in TCM across a suspension), and `retake` was never torn where `hold` was torn
+  9,529-14,096 times: tearing is a moved tile writing through its stale pointer into a worker where another tile runs; a
+  tile using its current worker's buffer is never interfered with between suspension points (one tile runs on a worker
+  at a time).
+- Rule 3 holds with a condition. A tile holding an `alloc_shared` slice never changed core (0 of 254,976 barriers over
+  the two sizes, against 66-76% without a slice in the same runs): by inference the runtime pins a tile to its worker
+  while it holds a slice (the header: the slice "must be released with `free_shared()` by the same tile"). Slices of 16
+  and 192 KiB are safe across every suspension and two tiles of one launch coexist on one worker with their own slices
+  (2,830-2,865 launches at 64 in flight). With the whole 384 KiB as the slice, the second tile on a worker suspends for
+  a pool the first holds until a barrier the second must reach: the runtime detects it, fails the launch with
+  `Deadlock` (403 of 500 rounds at 8 in flight; the 797 launches that ran lost nothing), and the stream then refuses
+  every later launch of the process, whatever the form; `tcmrelease` found all 8 blocks free afterwards (the TCM was not
+  leaked; the `Stream` was unusable). So ordered single-kernel launches can be made correct only with kernels that take
+  at most half a worker's pool. Our kernels take the whole buffer (the matmuls' slabs, the tiled attention), so for them
+  E3b stays as F16 left it, and F15's cost conclusion stands regardless (the runtime's floor per launch, 7.67 µs,
+  above the 5% line).
+- For SpacemiT (question 8): the header's sentence and this table; the questions left are why a tile without a slice
+  moves at all, and whether the pinning by a held slice is a rule they will keep.
+- For the design: nothing to change in the provider's loop for one launch per split (rule 1). If ordered launches were
+  ever wanted (not planned: F15), the conforming form would be `alloc_shared` of the kernels' TCM need, under half the
+  pool, with pair waits that yield.
 
 ## 7. Log
 

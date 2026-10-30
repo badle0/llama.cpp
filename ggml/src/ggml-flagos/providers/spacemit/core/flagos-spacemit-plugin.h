@@ -116,6 +116,9 @@ typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, 
                                           uint64_t * path_b_staged);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
+// test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
+// as MUL_MAT a, so that b can multiply what a's quantize step wrote
+typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
 
 typedef struct {
     uint32_t api_version;  // the mentor's fields (flagos-provider.h:66-67)

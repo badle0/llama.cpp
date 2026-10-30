@@ -337,12 +337,12 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "swiglu.f32",       spacemit_kernel_swiglu_f32,    nullptr,                     nullptr                              },
         { "mul_mat.quantize", spacemit_mul_mat_quantize,     nullptr,                     spacemit_mul_mat_workspace           },
         { "mul_mat.gemm",     spacemit_mul_mat_gemm,         nullptr,                     spacemit_mul_mat_workspace           },
-        { "flash_attn",       spacemit_kernel_flash_attn,    spacemit_flash_attn_supported, nullptr                             },
-        { "flash_attn.split.partial", spacemit_kernel_flash_attn_split_partial, spacemit_flash_attn_supported,
+        { "flash_attn",       spacemit_kernel_flash_attn,    spacemit_flash_attn_one_step_supported, nullptr                    },
+        { "flash_attn.split.partial", spacemit_kernel_flash_attn_split_partial, spacemit_flash_attn_split_supported,
           spacemit_flash_attn_split_workspace                                                                                  },
-        { "flash_attn.split.partial_paired", spacemit_kernel_flash_attn_split_partial_paired, spacemit_flash_attn_supported,
-          spacemit_flash_attn_split_workspace                                                                                  },
-        { "flash_attn.split.merge", spacemit_kernel_flash_attn_split_merge, spacemit_flash_attn_supported,
+        { "flash_attn.split.partial_paired", spacemit_kernel_flash_attn_split_partial_paired,
+          spacemit_flash_attn_split_paired_supported, spacemit_flash_attn_split_workspace                                      },
+        { "flash_attn.split.merge", spacemit_kernel_flash_attn_split_merge, spacemit_flash_attn_split_any_supported,
           spacemit_flash_attn_split_workspace                                                                                  },
     };
     if (count != nullptr) {
@@ -404,6 +404,10 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_run_stats_attach") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_run_stats_attach_fn>(spacemit_run_stats_attach));
+    }
+    if (std::strcmp(name, "spacemit_mul_mat_same_activations") == 0) {
+        return reinterpret_cast<void *>(
+            static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations));
     }
     return nullptr;
 }
