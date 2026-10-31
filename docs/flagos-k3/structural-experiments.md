@@ -597,7 +597,7 @@ Test-only; the defaults are unchanged.
 | `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (compile-time) | `gemm_kernel_i8i4_m1`, `flagos-spacemit-ime-kernels.cpp` | R12-hw: compiles upstream's active branch of the 1-row Q4_1 kernel instead of the exact one; only in build R, through `CMAKE_CXX_FLAGS` |
 | `FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1` | `run_ordered` and `spacemit_tile_main_ordered`, `flagos-spacemit-exec.cpp` | E3b-diag: with E3b, a full memory fence after every tile's join and at its end. E3b's launches also always note each tile's core after its join, after taking its TCM, after the TCM agreement and at its end, and its TCM; `spacemit_ordered_counts_take()` (`flagos-spacemit-exec.h`) returns what they showed |
 | `FLAGOS_SPACEMIT_TEST_VIEW=once` | `spert_executor` and `spacemit_tile_main`, `flagos-spacemit-exec.cpp` | the first `shared_buffer()` view kept through every barrier (the loop until 2026-10-30); unset or `step`: the view taken again after every barrier, the header's rule (E7, `spert.hpp:474-478`); the kernels keep nothing in TCM across a barrier, so the outputs are the same; a fresh view smaller than the agreed size fails the launch |
-| `FLAGOS_SPACEMIT_PLAN=none\|structure\|uid` | `spacemit_plan_cache`, `core/flagos-spacemit-plan.{h,cpp}`; the lookup in `graph_compute`, `flagos-spacemit.cpp` | S1 step 3 (A4): the plan cache behind a switch, `none` (today's path) the default; `structure` candidate S (Common's canonical compare, one entry), `uid` candidate U (the split's uid, the node pointers and the configuration word first, S behind it); the contract check per node runs under every setting; counters in the E3c stats line (`plan_hits_uid`, `plan_hits_structure`, `plan_misses`, `plan_rebinds`, `plan_lookup_us` from the top of `graph_compute`, `plan_key_us` the lookup alone); the runner's modes `plan-s`, `plan-u` (`EXPS=plan`); off under `FLAGOS_SPACEMIT_QUANTIZE=shared`. Run 11. Decision 2026-10-31: S to be removed, U kept, `uid-trust` added (step 3b) |
+| `FLAGOS_SPACEMIT_PLAN=none\|uid\|uid-trust` | `spacemit_plan_cache`, `core/flagos-spacemit-plan.{h,cpp}`; the probe and the lookup in `graph_compute`, `flagos-spacemit.cpp` | S1 steps 3 and 3b (A4): the plan cache behind a switch, `none` (the full path) the default until step 3c; one entry, the last plan, keyed by the split's uid, the node objects and the configuration word (the plugin's switch generation and the sharing fact); `uid` the checked form (the contract check on every graph, a hit also needing the cached steps to be the contracts' found, the hit guard), `uid-trust` the trusted form (the entry taken before the check, a hit skipping it: CUDA's and Hexagon's form); a uid of 0 or a new uid a miss; counters in the E3c stats line (`plan_hits_uid`, `plan_misses`, `plan_lookup_us` from the top of `graph_compute`, `plan_key_us` from after the check); the runner's modes `plan-u`, `plan-ut` (`EXPS=plan`); off under `FLAGOS_SPACEMIT_QUANTIZE=shared`. Step 3 (run 11) had `structure` (candidate S, Common's compare) in place of `uid-trust`, removed 2026-10-31. Run 12: `uid-trust` adopted; step 3c makes it the default and removes `uid` |
 | `FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>` | the same, and `spacemit_pair_wait` | E7b: each tile takes a slice of that size from its worker's shared buffer (`alloc_shared`, freed at the tile's end) as its TCM instead of the whole buffer, in every launch mode; an empty slice fails the launch; under `per-step-join` the pair waits yield the core (`Context::yield`) instead of spinning, so two tiles of one launch on one worker take turns |
 | `flagos-check-spacemit --e3b[=runs]` | `diagnose_e3b`, `tests/check_spacemit.cpp` | E3b-diag: only the E3b diagnosis (§4), nothing else checked |
 
@@ -1225,6 +1225,55 @@ rule, so its time columns are disturbed as in run 10; its differences between mo
   `ggml-cuda.cu:2555-2559`; Hexagon upstream, `cached_uid`; RPC's recompute by uid). Decision (user): S removed, U
   kept, the trusted form `uid-trust` built and measured next (step 3b, `plan.md`).
 
+### Run 12 (K3, 2026-11-01): S1 step 3b, the trusted uid hit against the checked form
+
+The step 3b patch on `02a1cb9ee` (`plan.md` "S1 step 3b spec"); `EXPS="plan" REPS=3 DEPTH=0`, Qwen3-4B with the
+perplexity text, Qwen3-0.6B without; the modes `ref`, `e3c` (the counters, the full path), `plan-u`
+(`FLAGOS_SPACEMIT_PLAN=uid`, the contract check on every graph with the hit guard), `plan-ut` (`uid-trust`, a hit
+skipping the check), interleaved, three `llama-bench` runs each. The check program passed under the three settings
+first. Placement unchanged (2 splits per token, 29 of 29 layers, the KV cache in the provider's buffer); the generated
+text identical in every mode on both models.
+
+| Model | Mode | pp128 | tg128 |
+|---|---|---|---|
+| 4B | `ref` | 106.48 ± 0.09 | 11.03 ± 0.03 |
+| 4B | `e3c` | 106.33 ± 0.24 (-0.1%) | 10.94 ± 0.01 (-0.8%) |
+| 4B | `plan-u` | 106.43 ± 0.13 (-0.0%) | 10.94 ± 0.00 (-0.8%) |
+| 4B | `plan-ut` | 106.10 ± 0.53 (-0.4%) | 11.00 ± 0.01 (-0.2%) |
+| 0.6B | `ref` | 692.28 ± 6.28 | 54.87 ± 0.09 |
+| 0.6B | `e3c` | 697.28 ± 7.01 (+0.7%) | 53.94 ± 0.35 (-1.7%) |
+| 0.6B | `plan-u` | 692.49 ± 3.46 (+0.0%) | 53.87 ± 0.18 (-1.8%) |
+| 0.6B | `plan-ut` | 701.00 ± 5.31 (+1.3%) | 55.10 ± 0.08 (+0.4%) |
+
+One generated token, µs, the mean over the repetitions (the E3c columns as in run 8; `lookup` from the top of
+`graph_compute`, the contract check included; `key` from after the check, on a trusted hit equal to `lookup`):
+
+| Model | Mode | Token | Host | Idle | Lookup | Key | Hits uid | Misses | Steps |
+|---|---|---|---|---|---|---|---|---|---|
+| 4B | `e3c` | 91,398 | 630 | 1,946 | 616 | 0 | 0 | 0 | 1,086 |
+| 4B | `plan-u` | 91,375 | 575 | 1,910 | 561 | 24 | 0.99 | 0.01 | 1,086 |
+| 4B | `plan-ut` | 90,884 | 46 | 1,365 | 20 | 18 | 0.99 | 0.01 | 1,086 |
+| 0.6B | `e3c` | 18,540 | 446 | 1,401 | 435 | 0 | 0 | 0 | 846 |
+| 0.6B | `plan-u` | 18,563 | 486 | 1,448 | 473 | 19 | 0.99 | 0.01 | 846 |
+| 0.6B | `plan-ut` | 18,150 | 39 | 1,009 | 16 | 15 | 0.99 | 0.01 | 846 |
+
+Logits on Qwen3-4B: both settings against `ref` mean KLD 0.000000, maximum 5.4e-5 at 512-token batches and 5.7e-5
+at one token, same top p 100% (the base file's floor, run 9). 0.6B's counters cost 1.7% and 4B's 0.8%, so the time
+columns are disturbed as in runs 10 and 11; the differences between modes stand. Readings:
+- The hits as predicted: every generation graph but the first of a run, under both settings.
+- **`uid-trust` adopted by the rule of 2026-10-29:** the host work per generated token falls from 630 to 46 µs on 4B
+  (584 saved, 200 required) and from 446 to 39 on 0.6B, with identical logits. The predictions held: 46 and 39 left
+  (50-120 and 30-80 predicted), the key 18 and 15 (5-20). Run 11's inference is confirmed: the per-node contract
+  check was about 0.55 ms of a 4B token, and skipping it on a hit is the saving.
+- The checked form `uid` saves nothing (575 against 630 on 4B, 486 against 446 on 0.6B), as in run 11.
+- Speed: against the counted modes `plan-ut` gains tg128 0.6% on 4B and 2.2% on 0.6B; against `ref` it reads -0.2%
+  and +0.4%, since the counters it carries cost `e3c` 0.8% and 1.7% here. The gain without counters is an estimate
+  (about +0.5% on 4B, +2% on 0.6B) until step 3c's A/B of the new default against `none` runs without them. The token
+  time fell 514 µs on 4B and 390 on 0.6B; the deck's idle share from 2.13% to 1.50% and from 7.56% to 5.56%.
+- Decision (user): `uid-trust` the default; `uid` removed with it (no performance fallback, since its host cost is
+  `none`'s; no better diagnostic, since a wrong trust shows as outputs differing between `uid-trust` and `none`; no
+  precedent keeps a checked form). Step 3c (`plan.md`).
+
 ## 7. Log
 
 - 2026-10-19: requirements, questions and findings collected from the deck, the AMD comparison, upstream `master`, the
@@ -1345,3 +1394,6 @@ rule, so its time columns are disturbed as in run 10; its differences between mo
 - 2026-10-31: run 11 (S1 step 3, the plan cache's two candidates on both models; `FLAGOS_SPACEMIT_PLAN` in §5):
   no cache by the rule; the contract check, not the expansion, is the host cost; S to be removed, U kept,
   `uid-trust` next (`plan.md` step 3b).
+- 2026-11-01: run 12 (S1 step 3b, the trusted uid hit against the checked form on both models): `uid-trust` adopted
+  by the rule (the host work per 4B token 630 to 46 µs, identical logits); the checked form saves nothing; step 3c
+  makes `uid-trust` the default and removes `uid` (`plan.md`).
