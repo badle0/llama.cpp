@@ -32,7 +32,9 @@
 #include "ggml-cpu.h"
 #include "ggml-flagos.h"
 #include "ggml.h"
+#include "../ggml-impl.h"  // ggml_cgraph's uid and ggml_graph_view (the plan cache's probes)
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
+#include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
 #include "providers/spacemit/flagos-spacemit-api.h"   // spacemit_device_plugin
 #include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
 #include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
@@ -49,6 +51,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -221,7 +224,7 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     const char * names[] = { "spacemit_steps_take",   "spacemit_ordered_counts_take",
                              "spacemit_mm_paths_take", "spacemit_mm_tail_take",
                              "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
-                             "spacemit_switches_reset" };
+                             "spacemit_switches_reset", "spacemit_switches_generation" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -240,6 +243,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
               static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations)));
     CHECK(table->get_proc_address("spacemit_switches_reset") ==
           reinterpret_cast<void *>(static_cast<spacemit_switches_reset_fn>(spacemit_switches_reset)));
+    CHECK(table->get_proc_address("spacemit_switches_generation") ==
+          reinterpret_cast<void *>(static_cast<spacemit_switches_generation_fn>(spacemit_switches_generation)));
     CHECK(table->get_proc_address("nonexistent") == nullptr);
 
     // the device facts the core reports come from the plugin's props
@@ -2254,18 +2259,18 @@ struct layer_out {
 // residual, and the last token's row: every op of a Qwen3 layer. The attention is flash attention over every cell of
 // the caches (build_flash_attn), so it reads the KV writes through views of the caches, not through the nodes: only
 // the graph's order puts the writes first. Expanded into gf in llama.cpp's order (src/llama-graph.cpp:2770-2790): q, v
-// and k, the KV writes, then the attention and the rest
+// and k, the KV writes, then the attention and the rest. freq_base: RoPE's base (check_plan's probe (c) changes it)
 static layer_out build_layer(ggml_context * ctx, ggml_cgraph * gf, const layer_weights & w, ggml_tensor * x,
                              ggml_tensor * pos, ggml_tensor * kv_idx, ggml_tensor * out_ids, ggml_tensor * k_cache,
-                             ggml_tensor * v_cache, ggml_tensor * mask, int64_t n_tokens) {
+                             ggml_tensor * v_cache, ggml_tensor * mask, int64_t n_tokens, float freq_base = 1e6f) {
     const float   eps = 1e-6f;
     ggml_tensor * h   = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w.attn_norm);
     ggml_tensor * q   = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w.wq, h), k_hd, k_nh, n_tokens);
     q                 = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), w.q_norm);
-    q = ggml_rope_ext(ctx, q, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    q = ggml_rope_ext(ctx, q, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_tensor * k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w.wk, h), k_hd, k_nkv, n_tokens);
     k               = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), w.k_norm);
-    k = ggml_rope_ext(ctx, k, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, 1e6f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    k = ggml_rope_ext(ctx, k, pos, nullptr, k_hd, GGML_ROPE_TYPE_NEOX, 0, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_tensor * v = ggml_mul_mat(ctx, w.wv, h);
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, v);
@@ -3267,6 +3272,528 @@ static int check_layer(ggml_backend_dev_t dev) {
     return 0;
 }
 
+//
+// S1 step 3 (plan.md "S1 step 3 spec" §3): the plan cache's probes under FLAGOS_SPACEMIT_PLAN=none, structure and uid
+//
+
+// one Qwen3-like layer (build_layer, down projection Q4_0) built once on the provider and on the CPU, computed as often
+// as a probe asks: the inputs, caches and weights of layer_nmse (fixed seeds), so two layers of one shape built apart
+// hold the same values and the provider must give them the same bytes
+struct plan_layer {
+    ggml_context *        ctx_h = nullptr, * ctx_wd = nullptr, * ctx_wc = nullptr, * ctx_gd = nullptr, * ctx_gc = nullptr;
+    ggml_backend_buffer_t bh = nullptr, bwd = nullptr, bwc = nullptr, bgd = nullptr, bgc = nullptr;
+    ggml_cgraph *         gd = nullptr, * gc = nullptr;
+    layer_out             od = {}, oc = {};
+    layer_weights         wd = {};  // the provider's graph's weights (probe (j) points a MUL_MAT at another one)
+    bool                  cpu_done = false;
+
+    // weights_on_cpu: the weights in a plain CPU buffer instead of the provider's (probe (j))
+    bool init(ggml_backend_dev_t dev, int64_t n_tokens, float freq_base, bool weights_on_cpu = false) {
+        ggml_init_params params = { ggml_tensor_overhead() * 128 + ggml_graph_overhead() * 2, nullptr, true };
+        ctx_h                   = ggml_init(params);
+        ctx_wd                  = ggml_init(params);
+        ctx_wc                  = ggml_init(params);
+        ctx_gd                  = ggml_init(params);
+        ctx_gc                  = ggml_init(params);
+        ggml_tensor * x         = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, k_d, n_tokens);
+        ggml_tensor * pos       = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n_tokens);
+        ggml_tensor * kv_idx    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I64, n_tokens);
+        ggml_tensor * out_ids   = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 1);
+        ggml_tensor * kc_d      = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+        ggml_tensor * vc_d      = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+        ggml_tensor * kc_c      = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+        ggml_tensor * vc_c      = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+        ggml_tensor * mask      = ggml_new_tensor_4d(ctx_h, GGML_TYPE_F16, k_slots, n_tokens, 1, 1);
+        wd                      = new_layer_weights(ctx_wd, GGML_TYPE_Q4_0);
+        const layer_weights wc  = new_layer_weights(ctx_wc, GGML_TYPE_Q4_0);
+        for (ggml_tensor * c : { kc_d, kc_c }) {
+            ggml_set_name(c, "cache_k_l0");
+        }
+        for (ggml_tensor * c : { vc_d, vc_c }) {
+            ggml_set_name(c, "cache_v_l0");
+        }
+        bh  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+        bwd = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx_wd, weights_on_cpu ? ggml_backend_cpu_buffer_type() : ggml_backend_dev_buffer_type(dev));
+        bwc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wc, ggml_backend_cpu_buffer_type());
+        if (bh == nullptr || bwd == nullptr || bwc == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_clear(bh, 0);
+        set_layer_weights(wd);
+        copy_layer_weights(wd, wc);
+
+        const std::vector<float> xv = random_values(k_d * n_tokens, 5, 1.0f);
+        std::vector<int32_t>     pv(n_tokens);
+        std::vector<int64_t>     iv(n_tokens);
+        std::vector<int32_t>     cell_pos(k_slots, -1);  // -1: empty
+        for (int64_t t = 0; t < n_tokens; t++) {
+            pv[t]           = (int32_t) (k_layer_pos + t);
+            iv[t]           = (3 + 5 * t) % k_slots;
+            cell_pos[iv[t]] = pv[t];
+        }
+        for (int32_t c = 0, p = 0; c < k_slots && p < k_layer_pos; c++) {
+            if (cell_pos[c] < 0) {
+                cell_pos[c] = p++;
+            }
+        }
+        std::vector<ggml_fp16_t> mv(k_slots * n_tokens);
+        for (int64_t t = 0; t < n_tokens; t++) {
+            for (int64_t c = 0; c < k_slots; c++) {
+                mv[t * k_slots + c] = ggml_fp32_to_fp16(cell_pos[c] >= 0 && cell_pos[c] <= pv[t] ? 0.0f : -INFINITY);
+            }
+        }
+        const int32_t last = (int32_t) (n_tokens - 1);
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(pos, pv.data(), 0, ggml_nbytes(pos));
+        ggml_backend_tensor_set(kv_idx, iv.data(), 0, ggml_nbytes(kv_idx));
+        ggml_backend_tensor_set(out_ids, &last, 0, sizeof(last));
+        ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
+        uint32_t cache_seed = 6;
+        for (const auto & caches : { std::pair<ggml_tensor *, ggml_tensor *>{ kc_d, kc_c }, { vc_d, vc_c } }) {
+            const std::vector<ggml_fp16_t> h = random_f16(ggml_nelements(caches.first), cache_seed++, 1.0f);
+            ggml_backend_tensor_set(caches.first, h.data(), 0, ggml_nbytes(caches.first));
+            ggml_backend_tensor_set(caches.second, h.data(), 0, ggml_nbytes(caches.second));
+        }
+        gd  = ggml_new_graph(ctx_gd);
+        gc  = ggml_new_graph(ctx_gc);
+        od  = build_layer(ctx_gd, gd, wd, x, pos, kv_idx, out_ids, kc_d, vc_d, mask, n_tokens, freq_base);
+        oc  = build_layer(ctx_gc, gc, wc, x, pos, kv_idx, out_ids, kc_c, vc_c, mask, n_tokens, freq_base);
+        bgd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gd, ggml_backend_dev_buffer_type(dev));
+        bgc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_gc, ggml_backend_cpu_buffer_type());
+        return bgd != nullptr && bgc != nullptr;
+    }
+
+    ~plan_layer() {
+        for (ggml_backend_buffer_t b : { bh, bwd, bwc, bgd, bgc }) {
+            ggml_backend_buffer_free(b);
+        }
+        for (ggml_context * c : { ctx_h, ctx_wd, ctx_wc, ctx_gd, ctx_gc }) {
+            ggml_free(c);
+        }
+    }
+
+    // the provider's layer output of graph g (default: gd), filled with NaN first, so steps bound to another graph's
+    // nodes leave it NaN; false if the provider failed
+    bool run(ggml_backend_t backend, std::vector<float> & out, ggml_cgraph * g = nullptr) {
+        out.assign(ggml_nelements(od.full), NAN);
+        ggml_backend_tensor_set(od.full, out.data(), 0, ggml_nbytes(od.full));
+        if (ggml_backend_graph_compute(backend, g != nullptr ? g : gd) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        ggml_backend_tensor_get(od.full, out.data(), 0, ggml_nbytes(od.full));
+        return true;
+    }
+
+    // out's NMSE against the CPU's layer (computed once); +inf if not finite
+    double cpu_nmse(ggml_backend_t cpu, const std::vector<float> & out) {
+        if (!cpu_done) {
+            cpu_done = ggml_backend_graph_compute(cpu, gc) == GGML_STATUS_SUCCESS;
+        }
+        return cpu_done ? nmse(out.data(), static_cast<const float *>(oc.full->data), (int64_t) out.size()) : HUGE_VAL;
+    }
+};
+
+static bool same_bytes(const std::vector<float> & a, const std::vector<float> & b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+// the guard probe's stand-in kernels: never run, only compared by the plan cache's hit guard
+static bool plan_fake_kernel_a1(const spacemit_tile *, ggml_tensor *) {
+    return true;
+}
+
+static bool plan_fake_kernel_a2(const spacemit_tile *, ggml_tensor *) {
+    return true;
+}
+
+static bool plan_fake_kernel_b1(const spacemit_tile *, ggml_tensor *) {
+    return true;
+}
+
+static bool plan_fake_kernel_b2(const spacemit_tile *, ggml_tensor *) {
+    return true;
+}
+
+// probe (j), the hit guard on the cache itself, with two-step stand-in contracts A and B on every node of g (uid and
+// word unchanged throughout). No real graph can show it: of the facts outside the structure and the word that the
+// contract check reads, a weight in a host buffer and the layout rule by name (flagos-spacemit-ops.cpp:140-151) both
+// make spacemit_find_op refuse the node, never pick another contract, so the graph fails before the lookup (checked in
+// check_plan). Each case stores one step list, then looks up: (1) both steps of A per node, sizes 4096 and 8192, asked
+// with A: a hit with those sizes and the steps; asked with B: a miss; (2) only A's first step cached per node: a miss
+// with A; (3) A's steps in reverse order: a miss; (4) one node without a contract at the store (its steps left out),
+// asked with every node on A: a miss, asked as stored: a hit. Returns false and reports when the cache does otherwise
+static bool plan_guard_probe(spacemit_plan_mode mode, const ggml_cgraph * g) {
+    const spacemit_plugin_kernel ka1 = { "fake.a1", plan_fake_kernel_a1, nullptr, nullptr };
+    const spacemit_plugin_kernel ka2 = { "fake.a2", plan_fake_kernel_a2, nullptr, nullptr };
+    const spacemit_plugin_kernel kb1 = { "fake.b1", plan_fake_kernel_b1, nullptr, nullptr };
+    const spacemit_plugin_kernel kb2 = { "fake.b2", plan_fake_kernel_b2, nullptr, nullptr };
+    const spacemit_op            op_a = { { &ka1, &ka2 }, 2 };
+    const spacemit_op            op_b = { { &kb1, &kb2 }, 2 };
+    ggml_cgraph *                gm   = const_cast<ggml_cgraph *>(g);
+    const int                    n    = ggml_graph_n_nodes(gm);
+    std::vector<const spacemit_op *>  ops_a(n, nullptr), ops_b(n, nullptr), ops_less(n, nullptr);
+    std::vector<spacemit_plugin_step> full, first_only, reversed, less;
+    int                               left_out = -1;  // case (4): the first node with a contract
+    for (int i = 0; i < n; i++) {
+        ggml_tensor * node = ggml_graph_node(gm, i);
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        ops_a[i] = &op_a;
+        ops_b[i] = &op_b;
+        full.push_back({ plan_fake_kernel_a1, node, 0 });
+        full.push_back({ plan_fake_kernel_a2, node, 0 });
+        first_only.push_back({ plan_fake_kernel_a1, node, 0 });
+        reversed.push_back({ plan_fake_kernel_a2, node, 0 });
+        reversed.push_back({ plan_fake_kernel_a1, node, 0 });
+        if (left_out < 0) {
+            left_out = i;
+            continue;
+        }
+        ops_less[i] = &op_a;
+        less.push_back({ plan_fake_kernel_a1, node, 0 });
+        less.push_back({ plan_fake_kernel_a2, node, 0 });
+    }
+    const uint64_t             word = 2;
+    const spacemit_plan_result hit  = mode == spacemit_plan_mode::uid && g->uid != 0 ? spacemit_plan_result::hit_uid :
+                                                                                      spacemit_plan_result::hit_structure;
+    std::vector<spacemit_plugin_step> steps;
+    std::vector<const char *>         names;
+    size_t                            scratch = 0, act = 0;
+    bool                              rebound = false, ok = left_out >= 0;
+    // a fresh cache holding `stored` for ops_stored, sizes 4096 and 8192, then asked with `asked`
+    const auto run_case = [&](const char * what, const std::vector<const spacemit_op *> & ops_stored,
+                              const std::vector<spacemit_plugin_step> & stored,
+                              const std::vector<const spacemit_op *> & asked, spacemit_plan_result want) {
+        spacemit_plan_cache cache;
+        bool                good = cache.lookup(mode, g, word, false, ops_stored, steps, names, scratch, act, rebound) ==
+                    spacemit_plan_result::miss;
+        cache.store(mode, g, word, ops_stored, stored, {}, 4096, 8192);
+        scratch = act = 0;
+        steps.clear();
+        const spacemit_plan_result got = cache.lookup(mode, g, word, false, asked, steps, names, scratch, act, rebound);
+        good = good && got == want;
+        if (got != spacemit_plan_result::miss) {  // a hit hands back the stored list and sizes
+            good = good && scratch == 4096 && act == 8192 && steps.size() == stored.size();
+            for (size_t j = 0; good && j < steps.size(); j++) {
+                good = steps[j].fn == stored[j].fn && steps[j].node == stored[j].node;
+            }
+        }
+        if (!good) {
+            std::fprintf(stderr,
+                         "FAIL: plan guard, %s: lookup gave %d (1 a hit by uid, 2 by structure, 3 a miss), expected %d; "
+                         "sizes %zu and %zu, %zu steps\n",
+                         what, (int) got, (int) want, scratch, act, steps.size());
+            g_failures++;
+        }
+        ok = ok && good;
+    };
+    run_case("(1) A's steps asked with A", ops_a, full, ops_a, hit);
+    run_case("(1) A's steps asked with B", ops_a, full, ops_b, spacemit_plan_result::miss);
+    run_case("(2) only A's first step cached", ops_a, first_only, ops_a, spacemit_plan_result::miss);
+    run_case("(3) A's steps reversed", ops_a, reversed, ops_a, spacemit_plan_result::miss);
+    run_case("(4) a node more with a contract", ops_less, less, ops_a, spacemit_plan_result::miss);
+    run_case("(4) as stored", ops_less, less, ops_less, hit);
+    return ok;
+}
+
+// The probes of plan.md "S1 design" §3 under each setting of FLAGOS_SPACEMIT_PLAN, each on a fresh backend (an empty
+// cache and workspace), with the counters read around every graph: (a) one layer graph computed twice as the same
+// object (stamped with a uid): a miss, then a hit, by uid under U, by structure under S; (e) the same structure built
+// again as new objects with the same uid: no hit by uid, a hit by structure with a rebind; (b) the same structure as
+// new objects, uid 0: a hit by structure with a rebind; (c) RoPE's base changed: a miss; (d) 7 tokens: a miss; (g) the
+// first layer again after the larger graph grew the workspace: a miss (the core keeps one entry, the last plan), then
+// its plan replayed in the grown workspace (a hit); (h) a graph view of it (uid 0): a hit by structure under both; (f)
+// FLAGOS_SPACEMIT_ATTN flipped between two one-token attention graphs (n_kv 1024): a miss, the step list the other
+// variant's (1 step one-chunk, 2 the split), counted by the steps the executor ran; (l) the switch set again to the
+// value it has: the generation moves and the contract stays, so a miss by the word alone, 1 step; (j) the first
+// layer's structure with its weights in a CPU buffer, right after the first layer is the entry, and (all settings) the
+// first layer's own graph object with one MUL_MAT pointed at such a weight: both refused by the contract check before
+// any lookup, nothing counted, the first layer a hit after each; and the hit guard on the cache itself
+// (plan_guard_probe); (k) under FLAGOS_SPACEMIT_QUANTIZE=shared no cache, so a layer graph twice counts nothing; (i)
+// under none every counter stays 0. Every output against the CPU, the layers' against each other byte for byte, and
+// every output of structure and uid against none's byte for byte
+static int check_plan(ggml_backend_dev_t dev) {
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    constexpr uint64_t k_uid = 0x504c414e00000001ULL;  // "PLAN", stamped as the scheduler stamps a split's graph
+    std::map<std::string, std::vector<float>> none_outputs;  // none's outputs by name, the reference of the others
+
+    for (const char * setting : { "none", "structure", "uid" }) {
+        env_override   plan_switch("FLAGOS_SPACEMIT_PLAN", setting);
+        env_override   quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", nullptr);  // separate; (k) sets shared itself
+        const bool     on      = std::strcmp(setting, "none") != 0;
+        const bool     by_uid  = std::strcmp(setting, "uid") == 0;
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        REQUIRE(backend != nullptr);
+        spacemit_plan_counters_take();
+        spacemit_plan_counters total;
+        int                    n_graphs = 0, n_probes = 0, n_passed = 0, n_compared = 0;
+        double                 worst_layer = 0.0, worst_attn = 0.0;
+
+        // the counters of the graphs since the last call, added to the total
+        const auto take = [&]() {
+            const spacemit_plan_counters d = spacemit_plan_counters_take();
+            total.hits_uid += d.hits_uid;
+            total.hits_structure += d.hits_structure;
+            total.misses += d.misses;
+            total.rebinds += d.rebinds;
+            total.lookup_us += d.lookup_us;
+            total.key_us += d.key_us;
+            return d;
+        };
+        // one graph's counters against what the probe expects with the cache on (all 0 under none); ran: whether the
+        // graph ran (a refused one is not counted among the graphs)
+        const auto expect = [&](const char * probe, uint64_t uid_hits, uint64_t structure_hits, uint64_t misses,
+                                uint64_t rebinds, bool ran_graph = true) {
+            n_graphs += ran_graph;
+            const spacemit_plan_counters d = take();
+            if (!on) {
+                uid_hits = structure_hits = misses = rebinds = 0;
+            }
+            const bool ok = d.hits_uid == uid_hits && d.hits_structure == structure_hits && d.misses == misses &&
+                            d.rebinds == rebinds;
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: plan %s, probe %s: hits by uid %llu, by structure %llu, misses %llu, rebinds %llu; "
+                             "expected %llu, %llu, %llu, %llu\n",
+                             setting, probe, (unsigned long long) d.hits_uid, (unsigned long long) d.hits_structure,
+                             (unsigned long long) d.misses, (unsigned long long) d.rebinds,
+                             (unsigned long long) uid_hits, (unsigned long long) structure_hits,
+                             (unsigned long long) misses, (unsigned long long) rebinds);
+                g_failures++;
+            }
+            return ok;
+        };
+        // an output kept under none and compared byte for byte under structure and uid
+        const auto as_none = [&](const char * name, const std::vector<float> & out) {
+            if (!on) {
+                none_outputs[name] = out;
+                return true;
+            }
+            n_compared++;
+            const auto it = none_outputs.find(name);
+            if (it == none_outputs.end() || !same_bytes(it->second, out)) {
+                std::fprintf(stderr, "FAIL: plan %s: output %s differs from FLAGOS_SPACEMIT_PLAN=none's\n", setting, name);
+                g_failures++;
+                return false;
+            }
+            return true;
+        };
+        // a probe's outcome: its counters and its outputs
+        const auto probe = [&](const char * name, bool counters, bool outputs) {
+            n_probes++;
+            if (!outputs) {
+                std::fprintf(stderr, "FAIL: plan %s, probe %s: the outputs are wrong or the provider failed\n", setting,
+                             name);
+                g_failures++;
+            }
+            n_passed += counters && outputs;
+        };
+        const auto layer_ok = [&](plan_layer & l, const std::vector<float> & out) {
+            const double e = l.cpu_nmse(cpu, out);
+            worst_layer    = std::max(worst_layer, e);
+            return e <= k_layer_max_nmse;
+        };
+
+        plan_layer a, e, b, c, d, w;
+        REQUIRE(a.init(dev, 1, 1e6f) && e.init(dev, 1, 1e6f) && b.init(dev, 1, 1e6f) && c.init(dev, 1, 1e4f) &&
+                d.init(dev, 7, 1e6f) && w.init(dev, 1, 1e6f, true));
+        a.gd->uid = k_uid;
+        e.gd->uid = k_uid;  // (e): the uid reused by other node objects
+
+        // (a) the same object twice
+        std::vector<float> out_a, out_a2;
+        bool               ran = a.run(backend, out_a);
+        bool               cnt = expect("(a) first", 0, 0, 1, 0);
+        ran                    = ran && a.run(backend, out_a2);
+        cnt                    = expect("(a) second", by_uid ? 1 : 0, by_uid ? 0 : 1, 0, 0) && cnt;
+        probe("(a)", cnt, ran && layer_ok(a, out_a) && same_bytes(out_a, out_a2) && as_none("a", out_a));
+
+        // (e) the uid stamped on other objects of the same structure
+        std::vector<float> out_e;
+        ran = e.run(backend, out_e);
+        probe("(e)", expect("(e)", 0, 1, 0, 1), ran && same_bytes(out_e, out_a) && as_none("e", out_e));
+
+        // (b) the same structure as new objects, uid 0
+        std::vector<float> out_b;
+        ran = b.run(backend, out_b);
+        probe("(b)", expect("(b)", 0, 1, 0, 1), ran && same_bytes(out_b, out_a) && as_none("b", out_b));
+
+        // (c) one op_params value changed: RoPE's base
+        std::vector<float> out_c;
+        ran = c.run(backend, out_c);
+        probe("(c)", expect("(c)", 0, 0, 1, 0),
+              ran && layer_ok(c, out_c) && !same_bytes(out_c, out_a) && as_none("c", out_c));
+
+        // (d) one shape changed: 7 tokens, a larger workspace
+        std::vector<float> out_d;
+        ran = d.run(backend, out_d);
+        probe("(d)", expect("(d)", 0, 0, 1, 0), ran && layer_ok(d, out_d) && as_none("d", out_d));
+
+        // (g) the first layer after the larger graph: a miss (one entry), then its plan replayed in the grown workspace
+        std::vector<float> out_g, out_g2;
+        ran = a.run(backend, out_g);
+        cnt = expect("(g) first", 0, 0, 1, 0);
+        ran = ran && a.run(backend, out_g2);
+        cnt = expect("(g) second", by_uid ? 1 : 0, by_uid ? 0 : 1, 0, 0) && cnt;
+        probe("(g)", cnt, ran && same_bytes(out_g, out_a) && same_bytes(out_g2, out_a) && as_none("g", out_g2));
+
+        // (h) a graph view of the first layer: uid 0, the structural path
+        ggml_cgraph        view = ggml_graph_view(a.gd, 0, ggml_graph_n_nodes(a.gd));
+        std::vector<float> out_h;
+        ran = view.uid == 0 && a.run(backend, out_h, &view);
+        probe("(h)", expect("(h)", 0, 1, 0, 0), ran && same_bytes(out_h, out_a) && as_none("h", out_h));
+
+        // (f) FLAGOS_SPACEMIT_ATTN flipped between two one-token attention graphs, then (l) set again to its value
+        {
+            const attn_shape s = { 32, 8, 128, 1024, 1, 1023 };
+            attn_run         r;
+            REQUIRE(r.init(dev, s, attn_mask::causal, 0.0f, 0.0f, 70));
+            REQUIRE(ggml_backend_graph_compute(cpu, r.g_cpu) == GGML_STATUS_SUCCESS);
+            const auto attn_ok = [&](const std::vector<float> & o) {
+                const attn_error err =
+                    attn_errors(o.data(), static_cast<const float *>(r.out_ref->data), (int64_t) o.size(), r.out->ne[0]);
+                worst_attn = std::max(worst_attn, err.all);
+                return err.all <= k_attn_max_nmse && err.row <= k_attn_max_row_nmse;
+            };
+            std::vector<float> one_chunk, one_chunk2, split;
+            uint64_t           steps_one = 0, steps_one2 = 0, steps_split = 0;
+            {
+                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
+                take();
+                spacemit_steps_take();
+                ran       = r.dev_output(backend, one_chunk);
+                steps_one = spacemit_steps_take();
+                cnt       = expect("(f) one-chunk", 0, 0, 1, 0);
+                ran       = ran && r.dev_output(backend, one_chunk2);
+                steps_one2 = spacemit_steps_take();
+                cnt        = expect("(f) one-chunk again", 0, 1, 0, 0) && cnt;
+            }
+            {
+                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);  // the default: the split, with the turns
+                take();
+                ran         = ran && r.dev_output(backend, split);
+                steps_split = spacemit_steps_take();
+                cnt         = expect("(f) split", 0, 0, 1, 0) && cnt;
+            }
+            const bool steps_ok = steps_one == 1 && steps_one2 == 1 && steps_split == 2;
+            if (!steps_ok) {
+                std::fprintf(stderr,
+                             "FAIL: plan %s, probe (f): steps run one-chunk %llu, again %llu, split %llu; expected 1, 1, "
+                             "2\n",
+                             setting, (unsigned long long) steps_one, (unsigned long long) steps_one2,
+                             (unsigned long long) steps_split);
+                g_failures++;
+            }
+            probe("(f)", cnt && steps_ok,
+                  ran && attn_ok(one_chunk) && same_bytes(one_chunk, one_chunk2) && attn_ok(split) &&
+                      as_none("f one-chunk", one_chunk) && as_none("f split", split));
+
+            // (l) back to one-chunk (a miss: the contract changes), then the same value set again through set_env:
+            // the switch generation moves, the contract stays, so only the word tells the plan apart: a miss, 1 step
+            std::vector<float> again, same;
+            uint64_t           steps_again = 0, steps_same = 0;
+            {
+                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
+                take();
+                spacemit_steps_take();
+                ran         = r.dev_output(backend, again);
+                steps_again = spacemit_steps_take();
+                cnt         = expect("(l) one-chunk after the split", 0, 0, 1, 0);
+                set_env("FLAGOS_SPACEMIT_ATTN", "one-chunk");
+                ran        = ran && r.dev_output(backend, same);
+                steps_same = spacemit_steps_take();
+                cnt        = expect("(l) the same value set again", 0, 0, 1, 0) && cnt;
+            }
+            const bool steps_l = steps_again == 1 && steps_same == 1;
+            if (!steps_l) {
+                std::fprintf(stderr, "FAIL: plan %s, probe (l): steps run %llu and %llu; expected 1 and 1\n", setting,
+                             (unsigned long long) steps_again, (unsigned long long) steps_same);
+                g_failures++;
+            }
+            probe("(l)", cnt && steps_l,
+                  ran && same_bytes(again, one_chunk) && same_bytes(same, one_chunk) && as_none("l", same));
+        }
+        take();
+
+        // (j) refusals right after the first layer is the entry: the same structure with its weights in a plain CPU
+        // buffer (the contract check refuses its MUL_MATs: an IME weight must sit in our buffer), then the first
+        // layer's own graph object, same uid and node objects, with one MUL_MAT pointed at such a weight; each fails
+        // with nothing looked up or counted, and the first layer is a hit after each; then the hit guard on the cache
+        // itself (plan_guard_probe)
+        {
+            std::vector<float> out_j, out_w, out_j2, out_x, out_j3;
+            ran = a.run(backend, out_j);  // a miss: the entry was (l)'s
+            cnt = expect("(j) the first layer", 0, 0, 1, 0);
+            const bool refused_w = !w.run(backend, out_w);
+            cnt = expect("(j) weights in a CPU buffer", 0, 0, 0, 0, false) && cnt;
+            ran = ran && a.run(backend, out_j2);
+            cnt = expect("(j) the first layer after the refusal", by_uid ? 1 : 0, by_uid ? 0 : 1, 0, 0) && cnt;
+            ggml_tensor * swapped = nullptr;
+            for (int i = 0; i < ggml_graph_n_nodes(a.gd) && swapped == nullptr; i++) {
+                ggml_tensor * node = ggml_graph_node(a.gd, i);
+                if (node->op == GGML_OP_MUL_MAT && node->src[0] == a.wd.wq) {
+                    swapped = node;
+                }
+            }
+            REQUIRE(swapped != nullptr);
+            swapped->src[0]       = w.wd.wq;  // the same type and shape, in a CPU buffer
+            const bool refused_x = !a.run(backend, out_x);
+            swapped->src[0]       = a.wd.wq;
+            cnt = expect("(j) a MUL_MAT of the cached object on a CPU-buffer weight", 0, 0, 0, 0, false) && cnt;
+            ran = ran && a.run(backend, out_j3);
+            cnt = expect("(j) the first layer restored", by_uid ? 1 : 0, by_uid ? 0 : 1, 0, 0) && cnt;
+            const bool guard = !on || plan_guard_probe(by_uid ? spacemit_plan_mode::uid : spacemit_plan_mode::structure,
+                                                       a.gd);
+            probe("(j)", cnt && guard,
+                  refused_w && refused_x && ran && same_bytes(out_j, out_a) && same_bytes(out_j2, out_a) &&
+                      same_bytes(out_j3, out_a) && as_none("j", out_j3));
+        }
+
+        // (k) FLAGOS_SPACEMIT_QUANTIZE=shared: no plan cache, so a layer graph twice counts nothing
+        {
+            env_override       shared("FLAGOS_SPACEMIT_QUANTIZE", "shared");
+            std::vector<float> out_k, out_k2;
+            ran = a.run(backend, out_k);
+            cnt = expect("(k) shared, first", 0, 0, 0, 0);
+            ran = ran && a.run(backend, out_k2);
+            cnt = expect("(k) shared, second", 0, 0, 0, 0) && cnt;
+            probe("(k)", cnt, ran && same_bytes(out_k, out_a) && same_bytes(out_k2, out_a) && as_none("k", out_k2));
+        }
+        take();
+
+        // (i) none: nothing counted
+        if (!on) {
+            const bool zero = total.hits_uid == 0 && total.hits_structure == 0 && total.misses == 0 &&
+                              total.rebinds == 0 && total.lookup_us == 0.0 && total.key_us == 0.0;
+            if (!zero) {
+                std::fprintf(stderr, "FAIL: plan none, probe (i): a counter moved\n");
+                g_failures++;
+            }
+            probe("(i)", zero, true);
+        }
+        ggml_backend_free(backend);
+        std::printf("plan     FLAGOS_SPACEMIT_PLAN=%s: probes %d/%d passed (a same object twice, b same structure as "
+                    "new objects, c RoPE base changed, d 7 tokens, e a stamped uid on other objects, f "
+                    "FLAGOS_SPACEMIT_ATTN flipped, l the same value set again, g replay after a larger graph, h a graph "
+                    "view, j refusals after the entry and the hit guard, k no cache under QUANTIZE=shared%s); %d "
+                    "graphs: %llu hits by uid, %llu by structure, %llu misses, %llu rebinds, lookup %.1f us and key "
+                    "%.1f us per graph; %s; layer NMSE %.2e (bound %.0e), attention NMSE %.2e (bound %.0e)\n",
+                    setting, n_passed, n_probes, on ? "" : ", i no counter moved", n_graphs,
+                    (unsigned long long) total.hits_uid, (unsigned long long) total.hits_structure,
+                    (unsigned long long) total.misses, (unsigned long long) total.rebinds,
+                    n_graphs > 0 ? total.lookup_us / n_graphs : 0.0, n_graphs > 0 ? total.key_us / n_graphs : 0.0,
+                    on ? (std::to_string(n_compared) + " outputs identical to none's").c_str() :
+                         (std::to_string(none_outputs.size()) + " outputs kept").c_str(),
+                    worst_layer, k_layer_max_nmse, worst_attn, k_attn_max_nmse);
+    }
+    ggml_backend_free(cpu);
+    return 0;
+}
+
 // eight 1-row matmuls of one weight on one input (sixteen steps: the activations quantized, then the matmul, each
 // time), their outputs one after another; false if the provider failed
 static bool matmuls_out(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_type type, std::vector<float> & out) {
@@ -4048,7 +4575,8 @@ int main(int argc, char ** argv) {
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv_strategies(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
-        check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0) {
+        check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0 ||
+        check_plan(dev) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 :

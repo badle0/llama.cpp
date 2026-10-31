@@ -11,6 +11,8 @@ list(APPEND FLAGOS_SOURCES
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plugin.h"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-loader.h"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-loader.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plan.h"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plan.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-plugin.cpp"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-exec.h"
     "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-exec.cpp"

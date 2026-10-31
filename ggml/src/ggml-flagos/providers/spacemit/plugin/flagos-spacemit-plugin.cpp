@@ -408,6 +408,9 @@ void * plugin_get_proc_address(const char * name) {
     if (std::strcmp(name, "spacemit_switches_reset") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_switches_reset_fn>(spacemit_switches_reset));
     }
+    if (std::strcmp(name, "spacemit_switches_generation") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_switches_generation_fn>(spacemit_switches_generation));
+    }
     if (std::strcmp(name, "spacemit_mul_mat_same_activations") == 0) {
         return reinterpret_cast<void *>(
             static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations));

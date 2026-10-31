@@ -597,6 +597,7 @@ Test-only; the defaults are unchanged.
 | `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (compile-time) | `gemm_kernel_i8i4_m1`, `flagos-spacemit-ime-kernels.cpp` | R12-hw: compiles upstream's active branch of the 1-row Q4_1 kernel instead of the exact one; only in build R, through `CMAKE_CXX_FLAGS` |
 | `FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1` | `run_ordered` and `spacemit_tile_main_ordered`, `flagos-spacemit-exec.cpp` | E3b-diag: with E3b, a full memory fence after every tile's join and at its end. E3b's launches also always note each tile's core after its join, after taking its TCM, after the TCM agreement and at its end, and its TCM; `spacemit_ordered_counts_take()` (`flagos-spacemit-exec.h`) returns what they showed |
 | `FLAGOS_SPACEMIT_TEST_VIEW=once` | `spert_executor` and `spacemit_tile_main`, `flagos-spacemit-exec.cpp` | the first `shared_buffer()` view kept through every barrier (the loop until 2026-10-30); unset or `step`: the view taken again after every barrier, the header's rule (E7, `spert.hpp:474-478`); the kernels keep nothing in TCM across a barrier, so the outputs are the same; a fresh view smaller than the agreed size fails the launch |
+| `FLAGOS_SPACEMIT_PLAN=none\|structure\|uid` | `spacemit_plan_cache`, `core/flagos-spacemit-plan.{h,cpp}`; the lookup in `graph_compute`, `flagos-spacemit.cpp` | S1 step 3 (A4): the plan cache behind a switch, `none` (today's path) the default; `structure` candidate S (Common's canonical compare, one entry), `uid` candidate U (the split's uid, the node pointers and the configuration word first, S behind it); the contract check per node runs under every setting; counters in the E3c stats line (`plan_hits_uid`, `plan_hits_structure`, `plan_misses`, `plan_rebinds`, `plan_lookup_us` from the top of `graph_compute`, `plan_key_us` the lookup alone); the runner's modes `plan-s`, `plan-u` (`EXPS=plan`); off under `FLAGOS_SPACEMIT_QUANTIZE=shared`. Run 11. Decision 2026-10-31: S to be removed, U kept, `uid-trust` added (step 3b) |
 | `FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>` | the same, and `spacemit_pair_wait` | E7b: each tile takes a slice of that size from its worker's shared buffer (`alloc_shared`, freed at the tile's end) as its TCM instead of the whole buffer, in every launch mode; an empty slice fails the launch; under `per-step-join` the pair waits yield the core (`Context::yield`) instead of spinning, so two tiles of one launch on one worker take turns |
 | `flagos-check-spacemit --e3b[=runs]` | `diagnose_e3b`, `tests/check_spacemit.cpp` | E3b-diag: only the E3b diagnosis (§4), nothing else checked |
 
@@ -1178,6 +1179,52 @@ as disturbed; the steps, the launches and the cost per step (a difference of two
   1,086 steps on Qwen3-4B (92.0 ms) and of 846 steps on Qwen3-0.6B (18.7 ms); one launch per kernel is 1,086 and 846
   launches at 11.8 and 10.7 µs of overhead each, 107.0 and 29.1 ms per token, with the same outputs.
 
+### Run 11 (K3, 2026-10-31): S1 step 3, the plan cache (A4), both candidates
+
+The step 3 patch on `a45231bba` (`plan.md` "S1 step 3 spec"); `EXPS="plan" REPS=3 DEPTH=0`, Qwen3-4B with the
+perplexity text, Qwen3-0.6B without; the modes `ref`, `e3c` (the counters, today's path), `plan-s`
+(`FLAGOS_SPACEMIT_PLAN=structure`), `plan-u` (`uid`), interleaved, three `llama-bench` runs each. The check program
+passed under the three settings first. Placement unchanged (2 splits per token, 29 of 29 layers, the KV cache in
+the provider's buffer); the generated text identical in every mode.
+
+| Model | Mode | pp128 | tg128 |
+|---|---|---|---|
+| 4B | `ref` | 106.54 ± 0.49 | 11.01 ± 0.01 |
+| 4B | `e3c` | 105.88 ± 0.03 (-0.6%) | 10.95 ± 0.01 (-0.5%) |
+| 4B | `plan-s` | 105.95 ± 0.20 (-0.6%) | 10.82 ± 0.01 (-1.7%) |
+| 4B | `plan-u` | 106.04 ± 0.45 (-0.5%) | 10.94 ± 0.02 (-0.6%) |
+| 0.6B | `ref` | 698.62 ± 4.19 | 54.89 ± 0.28 |
+| 0.6B | `e3c` | 697.13 ± 2.51 (-0.2%) | 54.10 ± 0.16 (-1.4%) |
+| 0.6B | `plan-s` | 693.19 ± 4.19 (-0.8%) | 51.68 ± 0.21 (-5.8%) |
+| 0.6B | `plan-u` | 698.33 ± 3.61 (-0.0%) | 54.06 ± 0.14 (-1.5%) |
+
+One generated token, µs, the mean over the repetitions (the E3c columns as in run 8; `lookup` from the top of
+`graph_compute`, the contract check included; `key` the cache lookup alone; hits and misses per token):
+
+| Model | Mode | Token | Host | Lookup | Key | Hits uid | Hits structure | Misses | Steps |
+|---|---|---|---|---|---|---|---|---|---|
+| 4B | `e3c` | 91,297 | 613 | 599 | 0 | 0 | 0 | 0 | 1,086 |
+| 4B | `plan-s` | 92,418 | 1,588 | 1,570 | 1,015 | 0 | 0.99 | 0.01 | 1,086 |
+| 4B | `plan-u` | 91,405 | 557 | 542 | 50 | 0.99 | 0 | 0.01 | 1,086 |
+| 0.6B | `e3c` | 18,486 | 406 | 394 | 0 | 0 | 0 | 0 | 846 |
+| 0.6B | `plan-s` | 19,350 | 1,230 | 1,214 | 801 | 0 | 0.99 | 0.01 | 846 |
+| 0.6B | `plan-u` | 18,497 | 409 | 397 | 39 | 0.99 | 0 | 0.01 | 846 |
+
+Logits on Qwen3-4B: both candidates against `ref` mean KLD 0.000000, maximum 5.4e-5 at 512-token batches and 5.7e-5
+at one token, same top p 100% (the base file's floor, run 9). No rebind. 0.6B's counters cost 1.4%, above E3c's 1%
+rule, so its time columns are disturbed as in run 10; its differences between modes stand. Readings:
+- The hits as predicted: every generation graph but the first of a run, by uid under U and by structure under S.
+- U's key 50 and 39 µs (predicted under 5: the hit guard walks the steps as well as the nodes); S's key 1,015 and
+  801 µs (predicted 200-600; the deck's 12 µs is AMD's compare on x86).
+- **No cache by the rule of 2026-10-29:** U lowers the host work by 56 µs per 4B token, under the 0.2 ms required;
+  S raises it by 0.8-1.0 ms and costs tg128 1.7% and 5.8%.
+- Read as differences of means (an inference, not a timed split): the per-node contract check is about 490 µs of a
+  4B token (357 on 0.6B) and the expansion the cache replaces about 105 (37). Both candidates keep the check on every
+  graph (`plan.md` "S1 design" §3 (i)); the deck's flow redoes ③ (the per-node contract check) and ④ (planning) only
+  when the structure changes (R5), and llama.cpp's uid users trust the uid without a node check (CUDA in our base,
+  `ggml-cuda.cu:2555-2559`; Hexagon upstream, `cached_uid`; RPC's recompute by uid). Decision (user): S removed, U
+  kept, the trusted form `uid-trust` built and measured next (step 3b, `plan.md`).
+
 ## 7. Log
 
 - 2026-10-19: requirements, questions and findings collected from the deck, the AMD comparison, upstream `master`, the
@@ -1295,3 +1342,6 @@ as disturbed; the steps, the launches and the cost per step (a difference of two
 - 2026-10-27: the IGPU switch in the code (F8 closed; Q5, E2-neg and §6 annotated; `PROJECT.md` item 22):
   `scripts/structural-experiments.sh` gives E1's modes `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel`, takes IGPU as the
   summary's default type and expects E2-neg's four runs to complete; nothing rerun on the K3 yet.
+- 2026-10-31: run 11 (S1 step 3, the plan cache's two candidates on both models; `FLAGOS_SPACEMIT_PLAN` in §5):
+  no cache by the rule; the contract check, not the expansion, is the host cost; S to be removed, U kept,
+  `uid-trust` next (`plan.md` step 3b).

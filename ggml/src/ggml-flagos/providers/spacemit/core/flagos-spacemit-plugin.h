@@ -122,6 +122,9 @@ typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * 
 // test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_GEMV, MM, TAIL, ATTN) once; a test that changes
 // them inside one process calls this so the next read parses again
 typedef void (*spacemit_switches_reset_fn)(void);
+// test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its
+// configuration word, plan.md "S1 step 3 spec"), so a switch that changes the step list cannot reuse a cached plan
+typedef uint32_t (*spacemit_switches_generation_fn)(void);
 
 typedef struct {
     uint32_t api_version;  // the mentor's fields (flagos-provider.h:66-67)

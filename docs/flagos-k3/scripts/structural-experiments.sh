@@ -26,7 +26,8 @@
 #        structural-experiments.sh run <model.gguf> [out]   the runs of $EXPS, then the summary (logs in out; default
 #                                                           ~/sx/<model name>)
 #        structural-experiments.sh summary <out>            the summary again from the logs
-# Env:   EXPS      experiments (default "e2 e2hp e2neg e4"; also e1, e3, e3a (E3a alone, without E3b), e3c and r12);
+# Env:   EXPS      experiments (default "e2 e2hp e2neg e4"; also e1, e3, e3a (E3a alone, without E3b), e3c, plan and
+#                  r12);
 #                  the reference always runs
 #        REPS      llama-bench repetitions per mode (default 3; 0 skips llama-bench)
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 1)
@@ -51,6 +52,8 @@
 #   e3b           A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join   E3b: ordered in the cores, the host waiting once
 #   e3c           A  FLAGOS_SPACEMIT_TEST_STATS=<log>.stats       E3c: the counters, written when each run ends
 #   e3c-a         A  as e3c, with FLAGOS_SPACEMIT_TEST_LAUNCH=per-step: E3c on E3a, what a launch costs inside a run
+#   plan-s        A  as e3c, with FLAGOS_SPACEMIT_PLAN=structure: the plan cache's candidate S (plan.md "S1 step 3 spec")
+#   plan-u        A  as e3c, with FLAGOS_SPACEMIT_PLAN=uid: candidate U
 #   ref-nohp      A  FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1    E2-hp, with e2-igpu-nohp (B, igpu, no huge pages)
 #   neg-{q8,shift}-{igpu,ref}  E2-neg: a Q8_0 KV cache and a context shift, as e2-igpu (B) and as ref (A, IGPU)
 #   e4-igpu       S  GGML_BACKEND_PATH=<M's libggml-flagos.so>, FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
@@ -89,11 +92,12 @@ TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
 unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES \
-    FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV
+    FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV FLAGOS_SPACEMIT_PLAN \
+    FLAGOS_SPACEMIT_QUANTIZE
 
 mode_build() {
     case $1 in
-        ref | ref-nohp | e3 | e3b | e3c | e3c-a | neg-*-ref) echo "$BUILD_A" ;;
+        ref | ref-nohp | e3 | e3b | e3c | e3c-a | plan-s | plan-u | neg-*-ref) echo "$BUILD_A" ;;
         e4-*) echo "$BUILD_S" ;;
         *) echo "$BUILD_B" ;;
     esac
@@ -107,6 +111,8 @@ mode_env() {
         e2-igpu-nohp) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1" ;;
         e3 | e3c-a) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step" ;;
         e3b) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join" ;;
+        plan-s) echo "FLAGOS_SPACEMIT_PLAN=structure" ;;
+        plan-u) echo "FLAGOS_SPACEMIT_PLAN=uid" ;;
         # the stock programs know no "flagos" module by name; GGML_BACKEND_PATH loads one from any path
         e4-igpu) echo "GGML_BACKEND_PATH=$MODULE FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu" ;;
         *) echo "" ;;
@@ -136,7 +142,7 @@ run() {
     bin=$(mode_build "$mode")/bin/$tool
     env=$(mode_env "$mode")
     # E3c: every run writes its counters next to its log, when it ends
-    case $mode in e3c | e3c-a) env="${env:+$env }FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;; esac
+    case $mode in e3c | e3c-a | plan-s | plan-u) env="${env:+$env }FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;; esac
     if [ -n "$DRY" ]; then
         echo "   [$mode] ${env:+$env }$bin $*"
         return 0
@@ -392,7 +398,9 @@ EOF
         echo "== E3c: one generated token, us, mean over the repetitions. busy: each step's slowest tile, summed; idle (the"
         echo "   deck's measure, R12): the token less busy = outside (llama.cpp, the CPU split, sampling) + host (graph_compute"
         echo "   outside the launches) + launch (the launches less the mean tile's kernels and barrier waits) + barriers (their"
-        echo "   own cost); imbal.: busy less the mean tile's kernels"
+        echo "   own cost); imbal.: busy less the mean tile's kernels. The plan cache (FLAGOS_SPACEMIT_PLAN; plan-s, plan-u):"
+        echo "   hits by uid (p.uid) and by structure (p.str), misses (p.miss) and rebinds (p.rebind) per token, lookup (from the top of graph_compute, the contract check included) and key (the lookup alone):"
+        echo "   the time from the top of graph_compute to the step list in hand (under e3c the check and the expansion)"
         python3 -I - "$OUT" << 'EOF'
 import glob, json, os, re, statistics, sys
 res = {}
@@ -422,15 +430,21 @@ for sf in sorted(glob.glob(os.path.join(sys.argv[1], "bench-*.stats"))):
         res.setdefault((m.group(1), test), []).append({
             "token": token, "outside": token - graph, "host": graph - launch, "launch": launch - kern - bar,
             "barriers": kern + bar - busy, "imbal.": busy - kern, "kernels": kern, "idle": token - busy,
-            "steps": k["steps"] / g, "launches": k["launches"] / g})
-cols = ["token", "outside", "host", "launch", "barriers", "imbal.", "kernels", "idle", "steps", "launches"]
+            "steps": k["steps"] / g, "launches": k["launches"] / g,
+            "p.uid": k.get("plan_hits_uid", 0) / g, "p.str": k.get("plan_hits_structure", 0) / g,
+            "p.miss": k.get("plan_misses", 0) / g, "p.rebind": k.get("plan_rebinds", 0) / g,
+            "lookup": k.get("plan_lookup_us", 0.0) / g, "key": k.get("plan_key_us", 0.0) / g})
+cols = ["token", "outside", "host", "launch", "barriers", "imbal.", "kernels", "idle", "steps", "launches",
+        "p.uid", "p.str", "p.miss", "p.rebind", "lookup", "key"]
+fractions = ("steps", "launches", "p.uid", "p.str", "p.miss", "p.rebind", "lookup", "key")
 print("   " + f"{'mode':7}{'test':11}" + "".join(f"{c:>10}" for c in cols) + f"{'idle %':>8}{'launch/each':>12}")
 order = {"tg128": 0, "tg32@0": 1, "tg32@1024": 2, "tg32@4096": 3}
 mean = {}
 for key in sorted(res, key=lambda k: (order.get(k[1], 9), k[1], k[0])):
     v = mean[key] = {c: statistics.mean(x[c] for x in res[key]) for c in cols}
     each = v["launch"] / v["launches"] if v["launches"] else 0.0
-    cells = "".join(f"{v[c]:10.1f}" if c in ("steps", "launches") else f"{v[c]:10.0f}" for c in cols)
+    cells = "".join(f"{v[c]:10.2f}" if c in fractions[2:] else f"{v[c]:10.1f}" if c in fractions else f"{v[c]:10.0f}"
+                    for c in cols)
     print("   " + f"{key[0]:7}{key[1]:11}" + cells + f"{100 * v['idle'] / v['token']:8.2f}{each:12.2f}")
 for (mode, test), v in mean.items():
     one = mean.get(("e3c", test))
@@ -501,6 +515,12 @@ run_all() {
     # the counters change no output (the checks compare them byte for byte), so no KLD
     if has e3c; then
         bench_modes+=" e3c e3c-a" depth_modes+=" e3c e3c-a"
+    fi
+    # the plan cache's two candidates against e3c, today's path with the same counters; their logits must read
+    # identical to the reference's (plan.md "S1 step 3 spec" §5)
+    if has plan; then
+        case " $bench_modes " in *" e3c "*) ;; *) bench_modes+=" e3c" depth_modes+=" e3c" ;; esac
+        bench_modes+=" plan-s plan-u" depth_modes+=" plan-s plan-u" kld_modes+=" plan-s plan-u" kld1_modes+=" plan-s plan-u"
     fi
     if has e2hp; then
         case " $depth_modes " in *" e2-igpu "*) ;; *) depth_modes+=" e2-igpu" ;; esac
@@ -600,5 +620,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: structural-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,30p' "$0"; exit 1 ;;
+    *) sed -n '2,31p' "$0"; exit 1 ;;
 esac
