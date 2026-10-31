@@ -49,7 +49,7 @@ After editing, report:
 2. Exact K3 commands to build, run, and test the change, plus results actually observed. Say clearly when hardware testing was unavailable.
 3. Useful parameters, environment variables, or shapes to vary and the expected behavior.
 
-When a build result, benchmark, hardware finding, design decision, or milestone changes project status, update the relevant `PROJECT.md`, `build.md`, `k3-hardware.md`, or `upstream-review.md` entry with date and evidence. Preserve the distinction between adopted and proposed decisions.
+When a build result, benchmark, hardware finding, design decision, or milestone changes project status, update the relevant `PROJECT.md` (its §8 current state), `progress.md` (the log, items by number, since 2026-10-31), `build.md`, `k3-hardware.md`, or `upstream-review.md` entry with date and evidence. Preserve the distinction between adopted and proposed decisions.
 
 ## Git and public-repository hygiene
 
