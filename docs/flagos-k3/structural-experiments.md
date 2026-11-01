@@ -597,7 +597,7 @@ Test-only; the defaults are unchanged.
 | `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (compile-time) | `gemm_kernel_i8i4_m1`, `flagos-spacemit-ime-kernels.cpp` | R12-hw: compiles upstream's active branch of the 1-row Q4_1 kernel instead of the exact one; only in build R, through `CMAKE_CXX_FLAGS` |
 | `FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1` | `run_ordered` and `spacemit_tile_main_ordered`, `flagos-spacemit-exec.cpp` | E3b-diag: with E3b, a full memory fence after every tile's join and at its end. E3b's launches also always note each tile's core after its join, after taking its TCM, after the TCM agreement and at its end, and its TCM; `spacemit_ordered_counts_take()` (`flagos-spacemit-exec.h`) returns what they showed |
 | `FLAGOS_SPACEMIT_TEST_VIEW=once` | `spert_executor` and `spacemit_tile_main`, `flagos-spacemit-exec.cpp` | the first `shared_buffer()` view kept through every barrier (the loop until 2026-10-30); unset or `step`: the view taken again after every barrier, the header's rule (E7, `spert.hpp:474-478`); the kernels keep nothing in TCM across a barrier, so the outputs are the same; a fresh view smaller than the agreed size fails the launch |
-| `FLAGOS_SPACEMIT_PLAN=none\|uid\|uid-trust` | `spacemit_plan_cache`, `core/flagos-spacemit-plan.{h,cpp}`; the probe and the lookup in `graph_compute`, `flagos-spacemit.cpp` | S1 steps 3 and 3b (A4): the plan cache behind a switch, `none` (the full path) the default until step 3c; one entry, the last plan, keyed by the split's uid, the node objects and the configuration word (the plugin's switch generation and the sharing fact); `uid` the checked form (the contract check on every graph, a hit also needing the cached steps to be the contracts' found, the hit guard), `uid-trust` the trusted form (the entry taken before the check, a hit skipping it: CUDA's and Hexagon's form); a uid of 0 or a new uid a miss; counters in the E3c stats line (`plan_hits_uid`, `plan_misses`, `plan_lookup_us` from the top of `graph_compute`, `plan_key_us` from after the check); the runner's modes `plan-u`, `plan-ut` (`EXPS=plan`); off under `FLAGOS_SPACEMIT_QUANTIZE=shared`. Step 3 (run 11) had `structure` (candidate S, Common's compare) in place of `uid-trust`, removed 2026-10-31. Run 12: `uid-trust` adopted; step 3c makes it the default and removes `uid` |
+| `FLAGOS_SPACEMIT_PLAN=none\|uid-trust` | `spacemit_plan_cache`, `core/flagos-spacemit-plan.{h,cpp}`; the probe and the store in `graph_compute`, `flagos-spacemit.cpp` | S1 steps 3, 3b and 3c (A4): the plan cache, `uid-trust` the default since step 3c (2026-11-01): one entry, the last plan, keyed by the split's uid, the very node objects and the configuration word (the plugin's switch generation and the sharing fact); the entry taken before the contract check and a hit skipping it (CUDA's and Hexagon's form, the deck's "redone only when the structure changes"); a uid of 0 or a new uid a miss: the contract check, the expansion and a store; `none` (test-only) the full path on every graph; counters in the E3c stats line (`plan_hits_uid`, `plan_misses`, `plan_lookup_us` from the top of `graph_compute`, `plan_key_us` from after the check, on a trusted hit the lookup time); the runner's modes `plan-n` (`none`), `plan-nc` (`none` with the counters); `e3c` is the default with the counters (`EXPS=plan`: `ref` against `plan-n` the A/B of the default, `e3c` against `plan-nc` the host columns); off under `FLAGOS_SPACEMIT_QUANTIZE=shared`. Step 3 (run 11) had `structure` (candidate S, Common's compare), removed 2026-10-31; step 3b (run 12) had `uid` (the checked form: the contract check on every graph with a hit guard, saving nothing), removed in 3c |
 | `FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>` | the same, and `spacemit_pair_wait` | E7b: each tile takes a slice of that size from its worker's shared buffer (`alloc_shared`, freed at the tile's end) as its TCM instead of the whole buffer, in every launch mode; an empty slice fails the launch; under `per-step-join` the pair waits yield the core (`Context::yield`) instead of spinning, so two tiles of one launch on one worker take turns |
 | `flagos-check-spacemit --e3b[=runs]` | `diagnose_e3b`, `tests/check_spacemit.cpp` | E3b-diag: only the E3b diagnosis (§4), nothing else checked |
 
@@ -1185,7 +1185,8 @@ The step 3 patch on `a45231bba` (`plan.md` "S1 step 3 spec"); `EXPS="plan" REPS=
 perplexity text, Qwen3-0.6B without; the modes `ref`, `e3c` (the counters, today's path), `plan-s`
 (`FLAGOS_SPACEMIT_PLAN=structure`), `plan-u` (`uid`), interleaved, three `llama-bench` runs each. The check program
 passed under the three settings first. Placement unchanged (2 splits per token, 29 of 29 layers, the KV cache in
-the provider's buffer); the generated text identical in every mode.
+the provider's buffer); the text check ran under `ref` alone (`EXPS=plan` adds no mode to it; corrected 2026-11-01:
+this said "the generated text identical in every mode", which no run tested), so the modes' sameness is the KLD's.
 
 | Model | Mode | pp128 | tg128 |
 |---|---|---|---|
@@ -1231,8 +1232,9 @@ The step 3b patch on `02a1cb9ee` (`plan.md` "S1 step 3b spec"); `EXPS="plan" REP
 perplexity text, Qwen3-0.6B without; the modes `ref`, `e3c` (the counters, the full path), `plan-u`
 (`FLAGOS_SPACEMIT_PLAN=uid`, the contract check on every graph with the hit guard), `plan-ut` (`uid-trust`, a hit
 skipping the check), interleaved, three `llama-bench` runs each. The check program passed under the three settings
-first. Placement unchanged (2 splits per token, 29 of 29 layers, the KV cache in the provider's buffer); the generated
-text identical in every mode on both models.
+first. Placement unchanged (2 splits per token, 29 of 29 layers, the KV cache in the provider's buffer); the text check
+ran under `ref` alone (`EXPS=plan` adds no mode to it; corrected 2026-11-01: this said "the generated text identical in
+every mode on both models", which no run tested), so the modes' sameness is the KLD's, on 4B only.
 
 | Model | Mode | pp128 | tg128 |
 |---|---|---|---|
@@ -1273,6 +1275,53 @@ columns are disturbed as in runs 10 and 11; the differences between modes stand.
 - Decision (user): `uid-trust` the default; `uid` removed with it (no performance fallback, since its host cost is
   `none`'s; no better diagnostic, since a wrong trust shows as outputs differing between `uid-trust` and `none`; no
   precedent keeps a checked form). Step 3c (`plan.md`).
+
+### Run 13 (K3, 2026-11-01): S1 step 3c, the default against the full path, without counters
+
+The step 3c patch on `65f31604b` (`plan.md` "S1 step 3c spec"); the check program passed under the switch unset,
+`none` and `uid-trust` first (the plan probes 15/15 under `none` and 14/14 under `uid-trust`, the outputs identical).
+`EXPS="plan" REPS=3 DEPTH=0`, Qwen3-4B with the perplexity text, Qwen3-0.6B without; the modes `ref` (the default:
+the cache on, no counters), `plan-n` (`FLAGOS_SPACEMIT_PLAN=none`, no counters), `e3c` (the default with the
+counters), `plan-nc` (`none` with the counters), interleaved, three `llama-bench` runs each. Placement unchanged
+(2 splits per token, 37 of 37 and 29 of 29 layers, flash attention kept under `-fa auto`, the KV cache in the
+provider's buffer); the text check under `ref` alone.
+
+| Model | Mode | pp128 | tg128 |
+|---|---|---|---|
+| 4B | `ref` | 106.36 ± 0.11 | 11.07 ± 0.01 |
+| 4B | `plan-n` | 106.45 ± 0.36 (+0.1%) | 11.01 ± 0.00 (-0.6%) |
+| 4B | `e3c` | 106.45 ± 0.30 (+0.1%) | 11.00 ± 0.03 (-0.6%) |
+| 4B | `plan-nc` | 106.72 ± 0.19 (+0.3%) | 10.94 ± 0.02 (-1.2%) |
+| 0.6B | `ref` | 703.57 ± 8.40 | 56.16 ± 0.17 |
+| 0.6B | `plan-n` | 697.47 ± 2.77 (-0.9%) | 54.88 ± 0.23 (-2.3%) |
+| 0.6B | `e3c` | 696.19 ± 5.25 (-1.0%) | 55.04 ± 0.07 (-2.0%) |
+| 0.6B | `plan-nc` | 699.22 ± 0.89 (-0.6%) | 53.76 ± 0.31 (-4.3%) |
+
+One generated token, µs, the mean over the repetitions (the columns as in run 12; under `none` the lookup is the
+contract check with the expansion, and the key two clock reads with no store between them):
+
+| Model | Mode | Token | Host | Idle | Lookup | Key | Hits uid | Misses | Steps |
+|---|---|---|---|---|---|---|---|---|---|
+| 4B | `e3c` | 90,891 | 46 | 1,375 | 19 | 17 | 0.99 | 0.01 | 1,086 |
+| 4B | `plan-nc` | 91,420 | 629 | 1,934 | 615 | 0.08 | 0 | 0 | 1,086 |
+| 0.6B | `e3c` | 18,170 | 39 | 1,000 | 16 | 15 | 0.99 | 0.01 | 846 |
+| 0.6B | `plan-nc` | 18,602 | 495 | 1,446 | 483 | 0.08 | 0 | 0 | 846 |
+
+Logits on Qwen3-4B: `plan-n` against `ref` mean KLD 0.000000, maximum 5.4e-5 at 512-token batches and 5.7e-5 at one
+token, same top p 100% (the base file's floor, run 9); perplexity 9.7736 and 9.7619. Readings:
+- **The default's gain without counters, the A/B step 3b could not give:** `none` is 0.6% below the default on
+  tg128 on 4B and 2.3% below on 0.6B, each difference several times the larger spread; pp128 within spread on both
+  (4B `none` +0.1%, inside its own ± 0.36; 0.6B -0.9%, inside the default's ± 8.40). The predictions held (tg128
+  +0.3 to +0.8% and +1.5 to +2.5%, pp128 within spread).
+- The host columns reproduce run 12: 629 to 46 µs per 4B token (583 saved; run 12 630 to 46) and 495 to 39 on 0.6B
+  (456 saved; run 12 446 to 39); the token 529 and 432 µs shorter, the deck's idle share from 2.12% to 1.51% and from
+  7.77% to 5.50%. The full path's host work on 0.6B has risen across sessions (run 11 406, run 12 446, run 13 495)
+  while 4B's stayed (613, 630, 629); the `none` path's code is the same in steps 3b and 3c by reading, so the rise is
+  between sessions, its cause not isolated.
+- The counters cost tg128 0.6% on 4B and 2.0% on 0.6B, with the cache and without it alike (`e3c` against `ref`,
+  `plan-nc` against `plan-n`).
+- **By step 3c's rule the default stays:** `ref` is nowhere below `plan-n` by more than the spread, and the acceptance
+  runs pass with the usual numbers (`build.md` §7, "S1 step 3c on the K3"). Step 3c accepted; A4's work done.
 
 ## 7. Log
 
@@ -1397,3 +1446,6 @@ columns are disturbed as in runs 10 and 11; the differences between modes stand.
 - 2026-11-01: run 12 (S1 step 3b, the trusted uid hit against the checked form on both models): `uid-trust` adopted
   by the rule (the host work per 4B token 630 to 46 µs, identical logits); the checked form saves nothing; step 3c
   makes `uid-trust` the default and removes `uid` (`plan.md`).
+- 2026-11-01: run 13 (S1 step 3c, the default `uid-trust` against `none` on both models, without counters): `none`
+  0.6% (4B) and 2.3% (0.6B) below the default on tg128, pp128 within spread, identical logits; with the acceptance
+  runner on both models (`build.md` §7) the default stays, step 3c accepted.

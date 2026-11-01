@@ -42,7 +42,8 @@
 # stock upstream with backends
 # as run-time modules, the provider loaded from build M; -fa is llama.cpp's default, auto, unless named; the provider
 # reports IGPU unless FLAGOS_SPACEMIT_TEST_DEVICE_TYPE names another type, D3):
-#   ref           A  IGPU                                    today's state
+#   ref           A  IGPU                                    today's state (the plan cache on, its default since
+#                                                            plan.md "S1 step 3c spec": FLAGOS_SPACEMIT_PLAN unset)
 #   e1-auto       B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel  E1: ACCEL; -fa auto turns flash attention off
 #   e1-on         B  as e1-auto, -fa on                      E1: ACCEL; the norms pinned to the CPU
 #   e2-igpu       B  FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
@@ -52,9 +53,10 @@
 #   e3b           A  FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join   E3b: ordered in the cores, the host waiting once
 #   e3c           A  FLAGOS_SPACEMIT_TEST_STATS=<log>.stats       E3c: the counters, written when each run ends
 #   e3c-a         A  as e3c, with FLAGOS_SPACEMIT_TEST_LAUNCH=per-step: E3c on E3a, what a launch costs inside a run
-#   plan-u        A  as e3c, with FLAGOS_SPACEMIT_PLAN=uid: the plan cache keyed by the uid, the contract check on every
-#                    graph (plan.md "S1 step 3b spec")
-#   plan-ut       A  as e3c, with FLAGOS_SPACEMIT_PLAN=uid-trust: the same key, a hit skipping the contract check
+#   plan-n        A  FLAGOS_SPACEMIT_PLAN=none: no plan cache, the contract check and the expansion on every graph
+#                    (plan.md "S1 step 3c spec"); ref against plan-n is the default's speed gain
+#   plan-nc       A  as e3c, with FLAGOS_SPACEMIT_PLAN=none: plan-n with the counters (e3c against plan-nc: the host
+#                    columns)
 #   ref-nohp      A  FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1    E2-hp, with e2-igpu-nohp (B, igpu, no huge pages)
 #   neg-{q8,shift}-{igpu,ref}  E2-neg: a Q8_0 KV cache and a context shift, as e2-igpu (B) and as ref (A, IGPU)
 #   e4-igpu       S  GGML_BACKEND_PATH=<M's libggml-flagos.so>, FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu, -ngl 99
@@ -98,7 +100,7 @@ unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEM
 
 mode_build() {
     case $1 in
-        ref | ref-nohp | e3 | e3b | e3c | e3c-a | plan-u | plan-ut | neg-*-ref) echo "$BUILD_A" ;;
+        ref | ref-nohp | e3 | e3b | e3c | e3c-a | plan-n | plan-nc | neg-*-ref) echo "$BUILD_A" ;;
         e4-*) echo "$BUILD_S" ;;
         *) echo "$BUILD_B" ;;
     esac
@@ -112,8 +114,7 @@ mode_env() {
         e2-igpu-nohp) echo "FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1" ;;
         e3 | e3c-a) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step" ;;
         e3b) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join" ;;
-        plan-u) echo "FLAGOS_SPACEMIT_PLAN=uid" ;;
-        plan-ut) echo "FLAGOS_SPACEMIT_PLAN=uid-trust" ;;
+        plan-n | plan-nc) echo "FLAGOS_SPACEMIT_PLAN=none" ;;
         # the stock programs know no "flagos" module by name; GGML_BACKEND_PATH loads one from any path
         e4-igpu) echo "GGML_BACKEND_PATH=$MODULE FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu" ;;
         *) echo "" ;;
@@ -143,7 +144,7 @@ run() {
     bin=$(mode_build "$mode")/bin/$tool
     env=$(mode_env "$mode")
     # E3c: every run writes its counters next to its log, when it ends
-    case $mode in e3c | e3c-a | plan-u | plan-ut) env="${env:+$env }FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;; esac
+    case $mode in e3c | e3c-a | plan-nc) env="${env:+$env }FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;; esac
     if [ -n "$DRY" ]; then
         echo "   [$mode] ${env:+$env }$bin $*"
         return 0
@@ -399,11 +400,12 @@ EOF
         echo "== E3c: one generated token, us, mean over the repetitions. busy: each step's slowest tile, summed; idle (the"
         echo "   deck's measure, R12): the token less busy = outside (llama.cpp, the CPU split, sampling) + host (graph_compute"
         echo "   outside the launches) + launch (the launches less the mean tile's kernels and barrier waits) + barriers (their"
-        echo "   own cost); imbal.: busy less the mean tile's kernels. The plan cache (FLAGOS_SPACEMIT_PLAN; plan-u, plan-ut):"
-        echo "   hits by uid (p.uid) and misses (p.miss) per token; lookup: the time from the top of graph_compute to the step"
-        echo "   list in hand (the contract check included; under e3c the check and the expansion); key: the lookup alone, from"
-        echo "   after the check, a miss's expansion and store included (under plan-ut a hit skips the check, so its key is its"
-        echo "   lookup, and a miss's probe lies before the check, in lookup only)"
+        echo "   own cost); imbal.: busy less the mean tile's kernels. The plan cache (FLAGOS_SPACEMIT_PLAN; on in every build-A"
+        echo "   mode since step 3c (e3c by default), off in plan-nc; logs from before step 3c ran e3c without it): hits by uid"
+        echo "   (p.uid) and misses (p.miss) per token; lookup: the time from the top of graph_compute to the step list in hand"
+        echo "   (on a miss and under plan-nc the contract check and the expansion);"
+        echo "   key: from after the check, on a miss the store (a hit skips the check, so its key is its lookup; a miss's probe"
+        echo "   lies before the check, in lookup only); plan-nc counts no hits or misses, its key about 0"
         python3 -I - "$OUT" << 'EOF'
 import glob, json, os, re, statistics, sys
 res = {}
@@ -518,12 +520,13 @@ run_all() {
     if has e3c; then
         bench_modes+=" e3c e3c-a" depth_modes+=" e3c e3c-a"
     fi
-    # the plan cache's two settings against e3c, today's path with the same counters; their logits must read
-    # identical to the reference's (plan.md "S1 step 3b spec" §6)
+    # the plan cache, the default since plan.md "S1 step 3c spec" (ref), against none: plan-n without the counters
+    # (ref against plan-n: the default's speed gain), e3c against plan-nc with them (the host columns); plan-n's
+    # logits must read identical to the reference's (step 3c §7)
     if has plan; then
-        case " $bench_modes " in *" e3c "*) ;; *) bench_modes+=" e3c" depth_modes+=" e3c" ;; esac
-        bench_modes+=" plan-u plan-ut" depth_modes+=" plan-u plan-ut" kld_modes+=" plan-u plan-ut"
-        kld1_modes+=" plan-u plan-ut"
+        bench_modes+=" plan-n"
+        case " $bench_modes " in *" e3c "*) ;; *) bench_modes+=" e3c" ;; esac
+        bench_modes+=" plan-nc" depth_modes+=" plan-n" kld_modes+=" plan-n" kld1_modes+=" plan-n"
     fi
     if has e2hp; then
         case " $depth_modes " in *" e2-igpu "*) ;; *) depth_modes+=" e2-igpu" ;; esac

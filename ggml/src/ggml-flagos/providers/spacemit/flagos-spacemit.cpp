@@ -62,12 +62,11 @@ struct spacemit_backend_context {
     spacemit_run_stats_attach_fn      attach = nullptr;  // test-only (E3c), nullptr when the plugin has no counters
     // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared), nullptr when the plugin does not offer the fact
     spacemit_mul_mat_same_activations_fn same_activations = nullptr;
-    // test-only (FLAGOS_SPACEMIT_PLAN): the plugin's switch generation, in the plan cache's word; nullptr: 0
+    // the plugin's switch generation, in the plan cache's word (moved only by a test's switch reset); nullptr: 0
     spacemit_switches_generation_fn   switches_generation = nullptr;
     std::vector<spacemit_plugin_step> steps;
     std::vector<const char *>         step_names;  // the steps' contract names, parallel to steps
-    spacemit_plan_cache               plan;        // test-only until A4 is decided (FLAGOS_SPACEMIT_PLAN)
-    std::vector<const spacemit_op *>  node_ops;    // with the plan cache: each node's contract from the check
+    spacemit_plan_cache               plan;        // the plan cache (FLAGOS_SPACEMIT_PLAN; plan.md "S1 step 3c spec")
     void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                            workspace_size = 0;
     spacemit_run_stats                run_stats;  // test-only (E3c): the current graph's, with FLAGOS_SPACEMIT_TEST_STATS
@@ -282,9 +281,9 @@ bool spacemit_overlaps(const ggml_tensor * node, const ggml_tensor * t) {
 // graphs, steps and launches and the time spent in graph_compute, in the launches as the host waits for them, in the
 // kernels (summed over the tiles; per step the slowest tile, "busy") and at the barriers (summed over the tiles), and
 // the plan cache's answers (FLAGOS_SPACEMIT_PLAN: hits by uid, misses) with the time to the step list in hand
-// (plan_lookup_us, under none the check and the expansion) and from after the check (plan_key_us, the lookup alone; on
-// a trusted hit, which skips the check, equal to plan_lookup_us). When the process ends it appends one
-// JSON line per kind to <file>. Read once; one launch per step joined in the cores (E3b) is not counted
+// (plan_lookup_us, the check and the expansion included on a miss and under none) and from after the check
+// (plan_key_us: on a miss the store; on a hit, which skips the check, equal to plan_lookup_us). When the process ends it
+// appends one JSON line per kind to <file>. Read once; one launch per step joined in the cores (E3b) is not counted
 class spacemit_stats_file {
   public:
     // nullptr when the switch is not set
@@ -294,9 +293,9 @@ class spacemit_stats_file {
     }
 
     // plan, lookup_us, key_us: the plan cache's answer for this graph (FLAGOS_SPACEMIT_PLAN), the time from the top of
-    // graph_compute to the step list in hand (the check and the expansion under none) and the time from after the
-    // contract check to it (the lookup alone, a miss's expansion and store included; under none about 0, the check
-    // expands as it goes; on a trusted hit from the top, as lookup_us)
+    // graph_compute to the step list in hand (the check and the expansion on a miss and under none) and the time from
+    // after the contract check to it (the check expands as it goes, so on a miss the store and under none about 0; on
+    // a hit, which skips the check, from the top, as lookup_us)
     void add(const char * launch, int64_t rows, int64_t n_kv, const spacemit_run_stats & run, double graph_us,
              spacemit_plan_result plan, double lookup_us, double key_us) {
         double kernel_ns = 0.0, busy_ns = 0.0, barrier_ns = 0.0;
@@ -634,8 +633,10 @@ class spacemit_op_stats_file {
     std::map<std::tuple<std::string, int64_t, int64_t, uint64_t>, totals> kinds;
 };
 
-// every node and the workspace are checked before the launch, so a graph either runs completely or fails with
-// nothing written (under the test-only FLAGOS_SPACEMIT_PLAN=uid-trust a hit trusts the check made at its store)
+// every node is checked before its graph first runs (on every graph when the cache is off, at its store in the plan
+// cache otherwise) and the workspace before every launch, so a graph either runs completely or fails with nothing
+// written; a hit trusts the check made at its store under the uid, which llama.cpp keeps only while the graph is reused
+// unchanged (its tensors and their allocations kept; a rebuilt graph gets a new uid, ggml-backend.cpp:1538)
 ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * ctx = static_cast<spacemit_backend_context *>(backend->context);
     auto * dev = static_cast<spacemit_device_context *>(backend->device->context);
@@ -643,14 +644,13 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     spacemit_stats_file * const    stats    = spacemit_stats_file::get();     // test-only (E3c)
     spacemit_op_stats_file * const op_stats = spacemit_op_stats_file::get();  // test-only (fusion-and-splitting.md §7)
     const bool                     timed    = stats != nullptr || op_stats != nullptr;
-    // test-only until A4 is decided (plan.md "S1 step 3b spec"): FLAGOS_SPACEMIT_PLAN=uid or uid-trust takes the step
-    // list and the workspace sizes from the plan cache on a hit, keyed by the split's uid, the node objects and the
-    // configuration word. Under uid the contract check runs first on every graph and a hit also needs the cached steps
-    // to be the contracts' it found; under uid-trust the entry is taken before the check and a hit skips it, trusting
-    // the uid as CUDA and Hexagon do: a change to a node's operands or placement under a kept uid and the same objects
-    // is not seen (llama.cpp never does this: a reused graph keeps its tensors and their allocations, and the uid
-    // changes when the graph is rebuilt), and the check still runs on every miss and every unstamped graph. none, the
-    // default, expands every graph as before
+    // the plan cache (plan.md "S1 step 3c spec"): by default (FLAGOS_SPACEMIT_PLAN unset or uid-trust) the step list
+    // and the workspace sizes come from the cache on a hit, keyed by the split's uid, the node objects and the
+    // configuration word; the entry is taken before the contract check and a hit skips it, trusting the uid as CUDA
+    // and Hexagon do: a change to a node's operands or placement under a kept uid and the same objects is not seen
+    // (llama.cpp never does this: a reused graph keeps its tensors and their allocations, and the uid changes when the
+    // graph is rebuilt). The check still runs at every store, that is on every miss, and on every graph the scheduler
+    // did not stamp (uid 0, a miss). The test-only none checks and expands every graph, nothing cached
     const spacemit_plan_mode                    plan_mode = spacemit_plan_mode_get();
     const bool                                  clocked   = timed || plan_mode != spacemit_plan_mode::none;
     const std::chrono::steady_clock::time_point start =
@@ -671,7 +671,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
     // no plan cache under FLAGOS_SPACEMIT_QUANTIZE=shared (test-only): its sharing decisions read data addresses
     // (spacemit_overlaps), which the key does not cover
-    const bool          planned = plan_mode != spacemit_plan_mode::none && !share;
+    const bool          cached = plan_mode == spacemit_plan_mode::uid_trust && !share;
     const ggml_tensor * held = nullptr;  // the MUL_MAT whose quantized activations that part holds
     size_t              scratch_size = 0, act_size = 0;
     ctx->steps.clear();
@@ -680,17 +680,18 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     // which moves whenever a kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading
     // a plugin switch); a different word is a miss
     uint64_t word = 0;
-    if (planned) {
+    if (cached) {
         const uint64_t generation = ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
         word                      = (generation << 1) | (share ? 1 : 0);
     }
-    // uid-trust: the key alone, before the contract check
+    // the key alone, before the contract check
     spacemit_plan_result plan = spacemit_plan_result::off;
-    if (planned && plan_mode == spacemit_plan_mode::uid_trust) {
+    if (cached) {
         plan = ctx->plan.probe(cgraph, word, op_stats != nullptr, ctx->steps, ctx->step_names, scratch_size, act_size);
     }
     const bool trusted = plan == spacemit_plan_result::hit_uid;
-    // a checked node's steps and its part of the workspace: every graph under none, a miss of the plan cache otherwise
+    // a checked node's steps and its part of the workspace: every graph when the cache is off (none, or
+    // FLAGOS_SPACEMIT_QUANTIZE=shared), a miss of the plan cache otherwise (expanded as the check goes, then stored)
     const auto expand = [&](ggml_tensor * node, const spacemit_op * op) {
         uint32_t first = 0;
         if (share) {
@@ -734,9 +735,6 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             }
         }
     } else {
-        if (planned) {
-            ctx->node_ops.assign(n_nodes, nullptr);
-        }
         // the contract check, every graph but a trusted hit: a graph either runs completely or fails with nothing
         // written
         for (int i = 0; i < n_nodes; i++) {
@@ -761,36 +759,21 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
                 GGML_LOG_ERROR("FlagOS SpacemiT: %s (%s) has an unallocated operand\n", ggml_op_desc(node), node->name);
                 return GGML_STATUS_FAILED;
             }
-            if (planned) {
-                ctx->node_ops[i] = op;
-            } else {
-                expand(node, op);
-            }
+            expand(node, op);
         }
     }
     // after the contract check; start when a trusted hit skipped it
     const std::chrono::steady_clock::time_point checked =
         clocked && !trusted ? std::chrono::steady_clock::now() : start;
-    if (planned && !trusted) {
-        // uid: the key and the hit guard; uid-trust: the probe missed, so a miss without a second lookup
-        plan = plan_mode == spacemit_plan_mode::uid ?
-                   ctx->plan.lookup(plan_mode, cgraph, word, op_stats != nullptr, ctx->node_ops, ctx->steps,
-                                    ctx->step_names, scratch_size, act_size) :
-                   spacemit_plan_result::miss;
-        if (plan == spacemit_plan_result::miss) {
-            for (int i = 0; i < n_nodes; i++) {
-                if (ctx->node_ops[i] != nullptr) {
-                    expand(ggml_graph_node(cgraph, i), ctx->node_ops[i]);
-                }
-            }
-            ctx->plan.store(cgraph, word, ctx->node_ops, ctx->steps, ctx->step_names, scratch_size, act_size);
-        }
+    if (cached && !trusted) {
+        // the probe missed: the checked graph's expansion stored, without a second lookup
+        ctx->plan.store(cgraph, word, ctx->steps, ctx->step_names, scratch_size, act_size);
     }
     const std::chrono::steady_clock::time_point in_hand =
         clocked ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const double lookup_us = std::chrono::duration<double, std::micro>(in_hand - start).count();
     const double key_us    = std::chrono::duration<double, std::micro>(in_hand - checked).count();
-    if (planned) {
+    if (cached) {
         spacemit_plan_counters_add(plan, lookup_us, key_us);
     }
     if (ctx->steps.empty()) {
@@ -944,8 +927,9 @@ ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
     auto * ctx  = new spacemit_backend_context;
     ctx->table  = dctx->table;
     ctx->stream = stream;
-    // test-only (E3c, FLAGOS_SPACEMIT_QUANTIZE=shared, FLAGOS_SPACEMIT_PLAN): neither the per-tile clock reads, the
-    // activation-sharing fact nor the switch generation is contract, so all three come by name (plan.md "S1 design" A2)
+    // test-only (E3c, FLAGOS_SPACEMIT_QUANTIZE=shared), and the plugin's switch generation, in the plan cache's word
+    // (moved only by a test's switch reset); nullptr: 0. Neither the per-tile clock reads, the activation-sharing fact
+    // nor the switch generation is contract, so all three come by name (plan.md "S1 design" A2)
     ctx->attach = reinterpret_cast<spacemit_run_stats_attach_fn>(dctx->table->get_proc_address("spacemit_run_stats_attach"));
     ctx->same_activations = reinterpret_cast<spacemit_mul_mat_same_activations_fn>(
         dctx->table->get_proc_address("spacemit_mul_mat_same_activations"));

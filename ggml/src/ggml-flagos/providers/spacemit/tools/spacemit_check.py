@@ -429,7 +429,9 @@ def perplexity(bdir, logs, model, text, milestone):
             # a negative rc is the signal that ended the run (-9: killed, e.g. out of memory; -11: segfault)
             problems[name] = (f"{name} run gave no result: rc={rc}, last log line: {last_line(err or out)[:100]}" +
                               (f"; segv.so report in {logs / f'ppl-{name}.err'}" if "=== segv.so" in err else ""))
-        if not fa:
+        # by name: since the thread flags of 2026-10-29 no run's argument list is empty, and "if not fa" stopped
+        # finding this one (the check went missing from the counts without a message until 2026-11-01)
+        if name == "enabled-fa-auto":
             fa_auto = attention_on_provider(err, rc)
     cpu = ppl["disabled"]
     checks = [("enabled", "")]

@@ -3273,8 +3273,8 @@ static int check_layer(ggml_backend_dev_t dev) {
 }
 
 //
-// S1 steps 3 and 3b (plan.md "S1 step 3 spec" §3, "S1 step 3b spec" §3): the plan cache's probes under
-// FLAGOS_SPACEMIT_PLAN=none, uid and uid-trust
+// S1 steps 3, 3b and 3c (plan.md "S1 step 3 spec" §3, "S1 step 3b spec" §3, "S1 step 3c spec" §3): the plan cache's
+// probes under FLAGOS_SPACEMIT_PLAN=none and uid-trust (the default)
 //
 
 // one Qwen3-like layer (build_layer, down projection Q4_0) built once on the provider and on the CPU, computed as often
@@ -3285,7 +3285,7 @@ struct plan_layer {
     ggml_backend_buffer_t bh = nullptr, bwd = nullptr, bwc = nullptr, bgd = nullptr, bgc = nullptr;
     ggml_cgraph *         gd = nullptr, * gc = nullptr;
     layer_out             od = {}, oc = {};
-    layer_weights         wd = {};  // the provider's graph's weights (probe (j) points a MUL_MAT at another one)
+    layer_weights         wd = {};  // the provider's graph's weights
     bool                  cpu_done = false;
 
     // weights_on_cpu: the weights in a plain CPU buffer instead of the provider's (probe (j))
@@ -3399,171 +3399,117 @@ static bool same_bytes(const std::vector<float> & a, const std::vector<float> & 
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }
 
-// the guard probe's stand-in kernels: never run, only compared by the plan cache's hit guard
-static bool plan_fake_kernel_a1(const spacemit_tile *, ggml_tensor *) {
+// the key probe's stand-in kernels: never run, only compared as the cached steps a hit hands back
+static bool plan_fake_kernel_1(const spacemit_tile *, ggml_tensor *) {
     return true;
 }
 
-static bool plan_fake_kernel_a2(const spacemit_tile *, ggml_tensor *) {
+static bool plan_fake_kernel_2(const spacemit_tile *, ggml_tensor *) {
     return true;
 }
 
-static bool plan_fake_kernel_b1(const spacemit_tile *, ggml_tensor *) {
-    return true;
-}
-
-static bool plan_fake_kernel_b2(const spacemit_tile *, ggml_tensor *) {
-    return true;
-}
-
-// probe (j), the hit guard and the key on the cache itself, with two-step stand-in contracts A and B on every node of g
-// (g stamped with a uid). Under uid, the hit guard (uid and word unchanged throughout): no real graph can show it: of
-// the facts outside the key that the contract check reads, a weight in a host buffer and the layout rule by name
-// (flagos-spacemit-ops.cpp:140-151) both make spacemit_find_op refuse the node, never pick another contract, so the
-// graph fails before the lookup (checked in check_plan). Each case stores one step list, then looks up: (1) both steps
-// of A per node, sizes 4096 and 8192, asked with A: a hit with those sizes and the steps; asked with B: a miss; (2)
-// only A's first step cached per node: a miss with A; (3) A's steps in reverse order: a miss; (4) one node without a
-// contract at the store (its steps left out), asked with every node on A: a miss, asked as stored: a hit. Under
-// uid-trust, which has no hit guard, the key alone through probe(), A's steps stored: (1) the same uid, nodes and word:
-// a hit with the stored sizes and steps; (2) one node pointer replaced in a copy of the node array: a miss; (3) one node
-// fewer: a miss; (4) another word: a miss; (5) uid 0 with the same nodes: a miss. Returns false and reports when the
-// cache does otherwise
-static bool plan_guard_probe(spacemit_plan_mode mode, const ggml_cgraph * g) {
-    const spacemit_plugin_kernel ka1 = { "fake.a1", plan_fake_kernel_a1, nullptr, nullptr };
-    const spacemit_plugin_kernel ka2 = { "fake.a2", plan_fake_kernel_a2, nullptr, nullptr };
-    const spacemit_plugin_kernel kb1 = { "fake.b1", plan_fake_kernel_b1, nullptr, nullptr };
-    const spacemit_plugin_kernel kb2 = { "fake.b2", plan_fake_kernel_b2, nullptr, nullptr };
-    const spacemit_op            op_a = { { &ka1, &ka2 }, 2 };
-    const spacemit_op            op_b = { { &kb1, &kb2 }, 2 };
-    ggml_cgraph *                gm   = const_cast<ggml_cgraph *>(g);
-    const int                    n    = ggml_graph_n_nodes(gm);
-    std::vector<const spacemit_op *>  ops_a(n, nullptr), ops_b(n, nullptr), ops_less(n, nullptr);
-    std::vector<spacemit_plugin_step> full, first_only, reversed, less;
-    int                               left_out = -1;  // case (4): the first node with a contract
+// probe (j)'s second part, the key on the cache itself through probe(), on g (stamped with a uid): two stand-in steps
+// per node with an op stored with sizes 4096 and 8192 and no names, then asked with a copy of g, each case one clause
+// of the key: (1) the same uid, nodes and word: a hit with the stored sizes and steps; (2) one node pointer replaced in
+// a copy of the node array: a miss (the pointer walk); (3) one node fewer and (6) one node more (the first again): a
+// miss each (the node count; without it (6) would walk only the stored nodes and hit, and (3) would read past the
+// copy); (4) another word: a miss (the word); (5) another stamped uid with the same nodes: a miss (the uid's equality;
+// "uid not 0" is (h)'s "the view again"); (7) the same uid, nodes and word asked with the op counters' names: a miss
+// (an entry stored without names serves no graph that wants them). Returns false and reports when the cache does
+// otherwise
+static bool plan_key_probe(const ggml_cgraph * g) {
+    ggml_cgraph *                     gm = const_cast<ggml_cgraph *>(g);
+    const int                         n  = ggml_graph_n_nodes(gm);
+    std::vector<spacemit_plugin_step> full;
     for (int i = 0; i < n; i++) {
         ggml_tensor * node = ggml_graph_node(gm, i);
         if (ggml_op_is_empty(node->op)) {
             continue;
         }
-        ops_a[i] = &op_a;
-        ops_b[i] = &op_b;
-        full.push_back({ plan_fake_kernel_a1, node, 0 });
-        full.push_back({ plan_fake_kernel_a2, node, 0 });
-        first_only.push_back({ plan_fake_kernel_a1, node, 0 });
-        reversed.push_back({ plan_fake_kernel_a2, node, 0 });
-        reversed.push_back({ plan_fake_kernel_a1, node, 0 });
-        if (left_out < 0) {
-            left_out = i;
-            continue;
-        }
-        ops_less[i] = &op_a;
-        less.push_back({ plan_fake_kernel_a1, node, 0 });
-        less.push_back({ plan_fake_kernel_a2, node, 0 });
+        full.push_back({ plan_fake_kernel_1, node, 0 });
+        full.push_back({ plan_fake_kernel_2, node, 0 });
     }
     const uint64_t                    word = 2;
     std::vector<spacemit_plugin_step> steps;
     std::vector<const char *>         names;
     size_t                            scratch = 0, act = 0;
-    bool                              ok = left_out >= 0 && g->uid != 0 && n > 1;
+    bool                              ok = !full.empty() && g->uid != 0 && n > 1;
     if (!ok) {
-        std::fprintf(stderr, "FAIL: plan guard: the graph needs a uid and two nodes with an op\n");
+        std::fprintf(stderr, "FAIL: plan key probe: the graph needs a uid and two nodes, one with an op\n");
         g_failures++;
         return false;
     }
-    // got against want; a hit hands back the stored list and sizes
-    const auto judge = [&](const char * what, spacemit_plan_result got, spacemit_plan_result want,
-                           const std::vector<spacemit_plugin_step> & stored) {
-        bool good = got == want;
+    spacemit_plan_cache cache;
+    cache.store(g, word, full, {}, 4096, 8192);
+    // a copy of g whose nodes are `nodes` and whose uid is `uid`, asked through probe() with `w` (and the op counters'
+    // names when want_names); a hit hands back the stored list and sizes
+    const auto ask = [&](const char * what, std::vector<ggml_tensor *> nodes, uint64_t uid, uint64_t w,
+                         spacemit_plan_result want, bool want_names = false) {
+        ggml_cgraph copy = *g;
+        copy.nodes       = nodes.data();
+        copy.n_nodes     = static_cast<int>(nodes.size());
+        copy.uid         = uid;
+        scratch = act = 0;
+        steps.clear();
+        names.clear();
+        const spacemit_plan_result got  = cache.probe(&copy, w, want_names, steps, names, scratch, act);
+        bool                       good = got == want;
         if (got != spacemit_plan_result::miss) {
-            good = good && scratch == 4096 && act == 8192 && steps.size() == stored.size();
+            good = good && scratch == 4096 && act == 8192 && steps.size() == full.size();
             for (size_t j = 0; good && j < steps.size(); j++) {
-                good = steps[j].fn == stored[j].fn && steps[j].node == stored[j].node;
+                good = steps[j].fn == full[j].fn && steps[j].node == full[j].node;
             }
         }
         if (!good) {
             std::fprintf(stderr,
-                         "FAIL: plan guard, %s: lookup gave %d (1 a hit by uid, 2 a miss), expected %d; sizes %zu and "
-                         "%zu, %zu steps\n",
+                         "FAIL: plan key probe, %s: probe gave %d (1 a hit by uid, 2 a miss), expected %d; sizes %zu "
+                         "and %zu, %zu steps\n",
                          what, (int) got, (int) want, scratch, act, steps.size());
             g_failures++;
         }
         ok = ok && good;
     };
-
-    if (mode == spacemit_plan_mode::uid_trust) {
-        spacemit_plan_cache cache;
-        cache.store(g, word, ops_a, full, {}, 4096, 8192);
-        // a copy of g whose nodes are `nodes` and whose uid is `uid`, asked through probe() with `w`
-        const auto ask = [&](const char * what, std::vector<ggml_tensor *> nodes, uint64_t uid, uint64_t w,
-                             spacemit_plan_result want) {
-            ggml_cgraph copy = *g;
-            copy.nodes       = nodes.data();
-            copy.n_nodes     = static_cast<int>(nodes.size());
-            copy.uid         = uid;
-            scratch = act = 0;
-            steps.clear();
-            judge(what, cache.probe(&copy, w, false, steps, names, scratch, act), want, full);
-        };
-        const std::vector<ggml_tensor *> same(g->nodes, g->nodes + n);
-        std::vector<ggml_tensor *>       replaced = same;
-        replaced[n / 2]                           = replaced[0];  // another of g's objects
-        const std::vector<ggml_tensor *> fewer(g->nodes, g->nodes + n - 1);
-        ask("(1) the same uid, nodes and word", same, g->uid, word, spacemit_plan_result::hit_uid);
-        ask("(2) one node pointer replaced", replaced, g->uid, word, spacemit_plan_result::miss);
-        ask("(3) one node fewer", fewer, g->uid, word, spacemit_plan_result::miss);
-        ask("(4) another word", same, g->uid, word + 2, spacemit_plan_result::miss);
-        ask("(5) uid 0 with the same nodes", same, 0, word, spacemit_plan_result::miss);
-        return ok;
-    }
-
-    // a fresh cache holding `stored` for ops_stored, sizes 4096 and 8192, then asked with `asked`
-    const auto run_case = [&](const char * what, const std::vector<const spacemit_op *> & ops_stored,
-                              const std::vector<spacemit_plugin_step> & stored,
-                              const std::vector<const spacemit_op *> & asked, spacemit_plan_result want) {
-        spacemit_plan_cache cache;
-        const bool empty = cache.lookup(mode, g, word, false, ops_stored, steps, names, scratch, act) ==
-                           spacemit_plan_result::miss;
-        if (!empty) {
-            std::fprintf(stderr, "FAIL: plan guard, %s: a fresh cache did not miss\n", what);
-            g_failures++;
-            ok = false;
-        }
-        cache.store(g, word, ops_stored, stored, {}, 4096, 8192);
-        scratch = act = 0;
-        steps.clear();
-        judge(what, cache.lookup(mode, g, word, false, asked, steps, names, scratch, act), want, stored);
-    };
-    run_case("(1) A's steps asked with A", ops_a, full, ops_a, spacemit_plan_result::hit_uid);
-    run_case("(1) A's steps asked with B", ops_a, full, ops_b, spacemit_plan_result::miss);
-    run_case("(2) only A's first step cached", ops_a, first_only, ops_a, spacemit_plan_result::miss);
-    run_case("(3) A's steps reversed", ops_a, reversed, ops_a, spacemit_plan_result::miss);
-    run_case("(4) a node more with a contract", ops_less, less, ops_a, spacemit_plan_result::miss);
-    run_case("(4) as stored", ops_less, less, ops_less, spacemit_plan_result::hit_uid);
+    const std::vector<ggml_tensor *> same(g->nodes, g->nodes + n);
+    std::vector<ggml_tensor *>       replaced = same;
+    replaced[n / 2]                           = replaced[0];  // another of g's objects
+    const std::vector<ggml_tensor *> fewer(g->nodes, g->nodes + n - 1);
+    std::vector<ggml_tensor *>       more = same;
+    more.push_back(same[0]);
+    ask("(1) the same uid, nodes and word", same, g->uid, word, spacemit_plan_result::hit_uid);
+    ask("(2) one node pointer replaced", replaced, g->uid, word, spacemit_plan_result::miss);
+    ask("(3) one node fewer", fewer, g->uid, word, spacemit_plan_result::miss);
+    ask("(4) another word", same, g->uid, word + 2, spacemit_plan_result::miss);
+    ask("(5) another stamped uid with the same nodes", same, g->uid + 1, word, spacemit_plan_result::miss);
+    ask("(6) one node more", more, g->uid, word, spacemit_plan_result::miss);
+    ask("(7) the names wanted, none stored", same, g->uid, word, spacemit_plan_result::miss, true);
     return ok;
 }
 
-// The probes of plan.md "S1 design" §3 ("S1 step 3b spec" §3) under each setting of FLAGOS_SPACEMIT_PLAN, each on a
-// fresh backend (an empty cache and workspace), with the counters read around every graph (hits by uid / misses, both
-// cache settings unless stated): (a) one layer graph computed twice as the same object (stamped with a uid): a miss,
-// then a hit; (e) the same structure built again as new objects with the same uid: a miss (the key's pointer walk);
-// (b) the same structure as new objects, uid 0: a miss; (c) RoPE's base changed and (d) 7 tokens: new objects, uid 0,
-// a miss each (the key reads neither op_params nor shapes: these two check the outputs, and (d) grows the workspace);
-// (g) the first layer again after the larger graph grew the workspace: a miss (the core keeps one entry, the last
-// plan), then its plan replayed in the grown workspace (a hit); (h) a graph view of it (uid 0): a miss, and a miss
-// again when computed a second time, the entry then its own (a uid of 0 never hits); (f) FLAGOS_SPACEMIT_ATTN
-// flipped between two one-token attention graphs (n_kv 1024, the graph stamped with its own uid): a miss each, the
-// one-chunk graph a hit when computed again, the step list the other variant's (1 step one-chunk, 2 the split), counted
-// by the steps the executor ran; (l) the switch set again to the value it has: the generation moves and the contract
-// stays, so a miss by the word alone, 1 step; (j) the first layer's structure with its weights in a CPU buffer (new
-// objects under the same uid), right after the first layer is the entry: refused by the contract check, nothing
-// counted, the first layer a hit after it;
-// under uid also the first layer's own graph object with one MUL_MAT pointed at such a weight, refused the same way
-// (not run under uid-trust, whose hit trusts the uid: see there); and the cache itself (plan_guard_probe: the hit guard
-// under uid, the key alone under uid-trust); (m) the first layer's own object with another uid, the entry its own: a
-// miss by the uid alone; (k) under FLAGOS_SPACEMIT_QUANTIZE=shared no cache, so a layer graph twice counts nothing; (i)
-// under none every counter stays 0. Under uid-trust every hit's key time equals its lookup time (the check skipped).
-// Every output against the CPU, the layers' against each other byte for byte, and every output of uid and uid-trust
-// against none's byte for byte
+// The probes of plan.md "S1 design" §3 ("S1 step 3b spec" §3, "S1 step 3c spec" §3) under each setting of
+// FLAGOS_SPACEMIT_PLAN, none and uid-trust, each on a fresh backend (an empty cache and workspace), with the counters
+// read around every graph (hits by uid / misses under uid-trust): (a) one layer graph computed twice as the same object
+// (stamped with a uid): a miss, then a hit; (e) the same structure built again as new objects with the same uid: a
+// miss (the key's pointer walk); (b) the same structure as new objects, uid 0: a miss; (c) RoPE's base changed and (d)
+// 7 tokens: new objects, uid 0, a miss each (the key reads neither op_params nor shapes: these two check the outputs,
+// and (d) grows the workspace); (g) the first layer again after the larger graph grew the workspace: a miss (the core
+// keeps one entry, the last plan), then its plan replayed in the grown workspace (a hit); (h) a graph view of it (uid
+// 0): a miss, and a miss again when computed a second time, the entry then its own (a uid of 0 never hits); (f)
+// FLAGOS_SPACEMIT_ATTN flipped between two one-token attention graphs (n_kv 1024, the graph stamped with its own uid):
+// a miss each, the one-chunk graph a hit when computed again, the step list the other variant's (1 step one-chunk, 2
+// the split), counted by the steps the executor ran; (l) the switch set again to the value it has: the generation moves
+// and the contract stays, so a miss by the word alone, 1 step; (j) the first layer's structure with its weights in a
+// CPU buffer (new objects under the same uid), right after the first layer is the entry: refused by the contract check,
+// nothing counted, the first layer a hit after it; and the cache itself (plan_key_probe: the key alone through
+// probe(), seven cases, under uid-trust); (o) a node unflagged after the store: one MUL_MAT of the first layer's
+// object loses GGML_TENSOR_FLAG_COMPUTE, so under none the check's filter skips it (2 steps fewer) and under uid-trust
+// the hit runs the stored steps (as many as before): the hit skips the check; (m) the first layer's own object with
+// another uid, the entry its own: a miss by the uid alone; (k) under FLAGOS_SPACEMIT_QUANTIZE=shared no cache, so a
+// layer graph twice counts nothing; (i) under none every counter stays 0; (n), made once before the settings and
+// counted in each line: the switch unset gives uid-trust (the default), none gives none, and the old uid falls to
+// uid-trust with one warning. Under uid-trust every hit's key time equals its lookup time (the counters' definition: a
+// hit reads `checked` as `start`; that the hit skips the check is (o)). Every output against the CPU, the layers'
+// against each other byte for byte, and every output of uid-trust against none's byte for byte. 15 probes under none,
+// 14 under uid-trust
 static int check_plan(ggml_backend_dev_t dev) {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     REQUIRE(cpu != nullptr);
@@ -3573,11 +3519,44 @@ static int check_plan(ggml_backend_dev_t dev) {
 
     constexpr uint64_t k_attn_uid = 0x504c414e00000002ULL;  // (f) and (l)'s attention graph's
 
-    for (const char * setting : { "none", "uid", "uid-trust" }) {
+    // (n) the default: the switch unset gives uid-trust, none gives none, the old uid gives uid-trust (each override
+    // restores the switch after)
+    bool default_ok = true;
+    {
+        env_override             unset("FLAGOS_SPACEMIT_PLAN", nullptr);
+        const spacemit_plan_mode got = spacemit_plan_mode_get();
+        if (got != spacemit_plan_mode::uid_trust) {
+            std::fprintf(stderr, "FAIL: plan, probe (n): FLAGOS_SPACEMIT_PLAN unset gave mode %d, not uid-trust\n",
+                         (int) got);
+            g_failures++;
+            default_ok = false;
+        }
+    }
+    {
+        env_override             none("FLAGOS_SPACEMIT_PLAN", "none");
+        const spacemit_plan_mode got = spacemit_plan_mode_get();
+        if (got != spacemit_plan_mode::none) {
+            std::fprintf(stderr, "FAIL: plan, probe (n): FLAGOS_SPACEMIT_PLAN=none gave mode %d, not none\n", (int) got);
+            g_failures++;
+            default_ok = false;
+        }
+    }
+    {
+        // the setting removed in step 3c: unknown now, so the default, with one warning
+        env_override             old("FLAGOS_SPACEMIT_PLAN", "uid");
+        const spacemit_plan_mode got = spacemit_plan_mode_get();
+        if (got != spacemit_plan_mode::uid_trust) {
+            std::fprintf(stderr, "FAIL: plan, probe (n): FLAGOS_SPACEMIT_PLAN=uid gave mode %d, not uid-trust\n",
+                         (int) got);
+            g_failures++;
+            default_ok = false;
+        }
+    }
+
+    for (const char * setting : { "none", "uid-trust" }) {
         env_override   plan_switch("FLAGOS_SPACEMIT_PLAN", setting);
         env_override   quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", nullptr);  // separate; (k) sets shared itself
-        const bool     on      = std::strcmp(setting, "none") != 0;
-        const bool     trust   = std::strcmp(setting, "uid-trust") == 0;
+        const bool     on      = std::strcmp(setting, "none") != 0;  // uid-trust: the cache on, a hit trusted
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         REQUIRE(backend != nullptr);
         spacemit_plan_counters_take();
@@ -3609,9 +3588,9 @@ static int check_plan(ggml_backend_dev_t dev) {
                              (unsigned long long) uid_hits, (unsigned long long) misses);
                 g_failures++;
             }
-            // a trusted hit skips the contract check, so its key time is its lookup time, the same clock reads
-            // (graph_compute takes `checked` as `start`); a hit that had run the check would show a larger lookup
-            if (trust && uid_hits == 1 && d.hits_uid == 1 && d.lookup_us != d.key_us) {
+            // the counters' definition: on a hit graph_compute takes `checked` as `start`, so its key time is its
+            // lookup time, the same clock reads (that a hit really skips the contract check is probe (o))
+            if (on && uid_hits == 1 && d.hits_uid == 1 && d.lookup_us != d.key_us) {
                 std::fprintf(stderr, "FAIL: plan %s, probe %s: a trusted hit took %.1f us to the step list but %.1f us "
                              "from after the check: the check ran\n", setting, probe, d.lookup_us, d.key_us);
                 g_failures++;
@@ -3619,7 +3598,7 @@ static int check_plan(ggml_backend_dev_t dev) {
             }
             return ok;
         };
-        // an output kept under none and compared byte for byte under uid and uid-trust
+        // an output kept under none and compared byte for byte under uid-trust
         const auto as_none = [&](const char * name, const std::vector<float> & out) {
             if (!on) {
                 none_outputs[name] = out;
@@ -3778,45 +3757,62 @@ static int check_plan(ggml_backend_dev_t dev) {
         }
         take();
 
-        // (j) refusals right after the first layer is the entry: the same structure with its weights in a plain CPU
-        // buffer (the contract check refuses its MUL_MATs: an IME weight must sit in our buffer, new objects, so the
-        // probe misses under uid-trust too), then, under uid only, the first layer's own graph object, same uid and
-        // node objects, with one MUL_MAT pointed at such a weight; each fails with nothing counted (a refused graph
-        // returns before the counters), and the first layer is a hit after each. Under uid-trust the second is not
-        // run: the probe would hit and the IME kernel would read an unrepacked weight; that is exactly the check the
-        // trust gives up (llama.cpp's reuse never changes a reused graph's tensors: the uid changes when the graph is
-        // rebuilt). Then the cache itself (plan_guard_probe: the hit guard under uid, the key alone under uid-trust)
+        // (j) a refusal right after the first layer is the entry: the same structure with its weights in a plain CPU
+        // buffer (the contract check refuses its MUL_MATs: an IME weight must sit in our buffer; new objects, so the
+        // probe misses and the check runs); it fails with nothing counted (a refused graph returns before the
+        // counters), and the first layer is a hit after it. The first layer's own graph object with a MUL_MAT pointed
+        // at such a weight is not run: the probe would hit and the IME kernel would read an unrepacked weight; that is
+        // exactly the check the trust gives up (llama.cpp's reuse never changes a reused graph's tensors: the uid
+        // changes when the graph is rebuilt). Then the cache itself (plan_key_probe: the key alone through probe())
         {
-            std::vector<float> out_j, out_w, out_j2, out_x, out_j3;
+            std::vector<float> out_j, out_w, out_j2;
             ran = a.run(backend, out_j);  // a miss: the entry was (l)'s
             cnt = expect("(j) the first layer", 0, 1);
             const bool refused_w = !w.run(backend, out_w);
             cnt = expect("(j) weights in a CPU buffer", 0, 0, false) && cnt;
             ran = ran && a.run(backend, out_j2);
             cnt = expect("(j) the first layer after the refusal", 1, 0) && cnt;
-            bool refused_x = true;
-            out_j3         = out_j2;
-            if (!trust) {
-                ggml_tensor * swapped = nullptr;
-                for (int i = 0; i < ggml_graph_n_nodes(a.gd) && swapped == nullptr; i++) {
-                    ggml_tensor * node = ggml_graph_node(a.gd, i);
-                    if (node->op == GGML_OP_MUL_MAT && node->src[0] == a.wd.wq) {
-                        swapped = node;
-                    }
+            const bool key = !on || plan_key_probe(a.gd);
+            probe("(j)", cnt && key,
+                  refused_w && ran && same_bytes(out_j, out_a) && same_bytes(out_j2, out_a) && as_none("j", out_j2));
+        }
+
+        // (o) a node unflagged after the store, a probe of the trust itself: the entry is the first layer's (its hit
+        // in (j)); one of its MUL_MATs loses GGML_TENSOR_FLAG_COMPUTE, the graph runs, the flag is restored. Under none
+        // the contract check's filter skips the node, its 2 steps fewer than the graph's; under uid-trust the probe
+        // hits and the stored steps run, as many as before, so the check was not made. The bytes are the same under
+        // both: the skipped node's output keeps the previous run's value. Not a scenario: llama.cpp sets the flag only
+        // when it builds a graph (ggml.c:7100), and a reused graph skips the build (src/llama-context.cpp:1339)
+        {
+            ggml_tensor * unflagged = nullptr;
+            for (int i = 0; i < ggml_graph_n_nodes(a.gd) && unflagged == nullptr; i++) {
+                ggml_tensor * node = ggml_graph_node(a.gd, i);
+                if (node->op == GGML_OP_MUL_MAT && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                    unflagged = node;
                 }
-                REQUIRE(swapped != nullptr);
-                swapped->src[0] = w.wd.wq;  // the same type and shape, in a CPU buffer
-                refused_x       = !a.run(backend, out_x);
-                swapped->src[0] = a.wd.wq;
-                cnt = expect("(j) a MUL_MAT of the cached object on a CPU-buffer weight", 0, 0, false) && cnt;
-                ran = ran && a.run(backend, out_j3);
-                cnt = expect("(j) the first layer restored", 1, 0) && cnt;
             }
-            const bool guard =
-                !on || plan_guard_probe(trust ? spacemit_plan_mode::uid_trust : spacemit_plan_mode::uid, a.gd);
-            probe("(j)", cnt && guard,
-                  refused_w && refused_x && ran && same_bytes(out_j, out_a) && same_bytes(out_j2, out_a) &&
-                      same_bytes(out_j3, out_a) && as_none("j", out_j3));
+            REQUIRE(unflagged != nullptr);
+            std::vector<float> out_o, out_o2;
+            take();
+            spacemit_steps_take();
+            ran                      = a.run(backend, out_o);
+            const uint64_t steps_all = spacemit_steps_take();
+            cnt                      = expect("(o) the first layer", 1, 0);
+            unflagged->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+            ran                      = ran && a.run(backend, out_o2);
+            const uint64_t steps_now = spacemit_steps_take();
+            unflagged->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            cnt                    = expect("(o) a node unflagged after the store", 1, 0) && cnt;
+            const uint64_t want    = on ? steps_all : steps_all - 2;
+            const bool     steps_o = steps_now == want;
+            if (!steps_o) {
+                std::fprintf(stderr, "FAIL: plan %s, probe (o): steps run %llu with the node unflagged, %llu before; "
+                             "expected %llu\n", setting, (unsigned long long) steps_now,
+                             (unsigned long long) steps_all, (unsigned long long) want);
+                g_failures++;
+            }
+            probe("(o)", cnt && steps_o,
+                  ran && same_bytes(out_o, out_a) && same_bytes(out_o2, out_a) && as_none("o", out_o2));
         }
 
         // (m) the first layer's own object with another uid: the entry is its own (the same objects and word), so only
@@ -3853,15 +3849,16 @@ static int check_plan(ggml_backend_dev_t dev) {
             }
             probe("(i)", zero, true);
         }
+        probe("(n)", default_ok, true);
         ggml_backend_free(backend);
         std::printf("plan     FLAGOS_SPACEMIT_PLAN=%s: probes %d/%d passed (a same object twice, b same structure as "
                     "new objects, c RoPE base changed, d 7 tokens, e a stamped uid on other objects, f "
                     "FLAGOS_SPACEMIT_ATTN flipped, l the same value set again, g replay after a larger graph, h a graph "
-                    "view, j refusals after the entry and %s, m another uid on the same objects, k no cache under "
-                    "QUANTIZE=shared%s); %d graphs: %llu "
+                    "view, j a refusal%s, o a node unflagged after the store, m another uid on the same objects, k no "
+                    "cache under QUANTIZE=shared%s, n the default uid-trust); %d graphs: %llu "
                     "hits by uid, %llu misses, lookup %.1f us and key %.1f us per graph; %s; layer NMSE %.2e (bound "
                     "%.0e), attention NMSE %.2e (bound %.0e)\n",
-                    setting, n_passed, n_probes, trust ? "the key alone" : "the hit guard",
+                    setting, n_passed, n_probes, on ? " after the entry and the key alone (seven cases)" : "",
                     on ? "" : ", i no counter moved", n_graphs, (unsigned long long) total.hits_uid,
                     (unsigned long long) total.misses, n_graphs > 0 ? total.lookup_us / n_graphs : 0.0,
                     n_graphs > 0 ? total.key_us / n_graphs : 0.0,
