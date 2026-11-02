@@ -54,32 +54,14 @@ class spacemit_executor {
     // false if any step or the runtime failed
     virtual bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size) = 0;
 
-    // test-only (structural-experiments.md E3b): every step a launch of its own, ordered where the runtime can order
-    // them without the host; here, as a runtime without that would do, the host waits for each
-    virtual bool run_ordered(const spacemit_plugin_step * steps, size_t n_steps, void * workspace,
-                             size_t workspace_size) {
-        for (size_t i = 0; i < n_steps; i++) {
-            if (!run(steps + i, 1, workspace, workspace_size)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     virtual const char * name() const = 0;
 
-    // test-only (E3c): set by graph_compute around the runs of a graph it counts; run() fills it, run_ordered() not
+    // test-only (E3c): set by graph_compute around the runs of a graph it counts; run() fills it
     spacemit_run_stats * stats = nullptr;
 };
 
 // spine-runtime executor on the AI cores; without spine-runtime (non-riscv64 builds) a serial stand-in for tests
 std::unique_ptr<spacemit_executor> spacemit_executor_create(spacemit_stream_policy policy, uint32_t n_cores);
-
-// test-only (structural-experiments.md E3b-diag): what the launches ordered in the cores (FLAGOS_SPACEMIT_TEST_LAUNCH=
-// per-step-join) did since the last call (spacemit_ordered_counts, the C interface). Each tile notes its core after its
-// join, after taking its TCM, after the TCM agreement and after its step, and which TCM it took. All zero without
-// spine-runtime
-spacemit_ordered_counts spacemit_ordered_counts_take();
 
 // test-only: the steps the executors have launched since the last call (flagos-check-spacemit counts the quantize steps
 // that FLAGOS_SPACEMIT_QUANTIZE=shared leaves out)

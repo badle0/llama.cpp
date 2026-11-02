@@ -30,9 +30,6 @@ struct mm_format {
 const mm_format k_q4_0_32x256 = { (int64_t) spacemit_ime::q4_0_k_block, spacemit_ime::q4_0_act_row_bytes,
                                   spacemit_ime::q4_0_weight_row_bytes,  spacemit_ime::q4_0_quantize_row,
                                   spacemit_ime::q4_0_quantize_4rows,    spacemit_ime::q4_0_gemm };
-const mm_format k_q4_1_32x32  = { (int64_t) spacemit_ime::q4_1_k_block, spacemit_ime::i8_act_row_bytes,
-                                  spacemit_ime::q4_1_weight_row_bytes,  spacemit_ime::i8_quantize_row,
-                                  spacemit_ime::i8_quantize_4rows,      spacemit_ime::q4_1_gemm };
 // Q8_0 weights, and Q4_1 and Q6_K weights requantized to Q8_0 at load: the same layout and kernels
 const mm_format k_q8_0_32x32  = { (int64_t) spacemit_ime::q8_0_k_block, spacemit_ime::i8_act_row_bytes,
                                   spacemit_ime::q8_0_weight_row_bytes,  spacemit_ime::i8_quantize_row,
@@ -43,8 +40,6 @@ const mm_format & mm_format_of(const ggml_tensor * w) {
     switch (spacemit_weight_layout(w)) {
         case spacemit_layout::q4_0_32x256:
             return k_q4_0_32x256;
-        case spacemit_layout::q4_1_32x32:
-            return k_q4_1_32x32;
         case spacemit_layout::q4_1_q8_0_32x32:
         case spacemit_layout::q8_0_32x32:
         case spacemit_layout::q6_k_q8_0_32x32:
@@ -91,16 +86,11 @@ bool use_reference() {
 
 // FLAGOS_SPACEMIT_MM (fusion-and-splitting.md §7.3): fit,staged, the default since 2026-10-25, takes path B where TCM
 // holds the batch's activations next to a 32-column slab, otherwise path A where every tile gets 4 rows, otherwise
-// path C (from the steps measured per shape under split, rows and spacemit), and on path B every tile copies and
-// multiplies its own slabs without the pair turns (gemm_slabs; §7.3, Qwen3-0.6B's run). The others are test-only, for
-// comparisons: split, the default until then, keeps ime.cpp's choice of path A and takes path C where ime.cpp takes
-// path B: below 113 rows, and for matrices more than 64 times wider than the rows; rows takes path A for every call
-// that gives each tile at least one group of 4 rows; spacemit takes path B there instead of path C whenever TCM holds
-// a slab, as ime.cpp and ggml-spacemit do; fit takes fit,staged's paths with the turns on path B; fit,mixed takes them
-// with the turns only while the batch's activations take fewer bytes than a slab (slabs_paired). The same bytes in all
-// six. Parsed once (spacemit_cached_switch; the check program resets between its settings); anything else is reported
-// once and ignored
-enum class mm_setting { split, rows, spacemit, fit, fit_staged, fit_mixed };
+// path C, and on path B every tile copies and multiplies its own slabs (gemm_slabs; §7.3, Qwen3-0.6B's run). test-only:
+// split, the default until then, for comparisons: ime.cpp's choice of path A and path C where ime.cpp takes path B
+// (below 113 rows, and for matrices more than 64 times wider than the rows). The same bytes under both. Parsed once
+// (spacemit_cached_switch; the check program resets between its settings); anything else is reported once and ignored
+enum class mm_setting { split, fit_staged };
 
 mm_setting parse_mm_setting() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_MM");
@@ -109,18 +99,6 @@ mm_setting parse_mm_setting() {
     }
     if (std::strcmp(v, "split") == 0) {
         return mm_setting::split;
-    }
-    if (std::strcmp(v, "rows") == 0) {
-        return mm_setting::rows;
-    }
-    if (std::strcmp(v, "spacemit") == 0) {
-        return mm_setting::spacemit;
-    }
-    if (std::strcmp(v, "fit") == 0) {
-        return mm_setting::fit;
-    }
-    if (std::strcmp(v, "fit,mixed") == 0) {
-        return mm_setting::fit_mixed;
     }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
@@ -142,30 +120,7 @@ mm_setting mm_setting_from_env() {
 // another while the others wait: on the K3 a tile with 2 or 3 such rows takes about 1.4 or 2.05 times as long as a
 // full round of path A, one row 0.68 (Qwen3-8B's op counters, fusion-and-splitting.md §7.3). Two rows in two calls
 // stream the weights twice: with groups on the other tiles 1.58 rounds, in one call 1.47 (the same counters). The
-// rows' bytes and their kernel calls stay the same, so the output does. test-only: FLAGOS_SPACEMIT_TAIL=one-tile keeps
-// ime.cpp's assignment, for comparisons; parsed once (spacemit_cached_switch); anything else is reported once and
-// ignored
-bool parse_path_a_tail_one_tile() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_TAIL");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "dealt") == 0) {
-        return false;
-    }
-    if (std::strcmp(v, "one-tile") == 0) {
-        return true;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_TAIL=%s: unknown setting ignored\n", __func__, v);
-    }
-    return false;
-}
-
-bool path_a_tail_one_tile() {
-    static std::atomic<bool>     value{ false };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_path_a_tail_one_tile);
-}
-
+// rows' bytes and their kernel calls stay the same, so the output does.
 // the tile that multiplies leftover row j of path A's r when dealt. g is the tile after the last group, which holds
 // them in ime.cpp; tiles g to nth - 1 have no group in the last round. Each takes one row, the first of them two
 // consecutive ones when fewer are idle than rows (two rows in one call take less time than a group and a row,
@@ -180,8 +135,8 @@ int64_t path_a_tail_tile(int64_t j, int64_t r, int64_t g, int64_t nth) {
     return j < std::min(r, 2 * idle) ? g + j - pairs : j - 2 * idle;
 }
 
-// test-only (spacemit_mm_paths_take); g_path_b_staged: path B steps whose tile 0 ran without the pair turns
-std::atomic<uint64_t> g_path_a{ 0 }, g_path_b{ 0 }, g_path_c{ 0 }, g_path_b_staged{ 0 };
+// test-only (spacemit_mm_paths_take)
+std::atomic<uint64_t> g_path_a{ 0 }, g_path_b{ 0 }, g_path_c{ 0 };
 // test-only (spacemit_mm_tail_take): path A's leftover rows each tile multiplied, and in how many calls
 std::atomic<uint64_t> g_tail_rows[SPACEMIT_MAX_TILES], g_tail_calls[SPACEMIT_MAX_TILES];
 
@@ -198,97 +153,25 @@ void gemm_rows(const uint8_t * qa, const uint8_t * wb, float * c, int64_t rows, 
 
 // How a single activation row (generation) is multiplied: the weights staged through TCM 32 columns at a time
 // (memcpy1d), each slab multiplied there, slabs dealt round-robin to the tiles, and the two tiles of each pair taking
-// turns as the in-tree path B does: while one copies its next slab, the other multiplies (gemv below). Measured on the
-// K3 (plan.md, "1-row matmul bandwidth"): staging takes 10% less time per Qwen3-4B token than reading the weights
-// straight from DRAM (memcpy1d reads DRAM faster than the kernels' own loads do; the kernels multiply a slab from TCM
-// about three times faster than DRAM delivers it), and the turns 5% less again (tg128 8.7 -> 9.2), as fast as the
-// in-tree path. Without room in TCM for a 32-column slab the weights are read straight from DRAM.
-// test-only: FLAGOS_SPACEMIT_GEMV=<strategy>[:<columns>][@<tiles>], parsed once (spacemit_cached_switch, packed into
-// one word), for comparisons: paired[:c]
-// (c = 32, the default); staged[:c] (c = 32): the same without the turns; direct[:c] (c = 128): straight from DRAM, c
-// columns per kernel call; copy[:c]: staging's copies alone, wrong results (the control of flagos-check-spacemit's
-// strategy check); @t: only the first t tiles take part, the others wait (also gives a tile without a partner)
-struct gemv_strategy {
-    enum kind_t { paired, staged, direct, copy_only };
-    kind_t  kind  = paired;
-    int64_t cols  = nb_cols;
-    int64_t tiles = 0;  // 0: all
-};
-
-gemv_strategy parse_gemv_strategy() {
-    static const struct {
-        const char *          name;
-        gemv_strategy::kind_t kind;
-        int64_t               cols;
-    } names[] = {
-        { "paired", gemv_strategy::paired, nb_cols },
-        { "staged", gemv_strategy::staged, nb_cols },
-        { "direct", gemv_strategy::direct, 4 * nb_cols },
-        { "copy", gemv_strategy::copy_only, nb_cols },
-    };
-    gemv_strategy s;
-    const char *  v = std::getenv("FLAGOS_SPACEMIT_GEMV");
-    if (v == nullptr) {
-        return s;
-    }
-    const size_t len = std::strcspn(v, ":@");
-    for (const auto & n : names) {
-        if (std::strlen(n.name) == len && std::strncmp(v, n.name, len) == 0) {
-            s.kind = n.kind;
-            s.cols = n.cols;
-        }
-    }
-    const char * cols  = std::strchr(v, ':');
-    const char * tiles = std::strchr(v, '@');
-    if (cols != nullptr && std::atoll(cols + 1) >= nb_cols) {
-        s.cols = std::atoll(cols + 1) / nb_cols * nb_cols;
-    }
-    if (tiles != nullptr && std::atoll(tiles + 1) > 0) {
-        s.tiles = std::atoll(tiles + 1);
-    }
-    return s;
-}
-
-// the strategy in one word for the cache: the kind in 8 bits, the columns in 32, the tiles in 16
-uint64_t pack_gemv_strategy(const gemv_strategy & s) {
-    return (uint64_t) s.kind | ((uint64_t) (uint32_t) s.cols << 8) | ((uint64_t) (uint16_t) s.tiles << 40);
-}
-
-gemv_strategy unpack_gemv_strategy(uint64_t w) {
-    gemv_strategy s;
-    s.kind  = static_cast<gemv_strategy::kind_t>(w & 0xff);
-    s.cols  = (int64_t) (uint32_t) (w >> 8);
-    s.tiles = (int64_t) (uint16_t) (w >> 40);
-    return s;
-}
-
-gemv_strategy gemv_strategy_from_env() {
-    static std::atomic<uint64_t> value{ 0 };
-    static std::atomic<uint32_t> seen{ 0 };
-    return unpack_gemv_strategy(spacemit_cached_switch(value, seen, [] { return pack_gemv_strategy(parse_gemv_strategy()); }));
-}
-
-// one activation row, already quantized into the start of the tile's TCM, times all weight rows (gemv_strategy); false
-// when a pair wait failed
-bool gemv(const gemv_strategy & s, const spacemit_tile & tile, const uint8_t * w, float * out, const mm_dims & d,
-          bool reference) {
-    const int64_t ith = tile.ith;
-    int64_t       nth = tile.nth;
-    if (s.tiles > 0) {
-        nth = std::min(nth, s.tiles);
-        if (ith >= nth) {
-            return true;
-        }
-    }
+// turns as the in-tree path B does: while one copies its next slab, the other multiplies. Measured on the K3 (plan.md,
+// "1-row matmul bandwidth"): staging takes 10% less time per Qwen3-4B token than reading the weights straight from
+// DRAM (memcpy1d reads DRAM faster than the kernels' own loads do; the kernels multiply a slab from TCM about three
+// times faster than DRAM delivers it), and the turns 5% less again (tg128 8.7 -> 9.2), as fast as the in-tree path.
+// Without room in TCM for a 32-column slab the weights are read straight from DRAM, 128 columns per kernel call.
+// One activation row, already quantized into the start of the tile's TCM, times all weight rows; false when a pair
+// wait failed
+bool gemv(const spacemit_tile & tile, const uint8_t * w, float * out, const mm_dims & d, bool reference) {
+    const int64_t ith   = tile.ith;
+    const int64_t nth   = tile.nth;
     uint8_t *     tcm   = static_cast<uint8_t *>(tile.tcm);
     const int64_t a_off = GGML_PAD(d.a_row_bytes, 64);
     const int64_t fit   = (int64_t) tile.tcm_size > a_off ?
                               ((int64_t) tile.tcm_size - a_off) / d.b_row_bytes / nb_cols * nb_cols :
                               0;
-    const int64_t slab  = std::min(s.cols, fit);
+    const int64_t slab  = std::min(nb_cols, fit);
 
-    if (s.kind == gemv_strategy::direct || slab < nb_cols) {
-        const int64_t chunk = s.kind == gemv_strategy::direct ? s.cols : 4 * nb_cols;
+    if (slab < nb_cols) {
+        const int64_t chunk = 4 * nb_cols;
         for (int64_t n0 = ith * chunk; n0 < d.n; n0 += chunk * nth) {
             d.f->gemm(tcm, w + n0 * d.b_row_bytes, out + n0, 1, std::min(d.n - n0, chunk), d.k_blocks, d.n, reference);
         }
@@ -308,20 +191,10 @@ bool gemv(const gemv_strategy & s, const spacemit_tile & tile, const uint8_t * w
         }
     };
 
-    if (s.kind != gemv_strategy::paired) {  // staged, or its copies alone
-        for (int64_t n0 = ith * slab; n0 < d.n; n0 += slab * nth) {
-            stage(n0);
-            if (s.kind == gemv_strategy::staged) {
-                multiply(n0);
-            }
-        }
-        return true;
-    }
-
-    // paired, the in-tree path B (ggml-cpu/spacemit/ime.cpp:435-494): the two tiles of a pair take turns. The even one
-    // copies its first slab while the odd one waits; then in every round one multiplies while the other copies. Both
-    // wait 1 + rounds times, rounds being the even tile's number of slabs (the odd tile may have one slab fewer and
-    // still waits in that last round); a tile without a partner (an odd number of tiles) runs as staged
+    // the in-tree path B (ggml-cpu/spacemit/ime.cpp:435-494): the two tiles of a pair take turns. The even one copies
+    // its first slab while the odd one waits; then in every round one multiplies while the other copies. Both wait
+    // 1 + rounds times, rounds being the even tile's number of slabs (the odd tile may have one slab fewer and still
+    // waits in that last round); a tile without a partner (an odd number of tiles) copies and multiplies alone
     const int64_t step    = slab * nth;
     const int64_t first   = (ith & ~int64_t(1)) * slab;  // the even tile's first slab
     const int64_t rounds  = first < d.n ? div_up(d.n - first, step) : 0;
@@ -359,101 +232,32 @@ bool slabs_hold_activations(const mm_dims & d, size_t tcm_size) {
     return GGML_PAD(d.m * d.a_row_bytes, 64) + nb_cols * d.b_row_bytes <= (int64_t) tcm_size;
 }
 
-// fit and its two variants choose the paths alike
-bool takes_fit_paths(mm_setting setting) {
-    return setting == mm_setting::fit || setting == mm_setting::fit_staged || setting == mm_setting::fit_mixed;
-}
-
-// whether gemm_slabs' pairs take turns: never under fit,staged (the default), under fit,mixed only while the batch's
-// activations take fewer bytes than a 32-column slab, always otherwise. With few rows a step is mostly copies, which
-// the turns keep apart; with more the multiplies dominate and the turns' tail costs more than the copies' collisions
-// (measured on the K3 at 2-320 rows, crossing between 8 and 16 rows for Q4_0 and Q4_1: fusion-and-splitting.md §7.3).
-// The row length cancels, so the threshold depends on the layout only: 16 rows for Q4_0 and Q4_1, 29 for Q8_0 (not
-// measured)
-bool slabs_paired(const mm_dims & d, mm_setting setting) {
-    switch (setting) {
-        case mm_setting::fit_staged:
-            return false;
-        case mm_setting::fit_mixed:
-            return d.m * d.a_row_bytes < nb_cols * d.b_row_bytes;
-        default:
-            return true;
+// path B for several rows (the default where TCM holds the batch's activations next to a slab): the in-tree path B
+// (ggml-cpu/spacemit/ime.cpp:435-494; ggml-spacemit's ime.cpp @ 4e782bc likewise) without its pair turns, which leave
+// the odd tile one slab's multiply behind the even one (fusion-and-splitting.md §7.3). 32-column weight slabs, dealt
+// round-robin to the tiles, are copied into TCM next to the batch's quantized activations and multiplied there for all
+// the batch's rows: every tile copies the activations and its first slab, then multiplies each slab and copies its
+// next. Every slab is multiplied by gemm_rows over rows 0 to m, the same kernel calls on the same groups of 4 rows and
+// blocks of 32 columns as paths A and C
+void gemm_slabs(const spacemit_tile & tile, const uint8_t * qa, const uint8_t * w, float * out, const mm_dims & d,
+                bool reference) {
+    const int64_t ith   = tile.ith;
+    const int64_t nth   = tile.nth;
+    uint8_t *     tcm   = static_cast<uint8_t *>(tile.tcm);
+    uint8_t *     buf   = tcm + GGML_PAD(d.m * d.a_row_bytes, 64);
+    const int64_t step  = nb_cols * nth;
+    const int64_t n_beg = ith * nb_cols;
+    if (n_beg >= d.n) {
+        return;
     }
-}
-
-// path B for several rows (by default, and with the test-only FLAGOS_SPACEMIT_MM=spacemit, fit and fit,mixed): the
-// in-tree path B (ggml-cpu/spacemit/ime.cpp:435-494; ggml-spacemit's ime.cpp @ 4e782bc likewise). 32-column weight
-// slabs, dealt round-robin to the tiles, are copied into TCM and multiplied there for all the batch's rows. The batch's
-// quantized activations go into TCM too when they fit next to a slab (ime.cpp:438-441); otherwise the kernels read
-// them from the workspace. The two tiles of a pair take turns as in gemv's paired (the even tile copies its first slab
-// and the activations while the odd one waits, then in every round one multiplies while the other copies; both wait
-// 1 + rounds times, rounds being the even tile's number of slabs; a tile without a partner runs alone). The turns leave
-// the odd tile one slab's multiply behind the even one (fusion-and-splitting.md §7.3); without them (paired false: the
-// default fit,staged, and fit,mixed from its threshold, slabs_paired) every tile runs alone, as gemv's staged: it
-// copies its first slab and the activations, then multiplies each slab and copies its next. Every slab is multiplied by
-// gemm_rows over rows 0 to m, the same kernel calls on the same groups of 4 rows and blocks of 32 columns as paths A
-// and C. False when a pair wait failed
-bool gemm_slabs(const spacemit_tile & tile, const uint8_t * qa, const uint8_t * w, float * out, const mm_dims & d,
-                bool reference, bool paired) {
-    const int64_t   ith   = tile.ith;
-    const int64_t   nth   = tile.nth;
-    uint8_t *       tcm   = static_cast<uint8_t *>(tile.tcm);
-    const int64_t   a_off = GGML_PAD(d.m * d.a_row_bytes, 64);
-    const bool      a_tcm = slabs_hold_activations(d, tile.tcm_size);
-    const uint8_t * acts  = a_tcm ? tcm : qa;
-    uint8_t *       buf   = a_tcm ? tcm + a_off : tcm;
-
-    const auto stage = [&](int64_t n0) {
-        if (n0 < d.n) {
-            spacemit_ime::copy(buf, w + n0 * d.b_row_bytes, std::min(d.n - n0, nb_cols) * d.b_row_bytes);
+    spacemit_ime::copy(tcm, qa, d.m * d.a_row_bytes);
+    spacemit_ime::copy(buf, w + n_beg * d.b_row_bytes, std::min(d.n - n_beg, nb_cols) * d.b_row_bytes);
+    for (int64_t n0 = n_beg; n0 < d.n; n0 += step) {
+        gemm_rows(tcm, buf, out + n0, d.m, std::min(d.n - n0, nb_cols), d, reference);
+        if (n0 + step < d.n) {
+            spacemit_ime::copy(buf, w + (n0 + step) * d.b_row_bytes, std::min(d.n - n0 - step, nb_cols) * d.b_row_bytes);
         }
-    };
-    const auto stage_acts = [&](int64_t n0) {
-        if (a_tcm && n0 < d.n) {
-            spacemit_ime::copy(tcm, qa, d.m * d.a_row_bytes);
-        }
-    };
-    const auto multiply = [&](int64_t n0) {
-        if (n0 < d.n) {
-            gemm_rows(acts, buf, out + n0, d.m, std::min(d.n - n0, nb_cols), d, reference);
-        }
-    };
-
-    const int64_t step    = nb_cols * nth;
-    const int64_t first   = (ith & ~int64_t(1)) * nb_cols;  // the even tile's first slab
-    const int64_t rounds  = first < d.n ? div_up(d.n - first, step) : 0;
-    const bool    even    = ith % 2 == 0;
-    const bool    partner = paired && (ith ^ 1) < nth;
-    const auto    wait    = [&] { return !partner || spacemit_pair_wait(tile); };
-    if (ith == 0 && !partner) {
-        g_path_b_staged.fetch_add(1, std::memory_order_relaxed);
     }
-    if (rounds == 0) {
-        return true;
-    }
-    int64_t n0 = ith * nb_cols;
-    if (even) {
-        stage(n0);
-        stage_acts(n0);
-    }
-    if (!wait()) {
-        return false;
-    }
-    if (!even) {
-        stage_acts(n0);
-        stage(n0);
-    }
-    for (int64_t r = 0; r < rounds; r++, n0 += step) {
-        if (!even && !wait()) {
-            return false;
-        }
-        multiply(n0);
-        if (even && !wait()) {
-            return false;
-        }
-        stage(n0 + step);
-    }
-    return true;
 }
 
 }  // namespace
@@ -463,11 +267,10 @@ size_t spacemit_mul_mat_workspace(const ggml_tensor * node) {
     return GGML_PAD((size_t) (d.m * d.a_row_bytes), 64);
 }
 
-void spacemit_mm_paths_take(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c, uint64_t * path_b_staged) {
-    *path_a        = g_path_a.exchange(0);
-    *path_b        = g_path_b.exchange(0);
-    *path_c        = g_path_c.exchange(0);
-    *path_b_staged = g_path_b_staged.exchange(0);
+void spacemit_mm_paths_take(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c) {
+    *path_a = g_path_a.exchange(0);
+    *path_b = g_path_b.exchange(0);
+    *path_c = g_path_c.exchange(0);
 }
 
 void spacemit_mm_tail_take(uint64_t * rows, uint64_t * calls, uint32_t n_tiles) {
@@ -541,10 +344,10 @@ bool spacemit_mul_mat_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
     const int64_t   ith       = tile.ith;
     const int64_t   nth       = tile.nth;
 
-    // one row (generation): the quantized row in TCM, the weights staged through TCM (gemv_strategy above)
+    // one row (generation): the quantized row in TCM, the weights staged through TCM (gemv above)
     if (d.m == 1 && tcm != nullptr && (size_t) d.a_row_bytes <= tile.tcm_size) {
         spacemit_ime::copy(tcm, qa, d.a_row_bytes);
-        return gemv(gemv_strategy_from_env(), tile, w, out, d, reference);
+        return gemv(tile, w, out, d, reference);
     }
 
     // ime.cpp's split: blocks of rows when there are enough for every tile, otherwise columns
@@ -558,13 +361,11 @@ bool spacemit_mul_mat_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
 
     // path A (batches with 4 rows for every tile): each tile stages 4 quantized rows in TCM and streams all weights
     // past them, the groups of 4 dealt round-robin to the tiles, the last m % 4 rows one per idle tile, a tile's in
-    // one call (path_a_tail_tile). By default (fit,staged; and with fit and fit,mixed) whenever every tile gets 4
-    // rows, unless path B holds the activations in TCM; with FLAGOS_SPACEMIT_MM=rows whenever every tile gets 4 rows;
-    // with split only where ime.cpp's split gives every tile all columns
-    const mm_setting setting = mm_setting_from_env();
-    const bool       fit     = takes_fit_paths(setting);
-    const bool       fit_b   = fit && tcm != nullptr && slabs_hold_activations(d, tile.tcm_size);
-    const bool       rows_a  = d.m >= row_align * nth && (setting == mm_setting::rows || (fit && !fit_b));
+    // one call (path_a_tail_tile). By default whenever every tile gets 4 rows, unless path B holds the activations in
+    // TCM; with split only where ime.cpp's split gives every tile all columns
+    const bool fit    = mm_setting_from_env() == mm_setting::fit_staged;
+    const bool fit_b  = fit && tcm != nullptr && slabs_hold_activations(d, tile.tcm_size);
+    const bool rows_a = fit && !fit_b && d.m >= row_align * nth;
     if (!fit_b && (n_stride == d.n || rows_a) && tcm != nullptr &&
         (size_t) (row_align * d.a_row_bytes) <= tile.tcm_size) {
         if (ith == 0) {
@@ -580,16 +381,6 @@ bool spacemit_mul_mat_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
         const int64_t m4 = d.m - d.m % row_align;  // the rows in groups of 4
         const int64_t r  = d.m - m4;               // the rows left over
         const int64_t g  = m4 / row_align % nth;   // the tile after the last group
-        if (path_a_tail_one_tile()) {
-            for (int64_t m0 = ith * row_align; m0 < d.m; m0 += row_align * nth) {
-                multiply(m0, std::min(d.m - m0, row_align));
-            }
-            if (ith == g && r > 0) {
-                g_tail_rows[ith].fetch_add(r, std::memory_order_relaxed);
-                g_tail_calls[ith].fetch_add(1, std::memory_order_relaxed);
-            }
-            return true;
-        }
         for (int64_t m0 = ith * row_align; m0 < m4; m0 += row_align * nth) {
             multiply(m0, row_align);
         }
@@ -610,16 +401,13 @@ bool spacemit_mul_mat_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
         return true;
     }
 
-    // path B (gemm_slabs): by default (fit,staged) where TCM holds the activations next to a 32-column slab, without
-    // the turns; with fit there too, with the turns; with fit,mixed there too, with the turns while the activations
-    // take fewer bytes than a slab (slabs_paired); with FLAGOS_SPACEMIT_MM=spacemit where ime.cpp takes it, whenever
-    // TCM holds a slab
-    if ((setting == mm_setting::spacemit || fit_b) && tcm != nullptr &&
-        nb_cols * d.b_row_bytes <= (int64_t) tile.tcm_size) {
+    // path B (gemm_slabs): by default where TCM holds the activations next to a 32-column slab
+    if (fit_b) {
         if (ith == 0) {
             g_path_b.fetch_add(1, std::memory_order_relaxed);
         }
-        return gemm_slabs(tile, qa, w, out, d, reference, slabs_paired(d, setting));
+        gemm_slabs(tile, qa, w, out, d, reference);
+        return true;
     }
 
     // path C: (rows, columns) tasks straight from DRAM, ime.cpp's choice only without TCM. By default below 32 rows

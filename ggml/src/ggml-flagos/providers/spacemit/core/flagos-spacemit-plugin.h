@@ -93,33 +93,21 @@ typedef struct {
 
 // flags of replay()
 enum {
-    SPACEMIT_REPLAY_SYNC_LAUNCH      = 1u << 0,  // one step per launch, the host waiting for each (E3a, test-only)
-    SPACEMIT_REPLAY_ORDERED_LAUNCHES = 1u << 1,  // one launch per step, ordered in the cores (E3b, test-only)
+    SPACEMIT_REPLAY_SYNC_LAUNCH = 1u << 0,  // one step per launch, the host waiting for each (E3a, test-only)
 };
-
-// test-only (structural-experiments.md E3b-diag): what the launches ordered in the cores did since the last call
-typedef struct spacemit_ordered_counts {
-    uint64_t launches;
-    uint64_t shared_core;        // launches with two tiles on one core, at any of the points
-    uint64_t moved_tiles;        // tiles found on another core than at the point before
-    uint64_t tcm_elsewhere;      // launches where two tiles on different cores held the same TCM
-    uint64_t pairs_on_one_core;  // launches where both tiles of a pair (2i, 2i+1) were on one core
-} spacemit_ordered_counts;
 
 struct spacemit_run_stats;  // test-only (E3c): the core's per-step clock reads, filled by the plugin's tiles
 
 // what is not contract (plan.md "S1 design" §2, A2): the test counters and the per-tile clock reads, by their current
 // names through get_proc_address, one typedef per name. NULL for every name in a release plugin
 typedef uint64_t (*spacemit_steps_take_fn)(void);
-typedef spacemit_ordered_counts (*spacemit_ordered_counts_take_fn)(void);
-typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c,
-                                          uint64_t * path_b_staged);
+typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
 // as MUL_MAT a, so that b can multiply what a's quantize step wrote
 typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
-// test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_GEMV, MM, TAIL, ATTN) once; a test that changes
+// test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_MM, ATTN) once; a test that changes
 // them inside one process calls this so the next read parses again
 typedef void (*spacemit_switches_reset_fn)(void);
 // test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its

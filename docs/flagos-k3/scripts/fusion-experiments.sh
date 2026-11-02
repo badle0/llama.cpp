@@ -1,31 +1,11 @@
 #!/usr/bin/env bash
 # Fusion measurements on the K3 (docs/flagos-k3/fusion-and-splitting.md §7), one candidate at a time. Every mode runs
 # today's build (build A, as structural-experiments.sh) with test-only switches, against the reference (the defaults) in
-# the same session, the modes interleaved in every repetition. Since 2026-10-25 the defaults take FLAGOS_SPACEMIT_MM's
-# fit,staged (§7.3), so ref is what fit-staged measures and the runs before compared with split. Experiments:
+# the same session, the modes interleaved in every repetition. Experiments:
 #   base the baseline: only ref and ops, where every op's time per token or batch is measured on the defaults (§7.1)
-#   split
-#        the matmul paths that were the default until 2026-10-25, ime.cpp's split with path C for path B (§7.3):
-#        FLAGOS_SPACEMIT_MM=split; the same prompts as pb
 #   q6   one quantization for Q, K and V and one for gate and up (§5, #6): FLAGOS_SPACEMIT_QUANTIZE=shared
-#   mm   path A for every batch that gives each tile 4 rows (§7.3, not fusion): FLAGOS_SPACEMIT_MM=rows; adds prompts
-#        of 32, 64 and 96 tokens (one batch each)
-#   pb   path B where the split gives no path A, as ime.cpp (§7.3, not fusion): FLAGOS_SPACEMIT_MM=spacemit; adds
-#        prompts of 2-129 tokens (one batch each; with mm these replace mm's three)
-#   fit  path B where TCM holds the activations next to a slab, else path A from 32 rows, else path C (§7.3):
-#        FLAGOS_SPACEMIT_MM=fit; the same prompts as pb
-#   fit-staged
-#        fit without path B's pair turns, every tile copying and multiplying its own slabs (§7.3):
-#        FLAGOS_SPACEMIT_MM=fit,staged; the same prompts as pb, and prompts of 160-320 tokens (one batch each)
-#   fit-mixed
-#        fit with path B's pair turns only while the batch's activations take fewer bytes than a slab (16 rows for
-#        Q4_0 and Q4_1, 29 for Q8_0; §7.3): FLAGOS_SPACEMIT_MM=fit,mixed; the same prompts as fit-staged
-#   tail the defaults with path A's last m % 4 rows all on one tile, as ime.cpp, where the build deals them to the
-#        tiles idle in path A's last round (§7.3): FLAGOS_SPACEMIT_TAIL=one-tile; the same prompts as pb (since the
-#        default change of 2026-10-25 the same paths as fs-tail)
-#   fs-tail
-#        fit,staged with them on one tile: FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile, to compare
-#        with fit-staged; the same prompts as pb
+# The matmul-path modes of §7.3 (split, mm, pb, fit, fit-staged, fit-mixed, tail, fs-tail) ran until the default
+# fit,staged was decided (2026-10-25); they were removed 2026-11-02 with their switches (in git history, cad674fda).
 #
 # Usage: fusion-experiments.sh prepare                  build A's tools and its provider checks, run once (they compare
 #                                                       every candidate with the defaults, byte for byte)
@@ -34,41 +14,17 @@
 #        fusion-experiments.sh summary <out>            the summary again from the logs
 # Env:   EXPS      experiments (default "q6"; ref and ops always run)
 #        REPS      llama-bench repetitions per mode (default 5; 0 skips llama-bench)
-#        PPODD     the prompt lengths split, pb, fit, fit-staged, fit-mixed, tail and fs-tail add, in llama-bench's -p
-#                  form (a list; ranges first-last[+step]); default 2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 0)
 #        PPL_TEXT  perplexity text for the logits check (default ~/ppl.txt; empty skips it); CHUNKS (default 8)
-#        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run);
-#                  mm's checks its logits with ubatches of 128 and 64 rows, where the two paths differ, pb's with 64
-#                  and 16 rows, split's, fit's and fit-staged's with 128, 64 and 16, fit-mixed's also with 8 (the
-#                  turns' side), tail's with 131 (the split's path A, 3 rows left over), fs-tail's with 79 and 131
-#        KLD_SETS  the logits check's ubatch sets instead of the experiments' (batch, ub1, ub128, ub64, ub16, ub8,
-#                  ub79, ub131, ub59, ub63; e.g. "ub79 ub131" for fit-staged, tail and fs-tail together); every set runs
-#                  every mode
+#        KLD_UB1   1: q6's logits check also with one token per ubatch, the 1-row matmuls (default 1; ~10 min a run)
 #        BUILD_A   the build (default <repo>/build-flagos); TCM_RELEASE (default ~/tcmtest/tcmrelease)
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
 # from the same clock reads, when it ends):
 #   ref      the defaults
 #   ops      FLAGOS_SPACEMIT_TEST_OP_STATS and FLAGOS_SPACEMIT_TEST_STATS: the op counters and E3c's, on the defaults
-#   split    FLAGOS_SPACEMIT_MM=split
-#   split-ops       split with the op counters
 #   q6       FLAGOS_SPACEMIT_QUANTIZE=shared
 #   q6-ops   q6 with the op counters
-#   mm       FLAGOS_SPACEMIT_MM=rows
-#   mm-ops   mm with the op counters
-#   pb       FLAGOS_SPACEMIT_MM=spacemit
-#   pb-ops   pb with the op counters
-#   fit      FLAGOS_SPACEMIT_MM=fit
-#   fit-ops  fit with the op counters
-#   fit-staged      FLAGOS_SPACEMIT_MM=fit,staged
-#   fit-staged-ops  fit-staged with the op counters
-#   fit-mixed       FLAGOS_SPACEMIT_MM=fit,mixed
-#   fit-mixed-ops   fit-mixed with the op counters
-#   tail            FLAGOS_SPACEMIT_TAIL=one-tile
-#   tail-ops        tail with the op counters
-#   fs-tail         FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile
-#   fs-tail-ops     fs-tail with the op counters
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -77,12 +33,10 @@ BUILD_A=${BUILD_A:-$REPO/build-flagos}
 TCM_RELEASE=${TCM_RELEASE:-$HOME/tcmtest/tcmrelease}
 EXPS=${EXPS:-q6}
 REPS=${REPS:-5}
-PPODD=${PPODD:-2,4,8,16,32,33,36,37,40,44,48,64,65,96,100,128,129}
 DEPTH=${DEPTH:-0}
 PPL_TEXT=${PPL_TEXT-$HOME/ppl.txt}
 CHUNKS=${CHUNKS:-8}
 KLD_UB1=${KLD_UB1:-1}
-KLD_SETS=${KLD_SETS:-}
 TIMEOUT=${TIMEOUT:-3600}
 DRY=${DRY:-}
 TOOLS="llama-completion llama-bench llama-perplexity"
@@ -92,20 +46,11 @@ TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
 unset FLAGOS_SPACEMIT_TEST_OP_STATS FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_MM \
-    FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_GEMV FLAGOS_SPACEMIT_TAIL \
-    FLAGOS_SPACEMIT_TEST_DEVICE_TYPE
+    FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_TEST_DEVICE_TYPE
 
 mode_env() {
     case $1 in
-        split | split-ops) echo "FLAGOS_SPACEMIT_MM=split" ;;
         q6 | q6-ops) echo "FLAGOS_SPACEMIT_QUANTIZE=shared" ;;
-        mm | mm-ops) echo "FLAGOS_SPACEMIT_MM=rows" ;;
-        pb | pb-ops) echo "FLAGOS_SPACEMIT_MM=spacemit" ;;
-        fit | fit-ops) echo "FLAGOS_SPACEMIT_MM=fit" ;;
-        fit-staged | fit-staged-ops) echo "FLAGOS_SPACEMIT_MM=fit,staged" ;;
-        fit-mixed | fit-mixed-ops) echo "FLAGOS_SPACEMIT_MM=fit,mixed" ;;
-        tail | tail-ops) echo "FLAGOS_SPACEMIT_TAIL=one-tile" ;;
-        fs-tail | fs-tail-ops) echo "FLAGOS_SPACEMIT_MM=fit,staged FLAGOS_SPACEMIT_TAIL=one-tile" ;;
         *) echo "" ;;
     esac
 }
@@ -165,7 +110,6 @@ prepare() {
     rc=$?
     echo "   flagos-check-spacemit: rc=$rc: $(tail -1 "$BUILD_A/fx-check.out")"
     grep -E "^layer" "$BUILD_A/fx-check.out" | grep -oE "one quantization for[^;]*" | sed 's/^/      /'
-    grep -E "^mm " "$BUILD_A/fx-check.out" | grep -oE "Q4_0, Q4_1.*" | sed 's/^/      matmul paths: /'
     grep -E "FAIL" "$BUILD_A/fx-check.err" | head -5 | sed 's/^/      /'
 }
 
@@ -232,7 +176,7 @@ kv_class = lambda n: 0 if n < 1024 else 1024 if n < 4096 else 4096  # E3c's KV c
 res = {}
 for sf in sorted(glob.glob(os.path.join(sys.argv[1], "bench-*.stats"))):
     stem = sf[: -len(".stats")]
-    m = re.match(r"bench-(.+)-(std|pp512|ppsmall|ppodd|tg|pp)-\d+$", os.path.basename(stem))
+    m = re.match(r"bench-(.+)-(std|pp512|tg|pp)-\d+$", os.path.basename(stem))
     if not m:
         continue
     kinds = [json.loads(line) for line in open(sf) if line.startswith("{")]
@@ -286,24 +230,6 @@ EOF
                 python3 -I "$HERE/op-stats.py" diff "$OUT"/bench-ops-*.ops -- "$OUT"/bench-"$c"-ops-*.ops | sed 's/^/   /'
             fi
         done
-        # the turns' own effect: the same paths with and without them, and the matmuls' even and odd tiles
-        if compgen -G "$OUT/bench-fit-ops-*.ops" > /dev/null && compgen -G "$OUT/bench-fit-staged-ops-*.ops" > /dev/null; then
-            echo "== op counters, fit-staged-ops against fit-ops: name by name, us per graph"
-            python3 -I "$HERE/op-stats.py" diff "$OUT"/bench-fit-ops-*.ops -- "$OUT"/bench-fit-staged-ops-*.ops |
-                sed 's/^/   /'
-        fi
-        # path A's leftover rows dealt (fit-staged) against all on one tile (fs-tail), the same paths otherwise
-        if compgen -G "$OUT/bench-fit-staged-ops-*.ops" > /dev/null && compgen -G "$OUT/bench-fs-tail-ops-*.ops" > /dev/null; then
-            echo "== op counters, fs-tail-ops against fit-staged-ops: name by name, us per graph"
-            python3 -I "$HERE/op-stats.py" diff "$OUT"/bench-fit-staged-ops-*.ops -- "$OUT"/bench-fs-tail-ops-*.ops |
-                sed 's/^/   /'
-        fi
-        for c in fit fit-staged fit-mixed; do
-            if compgen -G "$OUT/bench-$c-ops-*.ops" > /dev/null; then
-                echo "== op counters, $c-ops: the matmuls' even and odd tiles (path B's pair turns), us per graph"
-                python3 -I "$HERE/op-stats.py" pairs "$OUT"/bench-"$c"-ops-*.ops | sed 's/^/   /'
-            fi
-        done
     fi
     if compgen -G "$OUT/kld-*.err" > /dev/null; then
         echo "== logits against ref's (a candidate changes no output: KLD 0, same top p 100%)"
@@ -326,31 +252,16 @@ run_all() {
     [ -n "$DRY" ] || mkdir -p "$OUT"
     rm -f "$OUT/bench.jsonl"
 
-    # the logits check's settings: q6's at 512-token batches and one token per ubatch, mm's at 128 and 64 rows, pb's at
-    # 64 and 16 rows, fit's and fit-staged's at all three, fit-mixed's also at 8 rows (each set once)
+    # the logits check's settings: q6's at 512-token batches and one token per ubatch
     modes="ref ops" kld_modes="" kld_sets=""
-    if has split; then modes+=" split split-ops" kld_modes+=" split" kld_sets+=" ub128 ub64 ub16"; fi
     if has q6; then
         modes+=" q6 q6-ops" kld_modes+=" q6" kld_sets+=" batch"
         if [ "$KLD_UB1" = 1 ]; then kld_sets+=" ub1"; fi
     fi
-    if has mm; then modes+=" mm mm-ops" kld_modes+=" mm" kld_sets+=" ub128 ub64"; fi
-    if has pb; then modes+=" pb pb-ops" kld_modes+=" pb" kld_sets+=" ub64 ub16"; fi
-    if has fit; then modes+=" fit fit-ops" kld_modes+=" fit" kld_sets+=" ub128 ub64 ub16"; fi
-    if has fit-staged; then
-        modes+=" fit-staged fit-staged-ops" kld_modes+=" fit-staged" kld_sets+=" ub128 ub64 ub16"
-    fi
-    if has fit-mixed; then
-        modes+=" fit-mixed fit-mixed-ops" kld_modes+=" fit-mixed" kld_sets+=" ub128 ub64 ub16 ub8"
-    fi
-    if has tail; then modes+=" tail tail-ops" kld_modes+=" tail" kld_sets+=" ub131"; fi
-    if has fs-tail; then modes+=" fs-tail fs-tail-ops" kld_modes+=" fs-tail" kld_sets+=" ub79 ub131"; fi
-    if [ -n "$KLD_SETS" ]; then kld_sets=$KLD_SETS; fi
-    kld_sets=$(printf '%s\n' $kld_sets | awk '!seen[$0]++' | tr '\n' ' ')
     if [ -z "$DRY" ]; then
         {
             echo "date: $(date -u +%Y-%m-%dT%H:%MZ)"
-            echo "model: $M; EXPS: $EXPS; REPS: $REPS; PPODD: $PPODD; DEPTH: $DEPTH; PPL_TEXT: $PPL_TEXT; CHUNKS: $CHUNKS"
+            echo "model: $M; EXPS: $EXPS; REPS: $REPS; DEPTH: $DEPTH; PPL_TEXT: $PPL_TEXT; CHUNKS: $CHUNKS"
             echo "A: $BUILD_A at $(g -C "$REPO" rev-parse --short HEAD)"
         } > "$OUT/info.txt"
     fi
@@ -367,15 +278,6 @@ run_all() {
             for m in $modes; do
                 bench "$m" "std-$i" -p 128 -n 128 -ub 128
                 bench "$m" "pp512-$i" -p 512 -n 0
-                if has split || has pb || has fit || has fit-staged || has fit-mixed || has tail || has fs-tail; then
-                    bench "$m" "ppodd-$i" -p "$PPODD" -n 0
-                elif has mm; then
-                    bench "$m" "ppsmall-$i" -p 32,64,96 -n 0
-                fi
-                # where Qwen3-0.6B takes path B under fit and the split takes path A (on Qwen3-4B path A everywhere)
-                if has fit-staged || has fit-mixed; then
-                    bench "$m" "pplarge-$i" -p 160,192,256,320 -n 0
-                fi
                 if [ "$DEPTH" = 1 ]; then
                     bench "$m" "tg-$i" -p 0 -n 32 -d 0,1024,4096
                     bench "$m" "pp-$i" -p 512 -n 0 -d 4096
@@ -391,18 +293,6 @@ run_all() {
                 batch) args="" ;;
                 # one sequence, so every ubatch is one token: the 1-row matmuls (build.md §7, M2e.3 round 2)
                 ub1) args="-b 512 -ub 1" ;;
-                ub128) args="-ub 128" ;;
-                ub64) args="-ub 64" ;;
-                ub16) args="-ub 16" ;;
-                ub8) args="-ub 8" ;;
-                # path A with 3 rows left over: under fit,staged at 79 rows (down at least, on every model so far),
-                # under the split too at 131
-                ub79) args="-ub 79" ;;
-                ub131) args="-ub 131" ;;
-                # path A with a tile taking two leftover rows in one call: m % 32 = 27 (tile 6 two, tile 7 one) and 31
-                # (tile 7 two, tile 0 the third after its group), under fit,staged (at least the downs)
-                ub59) args="-ub 59" ;;
-                ub63) args="-ub 63" ;;
                 *) echo "   unknown logits set $s"; continue ;;
             esac
             base=$OUT/kld-base-ref-$s.bin
@@ -430,5 +320,5 @@ case ${1:-} in
     prepare) prepare ;;
     run) shift; run_all "$@" ;;
     summary) OUT=${2:?usage: fusion-experiments.sh summary <out>}; summary ;;
-    *) sed -n '2,71p' "$0"; exit 1 ;;
+    *) sed -n '2,27p' "$0"; exit 1 ;;
 esac

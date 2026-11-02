@@ -352,7 +352,7 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
 }
 
 // the captured steps of one split: one launch with a barrier after every step, each tile running every step
-// (plan.md §2.4). The test-only flags run one launch per step instead (E3a, E3b)
+// (plan.md §2.4). The test-only flag runs one launch per step instead (E3a)
 enum spacemit_status plugin_replay(spacemit_plugin_stream * stream, const spacemit_plugin_step * steps,
                                    uint32_t n_steps, void * workspace, size_t workspace_size, uint32_t flags) {
     if (stream == nullptr || (steps == nullptr && n_steps > 0)) {
@@ -360,9 +360,7 @@ enum spacemit_status plugin_replay(spacemit_plugin_stream * stream, const spacem
     }
     bool ok = true;
     try {
-        if ((flags & SPACEMIT_REPLAY_ORDERED_LAUNCHES) != 0) {
-            ok = stream->executor->run_ordered(steps, n_steps, workspace, workspace_size);
-        } else if ((flags & SPACEMIT_REPLAY_SYNC_LAUNCH) != 0) {
+        if ((flags & SPACEMIT_REPLAY_SYNC_LAUNCH) != 0) {
             // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every
             // tile before the next starts, as the barrier after a step does inside one launch
             for (uint32_t i = 0; i < n_steps && ok; i++) {
@@ -392,9 +390,6 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_steps_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_steps_take_fn>(spacemit_steps_take));
-    }
-    if (std::strcmp(name, "spacemit_ordered_counts_take") == 0) {
-        return reinterpret_cast<void *>(static_cast<spacemit_ordered_counts_take_fn>(spacemit_ordered_counts_take));
     }
     if (std::strcmp(name, "spacemit_mm_paths_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_mm_paths_take_fn>(spacemit_mm_paths_take));

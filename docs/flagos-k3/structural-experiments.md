@@ -424,6 +424,10 @@ tile first joining the previous launch's Future:
 All on Qwen3-4B Q4_0 unless named, in one session, every mode against the reference (today's build, default flags)
 with the modes interleaved in each repetition: the board drifts between sessions.
 
+The commands below for E1, E2, E2-hp, E2-neg, E3b, E3b-diag, E3d, E4, E7, E7b and R12-hw need the runner, the check
+program and the scripts as of `cad674fda`: their builds, modes and switches were removed 2026-11-02 once the decisions
+were made (§5). Today's runner keeps `EXPS` `e3`, `e3c` and `plan`.
+
 | ID | Answers | What changes | Prediction | Decision rule | Status |
 |---|---|---|---|---|---|
 | E2 | Q5 | Build B (upstream's `llama-context.cpp`), `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=igpu` and `gpu`, `-ngl 99`; once with the default `-ngl` (placement only) | 2 splits per token; flash attention enabled under `-fa auto`; logits identical to the reference (KLD 0, same top p 100%; the same kernels run the same nodes); speed within 1-2%; GPU = IGPU; the default `-ngl` offloads every layer | agreed (user, 2026-10-19): "IGPU is viable with no llama.cpp change" if logits are identical at both batch settings, a token takes 2 splits, and pp128, tg128, tg32 at depths 0/1024/4096 and pp512 at depth 4096 are within 2% of the reference | done 2026-10-19 (§6): passes; pp512 at depth 4096 +3.6% |
@@ -586,20 +590,14 @@ switch. Not tried on the Mac: stock upstream's programs (the K3's smoke check do
 
 ## 5. Code for the experiments
 
-Test-only; the defaults are unchanged.
+Test-only; the defaults are unchanged. Removed 2026-11-02 with the code they switched, once their decisions were made (`plan.md` "S1 cleanup before step 5"; the rows, the code and the scripts as of `cad674fda`): `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join` and `flagos-check-spacemit --e3b` (E3b, E3b-diag; F15 and F16 decided one launch per split), `FLAGOS_SPACEMIT_TEST_JOIN_FENCE` (E3b-diag), `FLAGOS_SPACEMIT_TEST_VIEW` (E7; the view taken again after every barrier since 2026-10-30), `FLAGOS_SPACEMIT_TEST_TCM_SLICE` (E7b), `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (R12-hw; the zero-point Q4_1 layout and its kernels went with it), the runner's builds B, S, M and R and its modes for E1, E2, E2-hp, E2-neg, E3b, E4 and R12-hw, and `scripts/spert-launch-bench.cpp` (E3d) and `scripts/spert-view-bench.cpp` (E7). §4 and §6 record the runs made with them.
 
 | Switch | Where | What |
 |---|---|---|
 | `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=gpu\|igpu` | `spacemit_device_type`, `flagos-spacemit.cpp` | reports that type instead of ACCEL; read once per process; logs one warning naming the type (the script reads it); anything else is reported and ignored |
 | `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step` | `spacemit_launch_mode` and `spacemit_backend_graph_compute`, `flagos-spacemit.cpp` | E3a: runs the executor once per step instead of once per split; the same steps, order and workspace, so the same outputs; read at every graph; `per-split` names the default |
-| `FLAGOS_SPACEMIT_TEST_LAUNCH=per-step-join` | the executors' `run_ordered` (`flagos-spacemit-exec.h`, `flagos-spacemit-exec.cpp`) | E3b: every step its own spine-runtime launch, queued without host waits; each tile first joins its own copy of the previous launch's `Future` (`Context::join`), before it takes its core's TCM; the host waits once (`Future::sync_all`) and reports, once, launches whose tiles shared a core (`sched_getcpu`), where the TCM agreement or a pair wait could deadlock. Without spine-runtime (the Mac) the host waits for each launch, as E3a |
 | `FLAGOS_SPACEMIT_TEST_STATS=<file>` | `spacemit_stats_file` and `spacemit_backend_graph_compute` (`flagos-spacemit.cpp`), `spacemit_run_stats` (`flagos-spacemit-exec.h`), the executors' `run` | E3c: per kind of graph (launch mode, the first matmul's rows, the first attention's KV length class: below 1024, below 4096, above), the graphs, steps and launches, the time in `graph_compute`, in the launches (host), in the kernels (summed over the tiles, and per step the slowest tile) and at the barriers; one JSON line per kind appended to `<file>` when the process ends. Read once; the tiles read the clock only with the switch set and write their times into their own rows. E3b's launches are not counted |
-| `FLAGOS_SPACEMIT_TEST_UPSTREAM_Q4_1_M1` (compile-time) | `gemm_kernel_i8i4_m1`, `flagos-spacemit-ime-kernels.cpp` | R12-hw: compiles upstream's active branch of the 1-row Q4_1 kernel instead of the exact one; only in build R, through `CMAKE_CXX_FLAGS` |
-| `FLAGOS_SPACEMIT_TEST_JOIN_FENCE=1` | `run_ordered` and `spacemit_tile_main_ordered`, `flagos-spacemit-exec.cpp` | E3b-diag: with E3b, a full memory fence after every tile's join and at its end. E3b's launches also always note each tile's core after its join, after taking its TCM, after the TCM agreement and at its end, and its TCM; `spacemit_ordered_counts_take()` (`flagos-spacemit-exec.h`) returns what they showed |
-| `FLAGOS_SPACEMIT_TEST_VIEW=once` | `spert_executor` and `spacemit_tile_main`, `flagos-spacemit-exec.cpp` | the first `shared_buffer()` view kept through every barrier (the loop until 2026-10-30); unset or `step`: the view taken again after every barrier, the header's rule (E7, `spert.hpp:474-478`); the kernels keep nothing in TCM across a barrier, so the outputs are the same; a fresh view smaller than the agreed size fails the launch |
 | `FLAGOS_SPACEMIT_PLAN=none\|uid-trust` | `spacemit_plan_cache`, `core/flagos-spacemit-plan.{h,cpp}`; the probe and the store in `graph_compute`, `flagos-spacemit.cpp` | S1 steps 3, 3b and 3c (A4): the plan cache, `uid-trust` the default since step 3c (2026-11-01): one entry, the last plan, keyed by the split's uid, the very node objects and the configuration word (the plugin's switch generation and the sharing fact); the entry taken before the contract check and a hit skipping it (CUDA's and Hexagon's form, the deck's "redone only when the structure changes"); a uid of 0 or a new uid a miss: the contract check, the expansion and a store; `none` (test-only) the full path on every graph; counters in the E3c stats line (`plan_hits_uid`, `plan_misses`, `plan_lookup_us` from the top of `graph_compute`, `plan_key_us` from after the check, on a trusted hit the lookup time); the runner's modes `plan-n` (`none`), `plan-nc` (`none` with the counters); `e3c` is the default with the counters (`EXPS=plan`: `ref` against `plan-n` the A/B of the default, `e3c` against `plan-nc` the host columns); off under `FLAGOS_SPACEMIT_QUANTIZE=shared`. Step 3 (run 11) had `structure` (candidate S, Common's compare), removed 2026-10-31; step 3b (run 12) had `uid` (the checked form: the contract check on every graph with a hit guard, saving nothing), removed in 3c |
-| `FLAGOS_SPACEMIT_TEST_TCM_SLICE=<bytes>` | the same, and `spacemit_pair_wait` | E7b: each tile takes a slice of that size from its worker's shared buffer (`alloc_shared`, freed at the tile's end) as its TCM instead of the whole buffer, in every launch mode; an empty slice fails the launch; under `per-step-join` the pair waits yield the core (`Context::yield`) instead of spinning, so two tiles of one launch on one worker take turns |
-| `flagos-check-spacemit --e3b[=runs]` | `diagnose_e3b`, `tests/check_spacemit.cpp` | E3b-diag: only the E3b diagnosis (§4), nothing else checked |
 
 The kernels are the same in every mode: the switches change only what llama.cpp is told (E2) or how the steps are
 grouped into launches (E3).
@@ -617,11 +615,11 @@ Checks in `flagos-check-spacemit` (`tests/check_spacemit.cpp`):
 
 During the experiments these comparisons and the forced-failure test also ran E3b's launches (ordered in the cores); its
 two 1-token layer cases differed at every run from 2026-10-20 (F16) and kept the checks' rc at 1. Since 2026-10-21 (user
-decision: one launch per split is settled) the default checks no longer run them; `flagos-check-spacemit --e3b` compares
-E3b on demand, for instance after a new spine-runtime release.
+decision: one launch per split is settled) the default checks no longer run them, and since 2026-11-02 the ordered
+launches are gone from the code.
 
-`scripts/structural-experiments.sh`: `prepare`, `run`, `summary` (§4). `scripts/spert-launch-bench.cpp`: E3d, built
-and run by hand (its header, and run 4 in §4).
+`scripts/structural-experiments.sh`: `prepare`, `run`, `summary`, with the modes `ref`, `e3` (E3a), `e3c`, `e3c-a`,
+`plan-n` and `plan-nc` since 2026-11-02 (its header).
 
 Verified on the Mac, 2026-10-19 (`build-host`, the simulated device, reference kernels): `flagos-check-spacemit
 --expect-device` passes with the defaults, with `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE` set to `igpu`, `gpu` and an unknown

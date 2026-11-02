@@ -206,7 +206,7 @@ whole graph at every call; at 0.1-0.3 ms per token (not measured) it would cance
 Candidate by candidate, by rank (user, 2026-10-21). Each candidate gets a test-only switch, checks that compare it with
 the defaults byte for byte, predictions and rules fixed before its K3 run, and a mode in `scripts/fusion-experiments.sh`.
 
-### 7.1 The op counters (built 2026-10-21; not yet run on the K3)
+### 7.1 The op counters (built 2026-10-21; the baseline run on the K3 the same day)
 
 `FLAGOS_SPACEMIT_TEST_OP_STATS=<file>` (test-only; `spacemit_op_stats_file`, `flagos-spacemit.cpp`) groups E3c's times by
 what each step does. It is M4's first item ("profile a generation step").
@@ -421,6 +421,11 @@ docs/flagos-k3/scripts/fusion-experiments.sh summary ~/fx/q6 > ~/fx-q6-summary.t
   for `ops` and `q6-ops`; the `ops` table per kind of graph; `q6-ops` against `ops` name by name; the logits.
 
 ### 7.3 Path A for small prompt batches (not fusion; prepared and measured 2026-10-21; user request, from the baseline)
+
+The settings and runner modes of this section other than the default and `split` (`FLAGOS_SPACEMIT_MM=rows`,
+`spacemit`, `fit`, `fit,mixed`, `FLAGOS_SPACEMIT_TAIL`, `FLAGOS_SPACEMIT_Q4_1=zero-point`, `--bench-grid`, and the
+modes `mm`, `pb`, `fit`, `fit-staged`, `fit-mixed`, `tail`, `fs-tail`) were removed 2026-11-02 once `fit,staged` was the
+default (`plan.md` "S1 cleanup before step 5"); the commands below need the code as of `cad674fda`.
 
 The baseline found gate and up at 128 rows on path C, 9.56 ms per layer, against 6.63 ms for the down projection of the
 same size on path A (§7.1). The split copied from the in-tree IME path (`flagos-spacemit-ime.cpp:299-306`) takes path A

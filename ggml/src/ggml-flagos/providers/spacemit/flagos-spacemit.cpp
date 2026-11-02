@@ -226,11 +226,10 @@ bool spacemit_data_ready(const ggml_tensor * node) {
 enum class spacemit_launch_kind {
     per_split,      // the default: a split's steps in one launch, a barrier after each
     per_step,       // E3a: every step its own launch, the host waiting for each
-    per_step_join,  // E3b: every step its own launch, ordered inside the cores, the host waiting once
 };
 
-// test-only: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step or per-step-join launches every step on its own, as a runtime
-// without graph capture launches each kernel (structural-experiments.md E3a, E3b); per-split names the default. Read
+// test-only: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step launches every step on its own, as a runtime without graph capture
+// launches each kernel (structural-experiments.md E3a); per-split names the default. Read
 // at every graph, so a benchmark can switch; anything else is reported once and ignored
 spacemit_launch_kind spacemit_launch_mode() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_LAUNCH");
@@ -239,9 +238,6 @@ spacemit_launch_kind spacemit_launch_mode() {
     }
     if (std::strcmp(v, "per-step") == 0) {
         return spacemit_launch_kind::per_step;
-    }
-    if (std::strcmp(v, "per-step-join") == 0) {
-        return spacemit_launch_kind::per_step_join;
     }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
@@ -283,7 +279,7 @@ bool spacemit_overlaps(const ggml_tensor * node, const ggml_tensor * t) {
 // the plan cache's answers (FLAGOS_SPACEMIT_PLAN: hits by uid, misses) with the time to the step list in hand
 // (plan_lookup_us, the check and the expansion included on a miss and under none) and from after the check
 // (plan_key_us: on a miss the store; on a hit, which skips the check, equal to plan_lookup_us). When the process ends it
-// appends one JSON line per kind to <file>. Read once; one launch per step joined in the cores (E3b) is not counted
+// appends one JSON line per kind to <file>. Read once
 class spacemit_stats_file {
   public:
     // nullptr when the switch is not set
@@ -478,7 +474,7 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
 // seen (spacemit_step_label). When the process ends it appends to <file> one JSON line per kind and name, and one for
 // all of the kind's steps, all per graph: the steps, the mean tile's kernel time (kernel_us) and its kernel and barrier
 // time (wall_us), each step's slowest tile summed (busy_us), each tile's kernel time (tile_us) and how often each was
-// a step's slowest (slowest, over all graphs). Read once; E3b's launches (per-step-join) are not counted
+// a step's slowest (slowest, over all graphs). Read once
 class spacemit_op_stats_file {
   public:
     // nullptr when the switch is not set
@@ -804,18 +800,13 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             GGML_LOG_WARN("FlagOS SpacemiT: the plugin has no step counters; the test statistics stay off\n");
         }
     }
-    const bool counted = timed && mode != spacemit_launch_kind::per_step_join && ctx->attach != nullptr;
+    const bool counted = timed && ctx->attach != nullptr;
     if (counted) {  // the counters attach to the stream for this graph only; an uncounted graph leaves them detached
         ctx->run_stats.reset(ctx->steps.size());
         ctx->attach(ctx->stream, &ctx->run_stats);
     }
-    // test-only: the two launch modes of E3a and E3b, one launch per step, are flags of the replay
-    uint32_t flags = 0;
-    if (mode == spacemit_launch_kind::per_step) {
-        flags |= SPACEMIT_REPLAY_SYNC_LAUNCH;
-    } else if (mode == spacemit_launch_kind::per_step_join) {
-        flags |= SPACEMIT_REPLAY_ORDERED_LAUNCHES;
-    }
+    // test-only: E3a's launch mode, one launch per step, is a flag of the replay
+    const uint32_t flags = mode == spacemit_launch_kind::per_step ? SPACEMIT_REPLAY_SYNC_LAUNCH : 0u;
     const bool ok = ctx->table->replay(ctx->stream, ctx->steps.data(), static_cast<uint32_t>(ctx->steps.size()),
                                        ctx->workspace, ctx->workspace_size, flags) == SPACEMIT_STATUS_SUCCESS;
     if (counted) {

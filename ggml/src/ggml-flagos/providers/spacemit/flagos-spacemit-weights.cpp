@@ -8,25 +8,6 @@
 #include <cstring>
 #include <vector>
 
-// test-only FLAGOS_SPACEMIT_Q4_1=zero-point: Q4_1 weights in the in-tree route's q4_1 32x32 layout, the minimum rounded
-// to an integer zero point (plan.md, M2c design), for comparisons; by default they are requantized to Q8_0, as that
-// rounding costs Llama-3.2-1B Q4_0 +5.5% perplexity against the CPU (fusion-and-splitting.md §7.3, 2026-10-23). Read
-// once: a weight must be read in the layout it was stored in
-static bool spacemit_q4_1_zero_point() {
-    static const bool zero_point = [] {
-        const char * v = std::getenv("FLAGOS_SPACEMIT_Q4_1");
-        if (v == nullptr || *v == '\0' || std::strcmp(v, "q8_0") == 0) {
-            return false;
-        }
-        if (std::strcmp(v, "zero-point") == 0) {
-            return true;
-        }
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_Q4_1=%s: unknown setting ignored\n", __func__, v);
-        return false;
-    }();
-    return zero_point;
-}
-
 // llama.cpp's KV cache and recurrent state, named before they are allocated (src/llama-kv-cache.cpp:231-235,
 // src/llama-memory-recurrent.cpp:102-103)
 static bool spacemit_is_cache_name(const char * name) {
@@ -46,8 +27,8 @@ spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_Q4_0 && t->ne[0] % spacemit_ime::q4_0_k_block == 0) {
         return spacemit_layout::q4_0_32x256;
     }
-    if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q4_1_k_block == 0) {
-        return spacemit_q4_1_zero_point() ? spacemit_layout::q4_1_32x32 : spacemit_layout::q4_1_q8_0_32x32;
+    if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {
+        return spacemit_layout::q4_1_q8_0_32x32;
     }
     if (t->type == GGML_TYPE_Q8_0 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {
         return spacemit_layout::q8_0_32x32;
@@ -87,9 +68,6 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
         case spacemit_layout::q4_0_32x256:
             rc = spacemit_ime::repack_q4_0(t, data, size);
             break;
-        case spacemit_layout::q4_1_32x32:
-            rc = spacemit_ime::repack_q4_1(t, data, size);
-            break;
         case spacemit_layout::q4_1_q8_0_32x32:
             rc = spacemit_ime::repack_q4_1_q8_0(t, data, size);
             break;
@@ -110,9 +88,6 @@ static void spacemit_unpack(const ggml_tensor * t, void * data) {
         case spacemit_layout::q4_0_32x256:
             spacemit_ime::unpack_q4_0(t, data);
             return;
-        case spacemit_layout::q4_1_32x32:
-            spacemit_ime::unpack_q4_1(t, data);
-            return;
         case spacemit_layout::q4_1_q8_0_32x32:
             spacemit_ime::unpack_q4_1_q8_0(t, data);
             return;
@@ -128,17 +103,11 @@ static void spacemit_unpack(const ggml_tensor * t, void * data) {
     GGML_ABORT("tensor has no IME layout");
 }
 
-// a partial write into a lossy layout goes through the read-back of the whole tensor. Zero-point Q4_1: it re-converts
-// the blocks it touches from what the layout kept, so a write that ends inside a block would change a value the next
-// write completes (a block's minimum split over two writes gets a different zero point than one whole write); it must
-// cover whole blocks. Requantized to Q8_0 (Q4_1, Q6_K): the read-back is approximate, so writing it back would
-// requantize every block the write leaves alone; only a write of the whole tensor is allowed. llama.cpp writes weights
-// whole on this device.
+// a partial write into a lossy layout goes through the read-back of the whole tensor. Requantized to Q8_0 (Q4_1, Q6_K):
+// the read-back is approximate, so writing it back would requantize every block the write leaves alone; only a write
+// of the whole tensor is allowed. llama.cpp writes weights whole on this device.
 static void spacemit_check_partial(const ggml_tensor * base, size_t offset, size_t size) {
     const spacemit_layout layout = spacemit_weight_layout(base);
-    const size_t          blk    = ggml_type_size(base->type);
-    GGML_ASSERT((layout != spacemit_layout::q4_1_32x32 || (offset % blk == 0 && size % blk == 0)) &&
-                "a partial write to a zero-point Q4_1 weight must cover whole blocks");
     GGML_ASSERT((!spacemit_requantized(layout) || (offset == 0 && size == ggml_nbytes(base))) &&
                 "a partial write to a Q4_1 or Q6_K weight must cover the whole tensor");
 }
