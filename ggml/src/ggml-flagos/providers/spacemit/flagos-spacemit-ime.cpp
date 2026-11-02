@@ -78,7 +78,7 @@ int64_t div_up(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
-// test-only FLAGOS_SPACEMIT_TEST_REFERENCE (flagos-spacemit-kernels.h); without the IME kernels the scalar references
+// test-only GGML_FLAGOS_KERNEL_VARIANTS=0 (flagos-spacemit-kernels.h); without the IME kernels the scalar references
 // are always used
 bool use_reference() {
     return spacemit_use_reference() || !spacemit_ime::have_ime();

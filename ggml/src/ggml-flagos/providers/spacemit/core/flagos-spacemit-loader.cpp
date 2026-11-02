@@ -4,6 +4,8 @@
 
 #include "flagos-spacemit-loader.h"
 
+#include "flagos-spacemit-diagnostics.h"  // spacemit_renamed
+
 #include "../flagos-spacemit-api.h"  // flagos_spacemit_provider: the core symbol dladdr locates
 
 #include <cstddef>
@@ -76,7 +78,8 @@ std::string spacemit_plugin_default_path(bool * self) {
     if (self != nullptr) {
         *self = false;
     }
-    const char * from_env = std::getenv("FLAGOS_SPACEMIT_PLUGIN");
+    spacemit_renamed("FLAGOS_SPACEMIT_PLUGIN", "GGML_FLAGOS_PROVIDER_PATH");
+    const char * from_env = std::getenv("GGML_FLAGOS_PROVIDER_PATH");
     if (from_env != nullptr && *from_env != '\0') {
         return from_env;  // that path only, no fallback (test-only)
     }

@@ -123,7 +123,7 @@ unused; :766-783), events and async copies (:766-783, :847-861), a second buffer
 | core L2 | `flagos-spacemit-ops.cpp` (the contract check), `graph_compute`'s step expansion and workspace sizing, the path and kernel choices in `ime.cpp`, `attn.cpp`, `kernels.cpp` | about 300 of ops and `graph_compute`, plus the choice logic (about 150) | the choices need facts `when` does not express (G3) and services the launch ABI does not carry (G5) |
 | plugin (17 functions, capture) | `exec.cpp` (the stream, the launch, the tile loop with its barriers and TCM agreement, the pair waits), the buffer allocation on huge pages, the probe, device memory and props | about 700-900 without the test-only code (E3b's ordered launches and E3c's clock reads, about 300) | against `amd-rt`'s 488 lines; the difference is the capture (the K3's main path, G4) |
 | package | the three kernel files and the matmul and attention orchestration (paths, staging, the split), about 6,500 lines, plus the weight layouts | 6,500 + 230 | compiled in today; FlagTree-compiled kernels for the ops FlagGems has from M3 (§6); the orchestration is kernel code in the deck's sense only if a kernel may use the tile services (G5) |
-| diagnostics | the two counter classes and the test switches | about 400 | names differ (G8) |
+| diagnostics | the two counter classes and the test switches | about 400 | names differ (G8; closed 2026-11-02, S1 step 5: `core/flagos-spacemit-diagnostics.{h,cpp}`) |
 | hostsim | the host executor and the portable references | about 500 | the Mac's simulated device plays hostsim's role today (`provider.cmake:73-84`): the checks pass there before the K3 |
 | tests | `check_spacemit.cpp`, `spacemit_check.py` | 3,634 | stay with the plugin |
 
@@ -280,6 +280,16 @@ Each gap: the deck, our code, what it costs today, what closes it, and whose it 
 
   Owner: us (cheap: a per-op fallback switch and a step trace; the names once the core owns them); the mentor (the
   names).
+
+  Closed 2026-11-02 (S1 step 5, `plan.md` "S1 step 5 spec"): the five exist under the deck's names, read by the core in
+  `core/flagos-spacemit-diagnostics.{h,cpp}` where the core acts on them. `GGML_FLAGOS_STATS` (E3c's per-graph
+  counters) and `GGML_FLAGOS_OP_STATS` (the op counters), JSON lines to a file at exit or to stderr with `-` or `1`;
+  `GGML_FLAGOS_KERNEL_VARIANTS=0` the portable references (plugin-side, since the variant choice sits in the kernels for
+  S1; the per-op tuning switches `MM`, `ATTN`, `QUANTIZE` keep their names); `GGML_FLAGOS_DISABLE_OPS=<op>,...` new,
+  refused in `spacemit_find_op`, so placement and execution agree and the scheduler runs the op on the CPU;
+  `GGML_FLAGOS_TRACE_LAUNCH=1` new, the steps logged by name before each replay and, with `SYNC_LAUNCH`, one replay per
+  step so the core names the failing one; `GGML_FLAGOS_SYNC_LAUNCH=1` E3a's launch mode (Denglin's reading of the
+  name). The loader's path variable is `GGML_FLAGOS_PROVIDER_PATH`. The old names warn once and are ignored.
 
 ### 4.7 The plugin ABI, function by function
 

@@ -22,6 +22,7 @@
 #include "ggml-flagos.h"
 #include "ggml.h"
 #include "../ggml-impl.h"  // ggml_cgraph's uid and ggml_graph_view (the plan cache's probes)
+#include "providers/spacemit/core/flagos-spacemit-diagnostics.h"  // the diagnostics under the deck's names (S1 step 5)
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
 #include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
 #include "providers/spacemit/flagos-spacemit-api.h"   // spacemit_device_plugin
@@ -41,9 +42,14 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#    include <unistd.h>  // dup, dup2 (the counters' lines read back from stderr)
+#endif
 
 static int g_failures = 0;
 
@@ -66,8 +72,9 @@ static int g_failures = 0;
 static const char * k_device_name = "FlagOS:SpacemiT:0";
 
 // sets or unsets a switch for this process. The kernels parse their switches once (spacemit_cached_switch), so every
-// change tells them to parse again (spacemit_switches_reset; the same function the plugin serves by name). Every switch
-// change in this program goes through here, directly or through env_override
+// change tells them to parse again (spacemit_switches_reset; the same function the plugin serves by name), and so do
+// the core's parsed-once diagnostics (GGML_FLAGOS_DISABLE_OPS, TRACE_LAUNCH and the replaced switches' warnings:
+// spacemit_diagnostics_reset). Every switch change in this program goes through here, directly or through env_override
 static void set_env(const char * name, const char * value) {
 #if defined(_WIN32)
     _putenv_s(name, value != nullptr ? value : "");
@@ -79,6 +86,7 @@ static void set_env(const char * name, const char * value) {
     }
 #endif
     spacemit_switches_reset();
+    spacemit_diagnostics_reset();
 }
 
 // sets an environment variable (nullptr: unsets it) and restores the caller's value when it goes out of scope, so that
@@ -103,6 +111,12 @@ class env_override {
     std::string saved;
     bool        had = false;
 };
+
+// ", reference kernels" when GGML_FLAGOS_KERNEL_VARIANTS=0 asks for them (flagos-spacemit-kernels.cpp), else ""
+static const char * reference_label() {
+    const char * v = std::getenv("GGML_FLAGOS_KERNEL_VARIANTS");
+    return v != nullptr && std::strcmp(v, "0") == 0 ? ", reference kernels" : "";
+}
 
 static std::vector<float> ramp(int64_t n, float scale, float offset) {
     std::vector<float> v(n);
@@ -290,11 +304,11 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
         }
     }
 
-    // FLAGOS_SPACEMIT_PLUGIN names the path and has no fallback; it is read at every call
+    // GGML_FLAGOS_PROVIDER_PATH names the path and has no fallback; it is read at every call
     {
         const std::string wanted = std::string(FLAGOS_SPACEMIT_TEST_PLUGIN_DIR) + "/absent" +
                                    FLAGOS_SPACEMIT_TEST_PLUGIN_SUFFIX;
-        env_override      override_path("FLAGOS_SPACEMIT_PLUGIN", wanted.c_str());
+        env_override      override_path("GGML_FLAGOS_PROVIDER_PATH", wanted.c_str());
         CHECK(spacemit_plugin_default_path() == wanted);
     }
 
@@ -665,7 +679,9 @@ static int check_ops(ggml_backend_dev_t dev) {
     constexpr int k_fail_runs = 100;
     int           fail_ok     = 0;
     for (const char * launch : { "per-split", "per-step" }) {
-        env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch);
+        // GGML_FLAGOS_SYNC_LAUNCH: unset is one launch per split, 1 one launch per step
+        env_override launch_switch("GGML_FLAGOS_SYNC_LAUNCH",
+                                   std::strcmp(launch, "per-step") == 0 ? "1" : nullptr);
         for (const char * fail_node : { "0", "1" }) {
             if (std::strcmp(launch, "per-split") != 0 && std::strcmp(fail_node, "1") == 0) {
                 continue;
@@ -1229,7 +1245,7 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
-    const char * kernels = std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "";
+    const char * kernels = reference_label();
     std::printf("matmul   Q4_0 (IME layout 32x256) vs CPU: %d cases, rows 1-%d, max NMSE %.2e (bound %.0e)%s\n",
                 n_cases[0], (int) max_rows[0], max_nmse[0], k_mul_mat_max_nmse, kernels);
     std::printf("matmul   Q4_1 (requantized to Q8_0, IME layout 32x32) vs CPU's Q4_1: %d cases, rows 1-%d, max NMSE "
@@ -1331,7 +1347,7 @@ static int check_gemv(ggml_backend_dev_t dev, bool host) {
     std::printf("gemv     the 1-row path at 6 shapes with TCM%s: %d/%d %s; vs CPU max NMSE %.2e (bound %.0e)%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
                 host ? "identical to the read without TCM" : "within the bound", worst, k_mul_mat_max_nmse,
-                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                reference_label());
     return 0;
 }
 
@@ -1511,7 +1527,7 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 "against FLAGOS_SPACEMIT_MM=split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, "
                 "paths and path A's leftover rows by tile, a tile's in one call, as expected%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
-                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                reference_label());
     return 0;
 }
 
@@ -1797,7 +1813,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     // each tile the same blocks in the same order, so their outputs must be identical (a turn that skips or repeats a
     // block breaks that). The cases take its edges: a last block of 40 positions (n_kv 1000), blocks the mask hides
     // (4000 of 4096 valid), n_kv 8192, GQA 2 and 1, head size 64, no mask. Without the RVV kernels (the Mac,
-    // FLAGOS_SPACEMIT_TEST_REFERENCE) the split's reference runs
+    // GGML_FLAGOS_KERNEL_VARIANTS=0) the split's reference runs
     struct split_case {
         const char * what;
         attn_shape   s;
@@ -1849,17 +1865,16 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         // structural-experiments.md E3a: the default split with its two steps (the tiles' partial results, then their
         // merge, passed through the workspace) in launches of their own, the host waiting for each, against both in
         // one launch
-        const char * const launch_settings[] = { "per-split", "per-step" };
-        std::vector<float> launched[2];
+        std::vector<float> launched[2];  // l 0: one launch per split, l 1: GGML_FLAGOS_SYNC_LAUNCH=1
         for (int l = 0; l < 2; l++) {
             env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
-            env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch_settings[l]);
+            env_override launch_switch("GGML_FLAGOS_SYNC_LAUNCH", l == 1 ? "1" : nullptr);
             REQUIRE(run.dev_output(backend, launched[l]));
         }
         const bool same_launch =
             std::memcmp(launched[0].data(), launched[1].data(), launched[0].size() * sizeof(float)) == 0;
         if (!same_launch) {
-            std::fprintf(stderr, "FAIL: attention split, %s: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step differs from one launch\n",
+            std::fprintf(stderr, "FAIL: attention split, %s: GGML_FLAGOS_SYNC_LAUNCH=1 differs from one launch\n",
                          c.what);
             g_failures++;
         }
@@ -1876,7 +1891,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         "(F16 K and V, head sizes to 128): checked%s\n",
         sizeof(cases) / sizeof(cases[0]), worst, k_attn_max_nmse, worst_row, k_attn_max_row_nmse, worst_row_tiled,
         k_attn_max_row_nmse_tiled, e_low, e_none, e_alibi,
-        std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+        reference_label());
     std::printf("attn     split over the tiles (the default; FLAGOS_SPACEMIT_ATTN=split without the turns) on %d "
                 "one-token cases: max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); %d/%d outputs differ from "
                 "the one-chunk kernels' (the split ran); with and without the turns identical in %d/%zu cases; one "
@@ -1914,7 +1929,7 @@ static layer_weights new_layer_weights(ggml_context * ctx, ggml_type down) {
     w.wg        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
     w.wu        = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k_d, k_ff);
     w.wd        = ggml_new_tensor_2d(ctx, down, k_ff, k_d);
-    // named as llama.cpp names a layer's weights, which the op counters read (FLAGOS_SPACEMIT_TEST_OP_STATS)
+    // named as llama.cpp names a layer's weights, which the op counters read (GGML_FLAGOS_OP_STATS)
     const std::pair<ggml_tensor *, const char *> names[] = {
         { w.attn_norm, "attn_norm" }, { w.q_norm, "attn_q_norm" }, { w.k_norm, "attn_k_norm" }, { w.ffn_norm, "ffn_norm" },
         { w.wq, "attn_q" },           { w.wk, "attn_k" },          { w.wv, "attn_v" },          { w.wo, "attn_output" },
@@ -2893,20 +2908,19 @@ static int check_layer(ggml_backend_dev_t dev) {
     // E3a: one launch per step (quantization and matmul, the norms, RoPE, the cache writes, attention, each launched on
     // its own), the host waiting for each, gives the same outputs as one launch for the layer; both settings given here,
     // whatever the run's
-    const char * const launch_settings[] = { "per-split", "per-step" };
-    int                n_launch_same = 0, n_launch_cases = 0;
+    int n_launch_same = 0, n_launch_cases = 0;  // l 0: one launch per split, l 1: GGML_FLAGOS_SYNC_LAUNCH=1
     for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
         for (int64_t n_tokens : { 1, 7 }) {
             std::vector<float> out[2];
             double             e[2];
             for (int l = 0; l < 2; l++) {
-                env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", launch_settings[l]);
+                env_override launch_switch("GGML_FLAGOS_SYNC_LAUNCH", l == 1 ? "1" : nullptr);
                 e[l] = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[l]);
             }
             const bool same = e[0] >= 0.0 && e[1] >= 0.0 && out[0].size() == out[1].size() &&
                               std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
             if (!same) {
-                std::fprintf(stderr, "FAIL: layer with %lld tokens, down projection %s: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step %s\n",
+                std::fprintf(stderr, "FAIL: layer with %lld tokens, down projection %s: GGML_FLAGOS_SYNC_LAUNCH=1 %s\n",
                              (long long) n_tokens, ggml_type_name(down),
                              e[0] < 0.0 || e[1] < 0.0 ? "refused or failed" : "differs from one launch per layer");
                 g_failures++;
@@ -2921,14 +2935,15 @@ static int check_layer(ggml_backend_dev_t dev) {
     int n_shared_same = 0, n_shared_fewer = 0, n_shared_cases = 0;
     for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
         for (int64_t n_tokens : { 1, 7 }) {
-            const char * const settings[3][2] = { { "separate", "per-split" }, { "shared", "per-split" },
-                                                  { "shared", "per-step" } };
+            // the second column is GGML_FLAGOS_SYNC_LAUNCH: unset one launch per split, 1 one per step
+            const char * const settings[3][2] = { { "separate", nullptr }, { "shared", nullptr },
+                                                  { "shared", "1" } };
             std::vector<float> out[3];
             double             e[3];
             uint64_t           steps[3];
             for (int s = 0; s < 3; s++) {
                 env_override quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", settings[s][0]);
-                env_override launch_switch("FLAGOS_SPACEMIT_TEST_LAUNCH", settings[s][1]);
+                env_override launch_switch("GGML_FLAGOS_SYNC_LAUNCH", settings[s][1]);
                 spacemit_steps_take();
                 e[s]     = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[s]);
                 steps[s] = spacemit_steps_take();
@@ -2972,7 +2987,7 @@ static int check_layer(ggml_backend_dev_t dev) {
                 "and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d cases, 3 steps fewer in %d/%d%s\n",
                 k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope, worst_kv, n_launch_same,
                 n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer, n_shared_cases,
-                std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr ? ", reference kernels" : "");
+                reference_label());
     return 0;
 }
 
@@ -3574,6 +3589,437 @@ static int check_plan(ggml_backend_dev_t dev) {
     return 0;
 }
 
+//
+// S1 step 5 (plan.md "S1 step 5 spec" §4): the diagnostics under the deck's names. GGML_FLAGOS_DISABLE_OPS sends the
+// ops it names back to the CPU (placement and execution together), GGML_FLAGOS_TRACE_LAUNCH logs the steps by name and
+// names the step whose launch failed, GGML_FLAGOS_STATS=- writes the counters to stderr, and every replaced
+// FLAGOS_SPACEMIT_* name is reported once with the new one and otherwise ignored
+//
+
+// the GGML log lines while it lives, kept and still printed by ggml's default callback
+class log_capture {
+  public:
+    log_capture() { ggml_log_set(sink, this); }
+
+    ~log_capture() { ggml_log_set(nullptr, nullptr); }
+
+    log_capture(const log_capture &)             = delete;
+    log_capture & operator=(const log_capture &) = delete;
+
+    // the lines since the last call
+    std::string take() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string                 out;
+        out.swap(text);
+        return out;
+    }
+
+  private:
+    static void sink(enum ggml_log_level level, const char * line, void * user) {
+        auto * self = static_cast<log_capture *>(user);
+        {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            self->text += line;
+        }
+        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
+            std::fputs(line, stderr);  // a warning the checks do not expect stays visible
+        }
+    }
+
+    std::mutex  mutex;
+    std::string text;
+};
+
+// lines of text that start with prefix
+static int count_lines(const std::string & text, const char * prefix) {
+    const size_t len = std::strlen(prefix);
+    int          n   = 0;
+    size_t       at  = 0;
+    while (at <= text.size()) {
+        const size_t end  = text.find('\n', at);
+        const size_t stop = end == std::string::npos ? text.size() : end;
+        if (stop - at >= len && text.compare(at, len, prefix) == 0) {
+            n++;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        at = end + 1;
+    }
+    return n;
+}
+
+// a Qwen3-like layer (build_layer, down projection Q4_0) with its weights in the provider's buffer and its inputs,
+// caches and mask in CPU buffers, its graph left for a scheduler to allocate: an op the provider refuses then has its
+// output in a CPU buffer, which is what GGML_FLAGOS_DISABLE_OPS asks of the scheduler (a graph allocated in our buffer
+// beforehand would instead give every node to the buffer's backend). The values are plan_layer's
+struct diag_layer {
+    ggml_context *        ctx_h = nullptr, * ctx_w = nullptr, * ctx_g = nullptr;
+    ggml_backend_buffer_t bh = nullptr, bw = nullptr;
+    ggml_cgraph *         g = nullptr;
+    layer_out             o = {};
+
+    bool init(ggml_backend_dev_t dev, int64_t n_tokens) {
+        ggml_init_params params = { ggml_tensor_overhead() * 128 + ggml_graph_overhead(), nullptr, true };
+        ctx_h                   = ggml_init(params);
+        ctx_w                   = ggml_init(params);
+        ctx_g                   = ggml_init(params);
+        ggml_tensor * x         = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, k_d, n_tokens);
+        ggml_tensor * pos       = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n_tokens);
+        ggml_tensor * kv_idx    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I64, n_tokens);
+        ggml_tensor * out_ids   = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 1);
+        ggml_tensor * kc        = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+        ggml_tensor * vc        = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F16, k_hd * k_nkv, k_slots);
+        ggml_tensor * mask      = ggml_new_tensor_4d(ctx_h, GGML_TYPE_F16, k_slots, n_tokens, 1, 1);
+        ggml_set_name(kc, "cache_k_l0");
+        ggml_set_name(vc, "cache_v_l0");
+        const layer_weights w = new_layer_weights(ctx_w, GGML_TYPE_Q4_0);
+        bh                    = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+        bw                    = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, ggml_backend_dev_buffer_type(dev));
+        if (bh == nullptr || bw == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_clear(bh, 0);
+        set_layer_weights(w);
+
+        const std::vector<float> xv = random_values(k_d * n_tokens, 5, 1.0f);
+        std::vector<int32_t>     pv(n_tokens);
+        std::vector<int64_t>     iv(n_tokens);
+        std::vector<int32_t>     cell_pos(k_slots, -1);  // -1: empty
+        for (int64_t t = 0; t < n_tokens; t++) {
+            pv[t]           = (int32_t) (k_layer_pos + t);
+            iv[t]           = (3 + 5 * t) % k_slots;
+            cell_pos[iv[t]] = pv[t];
+        }
+        for (int32_t c = 0, p = 0; c < k_slots && p < k_layer_pos; c++) {
+            if (cell_pos[c] < 0) {
+                cell_pos[c] = p++;
+            }
+        }
+        std::vector<ggml_fp16_t> mv(k_slots * n_tokens);
+        for (int64_t t = 0; t < n_tokens; t++) {
+            for (int64_t c = 0; c < k_slots; c++) {
+                mv[t * k_slots + c] = ggml_fp32_to_fp16(cell_pos[c] >= 0 && cell_pos[c] <= pv[t] ? 0.0f : -INFINITY);
+            }
+        }
+        const int32_t last = (int32_t) (n_tokens - 1);
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(pos, pv.data(), 0, ggml_nbytes(pos));
+        ggml_backend_tensor_set(kv_idx, iv.data(), 0, ggml_nbytes(kv_idx));
+        ggml_backend_tensor_set(out_ids, &last, 0, sizeof(last));
+        ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
+        uint32_t cache_seed = 6;
+        for (ggml_tensor * cache : { kc, vc }) {
+            const std::vector<ggml_fp16_t> h = random_f16(ggml_nelements(cache), cache_seed++, 1.0f);
+            ggml_backend_tensor_set(cache, h.data(), 0, ggml_nbytes(cache));
+        }
+        g = ggml_new_graph(ctx_g);
+        o = build_layer(ctx_g, g, w, x, pos, kv_idx, out_ids, kc, vc, mask, n_tokens);
+        ggml_set_output(o.full);
+        return true;
+    }
+
+    ~diag_layer() {
+        for (ggml_backend_buffer_t b : { bh, bw }) {
+            ggml_backend_buffer_free(b);
+        }
+        for (ggml_context * c : { ctx_h, ctx_w, ctx_g }) {
+            ggml_free(c);
+        }
+    }
+
+    // the layer once, through a scheduler of its own: the output, the splits the graph took and the backend the
+    // scheduler gave the SwiGLU. A layer is run once, since its nodes then hold the scheduler's allocations, which the
+    // scheduler owns; two settings are compared on two layers of the same values. false if the graph failed
+    bool run(ggml_backend_t backend, ggml_backend_t cpu, std::vector<float> & out, int & n_splits,
+             ggml_backend_t & glu_backend) {
+        ggml_tensor * glu = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(g) && glu == nullptr; i++) {
+            if (ggml_graph_node(g, i)->op == GGML_OP_GLU) {
+                glu = ggml_graph_node(g, i);
+            }
+        }
+        ggml_backend_t       both[2] = { backend, cpu };
+        ggml_backend_sched_t sched   = ggml_backend_sched_new(both, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        bool                 ok      = sched != nullptr && glu != nullptr &&
+                  ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            n_splits    = ggml_backend_sched_get_n_splits(sched);
+            glu_backend = ggml_backend_sched_get_tensor_backend(sched, glu);
+            out.assign(ggml_nelements(o.full), NAN);
+            ggml_backend_tensor_get(o.full, out.data(), 0, ggml_nbytes(o.full));
+        }
+        ggml_backend_sched_free(sched);
+        return ok;
+    }
+};
+
+static int check_diagnostics(ggml_backend_dev_t dev) {
+    const spacemit_plugin * loaded = spacemit_device_plugin(dev);
+    REQUIRE(loaded != nullptr);
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(loaded);
+    REQUIRE(table != nullptr);
+    spacemit_ops ops;
+    std::string  detail;
+    REQUIRE(spacemit_ops_bind(table, &ops, &detail));
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    // three nodes the provider claims without the switch: a SwiGLU, a one-token attention and an ADD
+    ggml_init_params params  = { ggml_tensor_overhead() * 32, nullptr, true };
+    ggml_context *   ctx     = ggml_init(params);
+    ggml_tensor *    gate    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_ff, 1);
+    ggml_tensor *    up      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_ff, 1);
+    ggml_tensor *    glu     = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor *    k_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k_hd * 2, 544);
+    ggml_tensor *    v_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k_hd * 2, 544);
+    ggml_tensor *    attn =
+        build_flash_attn(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_hd, 8, 1), k_cache, v_cache, nullptr, 2, 512,
+                         0.0f);
+    ggml_tensor * add = ggml_add(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_d, 1),
+                                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_d, 1));
+
+    // the switch's three settings: unset, two ops named, an unknown name. find_op and the device's supports_op must
+    // answer alike, since both call find_op (placement and execution cannot disagree)
+    const struct {
+        const char * value;
+        bool         glu, attn, add;
+    } cases[] = {
+        { nullptr,                 true,  true,  true },
+        { "GLU, FLASH_ATTN_EXT ",  false, false, true },  // spaces trimmed, case as given
+        { "NOPE",                  true,  true,  true },
+    };
+    int disable_ok = 0;
+    for (const auto & c : cases) {
+        env_override switch_off("GGML_FLAGOS_DISABLE_OPS", c.value);
+        log_capture  log;
+        bool         ok = true;
+        for (const auto & want : { std::pair<ggml_tensor *, bool>{ glu, c.glu }, { attn, c.attn }, { add, c.add } }) {
+            const bool found    = spacemit_find_op(ops, want.first, buft) != nullptr;
+            const bool claimed  = ggml_backend_dev_supports_op(dev, want.first);
+            ok                  = ok && found == want.second && claimed == want.second;
+        }
+        // an unknown name is reported once, however often the list is read, and disables nothing
+        const std::string text = log.take();
+        const int          said = count_lines(text, "FlagOS SpacemiT: GGML_FLAGOS_DISABLE_OPS: NOPE");
+        ok = ok && said == (c.value != nullptr && std::strcmp(c.value, "NOPE") == 0 ? 1 : 0);
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: diagnostics, GGML_FLAGOS_DISABLE_OPS=%s: the ops claimed are wrong, or the "
+                                 "unknown name was reported %d times\n", c.value != nullptr ? c.value : "(unset)", said);
+            g_failures++;
+        }
+        disable_ok += ok;
+    }
+    ggml_free(ctx);
+
+    // a layer through a scheduler of the provider and the CPU: with GLU disabled the scheduler gives the SwiGLU to the
+    // CPU and splits the layer around it, and the layer's output stays within the layer bound of the run that keeps it
+    // on the provider (the CPU's vectorized SiLU is not the reference kernel's expf, so the bytes differ)
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);
+    bool   sched_ok = false;
+    int    splits[2] = { 0, 0 };
+    double e_sched   = -1.0;
+    {
+        std::vector<float> out[2];
+        ggml_backend_t     glu_backend[2] = { nullptr, nullptr };
+        bool               ran            = true;
+        for (int i = 0; i < 2; i++) {
+            env_override switch_off("GGML_FLAGOS_DISABLE_OPS", i == 1 ? "GLU" : nullptr);
+            diag_layer   l;  // one layer per setting, of the same values: its nodes keep its scheduler's allocations
+            REQUIRE(l.init(dev, 1));
+            ran = ran && l.run(backend, cpu, out[i], splits[i], glu_backend[i]);
+        }
+        if (ran) {
+            e_sched  = nmse(out[1].data(), out[0].data(), (int64_t) out[0].size());
+            sched_ok = glu_backend[0] == backend && glu_backend[1] == cpu && splits[1] > splits[0] &&
+                       e_sched >= 0.0 && e_sched <= k_layer_max_nmse;
+        }
+        if (!sched_ok) {
+            std::fprintf(stderr,
+                         "FAIL: diagnostics, GGML_FLAGOS_DISABLE_OPS=GLU through the scheduler: %s; the SwiGLU went to "
+                         "%s (without the switch %s), splits %d against %d, NMSE %.3e\n",
+                         ran ? "wrong placement or output" : "a graph failed",
+                         glu_backend[1] != nullptr ? ggml_backend_name(glu_backend[1]) : "nowhere",
+                         glu_backend[0] != nullptr ? ggml_backend_name(glu_backend[0]) : "nowhere", splits[1],
+                         splits[0], e_sched);
+            g_failures++;
+        }
+    }
+
+    // GGML_FLAGOS_TRACE_LAUNCH: one line per step before the replay, then the two launch lines; with
+    // GGML_FLAGOS_SYNC_LAUNCH as well one status line per step, the core issuing a replay per step
+    int      trace_ok = 0;
+    uint64_t n_steps = 0, n_steps_sync = 0;
+    int      step_lines = 0, status_lines = 0;
+    {
+        env_override switch_off("GGML_FLAGOS_DISABLE_OPS", nullptr);
+        plan_layer   l;
+        REQUIRE(l.init(dev, 1, 1e6f));
+        for (int sync = 0; sync < 2; sync++) {
+            env_override       trace_switch("GGML_FLAGOS_TRACE_LAUNCH", "1");
+            env_override       sync_switch("GGML_FLAGOS_SYNC_LAUNCH", sync == 1 ? "1" : nullptr);
+            std::vector<float> out;
+            log_capture        log;
+            spacemit_steps_take();
+            const bool        ran   = l.run(backend, out);
+            const uint64_t    steps = spacemit_steps_take();
+            const std::string text  = log.take();
+            const int         lines = count_lines(text, "FlagOS SpacemiT: step ");
+            const int         status = count_lines(text, "FlagOS SpacemiT: launch step ");
+            const int         launch = count_lines(text, "FlagOS SpacemiT: launch ") - status;
+            const bool        ok = ran && steps > 0 && lines == (int) steps && launch == 2 &&
+                            status == (sync == 1 ? (int) steps : 0);
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: diagnostics, GGML_FLAGOS_TRACE_LAUNCH=1%s: %d step lines and %d launch lines "
+                             "(%d with a status) for %llu steps\n", sync == 1 ? " with SYNC_LAUNCH=1" : "", lines,
+                             launch, status, (unsigned long long) steps);
+                g_failures++;
+            }
+            trace_ok += ok;
+            if (sync == 1) {
+                n_steps_sync = steps;
+                status_lines = status;
+            } else {
+                n_steps    = steps;
+                step_lines = lines;
+            }
+        }
+    }
+
+    // the step whose launch failed, named by the core: FLAGOS_SPACEMIT_TEST_FAIL_NODE is the step's index inside a
+    // launch, so with one launch per step only the first step of a launch can be forced to fail, and the first failing
+    // step is step 1. With one launch per split the whole graph's launch fails, and the trace names no step
+    int fail_ok = 0, named_step = 0;
+    {
+        env_override switch_off("GGML_FLAGOS_DISABLE_OPS", nullptr);
+        plan_layer   l;
+        REQUIRE(l.init(dev, 1, 1e6f));
+        for (int sync = 0; sync < 2; sync++) {
+            env_override trace_switch("GGML_FLAGOS_TRACE_LAUNCH", "1");
+            env_override sync_switch("GGML_FLAGOS_SYNC_LAUNCH", sync == 1 ? "1" : nullptr);
+            set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", sync == 1 ? "0" : "3");
+            ggml_backend_t failing = ggml_backend_dev_init(dev, nullptr);
+            set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", nullptr);
+            REQUIRE(failing != nullptr);
+            std::vector<float> out;
+            std::fprintf(stderr, "(the next error lines are expected)\n");
+            log_capture log;
+            out.assign(ggml_nelements(l.od.full), NAN);
+            const bool        failed = ggml_backend_graph_compute(failing, l.gd) == GGML_STATUS_FAILED;
+            const std::string text   = log.take();
+            // the last status line of a failing sync run names the step: "launch step 1/<n>: failed"
+            const int  status = count_lines(text, "FlagOS SpacemiT: launch step ");
+            const bool named  = text.find("launch step 1/") != std::string::npos &&
+                               text.find(": failed") != std::string::npos;
+            const bool ok = failed && (sync == 1 ? status == 1 && named : status == 0) &&
+                            text.find("steps: failed") != std::string::npos;
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: diagnostics, a forced failure under GGML_FLAGOS_TRACE_LAUNCH=1%s: compute %s, %d "
+                             "status lines, the failing step %s\n", sync == 1 ? " with SYNC_LAUNCH=1" : "",
+                             failed ? "failed as it should" : "did not fail", status, named ? "named" : "not named");
+                g_failures++;
+            }
+            fail_ok += ok;
+            named_step += sync == 1 && named;
+            ggml_backend_free(failing);
+        }
+    }
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+
+    // GGML_FLAGOS_STATS=-: the counters' JSON lines go to stderr when the counter file is destroyed. The switch is
+    // read once per process, so the probe makes a counter file of its own from the switch's value, as get() does, and
+    // reads stderr from a temporary file
+    bool stats_stderr = false;
+#if !defined(_WIN32)
+    {
+        const std::string path = std::string(FLAGOS_SPACEMIT_TEST_PLUGIN_DIR) + "/diag-stats.jsonl";
+        std::fflush(stderr);
+        const int saved = dup(fileno(stderr));
+        FILE *    f     = std::fopen(path.c_str(), "w+");
+        if (f != nullptr && saved >= 0) {
+            dup2(fileno(f), fileno(stderr));
+            {
+                spacemit_stats_file counters("-");
+                spacemit_run_stats  run;
+                run.reset(2);
+                run.n_steps = 2;
+                run.n_tiles = 1;
+                counters.add("per-split", 1, -1, run, 123.0, spacemit_plan_result::off, 1.0, 1.0);
+            }  // the destructor writes
+            std::fflush(stderr);
+            dup2(saved, fileno(stderr));
+            close(saved);
+            std::fclose(f);
+            std::ifstream written(path);
+            std::string   line, all;
+            int           lines = 0;  // the JSON lines; the file also holds the warning that named stderr
+            while (std::getline(written, line)) {
+                if (!line.empty() && line[0] == '{') {
+                    lines++;
+                    all = line;
+                }
+            }
+            stats_stderr = lines == 1 && all.rfind("{\"launch\":\"per-split\",\"rows\":1,\"kv\":-1,\"graphs\":1,", 0) == 0;
+        }
+        if (!stats_stderr) {
+            std::fprintf(stderr, "FAIL: diagnostics, GGML_FLAGOS_STATS=-: no single JSON line on stderr (%s)\n",
+                         path.c_str());
+            g_failures++;
+        }
+    }
+#else
+    stats_stderr = true;
+#endif
+
+    // every replaced name: set, it is reported once with the new name and changes nothing
+    const struct {
+        const char * old_name;
+        const char * new_name;
+    } renamed[] = {
+        { "FLAGOS_SPACEMIT_TEST_STATS",     "GGML_FLAGOS_STATS"           },
+        { "FLAGOS_SPACEMIT_TEST_OP_STATS",  "GGML_FLAGOS_OP_STATS"        },
+        { "FLAGOS_SPACEMIT_TEST_REFERENCE", "GGML_FLAGOS_KERNEL_VARIANTS" },
+        { "FLAGOS_SPACEMIT_TEST_LAUNCH",    "GGML_FLAGOS_SYNC_LAUNCH"     },
+        { "FLAGOS_SPACEMIT_PLUGIN",         "GGML_FLAGOS_PROVIDER_PATH"   },
+    };
+    int renamed_ok = 0;
+    for (const auto & r : renamed) {
+        // every switch change resets the warnings, so each name is reported again here
+        env_override old_set(r.old_name, "per-step");
+        env_override sync_unset("GGML_FLAGOS_SYNC_LAUNCH", nullptr);
+        log_capture  log;
+        spacemit_renamed(r.old_name, r.new_name);
+        spacemit_renamed(r.old_name, r.new_name);
+        const std::string text = log.take();
+        const std::string said = std::string("FlagOS SpacemiT: ") + r.old_name + " is now " + r.new_name;
+        // "changes nothing": the launch mode is the default although the old launch switch says per-step
+        const bool ok = count_lines(text, said.c_str()) == 1 && count_lines(text, "FlagOS SpacemiT: FLAGOS_") == 1 &&
+                        spacemit_launch_mode() == spacemit_launch_kind::per_split;
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: diagnostics, %s set: not reported exactly once as %s, or it still acts\n",
+                         r.old_name, r.new_name);
+            g_failures++;
+        }
+        renamed_ok += ok;
+    }
+
+    std::printf("diag     DISABLE_OPS (%d/%zu settings: GLU and FLASH_ATTN_EXT refused by find_op and supports_op, an "
+                "unknown name reported once and ignored; a layer's SwiGLU on the CPU side of the scheduler, %d splits "
+                "against %d, NMSE %.2e, bound %.0e), TRACE_LAUNCH (%d/2: %d step lines for %llu steps and the two "
+                "launch lines, with one launch per step %d status lines for %llu; %d/2 forced failures reported, the "
+                "failing step named %d/1), STATS=- one JSON line to stderr: %s, renamed switches %d/%zu: checked\n",
+                disable_ok, sizeof(cases) / sizeof(cases[0]), splits[1], splits[0], e_sched, k_layer_max_nmse,
+                trace_ok, step_lines, (unsigned long long) n_steps, status_lines, (unsigned long long) n_steps_sync,
+                fail_ok, named_step, stats_stderr ? "yes" : "no", renamed_ok,
+                sizeof(renamed) / sizeof(renamed[0]));
+    return 0;
+}
+
 // eight 1-row matmuls of one weight on one input (sixteen steps: the activations quantized, then the matmul, each
 // time), their outputs one after another; false if the provider failed
 static bool matmuls_out(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_type type, std::vector<float> & out) {
@@ -3994,7 +4440,7 @@ int main(int argc, char ** argv) {
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0 ||
-        check_plan(dev) != 0) {
+        check_plan(dev) != 0 || check_diagnostics(dev) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 : (run_attn && bench_attn(dev) != 0) || (run_mm && bench_mm(dev) != 0)) {

@@ -4,10 +4,11 @@
 // requantized to Q8_0; M2d: the other ops of a layer except attention).
 
 #include "flagos-spacemit-api.h"
-#include "flagos-spacemit-exec.h"  // spacemit_run_stats (test-only, E3c)
 #include "flagos-spacemit-ops.h"
+#include "core/flagos-spacemit-diagnostics.h"  // the switches and the counter files (S1 step 5)
 #include "core/flagos-spacemit-loader.h"
 #include "core/flagos-spacemit-plan.h"
+#include "core/flagos-spacemit-stats.h"  // spacemit_run_stats (test-only, E3c)
 
 #include "../../../ggml-backend-impl.h"
 #include "../../../ggml-impl.h"
@@ -69,7 +70,7 @@ struct spacemit_backend_context {
     spacemit_plan_cache               plan;        // the plan cache (FLAGOS_SPACEMIT_PLAN; plan.md "S1 step 3c spec")
     void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                            workspace_size = 0;
-    spacemit_run_stats                run_stats;  // test-only (E3c): the current graph's, with FLAGOS_SPACEMIT_TEST_STATS
+    spacemit_run_stats                run_stats;  // test-only (E3c): the current graph's, with GGML_FLAGOS_STATS
 
     ~spacemit_backend_context() {
         if (stream != nullptr) {
@@ -223,412 +224,6 @@ bool spacemit_data_ready(const ggml_tensor * node) {
     return true;
 }
 
-enum class spacemit_launch_kind {
-    per_split,      // the default: a split's steps in one launch, a barrier after each
-    per_step,       // E3a: every step its own launch, the host waiting for each
-};
-
-// test-only: FLAGOS_SPACEMIT_TEST_LAUNCH=per-step launches every step on its own, as a runtime without graph capture
-// launches each kernel (structural-experiments.md E3a); per-split names the default. Read
-// at every graph, so a benchmark can switch; anything else is reported once and ignored
-spacemit_launch_kind spacemit_launch_mode() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_LAUNCH");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "per-split") == 0) {
-        return spacemit_launch_kind::per_split;
-    }
-    if (std::strcmp(v, "per-step") == 0) {
-        return spacemit_launch_kind::per_step;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_TEST_LAUNCH=%s: unknown setting ignored\n", __func__, v);
-    }
-    return spacemit_launch_kind::per_split;
-}
-
-// test-only until adopted (fusion-and-splitting.md §5, candidate 6): FLAGOS_SPACEMIT_QUANTIZE=shared leaves out a
-// MUL_MAT's quantize step when the matmul that last quantized took the same activations into the same layout (Q, V and
-// K of a layer; gate and up), so it multiplies what that step wrote; separate (the default) quantizes for every matmul.
-// The same bytes either way. Read at every graph, so a benchmark can switch; anything else is reported once and ignored
-bool spacemit_quantize_shared() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_QUANTIZE");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "separate") == 0) {
-        return false;
-    }
-    if (std::strcmp(v, "shared") == 0) {
-        return true;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_QUANTIZE=%s: unknown setting ignored\n", __func__, v);
-    }
-    return false;
-}
-
-// whether node's output overlaps t's data
-bool spacemit_overlaps(const ggml_tensor * node, const ggml_tensor * t) {
-    const char * a = static_cast<const char *>(node->data);
-    const char * b = static_cast<const char *>(t->data);
-    return a < b + ggml_nbytes(t) && b < a + ggml_nbytes(node);
-}
-
-// test-only (structural-experiments.md E3c): FLAGOS_SPACEMIT_TEST_STATS=<file> counts, per kind of graph (launch mode,
-// rows of its first matmul, KV length class of its first attention: 0 below 1024, 1024 below 4096, else 4096), the
-// graphs, steps and launches and the time spent in graph_compute, in the launches as the host waits for them, in the
-// kernels (summed over the tiles; per step the slowest tile, "busy") and at the barriers (summed over the tiles), and
-// the plan cache's answers (FLAGOS_SPACEMIT_PLAN: hits by uid, misses) with the time to the step list in hand
-// (plan_lookup_us, the check and the expansion included on a miss and under none) and from after the check
-// (plan_key_us: on a miss the store; on a hit, which skips the check, equal to plan_lookup_us). When the process ends it
-// appends one JSON line per kind to <file>. Read once
-class spacemit_stats_file {
-  public:
-    // nullptr when the switch is not set
-    static spacemit_stats_file * get() {
-        static spacemit_stats_file file(std::getenv("FLAGOS_SPACEMIT_TEST_STATS"));
-        return file.path.empty() ? nullptr : &file;
-    }
-
-    // plan, lookup_us, key_us: the plan cache's answer for this graph (FLAGOS_SPACEMIT_PLAN), the time from the top of
-    // graph_compute to the step list in hand (the check and the expansion on a miss and under none) and the time from
-    // after the contract check to it (the check expands as it goes, so on a miss the store and under none about 0; on
-    // a hit, which skips the check, from the top, as lookup_us)
-    void add(const char * launch, int64_t rows, int64_t n_kv, const spacemit_run_stats & run, double graph_us,
-             spacemit_plan_result plan, double lookup_us, double key_us) {
-        double kernel_ns = 0.0, busy_ns = 0.0, barrier_ns = 0.0;
-        for (size_t s = 0; s < run.n_steps; s++) {
-            uint32_t slowest = 0;
-            for (uint32_t t = 0; t < run.n_tiles; t++) {
-                const uint32_t ns = run.kernel_ns[t * run.stride + s];
-                kernel_ns += ns;
-                slowest = std::max(slowest, ns);
-            }
-            busy_ns += slowest;
-        }
-        for (uint32_t t = 0; t < run.n_tiles; t++) {
-            barrier_ns += static_cast<double>(run.barrier_ns[t]);
-        }
-        const int64_t               kv_class = n_kv < 0 ? -1 : n_kv < 1024 ? 0 : n_kv < 4096 ? 1024 : 4096;
-        std::lock_guard<std::mutex> lock(mutex);
-        totals & k = kinds[std::make_tuple(std::string(launch), rows, kv_class)];
-        k.graphs++;
-        k.steps += run.n_steps;
-        k.launches += run.launches;
-        k.tiles = run.n_tiles;
-        k.graph_us += graph_us;
-        k.launch_us += run.launch_us;
-        k.kernel_us += kernel_ns / 1e3;
-        k.busy_us += busy_ns / 1e3;
-        k.barrier_us += barrier_ns / 1e3;
-        k.plan_hits_uid += plan == spacemit_plan_result::hit_uid;
-        k.plan_misses += plan == spacemit_plan_result::miss;
-        k.plan_lookup_us += lookup_us;
-        k.plan_key_us += key_us;
-    }
-
-    ~spacemit_stats_file() {
-        if (path.empty() || kinds.empty()) {
-            return;
-        }
-        FILE * f = std::fopen(path.c_str(), "a");
-        if (f == nullptr) {
-            GGML_LOG_ERROR("FlagOS SpacemiT: cannot write the test statistics to %s\n", path.c_str());
-            return;
-        }
-        for (const auto & [key, k] : kinds) {
-            std::fprintf(f,
-                         "{\"launch\":\"%s\",\"rows\":%lld,\"kv\":%lld,\"graphs\":%llu,\"steps\":%llu,\"launches\":%llu,"
-                         "\"tiles\":%u,\"graph_us\":%.3f,\"launch_us\":%.3f,\"kernel_us\":%.3f,\"busy_us\":%.3f,"
-                         "\"barrier_us\":%.3f,\"plan_hits_uid\":%llu,\"plan_misses\":%llu,\"plan_lookup_us\":%.3f,"
-                         "\"plan_key_us\":%.3f}\n",
-                         std::get<0>(key).c_str(), (long long) std::get<1>(key), (long long) std::get<2>(key),
-                         (unsigned long long) k.graphs, (unsigned long long) k.steps, (unsigned long long) k.launches,
-                         k.tiles, k.graph_us, k.launch_us, k.kernel_us, k.busy_us, k.barrier_us,
-                         (unsigned long long) k.plan_hits_uid, (unsigned long long) k.plan_misses, k.plan_lookup_us,
-                         k.plan_key_us);
-        }
-        std::fclose(f);
-    }
-
-  private:
-    explicit spacemit_stats_file(const char * p) : path(p != nullptr ? p : "") {
-        if (!path.empty()) {
-            GGML_LOG_WARN("FlagOS SpacemiT: test statistics (FLAGOS_SPACEMIT_TEST_STATS) go to %s at exit\n", p);
-        }
-    }
-
-    struct totals {
-        uint64_t graphs = 0, steps = 0, launches = 0;
-        uint32_t tiles  = 0;
-        double   graph_us = 0.0, launch_us = 0.0, kernel_us = 0.0, busy_us = 0.0, barrier_us = 0.0;
-        uint64_t plan_hits_uid = 0, plan_misses = 0;
-        double   plan_lookup_us = 0.0, plan_key_us = 0.0;
-    };
-
-    std::string                                                     path;
-    std::mutex                                                      mutex;
-    std::map<std::tuple<std::string, int64_t, int64_t>, totals> kinds;
-};
-
-// the role in a tensor's name, for the op counters: blk.12.attn_q.weight -> attn_q, cache_k_l12 -> cache_k; "-" without
-std::string spacemit_role(const ggml_tensor * t) {
-    if (t == nullptr || t->name[0] == '\0') {
-        return "-";
-    }
-    std::string n = t->name;
-    n             = n.substr(0, n.find(' '));  // ggml's " (view)" and the like
-    if (n.compare(0, 4, "blk.") == 0 && n.find('.', 4) != std::string::npos) {
-        n = n.substr(n.find('.', 4) + 1);
-    }
-    const std::string weight = ".weight";
-    if (n.size() > weight.size() && n.compare(n.size() - weight.size(), weight.size(), weight) == 0) {
-        n.resize(n.size() - weight.size());
-    }
-    const size_t l = n.rfind("_l");
-    if (l != std::string::npos && l + 2 < n.size() && n.find_first_not_of("0123456789", l + 2) == std::string::npos) {
-        n.resize(l);
-    }
-    for (char & c : n) {
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '.' && c != '-') {
-            c = '_';  // the name goes into JSON as it is
-        }
-    }
-    return n.empty() ? "-" : n;
-}
-
-// a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention, by the step's contract
-// name), the role its tensors' names give, and its rows (r: the output's; m: a matmul's activations', after its weight
-// type)
-std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
-                                const std::vector<const char *> & names, size_t i) {
-    const spacemit_plugin_step & step = steps[i];
-    const char * const           name = names[i];
-    const ggml_tensor *          n    = step.node;
-    const long long              r    = static_cast<long long>(ggml_nrows(n));
-    char                         buf[192];
-    switch (n->op) {
-        case GGML_OP_MUL_MAT:
-            std::snprintf(buf, sizeof(buf), "MUL_MAT.%s %s %s m%lld",
-                          std::strcmp(name, "mul_mat.quantize") == 0 ? "quantize" : "gemm",
-                          spacemit_role(n->src[0]).c_str(), ggml_type_name(n->src[0]->type),
-                          static_cast<long long>(ggml_nrows(n->src[1])));
-            break;
-        case GGML_OP_RMS_NORM:
-            {
-                std::string role = "-";  // the norm weight of the MUL that takes it
-                for (size_t j = i + 1; j < steps.size() && j <= i + 8; j++) {
-                    if (steps[j].node->op == GGML_OP_MUL && steps[j].node->src[0] == n) {
-                        role = spacemit_role(steps[j].node->src[1]);
-                        break;
-                    }
-                }
-                std::snprintf(buf, sizeof(buf), "RMS_NORM %s r%lld", role.c_str(), r);
-                break;
-            }
-        case GGML_OP_MUL:
-            std::snprintf(buf, sizeof(buf), "MUL %s r%lld", spacemit_role(n->src[1]).c_str(), r);
-            break;
-        case GGML_OP_ROPE:  // the norm weight of the MUL before it
-            std::snprintf(buf, sizeof(buf), "ROPE %s r%lld",
-                          n->src[0]->op == GGML_OP_MUL ? spacemit_role(n->src[0]->src[1]).c_str() : "-", r);
-            break;
-        case GGML_OP_SET_ROWS:  // the cache it writes
-            std::snprintf(buf, sizeof(buf), "SET_ROWS %s r%lld", spacemit_role(n->src[2]).c_str(),
-                          static_cast<long long>(ggml_nrows(n->src[0])));
-            break;
-        case GGML_OP_ADD:
-            {
-                std::string role = "-";  // the weight of the matmul whose output it adds
-                for (int k = 0; k < 2 && role == "-"; k++) {
-                    const ggml_tensor * s = n->src[k];
-                    if (s->op == GGML_OP_GET_ROWS) {
-                        s = s->src[0];
-                    }
-                    if (s->op == GGML_OP_MUL_MAT) {
-                        role = "after " + spacemit_role(s->src[0]);
-                    }
-                }
-                std::snprintf(buf, sizeof(buf), "ADD %s r%lld", role.c_str(), r);
-                break;
-            }
-        case GGML_OP_GLU:
-            std::snprintf(buf, sizeof(buf), "GLU %s r%lld", ggml_glu_op_name(ggml_get_glu_op(n)), r);
-            break;
-        case GGML_OP_FLASH_ATTN_EXT:
-            std::snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT.%s q%lld kv%lld",
-                          std::strcmp(name, "flash_attn") == 0             ? "one-step" :
-                          std::strcmp(name, "flash_attn.split.merge") == 0 ? "merge" :
-                                                                             "partial",
-                          static_cast<long long>(n->src[0]->ne[1]), static_cast<long long>(n->src[1]->ne[1]));
-            break;
-        default:
-            std::snprintf(buf, sizeof(buf), "%s r%lld", ggml_op_name(n->op), r);
-            break;
-    }
-    return buf;
-}
-
-// test-only (fusion-and-splitting.md §7): FLAGOS_SPACEMIT_TEST_OP_STATS=<file> times the steps by what they do, from
-// E3c's clock reads (spacemit_run_stats). Per kind of graph (launch mode, rows of its first matmul, KV length of its
-// first attention, and the kernels and shapes of its steps in order) it sums each step's times over the graphs, leaving
-// out the kind's first graph (it may create the stream and touch new memory), and names each step when the kind is first
-// seen (spacemit_step_label). When the process ends it appends to <file> one JSON line per kind and name, and one for
-// all of the kind's steps, all per graph: the steps, the mean tile's kernel time (kernel_us) and its kernel and barrier
-// time (wall_us), each step's slowest tile summed (busy_us), each tile's kernel time (tile_us) and how often each was
-// a step's slowest (slowest, over all graphs). Read once
-class spacemit_op_stats_file {
-  public:
-    // nullptr when the switch is not set
-    static spacemit_op_stats_file * get() {
-        static spacemit_op_stats_file file(std::getenv("FLAGOS_SPACEMIT_TEST_OP_STATS"));
-        return file.path.empty() ? nullptr : &file;
-    }
-
-    void add(const char * launch, int64_t rows, int64_t n_kv, const std::vector<spacemit_plugin_step> & steps,
-             const std::vector<const char *> & names, const spacemit_run_stats & run) {
-        const size_t   n     = steps.size();
-        const uint32_t tiles = run.n_tiles;
-        if (run.n_steps != n || tiles == 0) {
-            return;
-        }
-        GGML_ASSERT(names.size() == n);  // the two vectors are filled together in graph_compute
-        const uint64_t              shape = structure_of(steps);
-        std::lock_guard<std::mutex> lock(mutex);
-        totals &                    k = kinds[std::make_tuple(std::string(launch), rows, n_kv, shape)];
-        if (k.labels.empty()) {  // the kind's first graph: its names only
-            k.tiles = tiles;
-            for (size_t s = 0; s < n; s++) {
-                k.labels.push_back(spacemit_step_label(steps, names, s));
-            }
-            k.kernel_ns.assign(n, 0.0);
-            k.busy_ns.assign(n, 0.0);
-            k.wall_ns.assign(n, 0.0);
-            k.tile_ns.assign(n * tiles, 0.0);
-            k.slowest.assign(n * tiles, 0);
-            return;
-        }
-        if (k.tiles != tiles) {
-            return;
-        }
-        k.graphs++;
-        k.launch_us += run.launch_us;
-        for (size_t s = 0; s < n; s++) {
-            uint32_t slowest = 0, at = 0;
-            for (uint32_t t = 0; t < tiles; t++) {
-                const uint32_t kernel = run.kernel_ns[t * run.stride + s];
-                k.kernel_ns[s] += kernel;
-                k.wall_ns[s] += static_cast<double>(kernel) + run.step_barrier_ns[t * run.stride + s];
-                k.tile_ns[s * tiles + t] += kernel;
-                if (kernel > slowest) {
-                    slowest = kernel;
-                    at      = t;
-                }
-            }
-            k.busy_ns[s] += slowest;
-            k.slowest[s * tiles + at]++;
-        }
-    }
-
-    ~spacemit_op_stats_file() {
-        if (path.empty() || kinds.empty()) {
-            return;
-        }
-        FILE * f = std::fopen(path.c_str(), "a");
-        if (f == nullptr) {
-            GGML_LOG_ERROR("FlagOS SpacemiT: cannot write the op counters to %s\n", path.c_str());
-            return;
-        }
-        for (const auto & [key, k] : kinds) {
-            // each name's steps, the names in the order of their first step; then all steps
-            std::vector<std::string>                    names;
-            std::map<std::string, std::vector<size_t>> steps_of;
-            std::vector<size_t>                         all(k.labels.size());
-            for (size_t s = 0; s < k.labels.size(); s++) {
-                std::vector<size_t> & of = steps_of[k.labels[s]];
-                if (of.empty()) {
-                    names.push_back(k.labels[s]);
-                }
-                of.push_back(s);
-                all[s] = s;
-            }
-            names.push_back("(all)");
-            steps_of["(all)"] = all;
-            const double per = 1e3 * static_cast<double>(std::max<uint64_t>(k.graphs, 1));  // ns summed -> us per graph
-            for (const std::string & name : names) {
-                double              kernel = 0.0, busy = 0.0, wall = 0.0;
-                std::vector<double> tile(k.tiles, 0.0);
-                std::vector<uint64_t> slowest(k.tiles, 0);
-                for (size_t s : steps_of[name]) {
-                    kernel += k.kernel_ns[s];
-                    busy += k.busy_ns[s];
-                    wall += k.wall_ns[s];
-                    for (uint32_t t = 0; t < k.tiles; t++) {
-                        tile[t] += k.tile_ns[s * k.tiles + t];
-                        slowest[t] += k.slowest[s * k.tiles + t];
-                    }
-                }
-                std::string tile_us, slowest_n;
-                for (uint32_t t = 0; t < k.tiles; t++) {
-                    char v[48];
-                    std::snprintf(v, sizeof(v), "%s%.3f", t > 0 ? "," : "", tile[t] / per);
-                    tile_us += v;
-                    std::snprintf(v, sizeof(v), "%s%llu", t > 0 ? "," : "", static_cast<unsigned long long>(slowest[t]));
-                    slowest_n += v;
-                }
-                std::fprintf(f,
-                             "{\"launch\":\"%s\",\"rows\":%lld,\"n_kv\":%lld,\"structure\":\"%016llx\",\"steps\":%zu,"
-                             "\"tiles\":%u,\"graphs\":%llu,\"label\":\"%s\",\"n\":%zu,\"wall_us\":%.3f,\"kernel_us\":%.3f,"
-                             "\"busy_us\":%.3f,\"launch_us\":%.3f,\"tile_us\":[%s],\"slowest\":[%s]}\n",
-                             std::get<0>(key).c_str(), static_cast<long long>(std::get<1>(key)),
-                             static_cast<long long>(std::get<2>(key)), static_cast<unsigned long long>(std::get<3>(key)),
-                             k.labels.size(), k.tiles, static_cast<unsigned long long>(k.graphs), name.c_str(),
-                             steps_of[name].size(), wall / k.tiles / per, kernel / k.tiles / per, busy / per,
-                             name == "(all)" ? 1e3 * k.launch_us / per : 0.0, tile_us.c_str(), slowest_n.c_str());
-            }
-        }
-        std::fclose(f);
-    }
-
-  private:
-    explicit spacemit_op_stats_file(const char * p) : path(p != nullptr ? p : "") {
-        if (!path.empty()) {
-            GGML_LOG_WARN("FlagOS SpacemiT: op counters (FLAGOS_SPACEMIT_TEST_OP_STATS) go to %s at exit\n", p);
-        }
-    }
-
-    // what tells two graphs' steps apart: kernels, ops and shapes, not addresses, which may change when llama.cpp
-    // builds the same graph again
-    static uint64_t structure_of(const std::vector<spacemit_plugin_step> & steps) {
-        uint64_t   h   = 0xcbf29ce484222325ULL;
-        const auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001b3ULL; };
-        for (const spacemit_plugin_step & s : steps) {
-            mix(reinterpret_cast<uintptr_t>(s.fn));
-            mix(static_cast<uint64_t>(s.node->op));
-            for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                mix(static_cast<uint64_t>(s.node->ne[d]));
-            }
-            if (s.node->src[0] != nullptr) {
-                mix(static_cast<uint64_t>(s.node->src[0]->type));
-                mix(static_cast<uint64_t>(s.node->src[0]->ne[0]));
-            }
-        }
-        return h;
-    }
-
-    struct totals {
-        uint32_t                 tiles     = 0;
-        uint64_t                 graphs    = 0;  // counted ones: all but the first
-        double                   launch_us = 0.0;
-        std::vector<std::string> labels;
-        std::vector<double>      kernel_ns, busy_ns, wall_ns;  // per step, summed over the tiles (busy: the slowest)
-        std::vector<double>      tile_ns;                      // [step * tiles + tile]
-        std::vector<uint64_t>    slowest;                      // [step * tiles + tile]: graphs where it was slowest
-    };
-
-    std::string                                                                path;
-    std::mutex                                                                 mutex;
-    std::map<std::tuple<std::string, int64_t, int64_t, uint64_t>, totals> kinds;
-};
-
 // every node is checked before its graph first runs (on every graph when the cache is off, at its store in the plan
 // cache otherwise) and the workspace before every launch, so a graph either runs completely or fails with nothing
 // written; a hit trusts the check made at its store under the uid, which llama.cpp keeps only while the graph is reused
@@ -640,6 +235,11 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     spacemit_stats_file * const    stats    = spacemit_stats_file::get();     // test-only (E3c)
     spacemit_op_stats_file * const op_stats = spacemit_op_stats_file::get();  // test-only (fusion-and-splitting.md §7)
     const bool                     timed    = stats != nullptr || op_stats != nullptr;
+    // GGML_FLAGOS_TRACE_LAUNCH: the steps logged by name before the replay. Both it and the op counters need the
+    // steps' contract names, so both the expansion below and the plan cache's entry must carry them (an entry stored
+    // without names serves no graph that wants them, core/flagos-spacemit-plan.cpp:60-66)
+    const bool                     trace      = spacemit_trace_launch();
+    const bool                     want_names = op_stats != nullptr || trace;
     // the plan cache (plan.md "S1 step 3c spec"): by default (FLAGOS_SPACEMIT_PLAN unset or uid-trust) the step list
     // and the workspace sizes come from the cache on a hit, keyed by the split's uid, the node objects and the
     // configuration word; the entry is taken before the contract check and a hit skips it, trusting the uid as CUDA
@@ -683,7 +283,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     // the key alone, before the contract check
     spacemit_plan_result plan = spacemit_plan_result::off;
     if (cached) {
-        plan = ctx->plan.probe(cgraph, word, op_stats != nullptr, ctx->steps, ctx->step_names, scratch_size, act_size);
+        plan = ctx->plan.probe(cgraph, word, want_names, ctx->steps, ctx->step_names, scratch_size, act_size);
     }
     const bool trusted = plan == spacemit_plan_result::hit_uid;
     // a checked node's steps and its part of the workspace: every graph when the cache is off (none, or
@@ -704,7 +304,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         }
         for (uint32_t s = first; s < op->n_steps; s++) {
             ctx->steps.push_back({ op->steps[s]->fn, node, 0 });
-            if (op_stats != nullptr) {  // the labels of the op counters, kept parallel to steps only when they are on
+            if (want_names) {  // the step names, kept parallel to steps only for the counters or the trace
                 ctx->step_names.push_back(op->steps[s]->name);
             }
         }
@@ -805,10 +405,31 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         ctx->run_stats.reset(ctx->steps.size());
         ctx->attach(ctx->stream, &ctx->run_stats);
     }
-    // test-only: E3a's launch mode, one launch per step, is a flag of the replay
-    const uint32_t flags = mode == spacemit_launch_kind::per_step ? SPACEMIT_REPLAY_SYNC_LAUNCH : 0u;
-    const bool ok = ctx->table->replay(ctx->stream, ctx->steps.data(), static_cast<uint32_t>(ctx->steps.size()),
-                                       ctx->workspace, ctx->workspace_size, flags) == SPACEMIT_STATUS_SUCCESS;
+    // test-only: GGML_FLAGOS_SYNC_LAUNCH, one launch per step, is a flag of the replay
+    const uint32_t flags   = mode == spacemit_launch_kind::per_step ? SPACEMIT_REPLAY_SYNC_LAUNCH : 0u;
+    const size_t   n_steps = ctx->steps.size();
+    if (trace) {
+        spacemit_trace_steps(ctx->steps, ctx->step_names);
+        GGML_LOG_INFO("FlagOS SpacemiT: launch %zu steps\n", n_steps);
+    }
+    enum spacemit_status status = SPACEMIT_STATUS_SUCCESS;
+    if (trace && mode == spacemit_launch_kind::per_step) {
+        // the trace with one launch per step: the core issues the replays itself, one step each (the same launches the
+        // plugin would make under the flag), so that it names the step whose launch failed
+        for (size_t i = 0; i < n_steps && status == SPACEMIT_STATUS_SUCCESS; i++) {
+            status = ctx->table->replay(ctx->stream, ctx->steps.data() + i, 1, ctx->workspace, ctx->workspace_size,
+                                        flags);
+            GGML_LOG_INFO("FlagOS SpacemiT: launch step %zu/%zu: %s\n", i + 1, n_steps,
+                          spacemit_status_name(status));
+        }
+    } else {
+        status = ctx->table->replay(ctx->stream, ctx->steps.data(), static_cast<uint32_t>(n_steps), ctx->workspace,
+                                    ctx->workspace_size, flags);
+    }
+    if (trace) {
+        GGML_LOG_INFO("FlagOS SpacemiT: launch %zu steps: %s\n", n_steps, spacemit_status_name(status));
+    }
+    const bool ok = status == SPACEMIT_STATUS_SUCCESS;
     if (counted) {
         ctx->attach(ctx->stream, nullptr);
     }

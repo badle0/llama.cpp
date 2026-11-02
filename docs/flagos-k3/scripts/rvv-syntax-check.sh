@@ -11,7 +11,7 @@ LOGS=${TMPDIR:-/tmp}
 [ $# -gt 0 ] || set -- flagos-spacemit-rvv-kernels.cpp flagos-spacemit-kernels.cpp flagos-spacemit-ime-kernels.cpp flagos-spacemit-ime.cpp flagos-spacemit-rvv-attn.cpp flagos-spacemit-attn.cpp
 status=0
 for f in "$@"; do
-  log="$LOGS/rvv-syntax-$f.log"
+  log="$LOGS/rvv-syntax-$(basename "$f").log"
   clang++ --target=riscv64-unknown-linux-gnu -march=rv64gcv_zfh_zvfh_zba -mabi=lp64d -std=c++17 -fsyntax-only \
     -Wall -Wextra -Wpedantic -Wcast-qual -Wmissing-declarations -Wshadow -Wsign-compare -Wno-unused-function \
     -DGGML_FLAGOS_SPACEMIT_RVV -DGGML_FLAGOS_SPACEMIT_IME2 -I"$INC" -Iggml/include -Iggml/src -Iggml/src/ggml-flagos \

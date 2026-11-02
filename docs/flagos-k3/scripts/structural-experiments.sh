@@ -20,9 +20,9 @@
 #        TIMEOUT   seconds per run (default 3600); DRY=1 prints the commands instead of running them
 # Modes (build A, today's; -fa is llama.cpp's default, auto):
 #   ref           today's state (the plan cache on, its default since plan.md "S1 step 3c spec")
-#   e3            FLAGOS_SPACEMIT_TEST_LAUNCH=per-step   E3a: one launch per step, the host waiting for each
-#   e3c           FLAGOS_SPACEMIT_TEST_STATS=<log>.stats  E3c: the counters, written when each run ends
-#   e3c-a         as e3c, with FLAGOS_SPACEMIT_TEST_LAUNCH=per-step: E3c on E3a, what a launch costs inside a run
+#   e3            GGML_FLAGOS_SYNC_LAUNCH=1       E3a: one launch per step, the host waiting for each
+#   e3c           GGML_FLAGOS_STATS=<log>.stats   E3c: the counters, written when each run ends
+#   e3c-a         as e3c, with GGML_FLAGOS_SYNC_LAUNCH=1: E3c on E3a, what a launch costs inside a run
 #   plan-n        FLAGOS_SPACEMIT_PLAN=none: no plan cache, the contract check and the expansion on every graph;
 #                 ref against plan-n is the default's speed gain
 #   plan-nc       as e3c, with FLAGOS_SPACEMIT_PLAN=none: plan-n with the counters (e3c against plan-nc: the host
@@ -48,12 +48,12 @@ PROMPT="The capital of France is"
 TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
-unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES \
-    FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_PLAN FLAGOS_SPACEMIT_QUANTIZE
+unset FLAGOS_SPACEMIT_TEST_DEVICE_TYPE GGML_FLAGOS_SYNC_LAUNCH FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES \
+    GGML_FLAGOS_STATS FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_PLAN FLAGOS_SPACEMIT_QUANTIZE
 
 mode_env() {
     case $1 in
-        e3 | e3c-a) echo "FLAGOS_SPACEMIT_TEST_LAUNCH=per-step" ;;
+        e3 | e3c-a) echo "GGML_FLAGOS_SYNC_LAUNCH=1" ;;
         plan-n | plan-nc) echo "FLAGOS_SPACEMIT_PLAN=none" ;;
         *) echo "" ;;
     esac
@@ -73,7 +73,7 @@ run() {
     bin=$BUILD_A/bin/$tool
     env=$(mode_env "$mode")
     # E3c: every run writes its counters next to its log, when it ends
-    case $mode in e3c | e3c-a | plan-nc) env="${env:+$env }FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;; esac
+    case $mode in e3c | e3c-a | plan-nc) env="${env:+$env }GGML_FLAGOS_STATS=$log.stats" ;; esac
     if [ -n "$DRY" ]; then
         echo "   [$mode] ${env:+$env }$bin $*"
         return 0

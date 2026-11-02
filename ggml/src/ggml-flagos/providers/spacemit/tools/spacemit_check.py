@@ -12,10 +12,12 @@
 #   (IGPU, D3), -fa auto keeping flash attention there (FAIL with llama.cpp's warning if it turns it off, or if the
 #   graphs take as many splits as the model has layers, as when the CPU runs attention), and a token in 2 graph splits;
 #   a Q8_0 KV cache and a context shift with the provider as with the CPU (structural-experiments.md E2-neg, F8);
-#   perplexity with -fa on and with -fa auto, each within 1% of the CPU (the CPU single-threaded, PROJECT.md §6); mean
-#   KLD against the CPU's logits with 512-token batches (the tiled kernel) and -ub 1 -b 512 (one token per ubatch: the
-#   1-row matmuls, from n_kv 512 the split over the tiles), to compare by hand with build.md §7; llama-bench pp128 and
-#   tg128 for the provider, the CPU and (if built) the upstream IME build; no TCM block left held.
+#   perplexity with -fa on and with -fa auto, each within 1% of the CPU (the CPU single-threaded, PROJECT.md §6);
+#   FLASH_ATTN_EXT disabled by name (GGML_FLAGOS_DISABLE_OPS) leaves the provider, every layer split around it, the
+#   perplexity over 2 chunks within 1% of the enabled run's; mean KLD against the CPU's logits with 512-token batches
+#   (the tiled kernel) and -ub 1 -b 512 (one token per ubatch: the 1-row matmuls, from n_kv 512 the split over the
+#   tiles), to compare by hand with build.md §7; llama-bench pp128 and tg128 for the provider, the CPU and (if built)
+#   the upstream IME build; no TCM block left held.
 #   --depth: after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 for the same
 #   modes; FAIL if the provider's runs miss one
 # Usage: spacemit_check.py [--build] [--build-dir DIR] [--model GGUF] [--ppl-text FILE] [--ime-build DIR]
@@ -135,7 +137,7 @@ def check_tools(bdir, logs):
                    timeout=900)
     # the same with the reference kernels on the AI cores: tells a kernel error from a tiling error
     check_spacemit(bdir, logs, "flagos-check-spacemit (reference kernels)", "check-spacemit-reference", [],
-                   env_extra={"FLAGOS_SPACEMIT_TEST_REFERENCE": "1"}, timeout=900)
+                   env_extra={"GGML_FLAGOS_KERNEL_VARIANTS": "0"}, timeout=900)
     # S1 step 1: the core reaches the device through a plugin table it loaded with dlopen; the check program's loader
     # line names the library it came from
     loader = next((ln for ln in read_log(logs / "check-spacemit") if ln.startswith("loader ")), "")
@@ -185,7 +187,7 @@ def op_correctness(bdir, logs):
         report(f"test-backend-ops {op}", *op_test(bdir, logs, op))
     # the same with the reference kernels on the AI cores, in one line
     failed = [op for op in OPS + GRAPHS
-              if not op_test(bdir, logs, op, {"FLAGOS_SPACEMIT_TEST_REFERENCE": "1"}, "-reference")[0]]
+              if not op_test(bdir, logs, op, {"GGML_FLAGOS_KERNEL_VARIANTS": "0"}, "-reference")[0]]
     report("test-backend-ops, reference kernels", not failed,
            f"{len(OPS + GRAPHS) - len(failed)}/{len(OPS + GRAPHS)} ops pass" + (f"; failed: {', '.join(failed)}" if failed else ""))
 
@@ -346,10 +348,12 @@ def perplexity(bdir, logs, model, text):
              ()),
             ("enabled-fa-auto", ["-t", "8"], {}, ("FLAGOS_SPACEMIT_DISABLE",))]
     kld_base.unlink(missing_ok=True)
-    ppl, problems, fa_auto = {}, {}, None
+    ppl, problems, fa_auto, enabled_log = {}, {}, None, ""
     for name, fa, extra, drop in runs:
         rc, out, err = run([*cmd, *fa], logs / f"ppl-{name}", env_extra={**extra, **preload}, env_drop=drop,
                            timeout=3600)
+        if name == "enabled":
+            enabled_log = out + err
         m = re.search(r"Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)", out + err)
         ppl[name] = float(m.group(1)) if rc == 0 and m else None
         problems[name] = ""
@@ -371,6 +375,37 @@ def perplexity(bdir, logs, model, text):
     if fa_auto is not None:
         # the -fa auto run measures the provider's attention only if it ran there
         report("perplexity -fa auto: flash attention on the provider", *fa_auto)
+    # GGML_FLAGOS_DISABLE_OPS=FLASH_ATTN_EXT: the provider refuses the op and the CPU runs attention; the perplexity
+    # of 2 chunks against the enabled run's over the same chunks, its running estimate after [2] (what a --chunks 2
+    # run reports as its final estimate)
+    rc, out, err = run([str(bdir / "bin" / "llama-perplexity"), "-m", model, "-f", text, "-c", "512", "--chunks", "2",
+                        "-t", "8", "-fa", "on", "-lv", "4"], logs / "ppl-disabled-ops",
+                       env_extra={"GGML_FLAGOS_DISABLE_OPS": "FLASH_ATTN_EXT", **preload},
+                       env_drop=("FLAGOS_SPACEMIT_DISABLE",), timeout=3600)
+    # attention on the CPU splits every layer in two (74 per Qwen3-4B token, attention_on_provider), so splits at or
+    # above the layer count say the op left the provider. Not attention_on_provider itself: under -fa on llama.cpp
+    # makes no auto check, and its flash-attention state is None
+    found = re.findall(r"graph splits = (\d+)(?: \(with bs=\d+\), (\d+) \(with bs=1\))?", err)
+    splits = [int(n) for n in found[-1] if n] if found else []
+    m = re.search(r"print_info: n_layer\s+=\s+(\d+)", err)
+    layers = int(m.group(1)) if m else None
+    m = re.search(r"Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)", out + err)
+    value = float(m.group(1)) if rc == 0 and m else None
+    m = re.search(r"\[2\]([0-9.]+)", enabled_log)
+    ref = float(m.group(1)) if m else None
+    both = None not in (value, ref)
+    ok = bool(splits) and layers is not None and max(splits) >= layers and both and abs(value / ref - 1.0) <= 0.01
+    missing = "; ".join(s for s in (
+        "" if splits else "no graph splits line",
+        "" if layers is not None else "no n_layer line",
+        "" if value is not None else
+        (f"disabled-ops run gave no result: rc={rc}, last log line: {last_line(err or out)[:100]}" +
+         (f"; segv.so report in {logs / 'ppl-disabled-ops.err'}" if "=== segv.so" in err else "")),
+        "" if ref is not None else "no [2] running estimate in the enabled run's log") if s)
+    detail = (f"graph splits {'/'.join(map(str, splits)) or '?'}, layers {layers or '?'}; PPL "
+              f"{'?' if value is None else f'{value:.4f}'} against the enabled run's first two chunks "
+              f"{'?' if ref is None else f'{ref:.4f}'}" + (f" ({100.0 * (value / ref - 1.0):+.2f}%)" if both else ""))
+    report("ops disabled by name leave the provider", ok, "; ".join(s for s in (detail, missing) if s))
     kl_divergence(bdir, logs, model, text, kld_base)
 
 

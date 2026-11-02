@@ -1,5 +1,7 @@
 #include "flagos-spacemit-ops.h"
 
+#include "core/flagos-spacemit-diagnostics.h"  // spacemit_op_disabled (GGML_FLAGOS_DISABLE_OPS)
+
 #include "../../../ggml-impl.h"
 
 #include <cstring>
@@ -252,6 +254,10 @@ bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std
 
 const spacemit_op * spacemit_find_op(const spacemit_ops & ops, const ggml_tensor * op,
                                      ggml_backend_buffer_type_t own_buft) {
+    // GGML_FLAGOS_DISABLE_OPS names ops that go back to the CPU: refused here, so supports_op and graph_compute agree
+    if (spacemit_op_disabled(op->op)) {
+        return nullptr;
+    }
     if (ops.table == nullptr || !spacemit_buffer_usable(op, own_buft)) {
         return nullptr;
     }

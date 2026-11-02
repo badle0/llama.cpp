@@ -1,5 +1,7 @@
 #include "flagos-spacemit-kernels.h"
 
+#include "core/flagos-spacemit-diagnostics.h"  // spacemit_renamed (GGML_FLAGOS_KERNEL_VARIANTS)
+
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 #    include "flagos-spacemit-rvv-kernels.h"
 #endif
@@ -15,8 +17,9 @@
 bool spacemit_use_reference() {
     static const bool reference = [] {
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-        const char * value = std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        spacemit_renamed("FLAGOS_SPACEMIT_TEST_REFERENCE", "GGML_FLAGOS_KERNEL_VARIANTS");
+        const char * value = std::getenv("GGML_FLAGOS_KERNEL_VARIANTS");
+        return value != nullptr && std::strcmp(value, "0") == 0;
 #else
         return true;
 #endif

@@ -208,8 +208,9 @@ the defaults byte for byte, predictions and rules fixed before its K3 run, and a
 
 ### 7.1 The op counters (built 2026-10-21; the baseline run on the K3 the same day)
 
-`FLAGOS_SPACEMIT_TEST_OP_STATS=<file>` (test-only; `spacemit_op_stats_file`, `flagos-spacemit.cpp`) groups E3c's times by
-what each step does. It is M4's first item ("profile a generation step").
+`GGML_FLAGOS_OP_STATS=<file>` (test-only; `spacemit_op_stats_file`, `core/flagos-spacemit-diagnostics.{h,cpp}` since S1
+step 5; the deck's name since 2026-11-02, `FLAGOS_SPACEMIT_TEST_OP_STATS` before, `-` or `1` for stderr) groups E3c's
+times by what each step does. It is M4's first item ("profile a generation step").
 - Recorded per step and tile: the kernel time (E3c's `kernel_ns`) and, new, the wait at the barrier after the step
   (`step_barrier_ns`), from the same clock reads.
 - Per kind of graph (launch mode, rows of the first matmul, n_kv of the first attention, and a hash of the steps' kernels,

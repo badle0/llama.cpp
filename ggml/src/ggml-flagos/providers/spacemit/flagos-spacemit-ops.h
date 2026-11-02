@@ -47,7 +47,8 @@ struct spacemit_ops {
 bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std::string * detail);
 
 // the op for a node, or nullptr when the provider does not handle exactly this op, type, shape and placement: the
-// first contract of the node's op whose structural check and whose every step's supports (where not NULL) pass.
+// first contract of the node's op whose structural check and whose every step's supports (where not NULL) pass, and
+// whose op GGML_FLAGOS_DISABLE_OPS does not name (the diagnostic that sends an op back to the CPU).
 // supports_op and graph_compute both call it, so placement and execution cannot disagree.
 const spacemit_op * spacemit_find_op(const spacemit_ops & ops, const ggml_tensor * op,
                                      ggml_backend_buffer_type_t own_buft);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Summary of the SpacemiT provider's op counters (FLAGOS_SPACEMIT_TEST_OP_STATS; docs/flagos-k3/fusion-and-splitting.md
+# Summary of the SpacemiT provider's op counters (GGML_FLAGOS_OP_STATS; docs/flagos-k3/fusion-and-splitting.md
 # §7). Each line of a counters file is one name (or "(all)") of one kind of graph, per graph.
 #
 # Usage: op-stats.py show <file>...                  per kind of graph, every name's time per graph, largest first

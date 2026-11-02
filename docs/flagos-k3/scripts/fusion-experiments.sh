@@ -22,7 +22,7 @@
 # Modes (all build A, llama.cpp's defaults otherwise; with the counters each run writes <log>.ops and E3c's <log>.stats,
 # from the same clock reads, when it ends):
 #   ref      the defaults
-#   ops      FLAGOS_SPACEMIT_TEST_OP_STATS and FLAGOS_SPACEMIT_TEST_STATS: the op counters and E3c's, on the defaults
+#   ops      GGML_FLAGOS_OP_STATS and GGML_FLAGOS_STATS: the op counters and E3c's, on the defaults
 #   q6       FLAGOS_SPACEMIT_QUANTIZE=shared
 #   q6-ops   q6 with the op counters
 set -uo pipefail
@@ -45,8 +45,8 @@ PROMPT="The capital of France is"
 TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
-unset FLAGOS_SPACEMIT_TEST_OP_STATS FLAGOS_SPACEMIT_TEST_STATS FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_MM \
-    FLAGOS_SPACEMIT_TEST_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_TEST_DEVICE_TYPE
+unset GGML_FLAGOS_OP_STATS GGML_FLAGOS_STATS FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_MM \
+    GGML_FLAGOS_SYNC_LAUNCH FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN FLAGOS_SPACEMIT_TEST_DEVICE_TYPE
 
 mode_env() {
     case $1 in
@@ -66,7 +66,7 @@ run() {
     shift 3
     env=$(mode_env "$mode")
     case $mode in
-        *ops) env="${env:+$env }FLAGOS_SPACEMIT_TEST_OP_STATS=$log.ops FLAGOS_SPACEMIT_TEST_STATS=$log.stats" ;;
+        *ops) env="${env:+$env }GGML_FLAGOS_OP_STATS=$log.ops GGML_FLAGOS_STATS=$log.stats" ;;
     esac
     if [ -n "$DRY" ]; then
         echo "   [$mode] ${env:+$env }$BUILD_A/bin/$tool $*"
