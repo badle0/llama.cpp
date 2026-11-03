@@ -341,25 +341,39 @@ def cache_runs(bdir, logs, model):
              "identical to the CPU" if text_on == text_off else f"differs from the CPU after {same} characters")
 
 
-# the server check (plan.md, "The server check, the baseline before S2"): the prompts and the reply names
+# the server check (plan.md, "The server check, the baseline before S2" and "The server check, the fix after the first
+# K3 run"): the prompts and the reply names
 SERVER_PROMPT_A = "The capital of France is"
-SERVER_B1 = "My favourite colour is green. I live in a small town by the sea.\nQuestion: Where do I live? Answer:"
-SERVER_B2 = "\nQuestion: What is my favourite colour? Answer:"
-SERVER_X1 = ("The train leaves at seven and the bus at nine. Tickets cost four euros.\nQuestion: When does the train "
-             "leave? Answer:")
-SERVER_X2 = "\nQuestion: How much do tickets cost? Answer:"
-SERVER_Y1 = "Anna has two cats and a dog. The dog is called Max.\nQuestion: How many cats does Anna have? Answer:"
-SERVER_Y2 = "\nQuestion: What is the dog called? Answer:"
-SERVER_D = ["Meeting notes.\n",
-            "Item one: the budget for next year is due on Friday, and the report must be sent to the board before then. ",
+# the follow-ups ask for a name their first sentence gives, so the first token is confident (on an unsure token the
+# reused and scratch turns differ most: the first K3 run's B, plan.md)
+SERVER_B1 = ("Tom has a red bicycle and a cat. The cat is called Luna.\nQ: What colour is the bicycle?\nA: Red\n"
+             "Q: What does Tom have?\nA:")
+SERVER_B2 = "\nQ: What is the cat called?\nA:"
+SERVER_X1 = ("The red car belongs to Oscar and the blue car belongs to Mia.\nQ: Who owns the red car?\nA: Oscar\n"
+             "Q: What colour is Oscar's car?\nA:")
+SERVER_X2 = "\nQ: Who owns the blue car?\nA:"
+SERVER_Y1 = ("Anna has two cats and a dog. The dog is called Max.\nQ: How many cats does Anna have?\nA: Two\n"
+             "Q: How many dogs does Anna have?\nA:")
+SERVER_Y2 = "\nQ: What is the dog called?\nA:"
+# the server gives D2 the slot holding D1 only if their common prefix is more than SERVER_SLOT_SIMILARITY of D2's
+# tokens (hence the header line); every part ends with a newline, so the kept part tokenizes the same after either
+SERVER_D = ["Minutes of the garden club meeting, Tuesday evening in the village hall. Present: Anna, Ben, Carla, David "
+            "and Emma. Apologies: Frank.\n",
+            "Item one: the budget for next year is due on Friday, and the report must be sent to the board "
+            "before then.\n",
             "Item two: my favourite colour is green and my sister's favourite colour is blue; we both like the sea and "
             "long walks in the hills on Sundays.\n",
             "Question: What is my favourite colour? Answer:"]
 SERVER_E = " ".join(["The quick brown fox jumps over the lazy dog."] * 50)
 SERVER_REPLIES = ["A", "B1", "B2", "B2-scratch", "C-x1", "C-y1", "C-x2", "C-y2", "C-x2-scratch", "C-y2-scratch", "D1",
                   "D2", "E"]
-# the first token's top-1 probability, reused turn against scratch: an estimate (0.0031 on the simulated device)
-SERVER_TOLERANCE = 0.05
+# checks 3 and 4: the first token's KL divergence of the reused turn from scratch at most this (plan.md, the fix after
+# the first K3 run: above every legitimate figure measured, 0.0369 at most, and the KLD runs' per-token 99.9% points,
+# 0.033 to 0.075; below every lost context the guard does not catch, 0.51 at least)
+SERVER_KLD_LIMIT = 0.1
+# llama-server's --slot-prompt-similarity default (common/common.h:677; tools/server/server-context.cpp:1604-1678),
+# which the runner does not set
+SERVER_SLOT_SIMILARITY = 0.1
 # the errors of a request or a /health poll (URLError and HTTPError are OSErrors, a bad reply a ValueError)
 HTTP_ERRORS = (OSError, ValueError, KeyError, http.client.HTTPException)
 
@@ -390,7 +404,8 @@ def server_wait(srv, url, timeout=600):
 def server_requests(url, replies):
     """The check's requests in order, each reply's content, first-token top_logprobs and timings saved in replies under
     its name. No id_slot: the server chooses the slot, so the interleaved conversations are reloaded from its prompt
-    cache. Returns (error, common prefix of D's two prompts in tokens); after an error the later requests are not sent."""
+    cache. Returns ("", (common prefix of D's two prompts, D2's length), in tokens) or (error, None); after an error the
+    later requests are not sent."""
     current = [""]
 
     def ask(name, prompt, n_predict, cache_prompt, n_probs=0):
@@ -428,35 +443,50 @@ def server_requests(url, replies):
         current[0] = "tokenize"
         t1, t2 = (server_post(url, "/tokenize", {"content": p, "add_special": True})["tokens"] for p in (d1, d2))
         prefix = next((i for i, (a, b) in enumerate(zip(t1, t2)) if a != b), min(len(t1), len(t2)))
-        return "", prefix
+        return "", (prefix, len(t2))
     except HTTP_ERRORS as e:
         return f"request {current[0]} failed: {e}", None
 
 
-def first_token(reply):
-    """(token, probability) of the entry of highest probability in the first token's top_logprobs, or None."""
+def first_probs(reply):
+    """{token id: (probability, token text)} of the first token's top_logprobs, or None."""
     probs = (reply or {}).get("top_logprobs") or []
     if not probs:
         return None
-    top = max(probs, key=lambda t: t["logprob"])
-    return top["token"], math.exp(top["logprob"])
+    return {t["id"]: (math.exp(t["logprob"]), t["token"]) for t in probs}
+
+
+def first_kld(p, q):
+    """(KL(p || q), shared): over the token ids both dicts hold (shared of them), plus one bucket per distribution for
+    the rest of its mass. Merging tokens never raises a KL divergence, so this bounds the full one from below; a token
+    that leaves one list moves its mass into the rest, where the bound does not see it (hence the guard in
+    server_reuse)."""
+    ids = p.keys() & q.keys()
+    rest_p, rest_q = (max(1 - sum(d[i][0] for i in ids), 1e-9) for d in (p, q))
+    kld = sum(p[i][0] * math.log(p[i][0] / q[i][0]) for i in ids) + rest_p * math.log(rest_p / rest_q)
+    return kld, len(ids)
 
 
 def server_reuse(replies, reused, scratch, why):
-    """(ok, detail): the turn that reused the cache (cache_n > 0) against the same prompt from scratch (cache_n 0), the
-    first token's top-1 the same token in both, its probabilities at most SERVER_TOLERANCE apart."""
+    """(ok, detail): the turn that reused the cache (cache_n > 0) against the same prompt from scratch (cache_n 0): each
+    first token's top token among the other's top_logprobs, and first_kld(scratch, reused) at most SERVER_KLD_LIMIT."""
     a, b = replies.get(reused), replies.get(scratch)
     if a is None or b is None:
         return False, f"no reply {reused if a is None else scratch}: {why or 'not sent'}"
     ca, cb = a["timings"].get("cache_n"), b["timings"].get("cache_n")
-    ta, tb = first_token(a), first_token(b)
+    pa, pb = first_probs(a), first_probs(b)
     detail = (f"{reused} cache_n {ca}, prompt_n {a['timings'].get('prompt_n')}; {scratch} cache_n {cb}, prompt_n "
               f"{b['timings'].get('prompt_n')}")
-    if ta is None or tb is None:
-        return False, f"{detail}; no top_logprobs in {reused if ta is None else scratch}"
-    diff = abs(ta[1] - tb[1])
-    ok = (ca or 0) > 0 and cb == 0 and ta[0] == tb[0] and diff <= SERVER_TOLERANCE
-    return ok, f"{detail}; top-1 {ta[0]!r} {ta[1]:.4f} / {tb[0]!r} {tb[1]:.4f}, difference {diff:.4f}"
+    if pa is None or pb is None:
+        return False, f"{detail}; no top_logprobs in {reused if pa is None else scratch}"
+    ta, tb = (max(d, key=lambda i: d[i][0]) for d in (pa, pb))
+    kld, shared = first_kld(pb, pa)
+    guard = [f"; {name}'s top token {mine[top][1]!r} not in {other}'s top {len(theirs)}"
+             for name, mine, top, other, theirs in ((reused, pa, ta, scratch, pb), (scratch, pb, tb, reused, pa))
+             if top not in theirs]
+    ok = (ca or 0) > 0 and cb == 0 and not guard and kld <= SERVER_KLD_LIMIT
+    return ok, (f"{detail}; top-1 {pa[ta][1]!r} {pa[ta][0]:.4f} / {pb[tb][1]!r} {pb[tb][0]:.4f}; KLD {kld:.6f} over "
+                f"{shared} shared tokens and the rest (limit {SERVER_KLD_LIMIT})" + "".join(guard))
 
 
 def server_checks(bdir, logs, model, baseline):
@@ -489,7 +519,7 @@ def server_checks(bdir, logs, model, baseline):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
-    replies, up_s, failure, prefix = {}, None, "", None
+    replies, up_s, failure, d_tokens = {}, None, "", None
     log_path = logs / "server.log"
     with open(log_path, "w") as log:
         srv = None
@@ -499,7 +529,7 @@ def server_checks(bdir, logs, model, baseline):
                                    stderr=subprocess.STDOUT, env=env)
             up_s, failure = server_wait(srv, url)
             if up_s is not None:
-                failure, prefix = server_requests(url, replies)
+                failure, d_tokens = server_requests(url, replies)
         except OSError as e:
             failure = f"llama-server did not start: {e}"
         finally:
@@ -559,14 +589,18 @@ def server_checks(bdir, logs, model, baseline):
     # 5. the shift: D2 reused a chunk beyond the common prefix
     d2 = replies.get("D2")
     chunks = re.findall(r"reusing chunk with size [^\n]*", text)
-    if d2 is None or prefix is None:
+    if d2 is None or d_tokens is None:
         report(names[4], False, f"no reply D2 or no common prefix: {failure}; {len(chunks)} 'reusing chunk' lines")
     else:
+        prefix, n2 = d_tokens
+        sim = prefix / n2 if n2 else 0.0
         cache_n, prompt_n = d2["timings"].get("cache_n") or 0, d2["timings"].get("prompt_n") or 0
         ok = bool(d2["content"]) and cache_n >= prefix + 16 and bool(chunks)
+        slot = (f"above the server's {SERVER_SLOT_SIMILARITY}: D2 can take D1's slot" if sim > SERVER_SLOT_SIMILARITY
+                else f"not above the server's {SERVER_SLOT_SIMILARITY}: D2 takes another slot")
         report(names[4], ok, f"D2: {len(d2['content'])} characters, cache_n {cache_n} of {cache_n + prompt_n} prompt "
-                             f"tokens, common prefix {prefix} tokens; {len(chunks)} 'reusing chunk' lines" +
-               (f", the last: {chunks[-1]}" if chunks else ""))
+                             f"tokens, common prefix {prefix} of {n2} tokens (similarity {sim:.3f}, {slot}); "
+                             f"{len(chunks)} 'reusing chunk' lines" + (f", the last: {chunks[-1]}" if chunks else ""))
 
     # 6. the replies against a saved baseline, exactly
     if baseline:
