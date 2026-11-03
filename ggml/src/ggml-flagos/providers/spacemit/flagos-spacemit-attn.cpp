@@ -466,6 +466,10 @@ int spacemit_flash_attn_split(const ggml_tensor * op) {
     return setting != 0 && split_shape(op) ? setting : 0;
 }
 
+void spacemit_flash_attn_read_switch() {
+    (void) split_setting_from_env();
+}
+
 bool spacemit_flash_attn_one_step_supported(const ggml_tensor * op) {
     return spacemit_flash_attn_supported(op) && spacemit_flash_attn_split(op) == 0;
 }

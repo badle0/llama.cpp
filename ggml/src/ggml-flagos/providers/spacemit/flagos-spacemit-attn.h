@@ -18,6 +18,8 @@ bool spacemit_kernel_flash_attn(const spacemit_tile * tile, ggml_tensor * dst);
 // spacemit_flash_attn_split tells the contracts apart: 2 the split with the turns (the default), 1 the split without
 // them, 0 the one-step op above (other calls, or FLAGOS_SPACEMIT_ATTN=one-chunk)
 int    spacemit_flash_attn_split(const ggml_tensor * op);
+// reads FLAGOS_SPACEMIT_ATTN at registration, so that its warning is not lost in llama.cpp's trial load (common/fit.cpp)
+void   spacemit_flash_attn_read_switch();
 size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node);
 bool   spacemit_kernel_flash_attn_split_partial(const spacemit_tile * tile, ggml_tensor * dst);
 bool   spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile * tile, ggml_tensor * dst);

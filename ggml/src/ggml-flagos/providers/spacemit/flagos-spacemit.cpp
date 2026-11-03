@@ -682,6 +682,11 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
     g_device.buffer_type.iface    = g_buffer_type_iface;
     g_device.buffer_type.device   = &g_device.device;
     g_device.buffer_type.context  = &g_device;
+
+    // llama.cpp would first read these switches inside common_fit_params's trial load, which passes lines below ERROR
+    // on as DEBUG (common/fit.cpp:49-53), so they are read here, at registration, and their once-only warnings show
+    (void) spacemit_device_type(&g_device.device);
+    (void) spacemit_op_disabled(GGML_OP_NONE);
     g_present = true;
     return true;
 }

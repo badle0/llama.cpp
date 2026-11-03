@@ -155,6 +155,8 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     d->description = "SpacemiT K3 A100 AI cores (" + std::to_string(n_ai_cores) + ")";
 #endif
     *dev = d;
+    // the plugin's own switch, read at registration: first read in llama.cpp's trial load, its warning would be hidden
+    spacemit_flash_attn_read_switch();
     return SPACEMIT_STATUS_SUCCESS;
 }
 
