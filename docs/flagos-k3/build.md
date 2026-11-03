@@ -852,6 +852,17 @@ Qwen3-4B Q4_0, the same commands (2026-11-03): the two single-threaded CPU base 
 
 Read: the means and the same-top-p shares are in line with `-c 512` (one token per ubatch +18%, about one standard error; batched -8%), but **the one-token path's tail is heavier at 4096 on 4B**: its maximum 0.41 against 0.06 at 512, and the per-token spread implied by its error bar (the standard error times the square root of 2,047 tokens) 0.0094 against 0.0026, 3.6 times; the batched path's spread grew 1.3 times (0.0090 against 0.0071), and on 0.6B neither grew (0.0040 both, one token per ubatch). Not explained. Two readings fit: a few hard tokens in this stretch of the text that the one-token path handles worse (the batched path reaches 0.35 on it), or a long-context effect in the one-token path of 4B's heads (32 query heads over 8 KV heads; one-token calls from n_kv 512 take the split attention, `flagos-spacemit-attn.cpp:165-166`, checked against the CPU at the NMSE bound 5e-4, `check_spacemit.cpp:1667`). The tests that separate them: the default run again with the whole output kept (whether the maximum reproduces, and the tail percentiles), the same with `FLAGOS_SPACEMIT_ATTN=one-chunk` (no split), and with `GGML_FLAGOS_DISABLE_OPS=FLASH_ATTN_EXT` (attention on the CPU); plus the split's measured NMSE in the runner's `check-spacemit.out`.
 
+The split's NMSE, read the same day, and what it measures. The check program's attention lines (`check-spacemit.out` of the last acceptance runs on the K3, both models' logs alike; the same program on the Mac's simulated device, where the portable reference kernels run), each kernel against ggml-cpu's single-threaded `FLASH_ATTN_EXT`:
+
+| kernel | V summed in | max NMSE against the CPU |
+|---|---|---|
+| RVV one-chunk (the K3) | F16 (`flagos-spacemit-rvv-attn.cpp:633-934`) | 2.78e-6 |
+| portable one-chunk (the Mac) | F32 (`flagos-spacemit-attn.cpp:45`) | 8.78e-5 |
+| RVV split, one token from n_kv 512 (the K3) | F32 (`flagos-spacemit-rvv-attn.cpp:1711-1714`) | 1.59e-4 |
+| portable split (the Mac) | F32 | 1.61e-4 |
+
+ggml-cpu's one-token path sums V in an F16 accumulator, rounded at every position (`ggml/src/ggml-cpu/ops.cpp:8566-8632`), single-threaded over all n_kv positions in one chunk (`:9116-9135`); its batched path (64 query rows and more, as in the KLD bases) sums in F32 (`ops.cpp`, the tiled kernel's `VKQ32`). The pattern, measured: the kernels that sum in F16 as the reference does match it to about 1e-6, those that sum in F32 differ from it by about 1e-4, on either machine. Read: the split's 1.6e-4 is most likely the reference's own rounding (an F16 sum over thousands of positions; a random walk of half-ulp errors over 4,096 positions gives a relative error near 1.6e-2, an NMSE near 2.5e-4, an estimate), not an imprecision of the split, which sums in F32 as the CPU's batched kernel does. So the split is not the likely cause of the 4B tail: in the KLD runs both sides summed attention in F32 (the provider's split against the CPU's batched base). Unverified until an exact reference exists: the check program compares against ggml-cpu, not against an F64 computation. Expected under this reading: `FLAGOS_SPACEMIT_ATTN=one-chunk` (F16 sums) leaves the KLD the same or worse, not better.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
