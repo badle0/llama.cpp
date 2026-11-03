@@ -12,6 +12,10 @@
 #   (IGPU, D3), -fa auto keeping flash attention there (FAIL with llama.cpp's warning if it turns it off, or if the
 #   graphs take as many splits as the model has layers, as when the CPU runs attention), and a token in 2 graph splits;
 #   a Q8_0 KV cache and a context shift with the provider as with the CPU (structural-experiments.md E2-neg, F8);
+#   llama-server (--skip-server leaves it out): every layer and the KV cache on the provider with 4 slots in one unified
+#   KV cache, a greedy reply equal to llama-completion's, a follow-up turn and two interleaved conversations (reloaded
+#   from the server's prompt cache) each against the same prompt from scratch, KV shifting (--cache-reuse); every reply
+#   saved in logs/server.json, and with --server-baseline equal to a saved one's;
 #   perplexity with -fa on and with -fa auto, each within 1% of the CPU (the CPU single-threaded, PROJECT.md §6);
 #   FLASH_ATTN_EXT disabled by name (GGML_FLAGOS_DISABLE_OPS) leaves the provider, every layer split around it, the
 #   perplexity over 2 chunks within 1% of the enabled run's; mean KLD against the CPU's logits with 512-token batches
@@ -21,14 +25,20 @@
 #   --depth: after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 for the same
 #   modes; FAIL if the provider's runs miss one
 # Usage: spacemit_check.py [--build] [--build-dir DIR] [--model GGUF] [--ppl-text FILE] [--ime-build DIR]
-#                          [--skip-support] [--depth] [--segv SO]
+#                          [--skip-support] [--depth] [--segv SO] [--skip-server] [--server-baseline JSON]
 import argparse
 import csv
+import http.client
 import io
+import json
+import math
 import os
 import re
+import socket
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[6]
@@ -102,7 +112,7 @@ def build(bdir, logs, spert_dir):
         return False
     targets = ["ggml-flagos", "flagos-check-provider", "flagos-check-target", "flagos-check-graph-plan",
                "flagos-check-registry", "flagos-check-spacemit", "test-backend-ops", "llama-completion", "llama-bench",
-               "llama-perplexity"]
+               "llama-perplexity", "llama-server"]
     rc, out, err = run(["cmake", "--build", str(bdir), "--target", *targets], logs / "build", timeout=3600)
     errors = [ln for ln in (out + err).splitlines() if "error:" in ln or "FAILED" in ln]
     report("build", rc == 0 and not errors, f"rc={rc}, {len(errors)} error lines" + (f": {errors[0][:120]}" if errors else ""))
@@ -331,6 +341,270 @@ def cache_runs(bdir, logs, model):
              "identical to the CPU" if text_on == text_off else f"differs from the CPU after {same} characters")
 
 
+# the server check (plan.md, "The server check, the baseline before S2"): the prompts and the reply names
+SERVER_PROMPT_A = "The capital of France is"
+SERVER_B1 = "My favourite colour is green. I live in a small town by the sea.\nQuestion: Where do I live? Answer:"
+SERVER_B2 = "\nQuestion: What is my favourite colour? Answer:"
+SERVER_X1 = ("The train leaves at seven and the bus at nine. Tickets cost four euros.\nQuestion: When does the train "
+             "leave? Answer:")
+SERVER_X2 = "\nQuestion: How much do tickets cost? Answer:"
+SERVER_Y1 = "Anna has two cats and a dog. The dog is called Max.\nQuestion: How many cats does Anna have? Answer:"
+SERVER_Y2 = "\nQuestion: What is the dog called? Answer:"
+SERVER_D = ["Meeting notes.\n",
+            "Item one: the budget for next year is due on Friday, and the report must be sent to the board before then. ",
+            "Item two: my favourite colour is green and my sister's favourite colour is blue; we both like the sea and "
+            "long walks in the hills on Sundays.\n",
+            "Question: What is my favourite colour? Answer:"]
+SERVER_E = " ".join(["The quick brown fox jumps over the lazy dog."] * 50)
+SERVER_REPLIES = ["A", "B1", "B2", "B2-scratch", "C-x1", "C-y1", "C-x2", "C-y2", "C-x2-scratch", "C-y2-scratch", "D1",
+                  "D2", "E"]
+# the first token's top-1 probability, reused turn against scratch: an estimate (0.0031 on the simulated device)
+SERVER_TOLERANCE = 0.05
+# the errors of a request or a /health poll (URLError and HTTPError are OSErrors, a bad reply a ValueError)
+HTTP_ERRORS = (OSError, ValueError, KeyError, http.client.HTTPException)
+
+
+def server_post(url, path, body, timeout=600):
+    req = urllib.request.Request(url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def server_wait(srv, url, timeout=600):
+    """(seconds, "") once GET /health answers {"status": "ok"}, or (None, why) if the server exits or the time runs out.
+    It answers 503 while the model loads."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if srv.poll() is not None:
+            return None, f"llama-server exited with rc={srv.returncode} before it was ready"
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=5) as r:
+                if json.loads(r.read()).get("status") == "ok":
+                    return time.time() - t0, ""
+        except HTTP_ERRORS:
+            pass
+        time.sleep(1)
+    return None, f"/health not ok after {timeout} s"
+
+
+def server_requests(url, replies):
+    """The check's requests in order, each reply's content, first-token top_logprobs and timings saved in replies under
+    its name. No id_slot: the server chooses the slot, so the interleaved conversations are reloaded from its prompt
+    cache. Returns (error, common prefix of D's two prompts in tokens); after an error the later requests are not sent."""
+    current = [""]
+
+    def ask(name, prompt, n_predict, cache_prompt, n_probs=0):
+        current[0] = name
+        body = {"prompt": prompt, "n_predict": n_predict, "temperature": 0, "cache_prompt": cache_prompt}
+        if n_probs:
+            body["n_probs"] = n_probs
+        r = server_post(url, "/completion", body)
+        probs = r.get("completion_probabilities") or []
+        replies[name] = {"content": r["content"], "top_logprobs": probs[0].get("top_logprobs") if probs else None,
+                         "timings": r.get("timings", {})}
+        return r["content"]
+
+    try:
+        # A: a fresh server against llama-completion
+        ask("A", SERVER_PROMPT_A, 32, False)
+        # B: a follow-up turn reusing the slot's cache, then the same prompt from scratch
+        p2 = SERVER_B1 + ask("B1", SERVER_B1, 12, True, 5) + SERVER_B2
+        ask("B2", p2, 12, True, 5)
+        ask("B2-scratch", p2, 12, False, 5)
+        # C: two conversations interleaved; each new task saves the other slot to the prompt cache and clears it
+        x2 = SERVER_X1 + ask("C-x1", SERVER_X1, 12, True, 5) + SERVER_X2
+        y2 = SERVER_Y1 + ask("C-y1", SERVER_Y1, 12, True, 5) + SERVER_Y2
+        ask("C-x2", x2, 12, True, 5)
+        ask("C-y2", y2, 12, True, 5)
+        ask("C-x2-scratch", x2, 12, False, 5)
+        ask("C-y2-scratch", y2, 12, False, 5)
+        # D: KV shifting, a cached A+B+C+Q then A+C+Q
+        d1, d2 = "".join(SERVER_D), SERVER_D[0] + "".join(SERVER_D[2:])
+        ask("D1", d1, 12, True, 5)
+        ask("D2", d2, 12, True, 5)
+        # E: about 500 prompt tokens, for the time to the first token and per token
+        ask("E", SERVER_E, 32, False)
+        # D's common prefix as the server counts its prompt (with BOS)
+        current[0] = "tokenize"
+        t1, t2 = (server_post(url, "/tokenize", {"content": p, "add_special": True})["tokens"] for p in (d1, d2))
+        prefix = next((i for i, (a, b) in enumerate(zip(t1, t2)) if a != b), min(len(t1), len(t2)))
+        return "", prefix
+    except HTTP_ERRORS as e:
+        return f"request {current[0]} failed: {e}", None
+
+
+def first_token(reply):
+    """(token, probability) of the entry of highest probability in the first token's top_logprobs, or None."""
+    probs = (reply or {}).get("top_logprobs") or []
+    if not probs:
+        return None
+    top = max(probs, key=lambda t: t["logprob"])
+    return top["token"], math.exp(top["logprob"])
+
+
+def server_reuse(replies, reused, scratch, why):
+    """(ok, detail): the turn that reused the cache (cache_n > 0) against the same prompt from scratch (cache_n 0), the
+    first token's top-1 the same token in both, its probabilities at most SERVER_TOLERANCE apart."""
+    a, b = replies.get(reused), replies.get(scratch)
+    if a is None or b is None:
+        return False, f"no reply {reused if a is None else scratch}: {why or 'not sent'}"
+    ca, cb = a["timings"].get("cache_n"), b["timings"].get("cache_n")
+    ta, tb = first_token(a), first_token(b)
+    detail = (f"{reused} cache_n {ca}, prompt_n {a['timings'].get('prompt_n')}; {scratch} cache_n {cb}, prompt_n "
+              f"{b['timings'].get('prompt_n')}")
+    if ta is None or tb is None:
+        return False, f"{detail}; no top_logprobs in {reused if ta is None else scratch}"
+    diff = abs(ta[1] - tb[1])
+    ok = (ca or 0) > 0 and cb == 0 and ta[0] == tb[0] and diff <= SERVER_TOLERANCE
+    return ok, f"{detail}; top-1 {ta[0]!r} {ta[1]:.4f} / {tb[0]!r} {tb[1]:.4f}, difference {diff:.4f}"
+
+
+def server_checks(bdir, logs, model, baseline):
+    """llama-server on the provider through the paths single-user clients use: its default 4 slots in one unified KV
+    cache, a follow-up turn reusing the cache, conversations reloaded from its host-RAM prompt cache, KV shifting
+    (--cache-reuse 16); every reply saved in logs/server.json, the baseline S2 must reproduce (with baseline, check 6
+    compares against one). A missing binary or model, or a server that does not come up, fails every check."""
+    names = ["llama-server: every layer and the KV cache on the provider, 4 slots in one unified KV cache",
+             "llama-server's greedy reply is llama-completion's",
+             "llama-server: a follow-up turn reusing its cache matches the turn from scratch",
+             "llama-server: interleaved conversations reload from the prompt cache and match from scratch",
+             "llama-server: KV shifting (--cache-reuse) runs on the provider"]
+    if baseline:
+        names.append("llama-server's replies equal the baseline's")
+    server = bdir / "bin" / "llama-server"
+    problem = (f"not found: {server}" if not server.is_file() else
+               f"model not found: {model}" if not Path(model).is_file() else "")
+    if problem:
+        for name in names:
+            report(name, False, problem)
+        return
+    # the reference first, so that it and the server never run at the same time
+    rc_ref, ref_out, ref_err = run([str(bdir / "bin" / "llama-completion"), "-m", model, "-p", SERVER_PROMPT_A, "-n",
+                                    "32", "--temp", "0", "-no-cnv", "-t", "8", "-c", "4096"], logs / "server-reference",
+                                   env_extra=preload, env_drop=("FLAGOS_SPACEMIT_DISABLE",))
+    # the environment of the model runs, as run() builds it
+    env = {k: v for k, v in os.environ.items() if k != "FLAGOS_SPACEMIT_DISABLE"}
+    env.update(preload)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    replies, up_s, failure, prefix = {}, None, "", None
+    log_path = logs / "server.log"
+    with open(log_path, "w") as log:
+        srv = None
+        try:
+            srv = subprocess.Popen([str(server), "-m", model, "--host", "127.0.0.1", "--port", str(port), "-t", "8", "-c",
+                                    "4096", "-lv", "4", "--cache-reuse", "16"], stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=subprocess.STDOUT, env=env)
+            up_s, failure = server_wait(srv, url)
+            if up_s is not None:
+                failure, prefix = server_requests(url, replies)
+        except OSError as e:
+            failure = f"llama-server did not start: {e}"
+        finally:
+            if srv is not None and srv.poll() is None:
+                srv.terminate()
+                try:
+                    srv.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    srv.kill()
+                    srv.wait()
+    text = ANSI.sub("", log_path.read_text(errors="replace"))
+    if up_s is None:
+        why = f"{failure}; last log line: {last_line(text)[:100]}"
+        for name in names:
+            report(name, False, why)
+        return
+    (logs / "server.json").write_text(json.dumps(replies, indent=1) + "\n")
+
+    # 1. placement and layout, from the last context the log creates
+    off = re.findall(r"offloaded (\d+)/(\d+) layers", text)
+    seq = re.findall(r"llama_context: n_seq_max\s*=\s*(\d+)", text)
+    unified = re.findall(r"llama_context: kv_unified\s*=\s*(\w+)", text)
+    splits = re.findall(r"graph splits = (\d+)(?: \(with bs=\d+\), (\d+) \(with bs=1\))?", text)
+    splits = [int(n) for n in splits[-1] if n] if splits else []
+    last_ctx = text[text.rfind("llama_context: n_seq_max"):] if seq else ""
+    kv = [(m.group(1), float(m.group(2))) for m in re.finditer(r"(\S+) KV buffer size\s*=\s*([0-9.]+) MiB", last_ctx)]
+    ok = (bool(off) and off[-1][0] == off[-1][1] and any(n.startswith("FlagOS:SpacemiT") and v > 0 for n, v in kv) and
+          seq[-1:] == ["4"] and unified[-1:] == ["true"] and bool(splits) and all(n == 2 for n in splits))
+    report(names[0], ok,
+           f"up after {up_s:.1f} s; " + (f"offloaded {off[-1][0]}/{off[-1][1]} layers" if off else "no offload line") +
+           f"; KV buffers {', '.join(f'{n} {v:.2f} MiB' for n, v in kv) or 'none'}; n_seq_max "
+           f"{seq[-1] if seq else '?'}, kv_unified {unified[-1] if unified else '?'}, graph splits "
+           f"{'/'.join(map(str, splits)) or '?'}")
+
+    # 2. A against llama-completion, whose output repeats the prompt and ends with two newlines
+    a = replies.get("A")
+    if a is None:
+        report(names[1], False, f"no reply A: {failure}")
+    elif rc_ref != 0 or not ref_out.startswith(SERVER_PROMPT_A):
+        report(names[1], False, f"llama-completion: rc={rc_ref}, output does not start with the prompt: "
+                                f"{ref_out[:40]!r}; last log line: {last_line(ref_err)[:100]}")
+    else:
+        got, want = a["content"].rstrip("\n"), ref_out[len(SERVER_PROMPT_A):].rstrip("\n")
+        i = next((i for i, (x, y) in enumerate(zip(got, want)) if x != y), min(len(got), len(want)))
+        report(names[1], got == want, f"{len(got)} characters equal" if got == want else
+               f"first difference at character {i} (lengths {len(got)}, {len(want)}): server {got[i:i + 20]!r}, "
+               f"llama-completion {want[i:i + 20]!r}")
+
+    # 3. the follow-up turn
+    report(names[2], *server_reuse(replies, "B2", "B2-scratch", failure))
+
+    # 4. the interleaved conversations, reloaded from the prompt cache
+    found = len(re.findall(r"found better prompt", text))
+    (ok_x, det_x), (ok_y, det_y) = (server_reuse(replies, f"C-{c}2", f"C-{c}2-scratch", failure) for c in "xy")
+    report(names[3], ok_x and ok_y and found > 0, f"{det_x}; {det_y}; {found} 'found better prompt' lines")
+
+    # 5. the shift: D2 reused a chunk beyond the common prefix
+    d2 = replies.get("D2")
+    chunks = re.findall(r"reusing chunk with size [^\n]*", text)
+    if d2 is None or prefix is None:
+        report(names[4], False, f"no reply D2 or no common prefix: {failure}; {len(chunks)} 'reusing chunk' lines")
+    else:
+        cache_n, prompt_n = d2["timings"].get("cache_n") or 0, d2["timings"].get("prompt_n") or 0
+        ok = bool(d2["content"]) and cache_n >= prefix + 16 and bool(chunks)
+        report(names[4], ok, f"D2: {len(d2['content'])} characters, cache_n {cache_n} of {cache_n + prompt_n} prompt "
+                             f"tokens, common prefix {prefix} tokens; {len(chunks)} 'reusing chunk' lines" +
+               (f", the last: {chunks[-1]}" if chunks else ""))
+
+    # 6. the replies against a saved baseline, exactly
+    if baseline:
+        try:
+            base = json.loads(Path(baseline).read_text())
+        except (OSError, ValueError) as e:
+            report(names[5], False, f"baseline not read: {e}")
+            base = None
+        if base is not None:
+            order = SERVER_REPLIES + sorted((set(base) | set(replies)) - set(SERVER_REPLIES))
+            differ = []
+            for name in order:
+                mine, theirs = replies.get(name), base.get(name)
+                if mine is None or theirs is None:
+                    differ.append(f"{name} missing in {'this run' if mine is None else 'the baseline'}")
+                    continue
+                fields = [k for k in ("content", "top_logprobs") if mine.get(k) != theirs.get(k)]
+                if fields:
+                    differ.append(f"{name} ({', '.join(fields)})")
+            report(names[5], not differ, f"{len(order) - len(differ)}/{len(order)} replies equal to {baseline}" +
+                   (f"; differ: {'; '.join(differ[:5])}" if differ else ""))
+
+    info("llama-server load", f"{up_s:.1f} s to /health ok")
+    if "E" in replies:
+        t = replies["E"]["timings"]
+        info("llama-server E", f"TTFT {t.get('prompt_ms', 0):.0f} ms for {t.get('prompt_n')} prompt tokens; "
+                               f"{t.get('predicted_per_token_ms', 0):.1f} ms per output token "
+                               f"({t.get('predicted_n')} tokens)")
+    if "B2" in replies and "B2-scratch" in replies:
+        r, s = replies["B2"]["timings"], replies["B2-scratch"]["timings"]
+        info("llama-server B", f"follow-up prompt {r.get('prompt_ms', 0):.0f} ms for {r.get('prompt_n')} tokens with "
+                               f"the cache, {s.get('prompt_ms', 0):.0f} ms for {s.get('prompt_n')} from scratch")
+    if a is not None:
+        info("llama-server text", " ".join(a["content"].split())[:90])
+    if failure:
+        info("llama-server requests", failure)
+
+
 def perplexity(bdir, logs, model, text):
     if not Path(text).is_file():
         report("perplexity", False, f"text not found: {text}")
@@ -497,6 +771,9 @@ def main():
     ap.add_argument("--depth", action="store_true",
                     help="llama-bench: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 for each mode "
                          "(long)")
+    ap.add_argument("--skip-server", action="store_true", help="skip the llama-server checks")
+    ap.add_argument("--server-baseline", default="", metavar="JSON",
+                    help="a saved logs/server.json: also check that llama-server's replies equal it")
     ap.add_argument("--segv", default="", help="crash reporter (scripts/segv.c built as .so) to preload into the model runs and the check program's passes")
     args = ap.parse_args()
     if args.segv:
@@ -526,6 +803,8 @@ def main():
     bench(bdir, logs)
     model_run(bdir, logs, args.model)
     cache_runs(bdir, logs, args.model)
+    if not args.skip_server:
+        server_checks(bdir, logs, args.model, args.server_baseline or None)
     perplexity(bdir, logs, args.model, args.ppl_text)
     llama_bench(bdir, logs, args.model, args.ime_build, args.tcm_dir, args.depth)
     tcm_hygiene(args.tcm_dir, logs)
