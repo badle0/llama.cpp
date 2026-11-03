@@ -886,6 +886,34 @@ Batched at `-c 256` (256-token ubatches): mean KLD 0.004177 ± 0.000133, 99% 0.0
 
 Run 1 gives the first probe's figures to every printed digit (mean, maximum, same top p, perplexity): the result is deterministic, and the follow-up's build gives the step 5 build's output on the K3. **The heavier tail is one token:** without its worst token run 1's mean is 0.001247, `-c 512`'s within its error bar, and that token alone accounts for 0.0091 of the 0.0094 per-token spread (the standard error times the square root of 2,047); the other 2,046 tokens' spread, what the error bar leaves after it, is 0.0026, `-c 512`'s, so a second token can reach at most 0.12 (with ggml-cpu's attention the same: 0.0027 left, at most 0.13). **Attention is not its cause:** with ggml-cpu's attention (run 3) the worst token reaches 0.36, and the bulk is the same (0.001279 without it); with the one-chunk kernels 0.18, their bulk slightly higher (0.001495 without the worst token, median 0.00045 against 0.00037), as their F16 sums predicted. The default, the split, has the lowest median, 99% and 99.9% of the three. Read: one token of this window is sensitive enough that every variant's rounding moves its distribution far (0.18 to 0.41), and the batched path reaches 0.35 on the same window (the first probe); which token, and why it is so sensitive, the KLD summary cannot show (that needs a per-token view). No defect found in the one-token path at long context. The perplexities differ by at most 0.4%, within the paired uncertainty (about ±0.34%); the CPU's own figure for this base was not saved (its runs printed only their last line).
 
+**Batch size and context on the K3: the bottleneck suite, 2026-11-03** (Qwen3-4B Q4_0, the build of the step 5 follow-up, `llama-bench -t 8 -fa on -lm none -r 3`; the suite's text tested on the Mac first). Step 1, one prompt graph of N rows each (`-p N -n 0`; one row is generation's shape):
+
+| rows | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| t/s | 11.45 | 18.91 | 36.05 | 60.79 | 80.99 | 103.55 | **116.55** | 106.85 | 103.37 | 96.39 |
+| time per graph against one row's 87.3 ms | 1.00 | 1.21 | 1.27 | 1.51 | 2.26 | 3.54 | 6.29 | 13.72 | 28.36 | 60.82 |
+
+Read (the derived figures computed from these, estimates where so labelled): one row reads the 2.51 GB the provider stores per token at 28.7 GB/s, the AI cores' streaming ceiling, so generation at batch size 1 is bound by DRAM bandwidth; up to 8 rows the graph takes at most 1.5 times one row's time (5.3 times the throughput), from 16 rows the time grows nearly in proportion, so the knee lies between 8 and 16 rows (the roofline estimate gave about 8 for Q4_0); the plateau is 116.55 t/s at 64 rows, about 0.85 int8 TOPS (2 operations per weight, the head excluded since a prompt graph computes one row of logits), the ceiling of our kernels, not necessarily the chip's; past 64 rows the speed falls (96.39 at 512), where the prompt's own attention grows (12% of a pp512 batch on 2026-10-21, `fusion-and-splitting.md` §4) and the matmuls change path. Two rows cost 1.21 times one, nearly what four cost (1.27): probably the 4-row kernel computing padding rows (the IME kernels come as `_m1` and `_m4`), not measured. Against the 2026-10-21 sweep (an older build, `fusion-and-splitting.md` §7.3) today's default matches or beats its best setting from 32 rows (pp64 116.55 against 108.39 at best). Step 2, generation against context depth (`-p 0 -n 32 -d N`):
+
+| tokens cached | 0 | 1,024 | 2,048 | 4,096 | 8,192 |
+|---|---|---|---|---|---|
+| tg32 t/s | 11.20 | 9.75 | 8.98 | 7.75 | 6.09 |
+| ms per token | 89.3 | 102.6 | 111.4 | 129.0 | 164.2 |
+| KV cache read per token (n_kv rounded up to 256; 144 KiB a position) | 36 MiB | 180 MiB | 324 MiB | 612 MiB | 1,188 MiB |
+
+Depths 0, 1024 and 4096 repeat step 5's run within 0.3%. Read: the cache costs 8.6 µs per cached position per token from 2,048 to 8,192 (computed), so it is read at about 17 GB/s at the margin, about 60% of the weights' rate (11-16 GB/s including attention's fixed costs at the shallower depths; all the extra time counted as cache reading, an estimate that ignores attention's arithmetic); at about 10,400 cached positions the cache would take as long as all the matmuls (extrapolated). Step 3, parallel decoding (`llama-batched-bench -c 8192 -b 2048 -ub 512 -npp 128 -ntg 128 -npl 1,2,4,8,16`; a KV stream per sequence; 37/37 layers, 2 graph splits, so attention stayed on the provider):
+
+| sequences decoded together | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| total generation t/s (S_TG) | 10.91 | 17.59 | 31.77 | 46.74 | 59.35 |
+| each sequence's t/s | 10.91 | 8.79 | 7.94 | 5.84 | 3.71 |
+| ms per step / the same rows in one prompt graph (step 1) | 91.7 / 87.3 | 113.7 / 105.8 | 125.9 / 111.0 | 171.2 / 131.6 | 269.6 / 197.6 |
+| prompt phase, S_PP t/s | 105.22 | 104.81 | 102.93 | 103.27 | 71.18 |
+
+Read: 2.9 times the total at 4 sequences with each at 73% of one alone, 4.3 times at 8 (54%), 5.4 times at 16 (34%). A step costs more than the same number of rows in one prompt graph, 15 ms more at 4 sequences and 72 at 16: each sequence reads its own cache (B × 256 positions × 144 KiB a step), at an implied 8-10 GB/s (all the gap counted as cache reading, an estimate), below one sequence's 17 GB/s at depth; with several streams one-token attention takes the one-step kernels (the split needs a single stream, `flagos-spacemit-attn.cpp:209`). Not measured: the per-op split of a parallel step (the op counters on `llama-batched-bench` would give it).
+
+Step 4, the op counters at 1, 8 and 128 rows (prompt graphs at n_kv 256, `op-stats.py show`): per graph 87.5, 131.9 and 1,198 ms (step 1's ratios), the tiles' imbalance 2.7, 8.8 and 3.8 ms (3.1%, 6.6%, 0.3%). Computed from the weights' sizes: at one row every matmul reads its weights at 26-31 GB/s, on the bandwidth line (the head, Q6_K run as Q8_0, 13.2 ms, 15.1% of a token); at 128 rows the Q4_0 matmuls run at 0.91-0.99 int8 TOPS, so the kernels' ceiling is about 0.96 TOPS and the ridge 0.96 TOPS / 29 GB/s / 3.6 operations per byte per row = about 9.3 rows (measured knee 8-16); the requantized Q4_1 downs (Q8_0) reach 0.55 TOPS and cost 2.13 times their one-row time at 8 rows, against 1.28-1.63 for the Q4_0 matmuls. At 8 rows the imbalance is largest: the quantize step of `ffn_down`'s input (its slowest tile 2.1 ms, its fastest 0.06) and the matmuls' spread across tiles. Attention at n_kv 256: 0.67 ms at one row, 4.2 at 8, 62 at 128.
+
 Manual checks:
 - Always report `pp` and `tg` separately; repeat and interleave runs and note mean and median.
 - Confirm IME is active: a `CPU_RISCV64_SPACEMIT` model buffer in `./build-ime/bin/llama-perplexity ... -lv 4` output (buffer name from `ggml/src/ggml-cpu/spacemit/ime.cpp:1477`).
