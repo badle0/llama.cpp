@@ -1578,7 +1578,7 @@ Every token count above, and check 2's length, is the Mac's simulated device's; 
 
 ### Two measurements without code: the KV cache's types on the Mac, speculative decoding on the K3 (spec, 2026-11-04)
 
-**Status:** written 2026-11-04 on the user's request ("help me plan the KV-cache quantization accuracy check (Mac only); speculative decoding with the 0.6B as the 4B's draft; give me commands to run them"), after the batch-size-1 discussion. Neither changes code; both use llama.cpp's own tools. The commands were tested on the Mac (below); the runs are the user's, the first on the Mac, the second on the K3. Part A measured 2026-11-04 (its result after the preview); part B's first K3 run found that a second provider context in one process gets no AI cores (below), the run with a stream per graph pending.
+**Status:** written 2026-11-04 on the user's request ("help me plan the KV-cache quantization accuracy check (Mac only); speculative decoding with the 0.6B as the 4B's draft; give me commands to run them"), after the batch-size-1 discussion. Neither changes code; both use llama.cpp's own tools. The commands were tested on the Mac (below); the runs are the user's, the first on the Mac, the second on the K3. Part A measured 2026-11-04 (its result after the preview); part B's first K3 run found that a second provider context in one process gets no AI cores, and with a stream per graph it was measured the same day (both below).
 
 **A. The KV cache's types on Qwen3: accuracy on the Mac.**
 - Question: what llama.cpp's quantized caches cost Qwen3 at long context, which half carries the cost, and what the Hadamard rotation buys, before a provider kernel for a quantized cache is designed (after S2).
@@ -1642,6 +1642,31 @@ Every token count above, and check 2's length, is the Mac's simulated device's; 
 - Decision: a gain of 1.3 times or more on the natural prompts makes speculative decoding a single-user option after S2 (the server's `-md` with `--spec-type draft-simple`), with no provider change; less, and it is recorded and set aside.
 - Tests on the Mac (Qwen3-0.6B as both models, so the mechanics only, not the speed): the loop's 16 runs complete; with the model drafting for itself every draft is accepted and every text equals the baseline's; on the simulated device two models in one process: 29/29 layers twice, two 448 MiB caches in the provider's buffer, 2 graph splits each, exit code 0.
 - First run on the K3 (2026-11-04; the user; the build of `f9ac19fb1` with `llama-speculative` added): the placement as predicted (37/37 and 29/29 layers on the provider, the caches 576.00 and 448.00 MiB in its buffer, 2 graph splits each), then an abort (exit code 134) before any token. The draft's context got no AI cores: `FlagOS SpacemiT: could not get 8 AI cores from spine-runtime`, three times 30 s apart (its warm-up, `common/common.cpp:1428`; its prompt, `examples/speculative/speculative.cpp:195`; its first draft, `:473`), each decode failing with -3; `llama-speculative` ignores `llama_decode`'s result, so it then sampled from the draft's missing logits (`:514`): `GGML_ASSERT(logits != nullptr)` at `common/sampling.cpp:154`. No TCM block held after. The cause: every backend context keeps a persistent spine-runtime stream holding all 8 AI cores until it is freed (`flagos-spacemit.cpp:529`; the plugin's executor, `flagos-spacemit-exec.cpp:233-258`; "Stream lifetime" above), and the target's warm-up took them. The first run with two provider contexts alive at once on the K3: llama-bench frees each context before the next, llama-server has one. The Mac's host executor has no cores to hold: there Qwen3-4B drafted by Qwen3-0.6B runs on the simulated device (21 tokens, 58% of drafts accepted, exit code 0). So any process with two provider contexts (speculative decoding, the server's `-md`, two models in one application) needs the cores shared between contexts: a constraint for S2's stream design, where the device already serializes its contexts' runs (`run_mutex`, `flagos-spacemit.cpp:50, 395`). The 30 s per failure looks like spine-runtime waiting for the cores before it gives up (an inference from the timestamps). Next: the same runs with a stream per graph (`FLAGOS_SPACEMIT_STREAM=per-call`, M2a's switch, 24.3 µs a launch against 9.9 then), every run of the comparison under it.
+- With a stream per graph (2026-11-04; the user; `FLAGOS_SPACEMIT_STREAM=per-call` for every run, the baselines included): the placement run completes (18 tokens, 36% of drafts accepted, no "could not get", no TCM block held), so the two contexts taking turns is enough; the loop's 16 runs complete, no TCM block held after. The baselines are the persistent stream's (p1 to p3 11.04 to 11.09 t/s, tg128 11.12 in the runner the same day; p4 10.09, the split's figure), so a stream per graph costs nothing measurable at one graph per token.
+
+| prompt | run | t/s | × baseline | drafts accepted | text against the baseline |
+|---|---|---|---|---|---|
+| p1, prose | baseline | 11.04 | | | |
+| | draft 2 | 11.19 | 1.01 | 68/122 (56%) | differs from character 401 of 736 |
+| | draft 4 | 11.77 | 1.07 | 80/200 (40%) | differs from character 401 |
+| | draft 8 | 8.60 | 0.78 | 88/368 (24%) | differs from character 332 |
+| p2, code | baseline | 11.06 | | | |
+| | draft 2 | 14.36 | 1.30 | 82/94 (87%) | equal |
+| | draft 4 | 17.75 | 1.61 | 96/128 (75%) | equal |
+| | draft 8 | 16.91 | 1.53 | 107/176 (61%) | equal |
+| p3, a question | baseline | 11.09 | | | |
+| | draft 2 | 11.65 | 1.05 | 70/116 (60%) | differs from character 190 of 727 |
+| | draft 4 | 10.81 | 0.98 | 77/220 (35%) | differs from character 469 |
+| | draft 8 | 7.52 | 0.68 | 78/400 (20%) | equal |
+| p4, the fox sentence 50 times | baseline | 10.09 | | | |
+| | draft 2 | 9.89 | 0.98 | 86/86 (100%) | equal |
+| | draft 4 | 12.17 | 1.21 | 104/104 (100%) | equal |
+| | draft 8 | 13.14 | 1.30 | 120/120 (100%) | equal |
+
+  Read:
+  - By the rule: 1.3 times or more on code only (1.30, 1.61 and 1.53), at most 1.07 on prose and 1.05 on the question, so not a single-user option in general: recorded and set aside, with the constraint the first run found (two contexts need the AI cores shared) for S2. Draft length 4 is the best on code and prose; 8 loses on prose and the question (0.78, 0.68).
+  - The predictions. Both models on the provider: held, once the contexts take turns. With 60% accepted no gain: held (p1 and p3 at 56% and 60% with 2 drafted: 1.01 and 1.05). With 80% accepted 1.3, 1.45 and 1.25 times: p2 at 87%, 75% and 61% gave 1.30, 1.61 and 1.53, at or above. Near 100% 1.5, 1.9 and 2.2 times: missed, p4 gave 0.98, 1.21 and 1.30. The text equal up to a near-tie: held (p2 and p4 equal; p1 and p3 apart from characters 190 to 469 on, where the batched check rounds differently from one row).
+  - Where a round goes (from the speeds and counts: the drafted tokens over the draft length give the rounds, each round's tokens are its accepted drafts plus one): on p1 to p3, whose cache stays shallow, a round takes 190, 222 and 340 ms at draft lengths 2, 4 and 8 whatever the text, about 20 to 45 ms more than the draft's steps (17.8 ms each) and the batched check (1.2 to 1.5 times a 89 ms step) give; on p4, from 500 cached positions, 303, 411 and 685 ms, 60 to 100% longer, where the one-row figures at that depth (the 0.6B's step 24.7 ms, the 4B's 99 ms) explain much less (estimates). So the cost model under the predictions missed a cost per round that grows with the draft length and most of all with the cache's depth. Not yet placed: the loop's logs hold the target's timings only (`common_perf_print`), the draft's (`llama_perf_context_print`, `examples/speculative/speculative.cpp:650`) are dropped at the default verbosity.
 
 Not covered by either: sampling above temperature 0, the n-gram drafters (`--spec-type ngram-*`, no draft model), the server's own speculative path.
 
