@@ -964,6 +964,7 @@ Renamed 2026-11-02 (S1 step 5, `plan.md` "S1 step 5 spec"; the deck's names, rea
 |---|---|
 | `ime.cpp: #error "riscv zba extension not enabled"` | add `-DGGML_RV_ZBA=ON` |
 | `wait tcm buffer failed for cpu_id: 0` (abort) | TCM path; use `SPACEMIT_DISABLE_TCM=1`; see `k3-hardware.md` |
+| `FlagOS SpacemiT: could not get 8 AI cores from spine-runtime`, then `failed to decode` (after about 30 s) | a second provider context in the same process (`llama-speculative`, the server's `-md`): each context's stream holds all 8 AI cores until it is freed (`plan.md` "Two measurements without code", part B) |
 | `open(/dev/tcm_sync_mem) failed, errno=2` | device absent; barrier falls back to heap (harmless on its own) |
 | `taskset -c 8 …` → invalid argument | A100 cores need `/proc/set_ai_thread` first |
 | CMake fatal error about Denglin SDK | pass `-DGGML_FLAGOS_DENGLIN=OFF` |
