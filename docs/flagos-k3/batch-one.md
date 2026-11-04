@@ -1,0 +1,199 @@
+# Batch-one inference on the K3: what to test and what to build
+
+Written 2026-11-04 on the user's request. This is analysis: nothing here is implemented, and the implementation waits until S2 is finished (user, 2026-11-04). Figures are Qwen3-4B Q4_0 on the K3 unless marked. "Measured" means a recorded run, "by reading" means the code was read but not run, "estimate" is my arithmetic from measured rates and each estimate names the test that would settle it.
+
+**Term (user, 2026-11-04).** Batch-one inference is one active request or sequence at a time. It says nothing about tokens per kernel call: a prompt batch of 512 rows and a generated token of 1 row are both batch-one. Older documents' "batch size 1" usually means one row per graph.
+
+**Criteria, in the user's order:** lowest TTFT first, then tg512 and pp.
+
+## 1. Conclusions
+
+1. **A batch-one request crosses three regimes with three different bounds** (§2), so one optimization does not serve all three criteria: tg512 is bound by DRAM bandwidth, a chat turn's TTFT by one-chunk attention at depth, and a fresh prompt's TTFT and pp by compute.
+2. **TTFT is not monotonic in prompt length today.** At 4096 cached positions 63 tokens take 17.2 s and 64 tokens 1.67 s (measured rates). Below 64 tokens, decoding less can cost more.
+3. **A real Qwen3 chat turn does not decode "12 tokens".** Qwen3's template drops the think block from earlier assistant turns, so the cached prefix breaks at the start of the last reply and the server re-decodes that whole reply (measured on the Mac, §7): with thinking off 109 tokens where the new turn is 26, with it on 138 where the new turn is 22. Earlier notes' "12-token turn, 3.3 s" holds only when the prefix is kept. The runner's follow-ups use `/completion`, so no acceptance check sees this.
+4. **The tails that matter are about 20 to 130 tokens, and the KV-head split does not reach most of them.** On Qwen3-4B it takes 1, 2 or 4 tokens in one read per call, and 3 and 5 to 8 with one read per token, a quarter of today's reads. The threshold experiment for 9 to 63 tokens is therefore the top kernel item for TTFT, ahead of the KV-head result.
+5. **The largest TTFT wins need no kernel work.** Restoring a saved system prompt turned 21.6 s into 1.73 s on the Mac's simulated device with the same reply text (§7).
+6. **tg512 follows one law:** 2.51 GB of weights per token at 28.7 GB/s. Only fewer bytes, more bandwidth, more rows per read (speculation) or cheaper attention at depth can move it. Step overheads total 1.8% of a token.
+7. **Two items touch S2's design** (§5): how the 11.0 s start-up divides, which decides whether the zero-copy entries are worth building, and a cancel check in the replay loop, which S2 moves into the plugin.
+
+## 2. Where a request spends its time
+
+TTFT = process start (when cold) + template and tokenize + cache restore + the sum over ubatches of a graph's time at (rows, n_kv) + first sampling. The server adds nothing measurable (`llama-completion` 5242 ms, server 5247 ms on the same prompt), and sampling takes about 0.5 ms per token.
+
+| Regime | Rows per graph | Bound by | Evidence | Serves |
+|---|---|---|---|---|
+| Generation | 1 | DRAM: 2.51 GB at 28.7 GB/s, 87.3 ms; attention adds 8.6 µs per cached position | bottleneck suite, `build.md` §7 | tg512 |
+| Few-token | 2 to 63 | at depth, one-chunk attention reading a KV head once per token and query head, about 0.27 s per token at n_kv 4352; shallow, the matmuls | pp12 and pp63 at depth 4096 | TTFT of chat turns |
+| Prefill | 64 and up | compute: kernels at about 0.96 int8 TOPS, attention far slower than the matmuls | rows table below | TTFT of fresh prompts, pp |
+
+Time per graph at depth 0 (measured):
+
+| Rows | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ms | 87.3 | 105.8 | 111.0 | 131.6 | 197.6 | 309 | 549 | 1,198 | 2,476 | 5,310 |
+| t/s | 11.45 | 18.91 | 36.05 | 60.79 | 80.99 | 103.55 | 116.55 | 106.85 | 103.37 | 96.39 |
+
+TTFT today:
+
+| Request | Decoded | Cached before | TTFT | Basis |
+|---|---|---|---|---|
+| Process start, added to any request below | | | +11.0 s (0.6B 5.0 s) | measured, server up |
+| Fresh prompt | 500 | 0 | 5.25 s | measured, server |
+| Fresh prompt | 4,096 | 0 | about 75 s | estimate, interpolated between pp512 at depth 0 and 4096 |
+| Follow-up, prefix kept | 12 | 47 | 182 ms | measured, server |
+| From scratch | 59 | 0 | 638 ms | measured, server |
+| Regenerate | 1 | 4,096 | 129 ms | measured, tg32 |
+| Follow-up, prefix kept | 12 | 4,096 | 3.27 s | measured rate, pp12 |
+| Follow-up, prefix kept | 26 | 4,096 | about 7 s | estimate at pp12's rate |
+| Chat turn after a short reply, default server | 38 | 4,096 | about 10 s | estimate at pp12's rate |
+| Prompt tail | 63 | 4,096 | 17.2 s | measured rate, pp63 |
+| Prompt tail | 64 | 4,096 | 1.67 s | measured rate, pp64 |
+| Chat turn after a longer reply, default server | 110 | 4,096 | about 2.9 s | estimate at pp64's rate |
+
+Generation against depth (tg32, measured): 89.3, 102.6, 111.4, 129.0 and 164.2 ms per token at 0, 1,024, 2,048, 4,096 and 8,192 cached positions. tg512 itself has never been run; from depth 0 it should be about 10.5 t/s and from depth 4096 about 7.6 (estimates, integrating this line).
+
+## 3. Cases that test and challenge batch-one
+
+None of these is an acceptance check today except where noted. Grid sizes are proposals.
+
+**Cold and idle**
+
+| # | Case | What it challenges | Known today |
+|---|---|---|---|
+| C1 | Process start to first token, page cache warm and cold (evict only the model file, no system setting) | Load, repack, warm-up, core grant | 11.0 s and 5.0 s. Two points fit 3.9 s fixed plus 3.0 s per GB (estimate); the split is unmeasured |
+| C2 | First request after minutes idle | Cold caches, frequency, what idle workers cost | Not measured |
+
+**Fresh prompts**
+
+| # | Case | What it challenges | Known today |
+|---|---|---|---|
+| C3 | TTFT against prompt length: 1 to 5, 8, 9, 16, 32, 63, 64, 65, 128, 256, 511 to 513, 575, 576, 1024, 2048, 4095 | Path thresholds, n_kv steps at multiples of 256, ubatch tails | Rows table at depth 0; not swept as TTFT |
+| C4 | New conversations sharing a system prompt, decoded against restored | The snapshot lever | Mac only, §7 |
+
+**Depth and chat**
+
+| # | Case | What it challenges | Known today |
+|---|---|---|---|
+| C5 | Grid: tails of 1, 2, 3, 4, 8, 12, 26, 38, 63, 64, 110 × depths 0, 256, 1024, 2048, 4096, 8192 | The few-token regime; the main TTFT map | pp12, pp63, pp64 at 4096; blocks 3 and 4 add 2, 3, 4, 8 |
+| C6 | A real client: 20 turns through `/v1/chat/completions`, thinking on and off, reading `cache_n` and `prompt_n` per turn | Prefix breaks, TTFT growth over a conversation | 3 turns on the Mac, §7; none on the K3 |
+| C7 | Regenerate; edit an early message; branch back | Prefix loss, `--cache-reuse` under edits | One shift check, depth about 100 |
+| C8 | Two conversations interleaved at depth | Prompt-cache save and load of up to 576 MiB of KV | Only at about 60 positions |
+| C9 | Context full | Shift, truncation or refusal: a TTFT spike or an error | Not measured in the server |
+| C10 | Cancel during prefill at depth, then a new request | Time the next request waits | By reading, no abort path: the provider exposes no `ggml_backend_set_abort_callback`, the server sets none, and it reads its queue between `llama_decode` calls of up to `-b` 2048 tokens, so up to about 57 s at depth 4096 (estimate) |
+
+**Generation**
+
+| # | Case | What it challenges | Known today |
+|---|---|---|---|
+| C11 | tg512 from depths 0, 500, 4096, ten runs back to back, speed per 100 tokens, reading the thermal sensors | The criterion itself, sustained load, throttling | tg128 and tg32 only |
+| C12 | Sampling: top-k and top-p, repetition penalty, grammar, `n_probs` | Host work per token on 151,936 logits | Default sampling only |
+| C13 | Speculation by prompt type (code, prose, question, repetitive), n-gram and draft model | Whether a gain survives real text and depth | Draft model only: 1.30 to 1.61 on code, at most 1.07 on prose |
+
+**System**
+
+| # | Case | What it challenges | Known today |
+|---|---|---|---|
+| C14 | `kill -9` during prefill, restart, first token | TCM with no dead-owner recovery (`k3-hardware.md` §4) | `tcmrelease` is run by hand before every run |
+| C15 | A second process or context wanting the AI cores | Each failure costs about 30 s, then an abort | Seen with speculation; the wait is inferred to be spine-runtime's |
+| C16 | A fixed memory load on the X100 cores | The weight stream shares DRAM with a shared board's other work | Not measured |
+| C17 | `-c` 8192 to 32768 | KV at 144 KiB per position, prompt cache 8 GiB by default, 31 GiB RAM and no swap | Attention extrapolates to about 280 ms per token at 32768 (estimate) |
+| C18 | Models: 0.6B (fixed costs weigh about 5 times more), 8B and 14B (1.9 and 3.4 times the bytes), head size 256 (D7) | Whether a lever generalizes; attention leaving the provider | Bandwidth holds at 28 GB/s across sizes; head size 256 unsupported |
+| C19 | Accuracy on every path a request crosses: 1 row, 2 to 63, 64 and up, and reused against scratch | Different rounding per path: ggml-cpu's own KLD goes from 0.001896 at `-ub 63` to 0.000000 at `-ub 64` (Mac) | Partly: `-ub 1`, 512-token batches, reuse KL |
+
+## 4. Techniques
+
+Gains are estimates unless marked. Each needs a rule set before its run, as the KV-head split has.
+
+**For TTFT, in the order I would try them**
+
+| # | Technique | Gain | Basis | Effort, risk |
+|---|---|---|---|---|
+| T1 | Tiled kernel below 64 rows (threshold by rows, perhaps n_kv) | 26-token tail at 4096: about 7 s to 0.7-1.4 s | pp64 is 10.5 times pp63; the kernel already takes fewer rows | One constant behind a test switch. May lose at n_kv 256, where a head stays in the core's cache. Its F32 sums might also improve accuracy (inference) |
+| T2 | Keep the prefix across chat turns: `--cache-reuse 16`, or a template keeping the empty think block | Measured on the Mac: decoded 109 to 26 and 138 to 22 | §7 | Settings only. **Replies change** (measured), so first-token KL against scratch must pass. Needs T1 first at depth, where fewer tokens are slower today |
+| T3 | System prompt decoded once, saved, restored at start or per conversation (`--slot-save-path`) | Measured on the Mac: 21.6 s to 1.73 s. K3: about 3.7 s to 0.3-0.7 s | §7; restore 4.7 ms, 39.9 MB | No provider code. The file is tied to model and build. Replies equal over 24 tokens only |
+| T4 | Prefill while the user types or between turns (`n_predict` 0 worked on the Mac) | Leaves the last few template tokens, the shapes T5 serves | §7 | Client work; wasted when the text changes |
+| T5 | KV-head split for 1 to 8 tokens | 4 tokens at n_kv 4096: about 28 ms to 3-5 ms per call | Blocks 2 to 6, running now | Built; decided by its rule |
+| T6 | Measure start-up, then parallel repack or a repacked-weights file | Cold start only; 3 s per GB suggests the copy is far from memory speed | C1 settles it | Moot for a server kept running |
+| T7 | Prefill attention at depth: more rows per K and V read, or positions split over tiles for many rows | Attention halved: pp512 at 4096 from 36 to about 54 t/s, a fresh 4,096-token prompt from about 75 to 55 s | Tiled kernel compute-bound, about 88 GFLOP/s before L3 and L4, against 600-890 for matmuls | Block 6 gives the per-op split first |
+| T8 | Head-contiguous KV layout inside the provider's buffer | Attention at 4096 from 40.8 to at best 21.6 ms per token, tg there +17% at most; few-token tails too | One-chunk kernels read 17.9 GB/s contiguous, 9.7 GB/s on the real layout (measured) | High: a third layout through state save, restore and shift. On huge pages the heads must not sit a power of two apart (`k3-hardware.md` §2) |
+| T9 | Q8_0 KV cache with rotation, new kernels | Half the bytes read and half the memory; perhaps IME for the scores (theory, untested) | Accuracy usable on both models: 0.0042 and 0.0013 (Mac); 4-bit ruled out | High: new kernels, rotation at store |
+| T10 | `-b 64 -ub 64` | pp +21% at depth 0, +7% at 4096; cancel wait at most about 1.7 s at 4096 | Rows table; pp64 against pp512 | One flag, but only after T1: every tail is then below 64 |
+| T11 | Cancel check in the replay loop | Cancel within a step instead of a whole decode | By reading, §5 | Small in the plugin; the server needs an abort callback (an `upstream-changes.md` entry) |
+
+**For pp**
+
+T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold 14% of a batch, with fusion's ceiling 5-6% (`fusion-and-splitting.md` §5); the requantized Q8_0 `ffn_down` of 4 layers cost about 2%; tile imbalance is largest at 8 rows, 6.6%.
+
+**For tg512**
+
+| # | Technique | Gain | Basis | Effort, risk |
+|---|---|---|---|---|
+| G1 | Test whether X100 and AI cores together read faster than 28.7 GB/s | Upper bound about 44.6 GB/s, 17 t/s, if they add (they may not) | Open since `fusion-and-splitting.md` §6; X100 cores alone read the head at 15.9 GB/s | One microbenchmark. Only if it adds: a matmul shared across core types, which needs scheduler work, and question 8's X100 fault applies |
+| G2 | Fewer bytes: head in Q4_0 instead of Q8_0 | About 7 ms per token, +8% | Head 413 MB, 13.2-16.6 ms, 15% of a token | KLD on the Mac first; the head may be too sensitive |
+| G3 | N-gram self-speculation (`--spec-type ngram-*`) | Code and repetitive text; no check runs when nothing matches, so little cost elsewhere (by reading, untested) | Up to 8 rows cost at most 1.5 times one; no draft context, so no second core grant | Settings. Needs T1 or T5 at depth. Text may differ at near-ties |
+| G4 | Cheaper attention at depth: T8, T9, the one-token KV-head if it clears 2% | At depth only | Above | Above |
+| G5 | Tile imbalance in the matmuls | At most 2.3% | 2.0 ms per token (0.6 pair tail, 1.4 spread) | Modest |
+| G6 | Fusion | 1-2% in all | `fusion-and-splitting.md` §5 | After everything above |
+
+**Not worth pursuing for batch-one**
+
+| Idea | Why |
+|---|---|
+| Launch, barriers, host work | 1.6 ms of 89.3 together with llama.cpp's own (measured) |
+| Zicbop prefetch | 41-58% slower on the 1-row matmuls (measured) |
+| More loads in flight (`burst`) | Faster over short caches, 16-26% slower over long ones (measured) |
+| Sampling and server overhead | About 0.5 ms per token; the server adds nothing measurable |
+| Attending to less of the cache | Leaves the target's distribution |
+
+## 5. Order after S2, and what S2 needs now
+
+**Inputs to S2's design, cheap and worth having before its spec:**
+
+1. **C1, the split of the 11.0 s** (no code: timestamps from `-lv 4`). My reading rated the zero-copy entries low value; 3 s per GB, if the copy is what costs it, changes that.
+2. **Cancel (T11).** S2 moves the replay loop and the plugin table. If cancel is wanted, one flag read at each barrier belongs in that design, not in a later interface change. The alternative is T10's small `-b`, with no code. This is the user's decision when the S2 spec is written.
+
+**After S2:**
+
+1. A TTFT harness in the runner: C3, C5, C6, C10 and C14, client-side and server-side, as the baseline.
+2. T1, with T5's result beside it.
+3. T2, T3 and T10, each against the baseline with its accuracy check.
+4. Block 6's per-op figures, then T7.
+5. G1 (could run any time, it needs no provider change), G3 and G2's KLD.
+6. T6, if cold start matters to the deployment.
+7. T8 or T9, only if attention at depth is still the largest cost at the depths that matter.
+
+**Targets, proposed for the user's decision, not agreed:** chat turn at depth 4096 at most 1 s; new conversation with a saved system prompt at most 0.5 s; fresh 500-token prompt at most 4 s; tg512 from depth 0 no worse than today, and from depth 4096 at least 9 t/s.
+
+## 6. How to measure so the results hold
+
+- Same session, settings interleaved, at least 5 repeats, p50 and p95, and the IME build as a control (between sessions tg128 moves 4-5%).
+- TTFT both from the client to the first streamed chunk and as the server's `prompt_ms`, with rows, n_kv, page-cache state and board load noted.
+- Each lever against a rule fixed beforehand, with accuracy in the same rule: mean KLD by the CPU-reference rule of `PROJECT.md` §6 per path, reused against scratch by the server check's KL, replies against `--server-baseline` where they should not change.
+- One lever at a time; `tcmrelease --apply` before each run.
+
+## 7. The Mac tests behind this analysis
+
+Throwaway scripts, 2026-11-04, `build-host`, Qwen3-0.6B Q4_0, whose tokenizer and template the 4B shares; token counts on the 4B will differ with its replies. None of this has run on the K3.
+
+**Chat turns**, `/v1/chat/completions`, the CPU, `-c 4096 -t 8`, temperature 0, the client resending the returned content:
+
+| Setting | Turn 2: prompt, cached, decoded | Turn 3: prompt, cached, decoded | Turn 1 reply |
+|---|---|---|---|
+| Thinking off, server defaults | 142, 33, **109** | 245, 138, 107 | 84 tokens |
+| Thinking off, `--cache-reuse 16` | 142, 116, **26** | 254, 228, 26 | 84 |
+| Thinking off, template keeping the empty think block in history | 146, 120, **26** | 243, 217, 26 | 84 |
+| Thinking on, server defaults | 171, 33, **138** | 292, 171, 121 | 268 |
+| Thinking on, `--cache-reuse 16` | 171, 149, **22** | 277, 255, 22 | 268 |
+
+Turn 2's and turn 3's replies differ from the defaults' in every variant: the template variant's turn 2 keeps the same first 8 words in what I read, and turn 2's length moves from 82 to 72 or 91 tokens with thinking off. First-token KL was not measured. With replies under 16 tokens `--cache-reuse 16` changes nothing, as its minimum chunk predicts. The template's text is `tokenizer.chat_template` in the GGUF: earlier assistant turns are rendered as `<|im_start|>assistant\n` plus the content, without the think block generation left in the cache.
+
+**Saved system prompt**, the simulated device (`FlagOS:SpacemiT` KV buffer, 29/29 layers, `graph splits = 2`), `-c 1024 -np 1 --slot-save-path`, a raw prompt of 348 tokens plus 24:
+
+| Path | Cached | Decoded | Time |
+|---|---|---|---|
+| From scratch | 0 | 372 | 21,600 ms |
+| Prefill with `n_predict` 0 | 0 | 348 | 19,897 ms |
+| The rest, after that prefill | 348 | 24 | 1,732 ms |
+| The rest, a fresh process after `action=restore` | 348 | 24 | 1,726 ms |
+
+Save 42 ms, restore 4.7 ms, 39.9 MB. The 24-token reply is identical in all three. The simulated device is serial, so only the ratios mean anything.

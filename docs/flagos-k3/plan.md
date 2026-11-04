@@ -1709,7 +1709,7 @@ Not covered by either: sampling above temperature 0, the n-gram drafters (`--spe
 
 **On the K3** (the user's runs):
 1. The build; the check program (`--expect-device`): today's cases unchanged with the switch off, the new cases with the RVV kernel under `1-8`; test-backend-ops `FLASH_ATTN_EXT` under `1-8`.
-2. Accuracy: Qwen3-4B, `llama-perplexity -c 4096 -b 4096 -ub 4 --chunks 1 -fa on`, the KLD against a CPU base of the same flags, the switch off and `2-4`.
+2. Accuracy: Qwen3-4B, `llama-perplexity -c 4096 -b 4096 -ub 4 --chunks 1 -fa on`, the switch off and `2-4`, the KLD against one CPU base made by `PROJECT.md` §6's rule: `-c 4096 -b 4096 --chunks 1 -fa on -t 1` with the provider disabled, twice, the two files byte-identical (corrected 2026-11-04: this said a base of the same flags, and my first block made it with 8 threads; "The CPU base" below).
 3. Speed, the settings taking turns twice, the faster of each:
    - the check program's attention benchmark extended to 1, 2, 3, 4 and 8 tokens at n_kv 256, 512, 1024, 4096 and 8192 (Qwen3-4B's heads): µs per call, off and `1-8`;
    - llama-bench (Qwen3-4B, `-t 8 -fa 1 -mmp 0 -r 3`): pp2, pp3, pp4 and pp8 at depths 0, 1024 and 4096 (`-n 0`), off and `2-8`; tg32 at the same depths, off and `1-8` (one token: the fork's path against the paired split); pp64 and pp512 at depth 4096 as controls;
@@ -1737,6 +1737,23 @@ Not covered by either: sampling above temperature 0, the n-gram drafters (`--spe
 - Qwen3-0.6B, `-c 1024 -b 1024 -ub 4 --chunks 2`, against the CPU: mean KLD 0.004163 ± 0.000160 unset and with `2-4` (every attention call through `kvh-partial` and `kvh-merge` by the op counters), to the last digit, as one chunk per KV head makes them.
 - Two mutations caught: the merge skipping the last chunk (70 checks failed), every token taking token 0's mask row (57 failed).
 - `--bench-attn` runs and prints its 25 rows (1, 2, 3, 4 and 8 tokens × n_kv 256 to 8192; meaningless on the Mac's serial reference).
+
+**The CPU base, corrected after the first K3 accuracy run (2026-11-04).** My first block made the base with `-t 8 -ub 4`, which §6 of `PROJECT.md` forbids ("Never use an 8-thread CPU run as a reference"). The run died with signal 11 (`rc=139`; the site to be read from the kernel log), so the base held its header and tokens and no log-probs. Both KLD runs then decoded the whole chunk, failed to read the log-probs and returned 0 without statistics, the table's header the only line the block's grep matched. Reproduced on the Mac with such a file: `rc=0`, that one line, `failed reading log-probs for chunk 0` in the log. The block now makes the base with one thread, twice, compares the files, starts the KLD runs only if they are identical, and greps the error line.
+
+The base also moved to the default ubatch, after a measurement that overturned my assumption that its ubatch does not matter. On the Mac (Qwen3-0.6B, `-c 1024 -b 1024 --chunks 1`, one-thread CPU runs), the CPU against its own default-ubatch base:
+
+| CPU run | Mean KLD | Maximum KLD | Same top token |
+|---|---|---|---|
+| `-ub 4` | 0.001896 ± 0.000124 | 0.026864 | 97.65% |
+| `-ub 63` | 0.001896 ± 0.000124 | 0.026864 | 97.65% |
+| `-ub 64` | 0.000000 | 0.000042 | 100% |
+| `-ub 128` | 0.000000 | 0.000042 | 100% |
+
+So ggml-cpu's two attention kernels disagree, the line exactly at the tiled kernel's threshold. By reading, its one-chunk kernel sums V in F16 (`ggml-cpu/ops.cpp:8632`) and its tiled kernel in F32 (`:8944`); that this sum is the cause is an inference, which the one-chunk kernel's F32 branch in a scratch build would settle. The provider divides the same way, by path and by machine: the reference kernels the Mac runs sum in F32 on both settings (`flagos-spacemit-attn.cpp:137`, `:536`), which is why the Mac's two settings agree to the last digit; the K3's RVV one-chunk and KV-head kernels both sum in F16 (`flagos-spacemit-rvv-attn.cpp:838`, `:941`, `:1143`, `:1365`), the split and the tiled kernel in F32. Consequences:
+
+- A default-ubatch base shares its rounding with neither setting under test, costs less (on the Mac 9.28 s per pass against 13.55), and is the runner's practice, one base for every batch size. The simulated device at `-ub 4`, both settings alike: 0.003275 ± 0.000201 against it, 0.003377 ± 0.000244 against a `-ub 4` base (maximum 0.030946 and 0.062357, same top token 98.04% and 97.46%).
+- The Mac's KLD says nothing about the F16 sums. On the K3 both settings carry that rounding, so their absolute KLDs may exceed the Mac's (estimate); the rule compares them with each other against one base, so it stands.
+- Possibly a second reason for the threshold experiment (part B): the tiled kernel sums in F32, so below 64 tokens it might gain accuracy as well as speed (an inference, untested).
 
 ### Not planned
 
