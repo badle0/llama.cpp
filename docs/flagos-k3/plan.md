@@ -1755,6 +1755,18 @@ So ggml-cpu's two attention kernels disagree, the line exactly at the tiled kern
 - The Mac's KLD says nothing about the F16 sums. On the K3 both settings carry that rounding, so their absolute KLDs may exceed the Mac's (estimate); the rule compares them with each other against one base, so it stands.
 - Possibly a second reason for the threshold experiment (part B): the tiled kernel sums in F32, so below 64 tokens it might gain accuracy as well as speed (an inference, untested).
 
+**Result on the K3, accuracy (2026-11-05; the user's run; the speed runs still to come, the rule not yet applied).** Qwen3-4B, one chunk of 4,096 tokens. The CPU base by the §6 rule: two one-thread runs without a fault, 2266.35 and 2265.88 s per pass, PPL 14.0963 ± 1.00014 both, the two files of 622,058,764 bytes identical. Against it at `-ub 4`, `-t 8`:
+
+| Setting | Mean KLD | PPL(Q)/PPL(base) | Same top token | Seconds per pass |
+|---|---|---|---|---|
+| off | 0.002732 ± 0.000101 | 1.003269 ± 0.004533 | 97.362 ± 0.354% | 625.58 |
+| `2-4` | 0.002570 ± 0.000089 | 1.007191 ± 0.004528 | 97.167 ± 0.367% | 164.51 |
+
+- The KV-head path's mean KLD is 0.000162 lower, 1.6 of the default's standard errors. Read literally, "within one standard error of the default's" is not met, on the better side. The rule's wording did not say which side it guards. My recommendation is to read it as guarding against lost accuracy, so that this passes; that reading came after the result, so it is the user's decision when the rule is applied.
+- The result does not show the KV-head path to be more accurate: the PPL ratio and the top token moved slightly the other way, each inside its standard error. Both runs score the same tokens, so these standard errors do not measure the difference between them directly, and the log gives no per-token figures to pair.
+- The prediction "the KLD about today's" holds. The two differ here where the Mac's reference kernels agree to the last digit, so the RVV kernels' arithmetic differs; which step causes it was not looked at.
+- Speed, a second reading of the same chunk, again one run each and not taking turns: 3.80 times faster (611 and 161 ms per ubatch), against 3.85 in the first. It does not count for the rule, which asks for the benchmark and llama-bench.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
