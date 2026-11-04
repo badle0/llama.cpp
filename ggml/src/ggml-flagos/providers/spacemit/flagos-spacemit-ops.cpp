@@ -168,8 +168,10 @@ struct spacemit_contract {
 };
 
 // M2e.3 round 2 (adopted 2026-10-14; the paired split is the default): one-token attention split over the tiles,
-// partial results then their merge. The three FLASH_ATTN_EXT contracts are tried in this order and the kernels'
-// supports pick one (spacemit_flash_attn_split, which reads the shape and FLAGOS_SPACEMIT_ATTN)
+// partial results then their merge. The four FLASH_ATTN_EXT contracts are tried in this order and the kernels'
+// supports pick one (spacemit_flash_attn_split, which reads the shape and FLAGOS_SPACEMIT_ATTN); first the KV-head split
+// for a few tokens, taken only under the test-only FLAGOS_SPACEMIT_ATTN_KVH (plan.md "The KV-head split for a few
+// tokens, from SpacemiT's fork")
 static const spacemit_contract k_contracts[] = {
     { GGML_OP_ADD,             spacemit_binary_f32_supported,   { "add.f32" },                                      1 },
     { GGML_OP_MUL,             spacemit_binary_f32_supported,   { "mul.f32" },                                      1 },
@@ -180,6 +182,7 @@ static const spacemit_contract k_contracts[] = {
     { GGML_OP_GET_ROWS,        spacemit_get_rows_f32_supported, { "get_rows.f32" },                                  1 },
     { GGML_OP_GLU,             spacemit_swiglu_f32_supported,   { "swiglu.f32" },                                    1 },
     { GGML_OP_MUL_MAT,         spacemit_mul_mat_ime_supported,  { "mul_mat.quantize", "mul_mat.gemm" },              2 },
+    { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn.kvh.partial", "flash_attn.kvh.merge" },                2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always,
       { "flash_attn.split.partial_paired", "flash_attn.split.merge" },                                               2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn.split.partial", "flash_attn.split.merge" },            2 },
@@ -191,12 +194,13 @@ static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts
 static_assert(k_n_contracts <= sizeof(spacemit_ops::ops) / sizeof(spacemit_ops::ops[0]),
               "spacemit_ops::ops must hold every contract");
 
-// the contract names of the 14 kernels the plugin offers, in the order of its kernel table (plan.md "S1 step 1 spec" §3)
+// the contract names of the 16 kernels the plugin offers, in the order of its kernel table (plan.md "S1 step 1 spec" §3)
 const char * const spacemit_required_kernels[] = {
     "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
     "set_rows",         "cpy.quant",        "get_rows.f32",             "swiglu.f32",
     "mul_mat.quantize", "mul_mat.gemm",     "flash_attn",               "flash_attn.split.partial",
-    "flash_attn.split.partial_paired",      "flash_attn.split.merge",
+    "flash_attn.split.partial_paired",      "flash_attn.split.merge",   "flash_attn.kvh.partial",
+    "flash_attn.kvh.merge",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 

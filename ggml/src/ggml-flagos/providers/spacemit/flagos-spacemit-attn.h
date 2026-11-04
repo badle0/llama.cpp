@@ -18,7 +18,8 @@ bool spacemit_kernel_flash_attn(const spacemit_tile * tile, ggml_tensor * dst);
 // spacemit_flash_attn_split tells the contracts apart: 2 the split with the turns (the default), 1 the split without
 // them, 0 the one-step op above (other calls, or FLAGOS_SPACEMIT_ATTN=one-chunk)
 int    spacemit_flash_attn_split(const ggml_tensor * op);
-// reads FLAGOS_SPACEMIT_ATTN at registration, so that its warning is not lost in llama.cpp's trial load (common/fit.cpp)
+// reads FLAGOS_SPACEMIT_ATTN and FLAGOS_SPACEMIT_ATTN_KVH at registration, so that their warnings are not lost in
+// llama.cpp's trial load (common/fit.cpp)
 void   spacemit_flash_attn_read_switch();
 size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node);
 bool   spacemit_kernel_flash_attn_split_partial(const spacemit_tile * tile, ggml_tensor * dst);
@@ -26,9 +27,19 @@ bool   spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile * til
 bool   spacemit_kernel_flash_attn_split_merge(const spacemit_tile * tile, ggml_tensor * dst);
 
 // the shape facts of each attention kernel, the plugin's `supports` in its kernel table (plan.md "S1 step 2 spec" §4):
-// the core's three FLASH_ATTN_EXT contracts are tried in order and the first whose every step's supports passes is
-// taken, so these four carry the variant choice (and with it FLAGOS_SPACEMIT_ATTN)
+// the core's FLASH_ATTN_EXT contracts are tried in order and the first whose every step's supports passes is taken, so
+// these four and the KV-head split's below carry the variant choice (and with it the switches)
 bool spacemit_flash_attn_one_step_supported(const ggml_tensor * op);
 bool spacemit_flash_attn_split_supported(const ggml_tensor * op);
 bool spacemit_flash_attn_split_paired_supported(const ggml_tensor * op);
 bool spacemit_flash_attn_split_any_supported(const ggml_tensor * op);  // the merge step, shared by both split contracts
+
+// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"; test-only):
+// the calls of FLAGOS_SPACEMIT_ATTN_KVH=<lo>-<hi> tokens (one stream, 2, 4 or 8 query heads per KV head, no ALiBi, from
+// 128 positions per chunk). Step 1 computes per unit (KV head x chunk of positions, dealt round-robin over the tiles)
+// the partial results of the KV head's query heads and tokens into the workspace; step 2 merges each row's chunks and
+// writes dst. The first attention contract: its supports is false with the switch unset, so the others decide as before
+bool   spacemit_flash_attn_kvh_supported(const ggml_tensor * op);
+size_t spacemit_flash_attn_kvh_workspace(const ggml_tensor * node);
+bool   spacemit_kernel_flash_attn_kvh_partial(const spacemit_tile * tile, ggml_tensor * dst);
+bool   spacemit_kernel_flash_attn_kvh_merge(const spacemit_tile * tile, ggml_tensor * dst);

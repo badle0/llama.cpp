@@ -119,6 +119,8 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "flash_attn.split.partial", fake_step, NULL, NULL },
         { "flash_attn.split.partial_paired", fake_step, NULL, NULL },
         { "flash_attn.split.merge", fake_step, NULL, NULL },
+        { "flash_attn.kvh.partial", fake_step, NULL, NULL },
+        { "flash_attn.kvh.merge", fake_step, NULL, NULL },
     };
     if (count != NULL) {
         *count = sizeof(kernels) / sizeof(kernels[0]);

@@ -1,6 +1,7 @@
 // FLASH_ATTN_EXT on the AI cores (plan.md, M2e design): the claim, the split of the rows over the tiles, and the
 // portable reference; for one token per call from n_kv 512, the split of the KV positions over the tiles and the merge
-// of their partial results (plan.md, M2e.3 round 2).
+// of their partial results (plan.md, M2e.3 round 2); under FLAGOS_SPACEMIT_ATTN_KVH, ggml-spacemit's split by KV head
+// for a few tokens and its merge (plan.md, "The KV-head split for a few tokens, from SpacemiT's fork").
 
 #include "flagos-spacemit-attn.h"
 
@@ -397,6 +398,154 @@ bool split_partial(const spacemit_tile & tile, ggml_tensor * dst, bool paired) {
     return true;
 }
 
+// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"), test-only
+// until the K3's runs decide: FLAGOS_SPACEMIT_ATTN_KVH=<lo>-<hi>, the token counts per call it takes, 1 <= lo <= hi <=
+// 63; unset, empty or off: none. Kept as lo * 64 + hi, 0 for none; parsed once (spacemit_cached_switch); anything else
+// is reported once and taken as off
+int parse_kvh_setting() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN_KVH");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "off") == 0) {
+        return 0;
+    }
+    const char * p      = v;
+    const auto   number = [&p](int & out) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        for (out = 0; *p >= '0' && *p <= '9'; ++p) {
+            out = std::min(out * 10 + (*p - '0'), 1000);
+        }
+        return true;
+    };
+    int lo = 0, hi = 0;
+    if (number(lo) && *p++ == '-' && number(hi) && *p == '\0' && 1 <= lo && lo <= hi && hi <= 63) {
+        return lo * 64 + hi;
+    }
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN_KVH=%s: not <lo>-<hi> with 1 <= lo <= hi <= 63, taken as off\n",
+                      __func__, v);
+    }
+    return 0;
+}
+
+int kvh_setting_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_kvh_setting);
+}
+
+// the KV-head split's units: a KV head times a chunk of its positions, n_chunks = kvh_units / KV heads (at least 1);
+// the K3's 8 AI cores as a constant, so that the shape, the workspace and both steps agree whatever the tile count
+constexpr int64_t kvh_units = 8;
+
+int64_t kvh_n_chunks(const ggml_tensor * op) {
+    return std::max<int64_t>(1, kvh_units / op->src[1]->ne[2]);
+}
+
+// the shapes the KV-head split takes (ggml-spacemit 855a53b, rvv_kernels.cpp:1380-1402, with the switch's token counts
+// for its 1 to 4): one stream, as many K as V heads, 2, 4 or 8 query heads per KV head, no ALiBi, the mask (if any) one
+// row per token for every head, from 128 positions per chunk. Softcap and sinks allowed
+bool kvh_shape(const ggml_tensor * op) {
+    const int setting = kvh_setting_from_env();
+    if (setting == 0) {
+        return false;
+    }
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    const int64_t       rk2  = q->ne[2] / k->ne[2];
+    return q->ne[1] >= setting / 64 && q->ne[1] <= setting % 64 && q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+           k->ne[2] == v->ne[2] && (rk2 == 2 || rk2 == 4 || rk2 == 8) && ggml_get_op_params_f32(op, 1) == 0.0f &&
+           (mask == nullptr || (mask->ne[2] == 1 && mask->ne[3] == 1)) && k->ne[1] >= 128 * kvh_n_chunks(op);
+}
+
+// the reference of the KV-head split's step 1, also its path without the RVV kernels or without TCM: the units, their
+// dealing and the partials' layout of spacemit_rvv_attn::kvh_partial; per unit, token and query head ggml-cpu's one-row
+// algorithm over the chunk's positions, V summed in F32 (as split_ref)
+void kvh_partial_ref(const ggml_tensor * dst, int64_t n_chunks, int64_t ith, int64_t nth, float * partials) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int64_t DK    = k->ne[0];
+    const int64_t DV    = v->ne[0];
+    const int64_t n_kv  = k->ne[1];
+    const int64_t n_kvh = k->ne[2];
+    const int64_t nh    = q->ne[2];
+    const int64_t nq    = q->ne[1];
+    const int64_t rk2   = nh / n_kvh;
+    const int64_t chunk = (n_kv + n_chunks - 1) / n_chunks;
+
+    float       scale         = ggml_get_op_params_f32(dst, 0);
+    const float logit_softcap = ggml_get_op_params_f32(dst, 2);
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    for (int64_t u = ith; u < n_kvh * n_chunks; u += nth) {
+        const int64_t kvh = u / n_chunks;
+        const int64_t c   = u % n_chunks;
+        const int64_t c0  = std::min(n_kv, c * chunk);
+        const int64_t c1  = std::min(n_kv, c0 + chunk);
+        for (int64_t t = 0; t < nq; ++t) {
+            const ggml_fp16_t * mp =
+                mask != nullptr ? (const ggml_fp16_t *) ((const char *) mask->data + t * mask->nb[1]) : nullptr;
+            for (int64_t h = kvh * rk2; h < (kvh + 1) * rk2; ++h) {
+                const float * pq = (const float *) ((const char *) q->data + t * q->nb[1] + h * q->nb[2]);
+                float         q16[max_head_size];
+                for (int64_t d = 0; d < DK; ++d) {
+                    q16[d] = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(pq[d]));
+                }
+                float VKQ[max_head_size] = {};
+                float S                  = 0.0f;
+                float M                  = -INFINITY;
+                for (int64_t ic = c0; ic < c1; ++ic) {
+                    const float mv = mp != nullptr ? GGML_FP16_TO_FP32(mp[ic]) : 0.0f;
+                    if (mv == -INFINITY) {
+                        continue;
+                    }
+                    const ggml_fp16_t * kr =
+                        (const ggml_fp16_t *) ((const char *) k->data + ic * k->nb[1] + kvh * k->nb[2]);
+                    float s = 0.0f;
+                    for (int64_t d = 0; d < DK; ++d) {
+                        s += q16[d] * GGML_FP16_TO_FP32(kr[d]);
+                    }
+                    s = s * scale;
+                    if (logit_softcap != 0.0f) {
+                        s = logit_softcap * tanhf(s);
+                    }
+                    s += mv;
+
+                    float ms = 1.0f;
+                    float vs = 1.0f;
+                    if (s > M) {
+                        ms = expf(M - s);
+                        M  = s;
+                        for (int64_t d = 0; d < DV; ++d) {
+                            VKQ[d] *= ms;
+                        }
+                    } else {
+                        vs = expf(s - M);
+                    }
+                    const ggml_fp16_t * vr =
+                        (const ggml_fp16_t *) ((const char *) v->data + ic * v->nb[1] + kvh * v->nb[2]);
+                    for (int64_t d = 0; d < DV; ++d) {
+                        VKQ[d] += GGML_FP16_TO_FP32(vr[d]) * vs;
+                    }
+                    S = S * ms + vs;
+                }
+                float * p = partials + ((t * nh + h) * n_chunks + c) * (DV + 2);
+                p[0]      = M;
+                p[1]      = S;
+                std::copy(VKQ, VKQ + DV, p + 2);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 // FLASH_ATTN_EXT: F32 q and F16 K and V, each with contiguous rows; DK (q's and K's row length) and DV in 1..128;
@@ -468,6 +617,7 @@ int spacemit_flash_attn_split(const ggml_tensor * op) {
 
 void spacemit_flash_attn_read_switch() {
     (void) split_setting_from_env();
+    (void) kvh_setting_from_env();
 }
 
 bool spacemit_flash_attn_one_step_supported(const ggml_tensor * op) {
@@ -552,6 +702,96 @@ bool spacemit_kernel_flash_attn_split_merge(const spacemit_tile * tile_p, ggml_t
         float *     o     = (float *) ((char *) dst->data + h * dst->nb[1]);
         for (int64_t d = 0; d < DV; ++d) {
             o[d] = out[d] * S_inv;
+        }
+    }
+    return true;
+}
+
+bool spacemit_flash_attn_kvh_supported(const ggml_tensor * op) {
+    return spacemit_flash_attn_supported(op) && kvh_shape(op);
+}
+
+// the partials of every row (token x query head) and chunk: the maximum, the sum and DV floats
+size_t spacemit_flash_attn_kvh_workspace(const ggml_tensor * node) {
+    return (size_t) node->src[0]->ne[1] * (size_t) node->src[0]->ne[2] * (size_t) kvh_n_chunks(node) *
+           (size_t) (node->src[2]->ne[0] + 2) * sizeof(float);
+}
+
+// step 1 of the KV-head split: the tile's units into the workspace. The RVV kernel needs TCM for its q and V sums, as
+// ggml-spacemit's dispatch (ime.cpp:1410-1421) needs its shared buffer
+bool spacemit_kernel_flash_attn_kvh_partial(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
+    GGML_ASSERT(tile.workspace != nullptr && tile.workspace_size >= spacemit_flash_attn_kvh_workspace(dst));
+    const int64_t n_chunks = kvh_n_chunks(dst);
+    float *       partials = (float *) tile.workspace;
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
+    const int64_t DK = dst->src[1]->ne[0];
+    const int64_t DV = dst->src[2]->ne[0];
+    if (!spacemit_use_reference() && __riscv_vlenb() == 128 && spacemit_rvv_attn::supported_shape(DK, DV) &&
+        tile.tcm != nullptr && tile.tcm_size >= spacemit_rvv_attn::kvh_scratch_bytes(dst)) {
+        spacemit_rvv_attn::kvh_partial(dst, n_chunks, tile.ith, tile.nth, partials, tile.tcm, tile.tcm_size);
+        return true;
+    }
+#endif
+    kvh_partial_ref(dst, n_chunks, tile.ith, tile.nth, partials);
+    return true;
+}
+
+// step 2 of the KV-head split: ggml-spacemit's forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16 (855a53b,
+// rvv_kernels.cpp:1479-1543) in scalar loops. Per row (token t x query head h, dealt round-robin over the tiles) the
+// chunks' maximum, their sums weighted in F32 (a chunk the mask hides skipped), the sinks, then dst's row t * ne[1] + h
+bool spacemit_kernel_flash_attn_kvh_merge(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile     = *tile_p;
+    const ggml_tensor *   q        = dst->src[0];
+    const ggml_tensor *   sinks    = dst->src[4];
+    const int64_t         DV       = dst->src[2]->ne[0];
+    const int64_t         nh       = q->ne[2];
+    const int64_t         nq       = q->ne[1];
+    const int64_t         n_chunks = kvh_n_chunks(dst);
+    const float *         partials = (const float *) tile.workspace;
+
+    for (int64_t r = tile.ith; r < nq * nh; r += tile.nth) {
+        const int64_t t  = r / nh;
+        const int64_t h  = r % nh;
+        const float * pr = partials + r * n_chunks * (2 + DV);
+
+        float M = -INFINITY;
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            M = std::max(M, pr[c * (2 + DV)]);
+        }
+
+        float acc[max_head_size] = {};
+        float S                  = 0.0f;
+        if (M != -INFINITY) {
+            for (int64_t c = 0; c < n_chunks; ++c) {
+                const float * pc = pr + c * (2 + DV);
+                if (pc[0] == -INFINITY) {
+                    continue;
+                }
+                const float w = expf(pc[0] - M);
+                S += w * pc[1];
+                for (int64_t d = 0; d < DV; ++d) {
+                    acc[d] += w * pc[2 + d];
+                }
+            }
+        }
+
+        float ms = 1.0f;
+        if (sinks != nullptr) {
+            const float s  = ((const float *) sinks->data)[h];
+            float       vs = 1.0f;
+            if (s > M) {
+                ms = M == -INFINITY ? 0.0f : expf(M - s);
+            } else {
+                vs = expf(s - M);
+            }
+            S = S * ms + vs;
+        }
+        const float f = S == 0.0f ? 0.0f : ms / S;
+
+        float * out = (float *) ((char *) dst->data + (t * dst->ne[1] + h) * dst->nb[1]);
+        for (int64_t d = 0; d < DV; ++d) {
+            out[d] = acc[d] * f;
         }
     }
     return true;

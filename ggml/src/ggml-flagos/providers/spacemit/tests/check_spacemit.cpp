@@ -10,7 +10,7 @@
 //                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the default matmul setting (fit,staged)
 //                    against split at the row counts of --bench-mm
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
-//                    one-chunk, against the default)
+//                    one-chunk, against the default; at 1, 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=1-8)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
@@ -319,7 +319,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
 
 // the attention checks' builder, below: check_contracts builds its FLASH_ATTN_EXT nodes the same way
 static ggml_tensor * build_flash_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k_cache, ggml_tensor * v_cache,
-                                      ggml_tensor * mask, int64_t n_head_kv, int64_t n_kv, float max_bias);
+                                      ggml_tensor * mask, int64_t n_head_kv, int64_t n_kv, float max_bias,
+                                      float logit_softcap = 0.0f, ggml_tensor * sinks = nullptr);
 
 // the real table, for the kernels() below: check_contracts sets it before the one call that needs it
 static const spacemit_plugin_v1 * g_real_table = nullptr;
@@ -369,7 +370,7 @@ static int check_contracts(ggml_backend_dev_t dev) {
     std::string  detail;
     REQUIRE(spacemit_ops_bind(table, &ops, &detail));
     CHECK(ops.table == table);
-    CHECK(ops.n_ops == 12);
+    CHECK(ops.n_ops == 13);
     for (uint32_t i = 0; i < ops.n_ops; i++) {
         REQUIRE(ops.ops[i].n_steps >= 1 && ops.ops[i].n_steps <= SPACEMIT_MAX_OP_STEPS);
         for (uint32_t s = 0; s < ops.ops[i].n_steps; s++) {
@@ -433,6 +434,79 @@ static int check_contracts(ggml_backend_dev_t dev) {
             REQUIRE(many != nullptr);
             CHECK(many->n_steps == 1 && many->steps[0] == entry_named("flash_attn"));
         }
+        ggml_free(ctx);
+    }
+
+    // the KV-head split (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): the first attention
+    // contract, taken for the token counts FLAGOS_SPACEMIT_ATTN_KVH names, with 2, 4 or 8 query heads per KV head,
+    // without ALiBi and from 128 positions per chunk (2 chunks with 4 KV heads); otherwise the calls go as above
+    {
+        ggml_init_params params = { ggml_tensor_overhead() * 512, nullptr, true };
+        ggml_context *   ctx    = ggml_init(params);
+        const int64_t    d      = 128;
+        const struct {
+            const char * setting;
+            int64_t      lo, hi;  // the token counts it takes; 0, 0: none
+        } settings[] = {
+            { nullptr, 0, 0 }, { "off", 0, 0 }, { "2-4", 2, 4 }, { "1-4", 1, 4 }, { "2-8", 2, 8 },
+        };
+        const struct {
+            const char * what;
+            int64_t      n_head, n_head_kv, n_kv;
+            float        max_bias;
+            bool         kvh;  // a shape the split takes
+        } shapes[] = {
+            { "Qwen3-4B", 32, 8, 512, 0.0f, true },
+            { "GQA 8, n_kv 256", 32, 4, 256, 0.0f, true },
+            { "GQA 8, n_kv 255", 32, 4, 255, 0.0f, false },
+            { "GQA 1", 8, 8, 512, 0.0f, false },
+            { "ALiBi", 32, 8, 512, 8.0f, false },
+        };
+        const int64_t token_counts[] = { 1, 2, 3, 4, 5, 8, 64 };
+        ggml_tensor * nodes[5][7];
+        for (int i = 0; i < 5; i++) {
+            ggml_tensor * k_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d * shapes[i].n_head_kv, shapes[i].n_kv + 32);
+            ggml_tensor * v_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d * shapes[i].n_head_kv, shapes[i].n_kv + 32);
+            for (int j = 0; j < 7; j++) {
+                ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, shapes[i].n_head, token_counts[j]);
+                ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, shapes[i].n_kv, token_counts[j], 1, 1);
+                nodes[i][j]        = build_flash_attn(ctx, q, k_cache, v_cache, mask, shapes[i].n_head_kv,
+                                                      shapes[i].n_kv, shapes[i].max_bias);
+            }
+        }
+        int n_checked = 0;
+        for (const auto & w : settings) {
+            env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", w.setting);
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+            for (int i = 0; i < 5; i++) {
+                for (int j = 0; j < 7; j++) {
+                    const auto &        sh       = shapes[i];
+                    const int64_t       n_tokens = token_counts[j];
+                    const spacemit_op * got      = spacemit_find_op(ops, nodes[i][j], buft);
+                    REQUIRE(got != nullptr);
+                    const bool   kvh   = sh.kvh && w.lo <= n_tokens && n_tokens <= w.hi;
+                    const bool   split = n_tokens == 1 && sh.max_bias == 0.0f && sh.n_kv >= 512;
+                    const char * first = kvh   ? "flash_attn.kvh.partial" :
+                                         split ? "flash_attn.split.partial_paired" :
+                                                 "flash_attn";
+                    const bool   ok    = got->steps[0] == entry_named(first) &&
+                                    (kvh   ? got->n_steps == 2 && got->steps[1] == entry_named("flash_attn.kvh.merge") :
+                                     split ? got->n_steps == 2 :
+                                             got->n_steps == 1);
+                    if (!ok) {
+                        std::fprintf(stderr,
+                                     "FAIL: contracts, FLAGOS_SPACEMIT_ATTN_KVH=%s, %s, %lld tokens: %s, not %s\n",
+                                     w.setting != nullptr ? w.setting : "(unset)", sh.what, (long long) n_tokens,
+                                     got->steps[0]->name, first);
+                        g_failures++;
+                    }
+                    n_checked++;
+                }
+            }
+        }
+        std::printf("contracts FLASH_ATTN_EXT under FLAGOS_SPACEMIT_ATTN_KVH (unset, off, 2-4, 1-4, 2-8; 1-64 tokens; "
+                    "Qwen3-4B, GQA 8 at n_kv 256 and 255, GQA 1, ALiBi): %d selections checked\n",
+                    n_checked);
         ggml_free(ctx);
     }
 
@@ -1539,7 +1613,8 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
 // (src/llama-kv-cache.cpp:1249-1300, V not transposed; src/llama-graph.cpp:2500-2545): views of the first n_kv cells
 // and q [d, n_head, n_tokens], each permuted (0, 2, 1, 3); scale 1/sqrt(d); precision F32
 static ggml_tensor * build_flash_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k_cache, ggml_tensor * v_cache,
-                                      ggml_tensor * mask, int64_t n_head_kv, int64_t n_kv, float max_bias) {
+                                      ggml_tensor * mask, int64_t n_head_kv, int64_t n_kv, float max_bias,
+                                      float logit_softcap, ggml_tensor * sinks) {
     const int64_t d = q->ne[0];
     ggml_tensor * k = ggml_view_4d(ctx, k_cache, d, n_head_kv, n_kv, 1, ggml_row_size(k_cache->type, d), k_cache->nb[1],
                                    ggml_nbytes(k_cache), 0);
@@ -1547,8 +1622,11 @@ static ggml_tensor * build_flash_attn(ggml_context * ctx, ggml_tensor * q, ggml_
                                    ggml_nbytes(v_cache), 0);
     ggml_tensor * a = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), ggml_permute(ctx, k, 0, 2, 1, 3),
                                           ggml_permute(ctx, v, 0, 2, 1, 3), mask, 1.0f / std::sqrt((float) d), max_bias,
-                                          0.0f);
+                                          logit_softcap);
     ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
+    if (sinks != nullptr) {
+        ggml_flash_attn_ext_add_sinks(a, sinks);
+    }
     return a;
 }
 
@@ -1572,7 +1650,8 @@ enum class attn_mask { none, causal, alibi };
 // one FLASH_ATTN_EXT (build_flash_attn) on the provider, its output in the provider's buffer, and on the CPU backend,
 // both reading the same inputs in a CPU buffer: caches of n_kv + 32 cells (cells beyond the view hold data too, as when
 // the context is longer than n_kv), random K and V in [-1, 1); q in [-4, 4), which spreads the scores over about 1.3
-// standard deviations at d 128; the mask F16 [n_kv, n_tokens, 1, 1], `visible` added to every cell a token sees
+// standard deviations at d 128; the mask F16 [n_kv, n_tokens, 1, 1], `visible` added to every cell a token sees.
+// logit_softcap as ggml_flash_attn_ext takes it; with_sinks: one sink per query head, in [-4, 4)
 struct attn_run {
     ggml_context *        ctx_host = nullptr, * ctx_dev = nullptr;
     ggml_backend_buffer_t buf_host = nullptr, buf_dev = nullptr;
@@ -1580,7 +1659,7 @@ struct attn_run {
     ggml_cgraph *         g_dev = nullptr, * g_cpu = nullptr;
 
     bool init(ggml_backend_dev_t dev, const attn_shape & s, attn_mask mode, float visible, float max_bias,
-              uint32_t seed, float q_scale = 4.0f) {
+              uint32_t seed, float q_scale = 4.0f, float logit_softcap = 0.0f, bool with_sinks = false) {
         ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
         ctx_host                = ggml_init(params);
         ctx_dev                 = ggml_init(params);
@@ -1590,8 +1669,11 @@ struct attn_run {
         ggml_tensor * q         = ggml_new_tensor_3d(ctx_host, GGML_TYPE_F32, s.d, s.n_head, s.n_tokens);
         ggml_tensor * mask =
             mode == attn_mask::none ? nullptr : ggml_new_tensor_4d(ctx_host, GGML_TYPE_F16, s.n_kv, s.n_tokens, 1, 1);
-        out_ref  = build_flash_attn(ctx_host, q, k_cache, v_cache, mask, s.n_head_kv, s.n_kv, max_bias);
-        out      = build_flash_attn(ctx_dev, q, k_cache, v_cache, mask, s.n_head_kv, s.n_kv, max_bias);
+        ggml_tensor * sinks = with_sinks ? ggml_new_tensor_1d(ctx_host, GGML_TYPE_F32, s.n_head) : nullptr;
+        out_ref  = build_flash_attn(ctx_host, q, k_cache, v_cache, mask, s.n_head_kv, s.n_kv, max_bias, logit_softcap,
+                                    sinks);
+        out      = build_flash_attn(ctx_dev, q, k_cache, v_cache, mask, s.n_head_kv, s.n_kv, max_bias, logit_softcap,
+                                    sinks);
         buf_host = ggml_backend_alloc_ctx_tensors_from_buft(ctx_host, ggml_backend_cpu_buffer_type());
         buf_dev  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, ggml_backend_dev_buffer_type(dev));
         if (buf_host == nullptr || buf_dev == nullptr) {
@@ -1603,6 +1685,9 @@ struct attn_run {
                                 ggml_nbytes(k_cache));
         ggml_backend_tensor_set(v_cache, random_f16(ggml_nelements(v_cache), seed + 2, 1.0f).data(), 0,
                                 ggml_nbytes(v_cache));
+        if (sinks != nullptr) {
+            ggml_backend_tensor_set(sinks, random_values(s.n_head, seed + 3, 4.0f).data(), 0, ggml_nbytes(sinks));
+        }
         if (mask != nullptr) {
             std::vector<ggml_fp16_t> m(ggml_nelements(mask));
             for (int64_t t = 0; t < s.n_tokens; t++) {
@@ -1881,6 +1966,136 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         n_launch_same += same_launch;
     }
 
+    // the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork") under
+    // FLAGOS_SPACEMIT_ATTN_KVH=1-8, against the CPU within the same bounds. Each case must take its contract
+    // (spacemit_find_op) and repeat bit for bit in a second run; that its outputs differ from the default path's is
+    // counted only, since with one chunk per KV head the reference (the Mac) sums as the default's does. The cases take
+    // its edges: 3 tokens on Qwen3-4B (3 passes of 4 rows), GQA 2 (8 tokens in one pass) and 8 (2 chunks), 2 KV heads (4
+    // chunks) with the last chunk hidden from tokens 0 and 1, n_kv 1000 and 999 (neither a multiple of 64 positions
+    // nor, at 999, of the chunk), head size 64, no mask, sinks, softcap, every cell hidden, one token. The two steps also
+    // run directly on the host with 3 and 5 tiles (the reference there), which must agree bit for bit
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    spacemit_ops ops;
+    std::string  detail;
+    REQUIRE(spacemit_ops_bind(table, &ops, &detail));
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    const spacemit_plugin_kernel * kvh_steps[2] = { nullptr, nullptr };
+    for (uint32_t k = 0; kernels != nullptr && k < n_kernels; k++) {
+        for (int i = 0; i < 2; i++) {
+            if (kernels[k].name != nullptr &&
+                std::strcmp(kernels[k].name, i == 0 ? "flash_attn.kvh.partial" : "flash_attn.kvh.merge") == 0) {
+                kvh_steps[i] = &kernels[k];
+            }
+        }
+    }
+    REQUIRE(kvh_steps[0] != nullptr && kvh_steps[1] != nullptr && kvh_steps[0]->workspace_size != nullptr);
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    struct kvh_case {
+        const char * what;
+        attn_shape   s;
+        attn_mask    mode    = attn_mask::causal;
+        float        softcap = 0.0f;
+        bool         sinks   = false;
+        float        visible = 0.0f;
+    };
+    std::vector<kvh_case> kvh_cases;
+    for (int64_t n_tokens : { 2, 3, 4, 8 }) {
+        for (int64_t n_kv : { 256, 512, 1000, 4096 }) {
+            kvh_cases.push_back({ "Qwen3-4B", { 32, 8, 128, n_kv, n_tokens, n_kv - n_tokens } });
+        }
+    }
+    kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 4, 508 } });
+    kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 8, 504 } });
+    kvh_cases.push_back({ "GQA 8, 2 chunks", { 32, 4, 128, 1024, 4, 1020 } });
+    kvh_cases.push_back({ "2 KV heads, 4 chunks, the last hidden from tokens 0 and 1", { 8, 2, 128, 1024, 4, 766 } });
+    kvh_cases.push_back({ "2 KV heads, chunks of 250 and 249 positions", { 8, 2, 128, 999, 3, 996 } });
+    kvh_cases.push_back({ "head size 64", { 32, 8, 64, 1024, 4, 1020 } });
+    kvh_cases.push_back({ "no mask", { 32, 8, 128, 1024, 4, 1020 }, attn_mask::none });
+    kvh_cases.push_back({ "sinks", { 32, 8, 128, 1024, 4, 1020 }, attn_mask::causal, 0.0f, true });
+    kvh_cases.push_back({ "sinks, GQA 8, 2 chunks", { 32, 4, 128, 1024, 4, 1020 }, attn_mask::causal, 0.0f, true });
+    kvh_cases.push_back({ "softcap 2", { 32, 8, 128, 1024, 4, 1020 }, attn_mask::causal, 2.0f });
+    kvh_cases.push_back(
+        { "every cell hidden, sinks", { 32, 4, 128, 1024, 4, 1020 }, attn_mask::causal, 0.0f, true, -INFINITY });
+    kvh_cases.push_back({ "1 token", { 32, 8, 128, 1024, 1, 1023 } });
+    int    n_kvh_taken = 0, n_kvh_differ = 0, n_kvh_repeat = 0, n_kvh_direct = 0, n_kvh_direct_same = 0;
+    double e_kvh = 0.0, e_kvh_row = 0.0;
+    for (const kvh_case & c : kvh_cases) {
+        attn_run run;
+        REQUIRE(run.init(dev, c.s, c.mode, c.visible, 0.0f, seed++, 4.0f, c.softcap, c.sinks));
+        REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
+        const int64_t            n = ggml_nelements(run.out);
+        const float *            r = static_cast<const float *>(run.out_ref->data);
+        const std::vector<float> ref(r, r + n);
+        std::vector<float>       def, kvh[2];
+        {
+            env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+            env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", nullptr);
+            REQUIRE(run.dev_output(backend, def));
+        }
+        env_override        attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+        env_override        kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", "1-8");
+        const spacemit_op * got   = spacemit_find_op(ops, run.out, buft);
+        const bool          taken = got != nullptr && got->steps[0] == kvh_steps[0];
+        if (!taken) {
+            std::fprintf(stderr, "FAIL: attention KV-head split, %s, %lld tokens at n_kv %lld: its contract not taken\n",
+                         c.what, (long long) c.s.n_tokens, (long long) c.s.n_kv);
+            g_failures++;
+        }
+        n_kvh_taken += taken;
+        for (int k = 0; k < 2; k++) {
+            REQUIRE(run.dev_output(backend, kvh[k]));
+        }
+        const attn_error  e    = attn_errors(kvh[0].data(), ref.data(), n, run.out->ne[0]);
+        const std::string what = std::string("KV-head split, ") + c.what;
+        attn_report(e, what.c_str(), c.s);
+        e_kvh     = std::max(e_kvh, e.all);
+        e_kvh_row = std::max(e_kvh_row, e.row);
+        n_kvh_differ += std::memcmp(kvh[0].data(), def.data(), n * sizeof(float)) != 0;
+        const bool repeat = std::memcmp(kvh[0].data(), kvh[1].data(), n * sizeof(float)) == 0;
+        if (!repeat) {
+            std::fprintf(stderr, "FAIL: attention KV-head split, %s: two runs differ\n", c.what);
+            g_failures++;
+        }
+        n_kvh_repeat += repeat;
+
+        // the steps called directly on the CPU-buffer node, with 3 and 5 tiles (the shorter cases only)
+        if (c.s.n_kv > 1024) {
+            continue;
+        }
+        ggml_tensor * node = run.out_ref;
+        CHECK(kvh_steps[0]->supports(node) && kvh_steps[1]->supports(node));
+        std::vector<float> direct[2];
+        for (int k = 0; k < 2; k++) {
+            const uint32_t     nth = k == 0 ? 3 : 5;
+            const size_t       ws  = kvh_steps[0]->workspace_size(node);
+            std::vector<float> workspace(ws / sizeof(float), NAN);
+            float *            out = static_cast<float *>(node->data);
+            std::fill(out, out + n, NAN);
+            bool ok = true;
+            for (int step = 0; step < 2; step++) {
+                for (uint32_t ith = 0; ith < nth; ith++) {
+                    const spacemit_tile tile = { ith, nth, nullptr, 0, workspace.data(), ws, nullptr };
+                    ok &= kvh_steps[step]->fn(&tile, node);
+                }
+            }
+            CHECK(ok);
+            direct[k].assign(out, out + n);
+            const attn_error  ed = attn_errors(direct[k].data(), ref.data(), n, run.out->ne[0]);
+            const std::string wd = std::string("KV-head split with ") + std::to_string(nth) + " tiles, " + c.what;
+            attn_report(ed, wd.c_str(), c.s);
+        }
+        const bool same = std::memcmp(direct[0].data(), direct[1].data(), n * sizeof(float)) == 0;
+        if (!same) {
+            std::fprintf(stderr, "FAIL: attention KV-head split, %s: 3 and 5 tiles differ\n", c.what);
+            g_failures++;
+        }
+        n_kvh_direct++;
+        n_kvh_direct_same += same;
+    }
+
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf(
@@ -1899,6 +2114,14 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
                 n_split, e_split, k_attn_max_nmse, e_split_row, k_attn_max_row_nmse, n_split_differ, n_split,
                 n_turns_same, sizeof(split_cases) / sizeof(split_cases[0]), n_launch_same,
                 sizeof(split_cases) / sizeof(split_cases[0]));
+    std::printf("attn     KV-head split for a few tokens (FLAGOS_SPACEMIT_ATTN_KVH=1-8) on %zu cases (1-8 tokens, n_kv "
+                "256-4096, GQA 2, 4 and 8, 1, 2 and 4 chunks, sinks, softcap, no mask, every cell hidden): max NMSE "
+                "%.2e (bound %.0e), worst row %.2e (bound %.0e); its contract taken in %d/%zu; %d/%zu outputs differ "
+                "from the default path's; two runs identical in %d/%zu; 3 and 5 tiles called directly identical in "
+                "%d/%d%s\n",
+                kvh_cases.size(), e_kvh, k_attn_max_nmse, e_kvh_row, k_attn_max_row_nmse, n_kvh_taken,
+                kvh_cases.size(), n_kvh_differ, kvh_cases.size(), n_kvh_repeat, kvh_cases.size(), n_kvh_direct_same,
+                n_kvh_direct, reference_label());
     return 0;
 }
 
@@ -4207,7 +4430,8 @@ static int bench_mm(ggml_backend_dev_t dev) {
 // has its own cache, every call reads its cache from DRAM: it takes the next of enough copies (32 MB together, as
 // bench_mm). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own
 // launch here. At one token the default (from n_kv 512 the split over the tiles with the turns; plan.md M2e.3, round 2)
-// also against FLAGOS_SPACEMIT_ATTN=split (the split without the turns) and one-chunk (the kernels before round 2)
+// also against FLAGOS_SPACEMIT_ATTN=split (the split without the turns) and one-chunk (the kernels before round 2); a
+// few tokens also against FLAGOS_SPACEMIT_ATTN_KVH=1-8 (below)
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -4265,6 +4489,45 @@ static int bench_attn(ggml_backend_dev_t dev) {
             std::printf("bench    attn %lld tokens n_kv %4lld: provider %8.0f us (%7.1f ms per batch), cpu %8.0f us "
                         "(%7.1f ms)\n",
                         (long long) s.n_tokens, (long long) s.n_kv, t_dev, 36 * t_dev / 1e3, t_cpu, 36 * t_cpu / 1e3);
+        }
+    }
+
+    // the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): 1, 2, 3,
+    // 4 and 8 tokens at n_kv 256-8192, the default (FLAGOS_SPACEMIT_ATTN_KVH unset) against FLAGOS_SPACEMIT_ATTN_KVH=1-8,
+    // the two taking turns twice, the faster turn of each kept; the copies and GB/s as above
+    for (const int64_t n_kv : { 256, 512, 1024, 4096, 8192 }) {
+        const int iterations = n_kv <= 256 ? 30 : n_kv <= 512 ? 25 : n_kv <= 1024 ? 20 : n_kv <= 4096 ? 10 : 5;
+        for (const int64_t n_tokens : { 1, 2, 3, 4, 8 }) {
+            const attn_shape s        = { 32, 8, 128, n_kv, n_tokens, n_kv - n_tokens };
+            const double     kv_bytes = 2.0 * (double) (s.n_kv * s.n_head_kv * s.d) * sizeof(ggml_fp16_t);
+            const size_t     copies   = (size_t) std::min(32.0, std::ceil(32e6 / kv_bytes));
+            std::vector<std::unique_ptr<attn_run>> runs;
+            for (size_t c = 0; c < copies; c++) {
+                runs.push_back(std::make_unique<attn_run>());
+                REQUIRE(runs.back()->init(dev, s, attn_mask::causal, 0.0f, 0.0f, (uint32_t) c));
+                CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
+            }
+            bool       ok     = true;
+            size_t     next   = 0;
+            const auto dev_us = [&](const char * kvh) {
+                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+                env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", kvh);
+                return time_us(
+                    [&] {
+                        ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS;
+                    },
+                    iterations);
+            };
+            double t_def = HUGE_VAL, t_kvh = HUGE_VAL;
+            for (int turn = 0; turn < 2; turn++) {
+                t_def = std::min(t_def, dev_us(nullptr));
+                t_kvh = std::min(t_kvh, dev_us("1-8"));
+            }
+            CHECK(ok);
+            std::printf("bench    attn %lld token%s n_kv %4lld, FLAGOS_SPACEMIT_ATTN_KVH: default %7.0f us (%5.1f GB/s); "
+                        "1-8 %7.0f us (%+.1f%%, %5.1f GB/s)\n",
+                        (long long) n_tokens, n_tokens == 1 ? " " : "s", (long long) n_kv, t_def,
+                        kv_bytes / t_def / 1e3, t_kvh, 100.0 * (t_kvh / t_def - 1.0), kv_bytes / t_kvh / 1e3);
         }
     }
     ggml_backend_free(backend);

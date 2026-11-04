@@ -46,6 +46,16 @@ void    split_compute(const ggml_tensor * dst, int64_t b, void * tcm, size_t tcm
 // maximum), then DV floats, V summed with those weights; -inf, 0 and zeros when it saw no visible position
 void    split_end(const ggml_tensor * dst, void * tcm, size_t tcm_size, float * partial);
 
+// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): step 1 of
+// ggml-spacemit's split-KV attention, flagos-spacemit-attn.cpp checks the shape and merges. A unit is (KV head, chunk
+// of n_kv / n_chunks positions); the tile takes units ith, ith + nth, ... and writes each row's {M, S, VKQ[DV]} at
+// partials + ((t * n_head + h) * n_chunks + c) * (DV + 2). Needs one stream, as many K as V heads, 2, 4 or 8 query
+// heads per KV head, no ALiBi, the mask (if any) one row per token for every head, and tcm of at least
+// kvh_scratch_bytes(dst) (with less than the K/V pack needs on top, the kernel reads the positions row by row)
+size_t kvh_scratch_bytes(const ggml_tensor * dst);
+void   kvh_partial(const ggml_tensor * dst, int64_t n_chunks, int64_t ith, int64_t nth, float * partials, void * tcm,
+                   size_t tcm_size);
+
 }  // namespace spacemit_rvv_attn
 
 #endif  // GGML_FLAGOS_SPACEMIT_RVV

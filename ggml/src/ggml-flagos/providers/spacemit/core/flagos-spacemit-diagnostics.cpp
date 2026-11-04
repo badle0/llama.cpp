@@ -168,6 +168,8 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
             std::snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT.%s q%lld kv%lld",
                           std::strcmp(name, "flash_attn") == 0             ? "one-step" :
                           std::strcmp(name, "flash_attn.split.merge") == 0 ? "merge" :
+                          std::strcmp(name, "flash_attn.kvh.partial") == 0 ? "kvh-partial" :
+                          std::strcmp(name, "flash_attn.kvh.merge") == 0   ? "kvh-merge" :
                                                                              "partial",
                           static_cast<long long>(n->src[0]->ne[1]), static_cast<long long>(n->src[1]->ne[1]));
             break;

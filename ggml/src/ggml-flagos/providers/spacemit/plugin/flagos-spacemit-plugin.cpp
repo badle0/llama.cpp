@@ -346,6 +346,10 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
           spacemit_flash_attn_split_paired_supported, spacemit_flash_attn_split_workspace                                      },
         { "flash_attn.split.merge", spacemit_kernel_flash_attn_split_merge, spacemit_flash_attn_split_any_supported,
           spacemit_flash_attn_split_workspace                                                                                  },
+        { "flash_attn.kvh.partial", spacemit_kernel_flash_attn_kvh_partial, spacemit_flash_attn_kvh_supported,
+          spacemit_flash_attn_kvh_workspace                                                                                    },
+        { "flash_attn.kvh.merge", spacemit_kernel_flash_attn_kvh_merge, spacemit_flash_attn_kvh_supported,
+          spacemit_flash_attn_kvh_workspace                                                                                    },
     };
     if (count != nullptr) {
         *count = sizeof(kernels) / sizeof(kernels[0]);
