@@ -1987,7 +1987,7 @@ Against the predictions: the weights stage the largest and mostly user time, hel
 
 ### S2 spec, for review (2026-11-05)
 
-**Status:** for the user's review; no code yet. S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
+**Status:** step 0 done on the Mac and the K3; steps 1 to 3 for the user's review, no code yet. S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
 - **The boundary is already clean.** From the Mac's objects: no core object uses a symbol the plugin side defines, or the reverse. The plugin side needs 18 functions of `ggml-base` and nothing else of ours. The check program calls 6 plugin-side functions directly, all of them answered by name by `get_proc_address`. No build definition of the plugin (`GGML_FLAGOS_SPACEMIT_SPERT`, `_IME2`, `_RVV`, `_HOST_TEST_DEVICE`) is read by a core file.
 - **Runs are already one at a time per device** (`run_mutex`, `flagos-spacemit.cpp:50`, `:395`), so sharing a stream needs no new locking around a run.
 - **The zero-copy entries do not help start-up** ("The start-up split").
@@ -2010,6 +2010,17 @@ The sides. Core: `flagos-spacemit.cpp`, `flagos-spacemit-ops.cpp`, `core/*`, `fl
 
 Not run on Qwen3-4B, so its margin is by construction. Expected on the K3: 49 on Qwen3-0.6B with `--build`, 47 on Qwen3-4B without `--depth`, which this step does not need; A to E as in today's `server.json`.
 
+**Result of step 0 on the K3 (2026-11-05; the user; on `29d48997e`, under the crash reporter).** As expected: Qwen3-0.6B with `--build` 49/49, Qwen3-4B without `--depth` 47/47. On both models all 13 replies of A to E equal the runner's from before this step, text and first-token probabilities, and F's three replies are new. Group F, one run on each model:
+
+| | F2, `cache_n` 19, `prompt_n` 4 | F2-scratch, `prompt_n` 23 | first token, F2 / scratch | KLD (limit 0.1) |
+|---|---|---|---|---|
+| Qwen3-0.6B | 24 ms | 53 ms | ' Rex' 0.9163 / 0.9147 | 0.000052 (4 shared tokens) |
+| Qwen3-4B | 112 ms | 324 ms | ' Rex' 0.9991 / 0.9992 | 0.000003 (5 shared tokens) |
+
+- The tail is 4 tokens on Qwen3-4B too, so its margin, by construction above, is now measured.
+- S2's baselines on the board are `~/kvh/s2-base-06.json` and `~/kvh/s2-base-4b.json`, in place of `~/server-baseline-*.json`, which lack F. With `--server-baseline` the runner's counts become 50 on Qwen3-0.6B with `--build` and 49 on Qwen3-4B with `--depth` (prediction, by adding this step's check to `build.md` §6's counts).
+- Not read on the K3: which kernel F2 took. The runner sets no op counters, so `kvh-partial` for F2 is the Mac's reading on Qwen3-0.6B (above) and, on the K3, an inference from the default's rule, 2 to 8 tokens from n_kv 256. The server's op counters on the K3 would settle it.
+
 **Step 1, the plugin as its own library.**
 1. `provider.cmake`: `FLAGOS_SOURCES` keeps the core's files. The plugin's files, `libspert`, its include directory, the IME2 checks and the per-file `-march` options move to the plugin. `GGML_FLAGOS_HAVE_SPACEMIT` stays with the core. A static build (`BUILD_SHARED_LIBS` off) stops with a `FATAL_ERROR` naming A5.
 2. New `providers/spacemit/plugin.cmake`, included from `ggml/src/ggml-flagos/CMakeLists.txt` right after the `ggml-flagos` target (one line, an `upstream-changes.md` entry in the same commit): `add_library(flagos-provider-spacemit SHARED ...)`, named `libflagos-provider-spacemit` as the loader expects, no version suffix, written beside `libggml-flagos` (`LIBRARY_OUTPUT_DIRECTORY` as `ggml_add_backend_library` sets it, also under `GGML_BACKEND_DL`), `ggml-base` linked privately, hidden visibility so that only `flagos_spacemit_plugin_v1` is exported, installed beside the core, and `add_dependencies(ggml-flagos flagos-provider-spacemit)`, since nothing links it and `--target llama-bench` must still build it.
@@ -2021,7 +2032,7 @@ Edge cases, each tested: the plugin file absent; `GGML_FLAGOS_PROVIDER_PATH` set
 
 Tests on the Mac: `build-host` without new warnings; the check program, all passed, its figures unchanged; test-backend-ops `FLASH_ATTN_EXT`; `nm`: the entry symbol only in the plugin, exported alone; the core links no plugin code; the plugin's file removed, a warning and CPU only. One mutation caught: the plugin target's dependency removed, `--target llama-bench` from clean leaves no plugin, and the run reports it.
 
-On the K3: the build; `readelf -d`, `libspert` needed by the plugin only; the check program and test-backend-ops; the runner on both models with `--server-baseline`, replies identical, Qwen3-4B with `--depth`; pp128 and tg128 within 1% of 106.24 and 11.04 t/s; `startup-split.py`, within 0.2 s of today (estimate: the separate file adds milliseconds).
+On the K3: the build; `readelf -d`, `libspert` needed by the plugin only; the check program and test-backend-ops; the runner on both models with `--server-baseline`, replies identical, Qwen3-4B with `--depth`; pp128 and tg128 within 1% of today's build, kept aside as `~/kvh/s2-base` before the step is pulled, the two interleaved in one session (corrected 2026-11-05: the spec compared against the stored 106.24 and 11.04 t/s, but speeds compare only within a session, `build.md` §7); `startup-split.py` on both builds in that session, within 0.2 s (estimate: the separate file adds milliseconds).
 
 **Step 2, one stream per device.** Today every backend context holds its own stream with all 8 AI cores, so a second live context cannot get them (the speculative decoding study above, its first K3 run: three 30 s waits, then an abort), and `llama-speculative` and a server with `-md` need `FLAGOS_SPACEMIT_STREAM=per-call`.
 1. In the plugin: `spacemit_plugin_device` holds one executor, created by the first `stream_create` and kept by a count of handles under a mutex; `spacemit_plugin_stream` becomes a handle holding it and that context's stats pointer; the last `stream_destroy` frees it and with it the core grant. Contexts may be freed in any order.
@@ -2032,7 +2043,7 @@ Edge cases: free the first context while the second lives; one thread each on tw
 
 Tests on the Mac: the check program's new block: two backends, one executor by the count, a graph on each interleaved with outputs equal to each run alone, the first freed and the second still running, both freed and a new one a new executor; the two-thread case under ThreadSanitizer. One mutation caught: a new executor per handle.
 
-On the K3, no switch set: `llama-speculative` on p2 and p4, draft lengths 2 and 3: no "could not get", the accepted counts of 2026-11-05, speed within 3% of 14.64, 17.50, 12.60 and 17.20 t/s (prediction: the same or slightly faster, a launch 9.9 against 24.3 µs); the runner with `--server-baseline`, identical; no TCM held.
+On the K3, no switch set: `llama-speculative` on p2 and p4, draft lengths 2 and 3: no "could not get", the accepted counts of 2026-11-05, speed within 3% of the same build under `FLAGOS_SPACEMIT_STREAM=per-call`, interleaved in one session (prediction: the same or slightly faster, a launch 9.9 against 24.3 µs; corrected 2026-11-05 as in step 1, the stored 14.64, 17.50, 12.60 and 17.20 t/s being that switch's speeds that day); the runner with `--server-baseline`, identical; no TCM held.
 
 **Step 3, the directory move.** `git mv` only, so that steps 1 and 2 read against the paths the docs cite: the core's files under `core/`, the plugin's under `plugin/`, include paths, `provider.cmake`, `plugin.cmake`, `scripts/rvv-syntax-check.sh`. Old line references in the docs stay as history of their commits. Mac: the build, the check program and `rvv-syntax-check.sh`. K3: the build and the check program.
 
