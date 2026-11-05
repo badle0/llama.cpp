@@ -1843,7 +1843,7 @@ pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two sett
 | `-ub 8`, 4 rows per token | `2-8` | 0.002570 ± 0.000089 | 1.007191 ± 0.004528 | 97.167 ± 0.367% | 209.41 |
 
 - Both pass: the KV-head path's mean KLD is below the default's at each ubatch. 3 and 5 to 7 tokens were not run; they take the same 4-row passes as 8 (by reading).
-- `-ub 8` matches `-ub 4` to every printed digit, on each setting. The runs are separate (the times differ), and it has precedent: the CPU at `-ub 4` and `-ub 63`, and the simulated device at `-ub 4` and `-ub 8`, agree to the last digit too. What follows is an inference: a row's arithmetic does not depend on the ubatch above 4 rows, and the 4-row quantizer's groups line up at 4 and 8. If so, the KV-head path's 16-row and 4-row passes give the same results at the printed precision, a cross-check of the two kernels. The maximum KLD of the four logs is one more digit of evidence, not a proof.
+- `-ub 8` matches `-ub 4` to every printed digit, on each setting. The runs are separate (the times differ), and it has precedent: the CPU at `-ub 4` and `-ub 63`, and the simulated device at `-ub 4` and `-ub 8`, agree to the last digit too. What follows is an inference: a row's arithmetic does not depend on the ubatch above 4 rows, and the 4-row quantizer's groups line up at 4 and 8. If so, the KV-head path's 16-row and 4-row passes give the same results at the printed precision, a cross-check of the two kernels. The maximum KLD of the four logs agrees, more evidence but not a proof: 0.100330 off at `-ub 4` and `-ub 8`, 0.061451 through the KV-head path at both, so its worst token is also the lower.
 - `-ub 2`'s lower KLD on both settings is near the 0.00205 measured at `-ub 1` earlier, so these rows may take the one-row quantizer rather than the 4-row one (inference; not read in the code).
 - Speed, one run each, not counted by the rule: 2.56 times faster at `-ub 2` (360 to 140 ms per ubatch) and 2.80 at `-ub 8` (1,147 to 409 ms).
 
@@ -1868,6 +1868,21 @@ pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two sett
 4. `spacemit_check.py` in full, its checks all passing, which gives the new server baseline before S2.
 
 **Not in this spec:** one token; the fused passes of 4 tokens; the threshold for 9 to 63 tokens (both after S2, with `batch-one.md`). **Time:** the coder, a short session; on the K3 one build and about 1.5 hours of runs (estimate).
+
+**Result on the K3, attention at depth by the op counters (2026-11-05; the user's run; the switch unset, today's default, `-p 512 -n 32 -d 1024,4096,8192 -fa 1 -mmp 0 -r 2`; `rc=0`, no TCM held).** The shapes here, 1 and 512 rows, are not the KV-head path's, so the default in the spec above does not change them. Per graph:
+
+| Shape | n_kv | Wall | Attention | Share | Everything else | Imbalance + barrier |
+|---|---|---|---|---|---|---|
+| 1 row | 1,280 | 102.3 ms | 14.2 ms | 13.9% | 88.1 ms | 4.5 ms (4.4%) |
+| 1 row | 4,352 | 128.7 ms | 40.5 ms | 31.5% | 88.1 ms | 4.4 ms (3.4%) |
+| 1 row | 8,448 | 163.5 ms | 75.7 ms | 46.3% | 87.8 ms | 4.4 ms (2.7%) |
+| 512 rows | 1,536 | 7,395 ms | 2,733 ms | 37.0% | 4,663 ms | 35.5 ms (0.48%) |
+| 512 rows | 4,608 | 14,208 ms | 9,571 ms | 67.4% | 4,637 ms | 23.9 ms (0.17%) |
+| 512 rows | 8,704 | 23,102 ms | 18,432 ms | 79.8% | 4,669 ms | 26.4 ms (0.11%) |
+
+- Everything other than attention does not move with depth (88 ms and about 4.65 s, within 1%), so what depth adds is attention. The one-row slope, 8.58 µs per cached position, confirms the 8.6 in `batch-one.md`. One-row calls of 375, 1,107 and 2,084 µs agree with the benchmark's split.
+- `batch-one.md`'s T7 sum holds on these figures: attention halved at n_kv 4,608 gives about 54 t/s against 36.
+- Ranking the attention work after S2, by what depth costs (my reading, for review with `batch-one.md` §5). For TTFT, first 9 to 63 tokens at depth, the few-token cost the KV-head path leaves (about 0.27 s per token at n_kv 4,352). For pp at depth, then the tiled kernel, 67 to 80% of the graph. For tg at depth, the one-row path is last: DRAM-bound and already split, 31.5% at n_kv 4,352. Imbalance and barriers are small at every shape, so they rank below all three.
 
 **Result on the K3, speculative decoding (2026-11-05; the user's run; 128 tokens, the stream per graph, one run each, not taking turns; the decision rule does not count it):**
 

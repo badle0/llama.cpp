@@ -52,6 +52,8 @@ TTFT today:
 
 Generation against depth (tg32, measured): 89.3, 102.6, 111.4, 129.0 and 164.2 ms per token at 0, 1,024, 2,048, 4,096 and 8,192 cached positions. tg512 itself has never been run; from depth 0 it should be about 10.5 t/s and from depth 4096 about 7.6 (estimates, integrating this line).
 
+Depth's cost, measured by the op counters (2026-11-05, `plan.md` "attention at depth by the op counters"): attention is 13.9%, 31.5% and 46.3% of a one-row graph at n_kv 1,280, 4,352 and 8,448, and 37.0%, 67.4% and 79.8% of a 512-row graph at n_kv 1,536, 4,608 and 8,704; everything else stays at 88 ms and about 4.65 s. The KV-head split, tested behind its switch and not yet the default, takes 2 to 8 tokens at depth 4096 from 3.18 to 3.51 t/s to 9.44 to 17.71 t/s (pp4: a graph of 1,166 to 226 ms; `plan.md`); the table above predates it, and 9 to 63 tokens stay as they are.
+
 ## 3. Cases that test and challenge batch-one
 
 None of these is an acceptance check today except where noted. Grid sizes are proposals.
