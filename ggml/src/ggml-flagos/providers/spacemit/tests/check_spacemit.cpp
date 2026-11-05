@@ -2012,6 +2012,9 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
             kvh_cases.push_back({ "Qwen3-4B", { 32, 8, 128, n_kv, n_tokens, n_kv - n_tokens } });
         }
     }
+    kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 2, 510 } });
+    kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 4096, 2, 4094 } });
+    kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 3, 509 } });
     kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 4, 508 } });
     kvh_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 8, 504 } });
     kvh_cases.push_back({ "GQA 8, 2 chunks", { 32, 4, 128, 1024, 4, 1020 } });
