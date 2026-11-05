@@ -1767,6 +1767,51 @@ So ggml-cpu's two attention kernels disagree, the line exactly at the tiled kern
 - The prediction "the KLD about today's" holds. The two differ here where the Mac's reference kernels agree to the last digit, so the RVV kernels' arithmetic differs; which step causes it was not looked at.
 - Speed, a second reading of the same chunk, again one run each and not taking turns: 3.80 times faster (611 and 161 ms per ubatch), against 3.85 in the first. It does not count for the rule, which asks for the benchmark and llama-bench.
 
+**Result on the K3, the attention benchmark (2026-11-05; the user's run, `--bench-attn`; `rc=0`).** Qwen3-4B's heads, one attention call, µs, the default against `1-8`, the two taking turns twice, the faster of each:
+
+| Tokens | n_kv 256 | n_kv 512 | n_kv 1024 | n_kv 4096 | n_kv 8192 |
+|---|---|---|---|---|---|
+| 1 | 140 → 160 (+14.8%) | 270 → 294 (+8.8%) | 389 → 550 (+41.5%) | 1,115 → 1,981 (+77.6%) | 2,064 → 3,258 (+57.9%) |
+| 2 | 680 → 196 (-71.1%) | 1,674 → 362 (-78.4%) | 3,512 → 657 (-81.3%) | 15,183 → 2,237 (-85.3%) | 31,840 → 3,931 (-87.7%) |
+| 3 | 990 → 380 (-61.6%) | 2,491 → 816 (-67.3%) | 5,306 → 1,598 (-69.9%) | 22,925 → 5,965 (-74.0%) | 47,880 → 11,941 (-75.1%) |
+| 4 | 1,290 → 268 (-79.2%) | 3,306 → 484 (-85.4%) | 7,069 → 872 (-87.7%) | 30,683 → 3,431 (-88.8%) | 63,870 → 6,764 (-89.4%) |
+| 8 | 2,479 → 873 (-64.8%) | 6,539 → 2,131 (-67.4%) | 14,122 → 4,130 (-70.8%) | 62,328 → 15,994 (-74.3%) | 128,435 → 31,186 (-75.7%) |
+
+- Against the predictions at n_kv 4096: 2, 3 and 4 tokens inside their ranges (2.24, 5.97 and 3.43 ms; predicted 2 to 3, 5 to 7 and 3 to 5). 8 tokens 15.99 ms, better than the 18 predicted. One token missed: 1.78 times the paired split, predicted 1.0 to 1.3, though it reads the same K and V in total; why was not looked at.
+- The rule, the benchmark's half only (llama-bench still to run): 2 to 4 tokens and 8 tokens clear the 20% bar at every n_kv, 256 included, so nothing here asks the path to start at 512. 5, 6 and 7 tokens are not measured by the benchmark or by llama-bench; they would rest on 8, which takes the same one pass per token. One token is slower at every n_kv: the paired split stays unless llama-bench's tg32 contradicts this, which I do not expect (inference).
+- The pass structure shows in the time per token at n_kv 4096: 0.86 ms at 4 tokens and 1.12 at 2 (one read per call), 1.99 at 3, 2.00 at 8 and 1.98 at 1 (one read per token). So 3 tokens cost 1.74 times 4. Candidate, not built and not part of this decision: 8 tokens as two fused passes of 4, about 6.9 ms against 16.0, and 3 tokens as one fused pass with an unused row, about 3.4 ms against 6.0 (estimates from the 4-token figure). The same grouping could serve 9 to 63 tokens, beside lowering the tiled kernel's threshold (part B); the test would be that candidate against the threshold at the same shapes.
+
+**Result on the K3, llama-bench (2026-11-05; the user's run; `-t 8 -fa 1 -mmp 0 -r 3`, the settings taking turns twice, the better of each).** t/s, the default against `2-8` (pp) or `1-8` (tg32):
+
+| Test | Depth 0 | Depth 1024 | Depth 4096 |
+|---|---|---|---|
+| pp2 | 19.04 → 18.96 (-0.4%) | 8.54 → 15.66 (+83.5%) | 3.18 → 10.97 (+244.8%) |
+| pp3 | 24.21 → 23.92 (-1.2%) | 9.52 → 16.65 (+74.9%) | 3.28 → 9.44 (+187.9%) |
+| pp4 | 37.71 → 37.46 (-0.7%) | 11.10 → 28.71 (+158.7%) | 3.43 → 17.71 (+416.8%) |
+| pp8 | 61.14 → 60.25 (-1.4%) | 12.58 → 28.31 (+125.0%) | 3.51 → 11.80 (+236.4%) |
+| pp64 (control) | 116.37 → 116.29 (-0.1%) | 78.18 → 77.99 (-0.2%) | 38.44 → 38.49 (+0.1%) |
+| pp512 (control) | 95.92 → 96.52 (+0.6%) | 69.06 → 69.17 (+0.2%) | 35.92 → 35.92 (-0.0%) |
+| tg32, 1 token | 11.18 → 11.16 (-0.2%) | 9.74 → 9.29 (-4.6%) | 7.75 → 6.35 (-18.1%) |
+
+- The prediction for pp4 at depth 4096, about 3.5 to about 15 t/s, was beaten: 3.43 to 17.71, a graph of 1,166 ms to 226 ms.
+- The benchmark predicts these gains: at depth 4096 the time saved per graph is 447, 597, 940 and 1,601 ms for 2, 3, 4 and 8 tokens, against 466, 611, 981 and 1,668 ms from the benchmark's saving at n_kv 4096 × 36 calls, within 5%. tg32's loss, 28.4 ms, against 31.2 ms by the same sum.
+- Against the rule so far. One token: settled, it fails (-4.6% and -18.1% where it had to gain 2%), so the paired split stays and the switch's range would start at 2. 2 to 4 tokens and 8 tokens: every shape from depth 1024 past the 20%, no control more than 0.2% slower, depth 0 inside the 2%.
+- Two points open. (1) Accuracy's side of the bar, above. (2) "If n_kv 256 is slower, the path starts at 512": at depth 0 all four shapes are slightly slower in llama-bench (0.4 to 1.9 ms per graph), while the benchmark has n_kv 256 62 to 79% faster. They measure different things: the benchmark's cache is full (`n_past = n_kv - n_tokens`), while at depth 0 almost every position is masked, and both kernels skip masked positions (by reading), so attention costs little either way (the inference that this explains the difference). llama-bench has not measured n_kv 256 with a filled cache, which is where a short conversation runs. The extra block settles it: pp2, 3, 4 and 8 at depths 64 and 200 (n_kv 256), and pp5, 6 and 7 at depths 0, 1024 and 4096, which no run has measured. Predictions (estimates, from the benchmark): pp4 about +8% at depth 64 and about +30% at depth 200; pp5 to pp7 at depth 4096 about pp8's 11.80 t/s or better.
+- What this does not cover, for TTFT: 9 to 63 tokens stay on the one-chunk kernels (pp12 at depth 4096, 3.67 t/s, part B), and the chat tails that matter are about 20 to 130 tokens (`batch-one.md`).
+
+**Result on the K3, speculative decoding (2026-11-05; the user's run; 128 tokens, the stream per graph, one run each, not taking turns; the decision rule does not count it):**
+
+| Prompt, draft length | Tokens per check | Accepted | Plain decoding | Off | `2-4` | Change |
+|---|---|---|---|---|---|---|
+| p2, 2 | 3 | 82/94 | 11.05 t/s | 14.38 t/s (1.30×) | 14.64 t/s (1.32×) | +1.8% |
+| p2, 3 | 4 | 90/117 | 11.05 t/s | 17.01 t/s (1.54×) | 17.50 t/s (1.58×) | +2.9% |
+| p4, 2 | 3 | 86/86 | 10.07 t/s | 9.92 t/s (0.98×) | 12.60 t/s (1.25×) | +27.0% |
+| p4, 3 | 4 | 96/96 | 10.07 t/s | 11.71 t/s (1.16×) | 17.20 t/s (1.71×) | +46.9% |
+
+- The predictions hold: p4 at draft length 3 about 1.1 to about 1.6 (1.16 to 1.71), at draft length 2 from 0.98 to about 1.3 (1.25); p2 about as today.
+- The accepted counts are the same on both settings, so the drafts did not change. On p4 every draft was accepted, the best case for speculation; this says little about prompts where fewer are.
+- It turns draft length 2 on p4, which lost to plain decoding, into a gain. Draft length 3 (a 4-token check, one read) gains more than draft length 2 (a 3-token check, three passes), as the benchmark's 3.43 and 5.97 ms suggest; the fused 3-token pass above would be the test of how much of that gap is the pass structure.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
