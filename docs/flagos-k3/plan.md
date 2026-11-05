@@ -1937,6 +1937,22 @@ pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two sett
 - The accepted counts are the same on both settings, so the drafts did not change. On p4 every draft was accepted, the best case for speculation; this says little about prompts where fewer are.
 - It turns draft length 2 on p4, which lost to plain decoding, into a gain. Draft length 3 (a 4-token check, one read) gains more than draft length 2 (a 3-token check, three passes), as the benchmark's 3.43 and 5.97 ms suggest; the fused 3-token pass above would be the test of how much of that gap is the pass structure.
 
+### The start-up split, S2's first input (2026-11-05)
+
+**Status:** the user chose S2 directly, this measurement first (`batch-one.md` C1 and §5 input 1). What the 11.0 s on Qwen3-4B and 5.0 s on Qwen3-0.6B to `/health` consist of, to settle whether the zero-copy entries belong in S2. The runner polls once a second, so each figure may be up to 1 s high. No provider code: `scripts/startup-split.py` takes each stage from the log's timestamps at `-lv 4`, the runner's server flags, and on Linux each stage's CPU time and page faults from `/proc`. Per model: the file read cold, 3 warm starts, one with `--load-mode none`, one with the provider disabled (`-t 1`), 2 cold starts (only the model file's pages evicted, no system setting), and after each start one short request twice.
+
+**Settled already, by the bytes.** Upstream-precedents §5.4's option A uses in place only tensors that keep the file's layout. Qwen3-0.6B's file (read on the Mac): Q4_0 231.19 MiB, Q4_1 5.62 MiB, Q6_K 121.71 MiB (`token_embd`, already mapped on the CPU, the tied output head loaded on the provider as well) and F32 0.25 MiB in 113 tensors. So of the 398.65 MiB the provider's load writes, 0.25 MiB is plain, 0.06%. Option A cannot shorten start-up on this model, whatever the split. Qwen3-4B's F32 tensors are likewise norms, so the same order (estimate). A's other gains stand and are not start-up: `get_tensor` exact under mmap, the deck's wording, the engineer's remark. Whether those earn it a place in S2 is the user's decision at the spec.
+
+**Reading, set before the K3 run.**
+1. The weights stage ("weights copied and repacked") on Qwen3-4B, warm. At least a quarter of the start: T6 stays on `batch-one.md`'s list for after S2, with this figure as its ceiling; mostly user time points to a parallel repack, mostly system time to page handling, where a repacked-weights file is the alternative. Under a quarter: T6 is dropped.
+2. The parameter fit and the warm-up run have flags (`--fit off`, `--no-warmup`). Either at least 1 s on Qwen3-4B: recorded as a no-code option, untested until its effect on the first request is measured.
+3. `--load-mode none` at least 10% faster to `/health` than the default mmap: recorded as a no-code option.
+4. Cold against warm: what a first start after a reboot costs, against the disk's rate.
+
+**Predictions (estimates).** The weights stage the largest on Qwen3-4B, about 6 to 7 s of the warm start, and about 1 s on Qwen3-0.6B, from the two points' 3.0 s per GB; mostly user time, the repack being one thread. Which stage holds the 3.9 s those two points leave fixed: no prediction.
+
+**Checks on the Mac** (the simulated device, Qwen3-0.6B): the whole script on one model, and on the default two models in a stand-in home, all stages found, the first log line at 0.03 s. The `/proc` parser on a sample line and a run with a stand-in `proc_stat` and `posix_fadvise`, since macOS has neither; so the eviction call and real `/proc` figures run first on the K3, whose output shows the file's share in the page cache after each eviction, about 0% if it worked. A model file that does not load: every start reported failed, exit status 1.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
