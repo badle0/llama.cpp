@@ -1762,7 +1762,7 @@ So ggml-cpu's two attention kernels disagree, the line exactly at the tiled kern
 | off | 0.002732 ± 0.000101 | 1.003269 ± 0.004533 | 97.362 ± 0.354% | 625.58 |
 | `2-4` | 0.002570 ± 0.000089 | 1.007191 ± 0.004528 | 97.167 ± 0.367% | 164.51 |
 
-- The KV-head path's mean KLD is 0.000162 lower, 1.6 of the default's standard errors. Read literally, "within one standard error of the default's" is not met, on the better side. The rule's wording did not say which side it guards. My recommendation is to read it as guarding against lost accuracy, so that this passes; that reading came after the result, so it is the user's decision when the rule is applied.
+- The KV-head path's mean KLD is 0.000162 lower, 1.6 of the default's standard errors. Read literally, "within one standard error of the default's" is not met, on the better side. The rule's wording did not say which side it guards. My recommendation is to read it as guarding against lost accuracy, so that this passes; that reading came after the result, so it is the user's decision when the rule is applied. Decided by the user, 2026-11-05: a lower KLD counts as passing.
 - The result does not show the KV-head path to be more accurate: the PPL ratio and the top token moved slightly the other way, each inside its standard error. Both runs score the same tokens, so these standard errors do not measure the difference between them directly, and the log gives no per-token figures to pair.
 - The prediction "the KLD about today's" holds. The two differ here where the Mac's reference kernels agree to the last digit, so the RVV kernels' arithmetic differs; which step causes it was not looked at.
 - Speed, a second reading of the same chunk, again one run each and not taking turns: 3.80 times faster (611 and 161 ms per ubatch), against 3.85 in the first. It does not count for the rule, which asks for the benchmark and llama-bench.
@@ -1796,8 +1796,78 @@ So ggml-cpu's two attention kernels disagree, the line exactly at the tiled kern
 - The prediction for pp4 at depth 4096, about 3.5 to about 15 t/s, was beaten: 3.43 to 17.71, a graph of 1,166 ms to 226 ms.
 - The benchmark predicts these gains: at depth 4096 the time saved per graph is 447, 597, 940 and 1,601 ms for 2, 3, 4 and 8 tokens, against 466, 611, 981 and 1,668 ms from the benchmark's saving at n_kv 4096 × 36 calls, within 5%. tg32's loss, 28.4 ms, against 31.2 ms by the same sum.
 - Against the rule so far. One token: settled, it fails (-4.6% and -18.1% where it had to gain 2%), so the paired split stays and the switch's range would start at 2. 2 to 4 tokens and 8 tokens: every shape from depth 1024 past the 20%, no control more than 0.2% slower, depth 0 inside the 2%.
-- Two points open. (1) Accuracy's side of the bar, above. (2) "If n_kv 256 is slower, the path starts at 512": at depth 0 all four shapes are slightly slower in llama-bench (0.4 to 1.9 ms per graph), while the benchmark has n_kv 256 62 to 79% faster. They measure different things: the benchmark's cache is full (`n_past = n_kv - n_tokens`), while at depth 0 almost every position is masked, and both kernels skip masked positions (by reading), so attention costs little either way (the inference that this explains the difference). llama-bench has not measured n_kv 256 with a filled cache, which is where a short conversation runs. The extra block settles it: pp2, 3, 4 and 8 at depths 64 and 200 (n_kv 256), and pp5, 6 and 7 at depths 0, 1024 and 4096, which no run has measured. Predictions (estimates, from the benchmark): pp4 about +8% at depth 64 and about +30% at depth 200; pp5 to pp7 at depth 4096 about pp8's 11.80 t/s or better.
+- One point open (accuracy's side of the bar was decided, above): "if n_kv 256 is slower, the path starts at 512": at depth 0 all four shapes are slightly slower in llama-bench (0.4 to 1.9 ms per graph), while the benchmark has n_kv 256 62 to 79% faster. They measure different things: the benchmark's cache is full (`n_past = n_kv - n_tokens`), while at depth 0 almost every position is masked, and both kernels skip masked positions (by reading), so attention costs little either way (the inference that this explains the difference). llama-bench has not measured n_kv 256 with a filled cache, which is where a short conversation runs. The extra block settles it: pp2, 3, 4 and 8 at depths 64 and 200 (n_kv 256), and pp5, 6 and 7 at depths 0, 1024 and 4096, which no run has measured. Predictions (estimates, from the benchmark): pp4 about +8% at depth 64 and about +30% at depth 200; pp5 to pp7 at depth 4096 about pp8's 11.80 t/s or better. How it will be read, set before the run: the path keeps starting at n_kv 256, the depth-0 loss accepted, if no shape at depth 64 or 200 is more than 2% slower; otherwise it starts at 512. 5 to 7 tokens take the same bar as 8: at least 20% faster at depths 1024 and 4096, no more than 2% slower at depth 0. Checked on the Mac (Qwen3-0.6B, the simulated device; op counters): depths 64 and 200 run at n_kv 256, and 2, 7 and 8 tokens go through `kvh-partial` and `kvh-merge`.
 - What this does not cover, for TTFT: 9 to 63 tokens stay on the one-chunk kernels (pp12 at depth 4096, 3.67 t/s, part B), and the chat tails that matter are about 20 to 130 tokens (`batch-one.md`).
+
+**Result on the K3, the extra llama-bench run (2026-11-05; the user's run; same flags, the settings taking turns twice, the better of each).** t/s, the default against `2-8`:
+
+| Test | Depth 64 (n_kv 256) | Depth 200 (n_kv 256) |
+|---|---|---|
+| pp2 | 18.12 → 18.58 (+2.5%) | 16.23 → 18.07 (+11.3%) |
+| pp3 | 23.15 → 23.23 (+0.3%) | 20.40 → 22.88 (+12.2%) |
+| pp4 | 35.11 → 36.89 (+5.1%) | 28.76 → 35.70 (+24.1%) |
+| pp8 | 55.03 → 57.00 (+3.6%) | 41.70 → 54.38 (+30.4%) |
+
+| Test | Depth 0 | Depth 1024 | Depth 4096 |
+|---|---|---|---|
+| pp5 | 43.03 → 42.31 (-1.7%) | 11.53 → 23.90 (+107.3%) | 3.45 → 11.06 (+220.9%) |
+| pp6 | 42.53 → 42.39 (-0.3%) | 11.57 → 23.69 (+104.8%) | 3.44 → 10.94 (+218.2%) |
+| pp7 | 43.91 → 43.00 (-2.1%) | 11.67 → 24.04 (+106.0%) | 3.43 → 10.84 (+215.7%) |
+
+- n_kv 256: settled by the reading set beforehand. No shape at depth 64 or 200 is slower, so the path keeps starting at n_kv 256, and the depth-0 loss is accepted. The estimates for pp4 were about +8% and about +30%; measured +5.1% and +24.1%.
+- 5 and 6 tokens pass the bar set beforehand. 7 tokens misses it by 0.1 point at depth 0 (-2.1% against 2%, 159.4 to 162.8 ms per graph), past 20% at the two other depths. The default's pp7 stands above its pp5 and pp6 there while the KV-head's does less so, which may be noise (inference, one comparison). A repeat settles it: pp5, 6 and 7 at depth 0, six turns of each setting, `-r 5`. Reading set beforehand: the same statistic as the bar, the better of the turns; pp7 passes if no more than 2% slower. If it stays above 2%, the range is the user's decision.
+- The estimate for pp5 to pp7 at depth 4096, about pp8's 11.80 t/s or better, was slightly high: 10.84 to 11.06.
+- The pass structure again: at depth 4096 a graph takes 226 ms at 4 tokens and 452 ms at 5, one token more doubling it (the fused passes of 4 above are the candidate, not built).
+
+The repeat (2026-11-05; the user's run; six turns of each setting, `-r 5`, depth 0), t/s, the default against `2-8`:
+
+| Test | Best of the turns | Median of the turns | Spread, off and `2-8` |
+|---|---|---|---|
+| pp5 | 42.82 → 42.54 (-0.7%) | 42.23 → 42.35 (+0.3%) | 1.6%, 2.9% |
+| pp6 | 42.80 → 42.25 (-1.3%) | 42.34 → 41.91 (-1.0%) | 1.4%, 1.0% |
+| pp7 | 43.69 → 43.61 (-0.2%) | 43.59 → 43.16 (-1.0%) | 0.7%, 1.3% |
+
+pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two settings' spreads across turns are as large as the differences, so the first run's -2.1% was within what this measurement varies by; a loss of about 1% or less at depth 0 is not ruled out, and the medians of pp6 and pp7 lean that way.
+
+**The decision rule applied (2026-11-05).** One token fails: the paired split stays. For 2 to 8 tokens the speed bars are met in the benchmark (8 tokens and 2 to 4; 5 to 7 not in it) and in llama-bench, with no control more than 0.2% slower, the path starting at n_kv 256; the KLD at `-ub 4` passes on the user's reading.
+
+**A gap found on applying it: the accuracy run covers only one of the kernels.** On Qwen3-4B a call of 4 tokens is one pass of 16 rows, the only shape `-ub 4` runs. 2 tokens are one pass of 8 rows, and 3 and 5 to 8 tokens are one pass of 4 rows per token (`flagos-spacemit-rvv-attn.cpp:2165-2169`). The spec's rule asked 5 to 8 tokens only for "the same 20% bar", so this does not fail the rule as written, but the default would send those shapes to arithmetic no model-level run on the board has checked. The check before the default: the same perplexity run at `-ub 2` and `-ub 8`, off and `2-8`, against the same base (`~/kvh/base1.kld`). Reading set beforehand, as the user's decision on `-ub 4`: each passes if its mean KLD is no more than one of the default's standard errors above the default's at that ubatch.
+
+**Result on the K3, accuracy at `-ub 2` and `-ub 8` (2026-11-05; the user's run; the same base, the file checked intact):**
+
+| Ubatch, kernel | Setting | Mean KLD | PPL(Q)/PPL(base) | Same top token | Seconds per pass |
+|---|---|---|---|---|---|
+| `-ub 2`, 8 rows | off | 0.002035 ± 0.000093 | 1.004814 ± 0.004557 | 97.509 ± 0.345% | 736.61 |
+| `-ub 2`, 8 rows | `2-8` | 0.001960 ± 0.000073 | 1.004044 ± 0.004579 | 97.655 ± 0.335% | 287.41 |
+| `-ub 8`, 4 rows per token | off | 0.002732 ± 0.000101 | 1.003269 ± 0.004533 | 97.362 ± 0.354% | 587.08 |
+| `-ub 8`, 4 rows per token | `2-8` | 0.002570 ± 0.000089 | 1.007191 ± 0.004528 | 97.167 ± 0.367% | 209.41 |
+
+- Both pass: the KV-head path's mean KLD is below the default's at each ubatch. 3 and 5 to 7 tokens were not run; they take the same 4-row passes as 8 (by reading).
+- `-ub 8` matches `-ub 4` to every printed digit, on each setting. The runs are separate (the times differ), and it has precedent: the CPU at `-ub 4` and `-ub 63`, and the simulated device at `-ub 4` and `-ub 8`, agree to the last digit too. What follows is an inference: a row's arithmetic does not depend on the ubatch above 4 rows, and the 4-row quantizer's groups line up at 4 and 8. If so, the KV-head path's 16-row and 4-row passes give the same results at the printed precision, a cross-check of the two kernels. The maximum KLD of the four logs is one more digit of evidence, not a proof.
+- `-ub 2`'s lower KLD on both settings is near the 0.00205 measured at `-ub 1` earlier, so these rows may take the one-row quantizer rather than the 4-row one (inference; not read in the code).
+- Speed, one run each, not counted by the rule: 2.56 times faster at `-ub 2` (360 to 140 ms per ubatch) and 2.80 at `-ub 8` (1,147 to 409 ms).
+
+**So the rule is met for 2 to 8 tokens, from n_kv 256, on Qwen3-4B.** No model-level run on the board covers Qwen3-0.6B (rows per pass 4, 8 and 16 at 2, 4 and 8 tokens); it passed the check program against the CPU, and the spec below adds its run.
+
+**Spec, for review (2026-11-05): 2 to 8 tokens through the KV-head split by default.**
+1. `parse_kvh_setting` (`flagos-spacemit-attn.cpp:405`): unset or empty means `2-8` (kept as 2 × 64 + 8); `off` none; `<lo>-<hi>` and the warning for anything else as today. Its comment no longer says test-only. The switch stays, for comparison and to turn the path off.
+2. The one-token path, the tiled kernel, 9 to 63 tokens and every other contract: unchanged. `FLAGOS_SPACEMIT_ATTN` does not select the KV-head path, as today: the row in `build.md` §7 says that comparing the one-chunk kernels at 2 to 8 tokens takes `FLAGOS_SPACEMIT_ATTN_KVH=off`.
+3. The check program (`tests/check_spacemit.cpp`):
+   - the contract table (`:450`): unset now takes 2 to 8, empty added, `off` none;
+   - the attention cases written for the one-chunk kernels pin `off`, so those kernels keep their coverage at 2 to 8 tokens;
+   - the KV-head block (`:2035`) compares against `off`, and adds one case with the switch unset that must take the contract;
+   - `--bench-attn` (`:4514`) compares `off` with `1-8` and labels it so.
+4. Docs: `build.md` §7 (the row, the result), `PROJECT.md` §8, `progress.md` item 42, this section.
+
+**Tests on the Mac:** `build-host` without new warnings; the check program, all passed, with today's figures under `off`; test-backend-ops `FLASH_ATTN_EXT` unset and `off`, all passed; `llama-perplexity` on Qwen3-0.6B, simulated device, `-c 1024 -b 1024 -ub 4 --chunks 2`, unset and `off`, identical as on the reference kernels, and the op counters showing `kvh-partial` unset and not under `off`. One mutation caught: the default left at none.
+
+**On the K3 (the user's runs):**
+1. The build, the check program (`--expect-device`), test-backend-ops `FLASH_ATTN_EXT` unset and `off`.
+2. Qwen3-0.6B's accuracy: a one-thread CPU base twice, byte-identical, then `-ub 2`, `-ub 4` and `-ub 8`, `off` and unset, with the same reading as Qwen3-4B's.
+3. That the default is the path measured: Qwen3-4B, pp4 at depth 4096, unset against `off`, about the 17.71 and 3.43 t/s above.
+4. `spacemit_check.py` in full, its checks all passing, which gives the new server baseline before S2.
+
+**Not in this spec:** one token; the fused passes of 4 tokens; the threshold for 9 to 63 tokens (both after S2, with `batch-one.md`). **Time:** the coder, a short session; on the K3 one build and about 1.5 hours of runs (estimate).
 
 **Result on the K3, speculative decoding (2026-11-05; the user's run; 128 tokens, the stream per graph, one run each, not taking turns; the decision rule does not count it):**
 
