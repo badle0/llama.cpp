@@ -1,7 +1,7 @@
 // FLASH_ATTN_EXT on the AI cores (plan.md, M2e design): the claim, the split of the rows over the tiles, and the
 // portable reference; for one token per call from n_kv 512, the split of the KV positions over the tiles and the merge
-// of their partial results (plan.md, M2e.3 round 2); under FLAGOS_SPACEMIT_ATTN_KVH, ggml-spacemit's split by KV head
-// for a few tokens and its merge (plan.md, "The KV-head split for a few tokens, from SpacemiT's fork").
+// of their partial results (plan.md, M2e.3 round 2); for 2 to 8 tokens by default (FLAGOS_SPACEMIT_ATTN_KVH),
+// ggml-spacemit's split by KV head and its merge (plan.md, "The KV-head split for a few tokens, from SpacemiT's fork").
 
 #include "flagos-spacemit-attn.h"
 
@@ -398,13 +398,18 @@ bool split_partial(const spacemit_tile & tile, ggml_tensor * dst, bool paired) {
     return true;
 }
 
-// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"), test-only
-// until the K3's runs decide: FLAGOS_SPACEMIT_ATTN_KVH=<lo>-<hi>, the token counts per call it takes, 1 <= lo <= hi <=
-// 63; unset, empty or off: none. Kept as lo * 64 + hi, 0 for none; parsed once (spacemit_cached_switch); anything else
-// is reported once and taken as off
+// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"), by default
+// for 2 to 8 tokens per call. FLAGOS_SPACEMIT_ATTN_KVH stays, to compare and to turn the path off: <lo>-<hi>, the token
+// counts per call it takes, 1 <= lo <= hi <= 63; off: none; unset or empty: the default. Kept as lo * 64 + hi, 0 for
+// none; parsed once (spacemit_cached_switch); anything else is reported once and taken as off
+constexpr int kvh_default_setting = 2 * 64 + 8;
+
 int parse_kvh_setting() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN_KVH");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "off") == 0) {
+    if (v == nullptr || *v == '\0') {
+        return kvh_default_setting;
+    }
+    if (std::strcmp(v, "off") == 0) {
         return 0;
     }
     const char * p      = v;

@@ -10,7 +10,8 @@
 //                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the default matmul setting (fit,staged)
 //                    against split at the row counts of --bench-mm
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
-//                    one-chunk, against the default; at 1, 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=1-8)
+//                    one-chunk, against the default; at 1, 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=off
+//                    against 1-8)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
@@ -438,8 +439,9 @@ static int check_contracts(ggml_backend_dev_t dev) {
     }
 
     // the KV-head split (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): the first attention
-    // contract, taken for the token counts FLAGOS_SPACEMIT_ATTN_KVH names, with 2, 4 or 8 query heads per KV head,
-    // without ALiBi and from 128 positions per chunk (2 chunks with 4 KV heads); otherwise the calls go as above
+    // contract, taken for the token counts FLAGOS_SPACEMIT_ATTN_KVH names (unset or empty: 2 to 8), with 2, 4 or 8 query
+    // heads per KV head, without ALiBi and from 128 positions per chunk (2 chunks with 4 KV heads); otherwise the calls
+    // go as above
     {
         ggml_init_params params = { ggml_tensor_overhead() * 512, nullptr, true };
         ggml_context *   ctx    = ggml_init(params);
@@ -448,7 +450,7 @@ static int check_contracts(ggml_backend_dev_t dev) {
             const char * setting;
             int64_t      lo, hi;  // the token counts it takes; 0, 0: none
         } settings[] = {
-            { nullptr, 0, 0 }, { "off", 0, 0 }, { "2-4", 2, 4 }, { "1-4", 1, 4 }, { "2-8", 2, 8 },
+            { nullptr, 2, 8 }, { "", 2, 8 }, { "off", 0, 0 }, { "2-4", 2, 4 }, { "1-4", 1, 4 }, { "2-8", 2, 8 },
         };
         const struct {
             const char * what;
@@ -462,12 +464,12 @@ static int check_contracts(ggml_backend_dev_t dev) {
             { "GQA 1", 8, 8, 512, 0.0f, false },
             { "ALiBi", 32, 8, 512, 8.0f, false },
         };
-        const int64_t token_counts[] = { 1, 2, 3, 4, 5, 8, 64 };
-        ggml_tensor * nodes[5][7];
+        const int64_t token_counts[] = { 1, 2, 3, 4, 5, 8, 9, 64 };
+        ggml_tensor * nodes[5][8];
         for (int i = 0; i < 5; i++) {
             ggml_tensor * k_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d * shapes[i].n_head_kv, shapes[i].n_kv + 32);
             ggml_tensor * v_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d * shapes[i].n_head_kv, shapes[i].n_kv + 32);
-            for (int j = 0; j < 7; j++) {
+            for (int j = 0; j < 8; j++) {
                 ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, shapes[i].n_head, token_counts[j]);
                 ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, shapes[i].n_kv, token_counts[j], 1, 1);
                 nodes[i][j]        = build_flash_attn(ctx, q, k_cache, v_cache, mask, shapes[i].n_head_kv,
@@ -479,7 +481,7 @@ static int check_contracts(ggml_backend_dev_t dev) {
             env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", w.setting);
             env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
             for (int i = 0; i < 5; i++) {
-                for (int j = 0; j < 7; j++) {
+                for (int j = 0; j < 8; j++) {
                     const auto &        sh       = shapes[i];
                     const int64_t       n_tokens = token_counts[j];
                     const spacemit_op * got      = spacemit_find_op(ops, nodes[i][j], buft);
@@ -504,8 +506,8 @@ static int check_contracts(ggml_backend_dev_t dev) {
                 }
             }
         }
-        std::printf("contracts FLASH_ATTN_EXT under FLAGOS_SPACEMIT_ATTN_KVH (unset, off, 2-4, 1-4, 2-8; 1-64 tokens; "
-                    "Qwen3-4B, GQA 8 at n_kv 256 and 255, GQA 1, ALiBi): %d selections checked\n",
+        std::printf("contracts FLASH_ATTN_EXT under FLAGOS_SPACEMIT_ATTN_KVH (unset, empty, off, 2-4, 1-4, 2-8; "
+                    "1-64 tokens; Qwen3-4B, GQA 8 at n_kv 256 and 255, GQA 1, ALiBi): %d selections checked\n",
                     n_checked);
         ggml_free(ctx);
     }
@@ -1870,8 +1872,10 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         return e.all < 0.0 ? HUGE_VAL : e.all;
     };
     // the cases and probes check the one-chunk and tiled kernels: one-token calls from n_kv 512 take the split by
-    // default (M2e.3 round 2, checked below, where each run sets the switch itself)
+    // default (M2e.3 round 2, checked below, where each run sets the switch itself), and 2 to 8 tokens the KV-head split
+    // (checked below, where each run sets FLAGOS_SPACEMIT_ATTN_KVH itself)
     env_override one_chunk_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
+    env_override kvh_off_switch("FLAGOS_SPACEMIT_ATTN_KVH", "off");
     double       worst = 0.0;
     uint32_t     seed  = 40;
     for (const attn_case & c : cases) {
@@ -1968,8 +1972,9 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
 
     // the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork") under
     // FLAGOS_SPACEMIT_ATTN_KVH=1-8, against the CPU within the same bounds. Each case must take its contract
-    // (spacemit_find_op) and repeat bit for bit in a second run; that its outputs differ from the default path's is
-    // counted only, since with one chunk per KV head the reference (the Mac) sums as the default's does. The cases take
+    // (spacemit_find_op) and repeat bit for bit in a second run; that its outputs differ from those under
+    // FLAGOS_SPACEMIT_ATTN_KVH=off is counted only, since with one chunk per KV head the reference (the Mac) sums as the
+    // other kernels' do. The check_contracts table holds the default's token counts. The cases take
     // its edges: 3 tokens on Qwen3-4B (3 passes of 4 rows), GQA 2 (8 tokens in one pass) and 8 (2 chunks), 2 KV heads (4
     // chunks) with the last chunk hidden from tokens 0 and 1, n_kv 1000 and 999 (neither a multiple of 64 positions
     // nor, at 999, of the chunk), head size 64, no mask, sinks, softcap, every cell hidden, one token. The two steps also
@@ -2029,11 +2034,11 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         const int64_t            n = ggml_nelements(run.out);
         const float *            r = static_cast<const float *>(run.out_ref->data);
         const std::vector<float> ref(r, r + n);
-        std::vector<float>       def, kvh[2];
+        std::vector<float>       off, kvh[2];
         {
             env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
-            env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", nullptr);
-            REQUIRE(run.dev_output(backend, def));
+            env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", "off");
+            REQUIRE(run.dev_output(backend, off));
         }
         env_override        attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
         env_override        kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", "1-8");
@@ -2053,7 +2058,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         attn_report(e, what.c_str(), c.s);
         e_kvh     = std::max(e_kvh, e.all);
         e_kvh_row = std::max(e_kvh_row, e.row);
-        n_kvh_differ += std::memcmp(kvh[0].data(), def.data(), n * sizeof(float)) != 0;
+        n_kvh_differ += std::memcmp(kvh[0].data(), off.data(), n * sizeof(float)) != 0;
         const bool repeat = std::memcmp(kvh[0].data(), kvh[1].data(), n * sizeof(float)) == 0;
         if (!repeat) {
             std::fprintf(stderr, "FAIL: attention KV-head split, %s: two runs differ\n", c.what);
@@ -2117,7 +2122,7 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     std::printf("attn     KV-head split for a few tokens (FLAGOS_SPACEMIT_ATTN_KVH=1-8) on %zu cases (1-8 tokens, n_kv "
                 "256-4096, GQA 2, 4 and 8, 1, 2 and 4 chunks, sinks, softcap, no mask, every cell hidden): max NMSE "
                 "%.2e (bound %.0e), worst row %.2e (bound %.0e); its contract taken in %d/%zu; %d/%zu outputs differ "
-                "from the default path's; two runs identical in %d/%zu; 3 and 5 tiles called directly identical in "
+                "from those under off; two runs identical in %d/%zu; 3 and 5 tiles called directly identical in "
                 "%d/%d%s\n",
                 kvh_cases.size(), e_kvh, k_attn_max_nmse, e_kvh_row, k_attn_max_row_nmse, n_kvh_taken,
                 kvh_cases.size(), n_kvh_differ, kvh_cases.size(), n_kvh_repeat, kvh_cases.size(), n_kvh_direct_same,
@@ -4431,7 +4436,7 @@ static int bench_mm(ggml_backend_dev_t dev) {
 // bench_mm). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own
 // launch here. At one token the default (from n_kv 512 the split over the tiles with the turns; plan.md M2e.3, round 2)
 // also against FLAGOS_SPACEMIT_ATTN=split (the split without the turns) and one-chunk (the kernels before round 2); a
-// few tokens also against FLAGOS_SPACEMIT_ATTN_KVH=1-8 (below)
+// few tokens FLAGOS_SPACEMIT_ATTN_KVH=off against 1-8 (below)
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -4493,7 +4498,7 @@ static int bench_attn(ggml_backend_dev_t dev) {
     }
 
     // the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): 1, 2, 3,
-    // 4 and 8 tokens at n_kv 256-8192, the default (FLAGOS_SPACEMIT_ATTN_KVH unset) against FLAGOS_SPACEMIT_ATTN_KVH=1-8,
+    // 4 and 8 tokens at n_kv 256-8192, FLAGOS_SPACEMIT_ATTN_KVH=off against FLAGOS_SPACEMIT_ATTN_KVH=1-8,
     // the two taking turns twice, the faster turn of each kept; the copies and GB/s as above
     for (const int64_t n_kv : { 256, 512, 1024, 4096, 8192 }) {
         const int iterations = n_kv <= 256 ? 30 : n_kv <= 512 ? 25 : n_kv <= 1024 ? 20 : n_kv <= 4096 ? 10 : 5;
@@ -4518,16 +4523,16 @@ static int bench_attn(ggml_backend_dev_t dev) {
                     },
                     iterations);
             };
-            double t_def = HUGE_VAL, t_kvh = HUGE_VAL;
+            double t_off = HUGE_VAL, t_kvh = HUGE_VAL;
             for (int turn = 0; turn < 2; turn++) {
-                t_def = std::min(t_def, dev_us(nullptr));
+                t_off = std::min(t_off, dev_us("off"));
                 t_kvh = std::min(t_kvh, dev_us("1-8"));
             }
             CHECK(ok);
-            std::printf("bench    attn %lld token%s n_kv %4lld, FLAGOS_SPACEMIT_ATTN_KVH: default %7.0f us (%5.1f GB/s); "
+            std::printf("bench    attn %lld token%s n_kv %4lld, FLAGOS_SPACEMIT_ATTN_KVH: off %7.0f us (%5.1f GB/s); "
                         "1-8 %7.0f us (%+.1f%%, %5.1f GB/s)\n",
-                        (long long) n_tokens, n_tokens == 1 ? " " : "s", (long long) n_kv, t_def,
-                        kv_bytes / t_def / 1e3, t_kvh, 100.0 * (t_kvh / t_def - 1.0), kv_bytes / t_kvh / 1e3);
+                        (long long) n_tokens, n_tokens == 1 ? " " : "s", (long long) n_kv, t_off,
+                        kv_bytes / t_off / 1e3, t_kvh, 100.0 * (t_kvh / t_off - 1.0), kv_bytes / t_kvh / 1e3);
         }
     }
     ggml_backend_free(backend);

@@ -170,8 +170,8 @@ struct spacemit_contract {
 // M2e.3 round 2 (adopted 2026-10-14; the paired split is the default): one-token attention split over the tiles,
 // partial results then their merge. The four FLASH_ATTN_EXT contracts are tried in this order and the kernels'
 // supports pick one (spacemit_flash_attn_split, which reads the shape and FLAGOS_SPACEMIT_ATTN); first the KV-head split
-// for a few tokens, taken only under the test-only FLAGOS_SPACEMIT_ATTN_KVH (plan.md "The KV-head split for a few
-// tokens, from SpacemiT's fork")
+// for a few tokens, by default 2 to 8, set or turned off by FLAGOS_SPACEMIT_ATTN_KVH (plan.md "The KV-head split for a
+// few tokens, from SpacemiT's fork")
 static const spacemit_contract k_contracts[] = {
     { GGML_OP_ADD,             spacemit_binary_f32_supported,   { "add.f32" },                                      1 },
     { GGML_OP_MUL,             spacemit_binary_f32_supported,   { "mul.f32" },                                      1 },

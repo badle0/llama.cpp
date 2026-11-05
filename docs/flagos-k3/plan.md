@@ -1849,7 +1849,7 @@ pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two sett
 
 **So the rule is met for 2 to 8 tokens, from n_kv 256, on Qwen3-4B.** No model-level run on the board covers Qwen3-0.6B (rows per pass 4, 8 and 16 at 2, 4 and 8 tokens); it passed the check program against the CPU, and the spec below adds its run.
 
-**Spec, for review (2026-11-05): 2 to 8 tokens through the KV-head split by default.**
+**Spec (2026-11-05; approved by the user the same day): 2 to 8 tokens through the KV-head split by default.**
 1. `parse_kvh_setting` (`flagos-spacemit-attn.cpp:405`): unset or empty means `2-8` (kept as 2 × 64 + 8); `off` none; `<lo>-<hi>` and the warning for anything else as today. Its comment no longer says test-only. The switch stays, for comparison and to turn the path off.
 2. The one-token path, the tiled kernel, 9 to 63 tokens and every other contract: unchanged. `FLAGOS_SPACEMIT_ATTN` does not select the KV-head path, as today: the row in `build.md` §7 says that comparing the one-chunk kernels at 2 to 8 tokens takes `FLAGOS_SPACEMIT_ATTN_KVH=off`.
 3. The check program (`tests/check_spacemit.cpp`):
@@ -1859,7 +1859,14 @@ pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two sett
    - `--bench-attn` (`:4514`) compares `off` with `1-8` and labels it so.
 4. Docs: `build.md` §7 (the row, the result), `PROJECT.md` §8, `progress.md` item 42, this section.
 
-**Tests on the Mac:** `build-host` without new warnings; the check program, all passed, with today's figures under `off`; test-backend-ops `FLASH_ATTN_EXT` unset and `off`, all passed; `llama-perplexity` on Qwen3-0.6B, simulated device, `-c 1024 -b 1024 -ub 4 --chunks 2`, unset and `off`, identical as on the reference kernels, and the op counters showing `kvh-partial` unset and not under `off`. One mutation caught: the default left at none.
+**Tests on the Mac:** `build-host` without new warnings; the check program, all passed, with today's figures under `off`; test-backend-ops `FLASH_ATTN_EXT` unset; the op counters showing `kvh-partial` unset and not under `off`. One mutation caught: the default left at none. (Reduced at approval, the user's request for efficiency: test-backend-ops under `off` and `llama-perplexity` on the Mac dropped, the K3's accuracy runs covering that ground on the real kernels.)
+
+**Result on the Mac (2026-11-05; the coder from this spec; read and rerun in the main session).** Built as specified: `kvh_default_setting = 2 * 64 + 8` for unset or empty in `parse_kvh_setting`, `off` none; comments in the attention and ops files; no RVV code changed. In the check program the contract table gains unset and empty at 2 to 8 and a 9-token column (240 selections, was 175), one pin of `off` in `check_flash_attn` beside `one_chunk_switch` (needed by "Qwen3-4B batch", 7 tokens at n_kv 256; the other blocks' shapes do not reach the path), the KV-head block and `--bench-attn` compare against `off`. Different from the spec, kept: no unset case added to the KV-head block, since the contract table covers unset through the same lookup at 1, 2 to 8 and 9 tokens.
+- `build-host` built without compiler warnings. The check program: all checks passed; against the build before the change, only the contracts line, the KV-head line's wording ("those under off") and a timing line differ, the attention figures the same.
+- test-backend-ops `FLASH_ATTN_EXT` unset: 1324/1324.
+- The op counters on Qwen3-0.6B, simulated device: `kvh-partial` and `kvh-merge` unset at 2, 4 and 8 tokens; `one-step` at 4 tokens under `off` and at 9 unset; at one token, n_kv 768, the paired split's `partial` and `merge`.
+- The mutation, the default left at none: rc 1, 20 failures, all in the contract table (unset and empty × Qwen3-4B and GQA 8 × 2, 3, 4, 5 and 8 tokens); the tree restored and passing.
+- Not run: `--bench-attn` (compiled; its line now reads `FLAGOS_SPACEMIT_ATTN_KVH: off`, on the Mac meaningless anyway), `spacemit_check.py` (needs the K3), the riscv64 syntax check (no RVV code changed).
 
 **On the K3 (the user's runs):**
 1. The build, the check program (`--expect-device`), test-backend-ops `FLASH_ATTN_EXT` unset and `off`.
