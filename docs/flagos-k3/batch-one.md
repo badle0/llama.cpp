@@ -37,7 +37,7 @@ TTFT today:
 
 | Request | Decoded | Cached before | TTFT | Basis |
 |---|---|---|---|---|
-| Process start, added to any request below | | | +11.0 s (0.6B 5.0 s) | measured, server up |
+| Process start, added to any request below | | | +11.04 s (0.6B 4.29 s) | measured, server up (`plan.md` "The start-up split") |
 | Fresh prompt | 500 | 0 | 5.25 s | measured, server |
 | Fresh prompt | 4,096 | 0 | about 75 s | estimate, interpolated between pp512 at depth 0 and 4096 |
 | Follow-up, prefix kept | 12 | 47 | 182 ms | measured, server |
@@ -62,7 +62,7 @@ None of these is an acceptance check today except where noted. Grid sizes are pr
 
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
-| C1 | Process start to first token, page cache warm and cold (evict only the model file, no system setting) | Load, repack, warm-up, core grant | 11.0 s and 5.0 s. Two points fit 3.9 s fixed plus 3.0 s per GB (estimate); the split is unmeasured |
+| C1 | Process start to first token, page cache warm and cold (evict only the model file, no system setting) | Load, repack, warm-up, core grant | Measured (`plan.md` "The start-up split"): warm 11.04 s and 4.29 s, cold 13.37 s and 4.70 s; the weights stage 8.47 s and 2.11 s, 97% user time; the fit and vocabulary 1.78 s on both; a first request adds 3 ms |
 | C2 | First request after minutes idle | Cold caches, frequency, what idle workers cost | Not measured |
 
 **Fresh prompts**
@@ -116,7 +116,7 @@ Gains are estimates unless marked. Each needs a rule set before its run, as the 
 | T3 | System prompt decoded once, saved, restored at start or per conversation (`--slot-save-path`) | Measured on the Mac: 21.6 s to 1.73 s. K3: about 3.7 s to 0.3-0.7 s | §7; restore 4.7 ms, 39.9 MB | No provider code. The file is tied to model and build. Replies equal over 24 tokens only |
 | T4 | Prefill while the user types or between turns (`n_predict` 0 worked on the Mac) | Leaves the last few template tokens, the shapes T5 serves | §7 | Client work; wasted when the text changes |
 | T5 | KV-head split for 1 to 8 tokens | 4 tokens at n_kv 4096: about 28 ms to 3-5 ms per call | Blocks 2 to 6, running now | Built; decided by its rule |
-| T6 | Measure start-up, then parallel repack or a repacked-weights file | Cold start only; 3 s per GB suggests the copy is far from memory speed | C1 settles it | Moot for a server kept running |
+| T6 | Measure start-up, then parallel repack or a repacked-weights file | Every start: the repack is one thread at about 280 MiB/s, 8.24 s of user time on Qwen3-4B | C1: ceiling 8.47 s of 11.04 s. A parallel repack needs no interface; `perf` can rank the head against the Q4 repack | Moot for a server kept running |
 | T7 | Prefill attention at depth: more rows per K and V read, or positions split over tiles for many rows | Attention halved: pp512 at 4096 from 36 to about 54 t/s, a fresh 4,096-token prompt from about 75 to 55 s | Tiled kernel compute-bound, about 88 GFLOP/s before L3 and L4, against 600-890 for matmuls | Block 6 gives the per-op split first |
 | T8 | Head-contiguous KV layout inside the provider's buffer | Attention at 4096 from 40.8 to at best 21.6 ms per token, tg there +17% at most; few-token tails too | One-chunk kernels read 17.9 GB/s contiguous, 9.7 GB/s on the real layout (measured) | High: a third layout through state save, restore and shift. On huge pages the heads must not sit a power of two apart (`k3-hardware.md` §2) |
 | T9 | Q8_0 KV cache with rotation, new kernels | Half the bytes read and half the memory; perhaps IME for the scores (theory, untested) | Accuracy usable on both models: 0.0042 and 0.0013 (Mac); 4-bit ruled out | High: new kernels, rotation at store |
@@ -152,7 +152,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 
 **Inputs to S2's design, cheap and worth having before its spec:**
 
-1. **C1, the split of the 11.0 s** (no code: `scripts/startup-split.py`; `plan.md` "The start-up split"). My reading rated the zero-copy entries low value, and 3 s per GB might have changed that. The bytes settle that part (2026-11-05): plain tensors are 0.06% of what the provider loads on Qwen3-0.6B, so option A cannot shorten start-up; the split decides T6 and the no-code flags.
+1. **C1, the split of the 11.0 s** (no code: `scripts/startup-split.py`; `plan.md` "The start-up split"). My reading rated the zero-copy entries low value, and 3 s per GB might have changed that. The bytes settle that part (2026-11-05): plain tensors are 0.06% of what the provider loads on Qwen3-0.6B, so option A cannot shorten start-up. The split, measured the same day, keeps T6 and rules out the flags.
 2. **Cancel (T11).** S2 moves the replay loop and the plugin table. If cancel is wanted, one flag read at each barrier belongs in that design, not in a later interface change. The alternative is T10's small `-b`, with no code. This is the user's decision when the S2 spec is written.
 3. **A short tail in the server check.** No server request ends in 2 to 8 tokens, so the baseline S2 must reproduce does not exercise the KV-head path, the default for those calls since 2026-11-05 (`plan.md`). One such request belongs in the check before S2 relies on it; it would need a new baseline.
 

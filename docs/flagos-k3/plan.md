@@ -1953,6 +1953,86 @@ pp7 passes by the reading set beforehand, -0.2%, as do pp5 and pp6. The two sett
 
 **Checks on the Mac** (the simulated device, Qwen3-0.6B): the whole script on one model, and on the default two models in a stand-in home, all stages found, the first log line at 0.03 s. The `/proc` parser on a sample line and a run with a stand-in `proc_stat` and `posix_fadvise`, since macOS has neither; so the eviction call and real `/proc` figures run first on the K3, whose output shows the file's share in the page cache after each eviction, about 0% if it worked. A model file that does not load: every start reported failed, exit status 1.
 
+**Result on the K3 (2026-11-05; the user's run; medians, seconds; 3 warm, 1 `--load-mode none`, 1 provider disabled at `-t 1`, 2 cold; user and system time from the warm runs).**
+
+| Stage | 4B warm | user, sys | none | cpu | cold | 0.6B warm | user, sys | none | cpu | cold |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Process start to first log line | 0.02 | 0.01, 0.00 | 0.02 | 0.02 | 0.02 | 0.02 | 0.02, 0.00 | 0.02 | 0.02 | 0.02 |
+| Parameter fit (a trial load) | 0.97 | 0.92, 0.04 | 0.97 | 0.97 | 0.97 | 0.97 | 0.93, 0.04 | 0.97 | 0.95 | 0.97 |
+| Metadata and vocabulary | 0.81 | 0.79, 0.01 | 0.81 | 0.81 | 0.82 | 0.81 | 0.79, 0.02 | 0.81 | 0.82 | 0.82 |
+| Tensors, file mapped, buffers | 0.19 | 0.02, 0.19 | 0.01 | 0.19 | 2.51 | 0.04 | 0.00, 0.02 | 0.01 | 0.04 | 0.45 |
+| Weights copied and repacked | 8.47 | 8.24, 0.26 | 9.33 | 5.35 | 8.40 | 2.11 | 2.08, 0.04 | 2.34 | 0.64 | 2.10 |
+| Context and KV cache | 0.08 | 0.03, 0.03 | 0.08 | 0.30 | 0.13 | 0.06 | 0.04, 0.04 | 0.06 | 0.23 | 0.06 |
+| Graph reserve | 0.02 | 0.03, 0.04 | 0.02 | 0.01 | 0.02 | 0.01 | 0.00, 0.00 | 0.01 | 0.01 | 0.01 |
+| Warm-up run | 0.34 | 2.10, 0.03 | 0.34 | 2.10 | 0.35 | 0.14 | 0.47, 0.01 | 0.14 | 0.44 | 0.14 |
+| Slots and template | 0.09 | 0.07, 0.00 | 0.09 | 0.09 | 0.09 | 0.09 | 0.08, 0.00 | 0.09 | 0.09 | 0.09 |
+| Ready to `/health` ok | 0.04 | 0.00, 0.00 | 0.06 | 0.07 | 0.05 | 0.05 | 0.00, 0.00 | 0.06 | 0.02 | 0.04 |
+| **`/health` ok** | **11.04** | | 11.72 | 9.91 | 13.37 | **4.29** | | 4.51 | 3.26 | 4.70 |
+| First request, ms | 125 | | 124 | 1973 | 125 | 31 | | 30 | 301 | 31 |
+| Second request, ms | 122 | | 121 | 1971 | 122 | 28 | | 28 | 299 | 28 |
+
+Model buffers: Qwen3-4B 304.28 MiB mapped on the CPU and 2391.43 MiB on the provider, Qwen3-0.6B 121.71 and 398.65 MiB. Warm starts within 11.02 to 11.05 s and 4.29 to 4.30 s. The eviction worked (0.0% in the page cache at each cold start); Qwen3-0.6B's file read cold at 860 MiB/s.
+
+The readings set beforehand:
+1. The weights stage is 76.7% of Qwen3-4B's warm start (49% on Qwen3-0.6B) and 97% user time, so **T6 stays on `batch-one.md`'s list, a parallel repack first, ceiling 8.47 s**. It needs no interface: `tensor_set` is the plugin's. A repacked-weights file could remove the stage too, but needs a file format. The rate is low, 282 MiB/s of the provider's buffer on Qwen3-4B and 189 on Qwen3-0.6B. The two points suggest why (an estimate, solving for two rates and assuming nothing else in the stage): the output head's requantization at about 100 M weights/s, about 3.9 s on Qwen3-4B and 1.6 s on Qwen3-0.6B, the Q4 repack at about 435 MiB/s. `perf` is on the board (`/usr/bin/perf`), so a profile of one warm start would settle it when T6 comes up.
+2. Neither flag reaches 1 s on Qwen3-4B: the parameter fit 0.97 s, the warm-up 0.34 s. So neither is recorded as an option, the fit by 0.03 s. It is noted here because it costs the same on every model, 23% of Qwen3-0.6B's start.
+3. `--load-mode none` is slower, 6.2% on Qwen3-4B and 5.1% on Qwen3-0.6B: no option.
+4. A cold start costs 2.33 s more on Qwen3-4B and 0.41 s on Qwen3-0.6B, all in the stage that maps the file. The disk is 3 times the repack's rate, so it is not the limit.
+
+Also: a first request adds 3 ms, so the warm-up does its job and process start to first token is 11.17 s on Qwen3-4B (5 prompt tokens). What is not the weights stage is 2.2 s on Qwen3-0.6B and 2.6 s on Qwen3-4B, not the 3.9 s the two earlier points gave: the runner's 5.0 s for Qwen3-0.6B was most likely 4.29 s under its one-second poll. The fit and the vocabulary take the same on both models, 1.78 s, most likely the vocabulary read twice (inference; the two models share a tokenizer). The `cpu` column is not a copy-free control: on the Mac that run allocates a `CPU_REPACK` buffer, so its weights stage is ggml-cpu's own repack (the K3's log to confirm).
+
+Against the predictions: the weights stage the largest and mostly user time, held; its size was low, 8.47 s against 6 to 7 and 2.11 s against about 1.
+
+**So option A has no start-up case: it can remove neither the repack nor its CPU time, only the copy of 0.06% of the bytes.** Whether to build it for its other gains is decision 1 of S2's spec.
+
+### S2 spec, for review (2026-11-05)
+
+**Status:** for the user's review; no code yet. S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
+- **The boundary is already clean.** From the Mac's objects: no core object uses a symbol the plugin side defines, or the reverse. The plugin side needs 18 functions of `ggml-base` and nothing else of ours. The check program calls 6 plugin-side functions directly, all of them answered by name by `get_proc_address`. No build definition of the plugin (`GGML_FLAGOS_SPACEMIT_SPERT`, `_IME2`, `_RVV`, `_HOST_TEST_DEVICE`) is read by a core file.
+- **Runs are already one at a time per device** (`run_mutex`, `flagos-spacemit.cpp:50`, `:395`), so sharing a stream needs no new locking around a run.
+- **The zero-copy entries do not help start-up** ("The start-up split").
+
+The sides. Core: `flagos-spacemit.cpp`, `flagos-spacemit-ops.cpp`, `core/*`, `flagos-spacemit-api.h`. Plugin: `plugin/*`, `-exec`, `-kernels`, `-rvv-kernels`, `-weights`, `-ime`, `-ime-kernels`, `-attn`, `-rvv-attn`. Headers both include: `core/flagos-spacemit-plugin.h`, `core/flagos-spacemit-stats.h`, `flagos-spacemit-ops.h`.
+
+**Decisions for the user, with my recommendation.**
+1. **The zero-copy entries (`register_host_ptr`, `tensor_prepare`): stay NULL, not built in S2.** 150 to 250 lines (estimate) for an exact `get_tensor` and the deck's wording, no start-up or memory gain. The table's optional tail stays, so adding them later needs no version change. The question to the engineer (`upstream-precedents.md` §5.5) stays open either way.
+2. **A cancel check (T11): not in S2.** I had written that it belongs in S2's design because S2 moves the replay loop, but the plugin is in-tree and built with the core, so a later change costs one member and one version bump. It would also need the server to set an abort callback, an upstream change, and a callback that is safe to call while the AI cores run. `-b 64 -ub 64` (T10) bounds the wait with no code, to about 1.7 s at depth 4096 (estimate).
+3. **A short tail in the server check: yes, first (step 0).** Otherwise S2's baseline never runs the KV-head path.
+
+**Step 0, the server check (`tools/spacemit_check.py` only).** After request group B, a new group F, by B's pattern: `F1` (cached), then `F2` = F1 + its reply + a fixed continuation of about 4 tokens, then `F2-scratch`. A new check, "a follow-up ending in 2 to 8 tokens": F2's `timings.prompt_n` between 2 and 8, F1's cache reused, the first token's distribution against scratch within `SERVER_KLD_LIMIT` (`server_reuse`). The continuation is chosen on the Mac with the board's Qwen3-0.6B; 4 tokens leave margin if a reply re-tokenizes one short (seen on Qwen3-4B, `build.md` §7). Expected counts 49 and 48, one more each with `--server-baseline`. On the K3, both models, on today's code: the new `server.json` is S2's baseline.
+
+**Step 1, the plugin as its own library.**
+1. `provider.cmake`: `FLAGOS_SOURCES` keeps the core's files. The plugin's files, `libspert`, its include directory, the IME2 checks and the per-file `-march` options move to the plugin. `GGML_FLAGOS_HAVE_SPACEMIT` stays with the core. A static build (`BUILD_SHARED_LIBS` off) stops with a `FATAL_ERROR` naming A5.
+2. New `providers/spacemit/plugin.cmake`, included from `ggml/src/ggml-flagos/CMakeLists.txt` right after the `ggml-flagos` target (one line, an `upstream-changes.md` entry in the same commit): `add_library(flagos-provider-spacemit SHARED ...)`, named `libflagos-provider-spacemit` as the loader expects, no version suffix, written beside `libggml-flagos` (`LIBRARY_OUTPUT_DIRECTORY` as `ggml_add_backend_library` sets it, also under `GGML_BACKEND_DL`), `ggml-base` linked privately, hidden visibility so that only `flagos_spacemit_plugin_v1` is exported, installed beside the core, and `add_dependencies(ggml-flagos flagos-provider-spacemit)`, since nothing links it and `--target llama-bench` must still build it.
+3. The loader: `spacemit_plugin_default_path` loses S1's fallback to the core's own image (`self`), and `flagos-spacemit.cpp:619-635` with it. No plugin beside the core: a warning and no device, as any failed probe. `GGML_FLAGOS_PROVIDER_PATH` as today. As upstream's registry (`ggml-backend-reg.cpp:183-191`), the plugin is not unloaded at teardown; the failed-probe paths keep their `dlclose`.
+4. The check program: the 6 direct calls go through `get_proc_address`, looked up once from the device's table; the headers `-exec.h`, `-ime.h` and `-kernels.h` go. The check that a name answers "with those very functions" (`check_spacemit.cpp:226`) becomes non-NULL, the behaviour being checked where each is used. Where there is no device, the switches' reset is a no-op.
+5. Comments and docs: the plugin header's "one build" stays true (in-tree, built with the core); `build.md` §6 and the plan's layout notes say there are two libraries.
+
+Edge cases, each tested: the plugin file absent; `GGML_FLAGOS_PROVIDER_PATH` set; `build-host-dl` (backends as modules; the plugin beside the module); ThreadSanitizer's build; the `.dylib` suffix on the Mac; a host without the test device (the plugin loads, `device_count` 0, its `dlclose` on that path); `FLAGOS_SPACEMIT_DISABLE=1`.
+
+Tests on the Mac: `build-host` without new warnings; the check program, all passed, its figures unchanged; test-backend-ops `FLASH_ATTN_EXT`; `nm`: the entry symbol only in the plugin, exported alone; the core links no plugin code; the plugin's file removed, a warning and CPU only. One mutation caught: the plugin target's dependency removed, `--target llama-bench` from clean leaves no plugin, and the run reports it.
+
+On the K3: the build; `readelf -d`, `libspert` needed by the plugin only; the check program and test-backend-ops; the runner on both models with `--server-baseline`, replies identical, Qwen3-4B with `--depth`; pp128 and tg128 within 1% of 106.24 and 11.04 t/s; `startup-split.py`, within 0.2 s of today (estimate: the separate file adds milliseconds).
+
+**Step 2, one stream per device.** Today every backend context holds its own stream with all 8 AI cores, so a second live context cannot get them (the speculative decoding study above, its first K3 run: three 30 s waits, then an abort), and `llama-speculative` and a server with `-md` need `FLAGOS_SPACEMIT_STREAM=per-call`.
+1. In the plugin: `spacemit_plugin_device` holds one executor, created by the first `stream_create` and kept by a count of handles under a mutex; `spacemit_plugin_stream` becomes a handle holding it and that context's stats pointer; the last `stream_destroy` frees it and with it the core grant. Contexts may be freed in any order.
+2. `spacemit_run_stats_attach` stores the pointer on the handle, and `replay` passes it to the executor for that run, the runs being serialized by `run_mutex`.
+3. A test-only name, `spacemit_executors_take`, counts executors created. Comments at `flagos-spacemit.cpp:529` and the plugin header's stream note; "S1 design" §5's "one stream per backend context" gets a note. `FLAGOS_SPACEMIT_STREAM=per-call` stays as the test switch it is.
+
+Edge cases: free the first context while the second lives; one thread each on two contexts (ThreadSanitizer); a failed launch on one context leaving the other able to run; the cores' request failing, retried on the next run as today.
+
+Tests on the Mac: the check program's new block: two backends, one executor by the count, a graph on each interleaved with outputs equal to each run alone, the first freed and the second still running, both freed and a new one a new executor; the two-thread case under ThreadSanitizer. One mutation caught: a new executor per handle.
+
+On the K3, no switch set: `llama-speculative` on p2 and p4, draft lengths 2 and 3: no "could not get", the accepted counts of 2026-11-05, speed within 3% of 14.64, 17.50, 12.60 and 17.20 t/s (prediction: the same or slightly faster, a launch 9.9 against 24.3 µs); the runner with `--server-baseline`, identical; no TCM held.
+
+**Step 3, the directory move.** `git mv` only, so that steps 1 and 2 read against the paths the docs cite: the core's files under `core/`, the plugin's under `plugin/`, include paths, `provider.cmake`, `plugin.cmake`, `scripts/rvv-syntax-check.sh`. Old line references in the docs stay as history of their commits. Mac: the build, the check program and `rvv-syntax-check.sh`. K3: the build and the check program.
+
+**Exit:** S2's as proposed above: the plugin loads through S1's loader; the same checks and acceptance runs pass with identical replies and speed within 1%; the plugin alone links `libspert` and needs the IME2 toolchain; TCM hygiene unchanged; and new, two live contexts work with no switch.
+
+**Not in S2:** the zero-copy entries and cancel, unless decided otherwise above; T6 and the rest of `batch-one.md`'s list (9 to 63 tokens first); the batch-size-1 checks; M3 and fusion.
+
+**Time (estimates):** the coder, one short session per step; on the K3, step 0 about 1.5 hours of unattended runs, step 1 about 3 hours (the 4B runner with `--depth`), step 2 about 1 hour, step 3 minutes.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
