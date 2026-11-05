@@ -933,6 +933,8 @@ Manual checks:
 - Where threads run: `ps -L -o tid,psr,comm -p $(pgrep llama-bench)` (`psr` 8-15 = A100).
 - Compare speeds only within one session, interleaved and repeated: between sessions or harnesses tg128 moves by about 4-5%.
 
+**The KV-head split on the K3, 2026-11-05** (`plan.md` "The KV-head split for a few tokens, from SpacemiT's fork", each run's result; `PROJECT.md` item 42). Measured behind the switch, then made the default for 2 to 8 tokens from n_kv 256 (`off` keeps the old kernels). Qwen3-4B: one call at n_kv 4096, 2, 3, 4 and 8 tokens from 15.2, 22.9, 30.7 and 62.3 ms to 2.24, 5.97, 3.43 and 15.99 ms; pp4 at depth 4096 from 3.43 to 17.71 t/s, pp2 3.18 to 10.97, pp3 3.28 to 9.44, pp8 3.51 to 11.80; speculative p4 at draft length 3 from 1.16 to 1.71 times plain decoding; controls within 0.2%, depth 0 within about 1%. One token loses (tg32 -4.6% and -18.1% at depths 1024 and 4096), so the paired split stays. Mean KLD against one one-thread CPU base, off and on: Qwen3-4B 0.002035 and 0.001960 at `-ub 2`, 0.002732 and 0.002570 at `-ub 4` and `-ub 8`; Qwen3-0.6B 0.003585 and 0.003626 at `-ub 2` over 3 chunks, 0.005864 and 0.005783 at `-ub 4` and `-ub 8`. The runner on the default: 48/48 and 47/47; the server's replies unchanged, as none of its requests ends in 2 to 8 tokens.
+
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 
 | Variable | Applies to | Effect |
