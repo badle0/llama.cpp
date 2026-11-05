@@ -14,8 +14,9 @@
 #   a Q8_0 KV cache and a context shift with the provider as with the CPU (structural-experiments.md E2-neg, F8);
 #   llama-server (--skip-server leaves it out): every layer and the KV cache on the provider with 4 slots in one unified
 #   KV cache, a greedy reply equal to llama-completion's, a follow-up turn and two interleaved conversations (reloaded
-#   from the server's prompt cache) each against the same prompt from scratch, KV shifting (--cache-reuse); every reply
-#   saved in logs/server.json, and with --server-baseline equal to a saved one's;
+#   from the server's prompt cache) each against the same prompt from scratch, KV shifting (--cache-reuse), a follow-up
+#   ending in 2 to 8 tokens against the same prompt from scratch; every reply saved in logs/server.json, and with
+#   --server-baseline equal to a saved one's;
 #   perplexity with -fa on and with -fa auto, each within 1% of the CPU (the CPU single-threaded, PROJECT.md §6);
 #   FLASH_ATTN_EXT disabled by name (GGML_FLAGOS_DISABLE_OPS) leaves the provider, every layer split around it, the
 #   perplexity over 2 chunks within 1% of the enabled run's; mean KLD against the CPU's logits with 512-token batches
@@ -365,11 +366,15 @@ SERVER_D = ["Minutes of the garden club meeting, Tuesday evening in the village 
             "long walks in the hills on Sundays.\n",
             "Question: What is my favourite colour? Answer:"]
 SERVER_E = " ".join(["The quick brown fox jumps over the lazy dog."] * 50)
+# F2 ends in 2 to 8 tokens, the calls the KV-head split takes by default (plan.md, "S2 spec", step 0): F1's one reply
+# token, which the server does not decode, and the 3 tokens of SERVER_F2. The list makes the first token confident
+SERVER_F1 = "Pets:\nCat: Luna\nDog: Rex\nBird: Kiwi\n\nPets:\nCat:"
+SERVER_F2 = "\nDog:"
 SERVER_REPLIES = ["A", "B1", "B2", "B2-scratch", "C-x1", "C-y1", "C-x2", "C-y2", "C-x2-scratch", "C-y2-scratch", "D1",
-                  "D2", "E"]
-# checks 3 and 4: the first token's KL divergence of the reused turn from scratch at most this (plan.md, the fix after
-# the first K3 run: above every legitimate figure measured, 0.0369 at most, and the KLD runs' per-token 99.9% points,
-# 0.033 to 0.075; below every lost context the guard does not catch, 0.51 at least)
+                  "D2", "E", "F1", "F2", "F2-scratch"]
+# checks 3, 4 and 6: the first token's KL divergence of the reused turn from scratch at most this (plan.md, the fix
+# after the first K3 run: above every legitimate figure measured, 0.0369 at most, and the KLD runs' per-token 99.9%
+# points, 0.033 to 0.075; below every lost context the guard does not catch, 0.51 at least)
 SERVER_KLD_LIMIT = 0.1
 # llama-server's --slot-prompt-similarity default (common/common.h:677; tools/server/server-context.cpp:1604-1678),
 # which the runner does not set
@@ -439,6 +444,10 @@ def server_requests(url, replies):
         ask("D2", d2, 12, True, 5)
         # E: about 500 prompt tokens, for the time to the first token and per token
         ask("E", SERVER_E, 32, False)
+        # F: a follow-up ending in 2 to 8 tokens, then the same prompt from scratch; last, so that A to E do not change
+        f2 = SERVER_F1 + ask("F1", SERVER_F1, 1, True, 5) + SERVER_F2
+        ask("F2", f2, 12, True, 5)
+        ask("F2-scratch", f2, 12, False, 5)
         # D's common prefix as the server counts its prompt (with BOS)
         current[0] = "tokenize"
         t1, t2 = (server_post(url, "/tokenize", {"content": p, "add_special": True})["tokens"] for p in (d1, d2))
@@ -492,13 +501,15 @@ def server_reuse(replies, reused, scratch, why):
 def server_checks(bdir, logs, model, baseline):
     """llama-server on the provider through the paths single-user clients use: its default 4 slots in one unified KV
     cache, a follow-up turn reusing the cache, conversations reloaded from its host-RAM prompt cache, KV shifting
-    (--cache-reuse 16); every reply saved in logs/server.json, the baseline S2 must reproduce (with baseline, check 6
-    compares against one). A missing binary or model, or a server that does not come up, fails every check."""
+    (--cache-reuse 16), a follow-up ending in 2 to 8 tokens; every reply saved in logs/server.json, the baseline S2 must
+    reproduce (with baseline, check 7 compares against one). A missing binary or model, or a server that does not come
+    up, fails every check."""
     names = ["llama-server: every layer and the KV cache on the provider, 4 slots in one unified KV cache",
              "llama-server's greedy reply is llama-completion's",
              "llama-server: a follow-up turn reusing its cache matches the turn from scratch",
              "llama-server: interleaved conversations reload from the prompt cache and match from scratch",
-             "llama-server: KV shifting (--cache-reuse) runs on the provider"]
+             "llama-server: KV shifting (--cache-reuse) runs on the provider",
+             "llama-server: a follow-up ending in 2 to 8 tokens matches the turn from scratch"]
     if baseline:
         names.append("llama-server's replies equal the baseline's")
     server = bdir / "bin" / "llama-server"
@@ -602,12 +613,20 @@ def server_checks(bdir, logs, model, baseline):
                              f"tokens, common prefix {prefix} of {n2} tokens (similarity {sim:.3f}, {slot}); "
                              f"{len(chunks)} 'reusing chunk' lines" + (f", the last: {chunks[-1]}" if chunks else ""))
 
-    # 6. the replies against a saved baseline, exactly
+    # 6. the follow-up that ends in 2 to 8 tokens
+    ok, detail = server_reuse(replies, "F2", "F2-scratch", failure)
+    if "F2" in replies:
+        tail = replies["F2"]["timings"].get("prompt_n")
+        if tail is None or not 2 <= tail <= 8:
+            ok, detail = False, f"{detail}; F2 prompt_n {tail} not between 2 and 8"
+    report(names[5], ok, detail)
+
+    # 7. the replies against a saved baseline, exactly
     if baseline:
         try:
             base = json.loads(Path(baseline).read_text())
         except (OSError, ValueError) as e:
-            report(names[5], False, f"baseline not read: {e}")
+            report(names[6], False, f"baseline not read: {e}")
             base = None
         if base is not None:
             order = SERVER_REPLIES + sorted((set(base) | set(replies)) - set(SERVER_REPLIES))
@@ -620,7 +639,7 @@ def server_checks(bdir, logs, model, baseline):
                 fields = [k for k in ("content", "top_logprobs") if mine.get(k) != theirs.get(k)]
                 if fields:
                     differ.append(f"{name} ({', '.join(fields)})")
-            report(names[5], not differ, f"{len(order) - len(differ)}/{len(order)} replies equal to {baseline}" +
+            report(names[6], not differ, f"{len(order) - len(differ)}/{len(order)} replies equal to {baseline}" +
                    (f"; differ: {'; '.join(differ[:5])}" if differ else ""))
 
     info("llama-server load", f"{up_s:.1f} s to /health ok")
@@ -632,6 +651,10 @@ def server_checks(bdir, logs, model, baseline):
     if "B2" in replies and "B2-scratch" in replies:
         r, s = replies["B2"]["timings"], replies["B2-scratch"]["timings"]
         info("llama-server B", f"follow-up prompt {r.get('prompt_ms', 0):.0f} ms for {r.get('prompt_n')} tokens with "
+                               f"the cache, {s.get('prompt_ms', 0):.0f} ms for {s.get('prompt_n')} from scratch")
+    if "F2" in replies and "F2-scratch" in replies:
+        r, s = replies["F2"]["timings"], replies["F2-scratch"]["timings"]
+        info("llama-server F", f"follow-up prompt {r.get('prompt_ms', 0):.0f} ms for {r.get('prompt_n')} tokens with "
                                f"the cache, {s.get('prompt_ms', 0):.0f} ms for {s.get('prompt_n')} from scratch")
     if a is not None:
         info("llama-server text", " ".join(a["content"].split())[:90])

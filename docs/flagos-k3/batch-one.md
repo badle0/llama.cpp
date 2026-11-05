@@ -154,7 +154,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 
 1. **C1, the split of the 11.0 s** (no code: `scripts/startup-split.py`; `plan.md` "The start-up split"). My reading rated the zero-copy entries low value, and 3 s per GB might have changed that. The bytes settle that part (2026-11-05): plain tensors are 0.06% of what the provider loads on Qwen3-0.6B, so option A cannot shorten start-up. The split, measured the same day, keeps T6 and rules out the flags.
 2. **Cancel (T11).** S2 moves the replay loop and the plugin table. If cancel is wanted, one flag read at each barrier belongs in that design, not in a later interface change. The alternative is T10's small `-b`, with no code. This is the user's decision when the S2 spec is written.
-3. **A short tail in the server check.** No server request ends in 2 to 8 tokens, so the baseline S2 must reproduce does not exercise the KV-head path, the default for those calls since 2026-11-05 (`plan.md`). One such request belongs in the check before S2 relies on it; it would need a new baseline.
+3. **A short tail in the server check.** S2's baseline ran the KV-head path only on an almost empty cache (the warm-up and request A), with only A's text compared (corrected 2026-11-05; `plan.md`). A follow-up ending in 2 to 8 tokens is S2's step 0; it needs a new baseline.
 
 **After S2:**
 
