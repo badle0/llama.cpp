@@ -95,8 +95,8 @@ None of these is an acceptance check today except where noted. Grid sizes are pr
 
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
-| C14 | `kill -9` during prefill, restart, first token | TCM with no dead-owner recovery (`k3-hardware.md` §4) | `tcmrelease` is run by hand before every run |
-| C15 | A second process or context wanting the AI cores | Each failure costs about 30 s, then an abort | Seen with speculation; the wait is inferred to be spine-runtime's |
+| C14 | `kill -9` during prefill, restart, first token | Whether anything outlives a killed process. Not the TCM mark, which the provider does not hold while computing (2026-11-06, `plan.md` "S2's exit against the results"), so read what the next run gets: the cores, `/dev/tcm` mapped, the same speed, `libspert` falling back to the heap silently | Not measured |
+| C15 | A second process wanting the AI cores (a second context needs none since S2's step 2). Proposed 2026-11-06: an IME process as the second, which does not ask spine-runtime and takes a TCM mark the provider ignores | Each failure costs about 30 s, then an abort, retried on the next run; replies going wrong with no error (inference, `plan.md`) | Seen with speculation; the wait is inferred to be spine-runtime's. The retry and an IME process alongside never run |
 | C15b | 1, 2, 4 and 8 AI cores on the one-row matmuls and on attention at depth | Whether the weight stream saturates before 8 cores (Codex's point, §8) | Not measured; needs a test-only core count |
 | C16 | A fixed memory load on the X100 cores | The weight stream shares DRAM with a shared board's other work | Not measured |
 | C17 | `-c` 8192 to 32768 | KV at 144 KiB per position, prompt cache 8 GiB by default, 31 GiB RAM and no swap | Attention extrapolates to about 280 ms per token at 32768 (estimate) |
@@ -158,7 +158,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 
 **After S2:**
 
-1. A TTFT harness in the runner: C3, C5, C6, C10 and C14, client-side and server-side, as the baseline.
+1. A TTFT harness in the runner: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline.
 2. T1, with T5's result beside it.
 3. T2, T3 and T10, each against the baseline with its accuracy check.
 4. Block 6's per-op figures, then T7.
@@ -166,7 +166,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 6. T6, if cold start matters to the deployment.
 7. T8 or T9, only if attention at depth is still the largest cost at the depths that matter.
 
-**Targets, proposed for the user's decision, not agreed:** chat turn at depth 4096 at most 1 s; new conversation with a saved system prompt at most 0.5 s; fresh 500-token prompt at most 4 s; tg512 from depth 0 no worse than today, and from depth 4096 at least 9 t/s.
+**Targets, agreed by the user 2026-11-06:** chat turn at depth 4096 at most 1 s; new conversation with a saved system prompt at most 0.5 s; fresh 500-token prompt at most 4 s; tg512 from depth 0 no worse than today, and from depth 4096 at least 9 t/s.
 
 ## 6. How to measure so the results hold
 
