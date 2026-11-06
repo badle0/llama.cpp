@@ -2145,7 +2145,8 @@ Expected on the K3 (predictions): the build and the check program pass, its `loa
 
 0 of 8 before and after the two runs.
 - **What it shows.** The control shows the read can catch a mark: 8 of 8 through the IME build's compute, none left. The provider's 4 and 12 reads fit its start-up (4.29 s) and its compute (12.2 s from step 2's rates), and its stream comes at the first compute (`plugin/flagos-spacemit-exec.cpp:234-236`), so by timing those 12 reads fell in compute (inference). So the mark is the IME path's, the provider does not hold it while computing, and `0 of 8` says nothing about the provider, in this row or in any `no TCM block left held` since M2a.
-- **The row holds on another basis,** by inference: a provider that holds no mark has none to leave, and how TCM is taken did not change (the same instructions). Not ruled out: a mark held for a small share of the time (one held 10% of the time slips past 12 reads about 28% of the time), and marks kept where `tcmtest` does not read them.
+- **The row holds on another basis,** by inference: a provider that holds no mark has none to leave, and how TCM is taken did not change (the same instructions). Not ruled out: a mark held for a small share of the time (one held 10% of the time slips past 12 reads about 28% of the time), which C14 can catch by reading the blocks straight after each kill.
+- **Marks are not kept elsewhere, as far as the TCM library goes (K3, 2026-11-06; the user; the same build, `SPINE_TCM_RUNTIME_LOG=true`, `/proc/<pid>/maps` 9 s into a run of Qwen3-0.6B).** The provider's process maps `/usr/lib/libspine_tcm.so.0.2.0`, the board's only copy of the library by `find` under `/usr/lib` and `~/spine-runtime`, and `/dev/shm/tcm_sync_standalone`, the file where marks were found on 2026-10-07. `tcmtest` reports the same version 0.2.0 and driver 2. The nine `/dev/tcm` mappings are one of 3 MiB, the whole device, and eight of 384 KiB, one per block; the IME build's nine are a count only. The library logged its start and end and nothing else that names TCM, in either process. The speeds of the live read's runs, which my `tail` cut off then, are the provider's pp128 708.31 and tg128 56.24 and the IME build's 541.92 and 53.93: one run each and not interleaved, so no comparison, but the provider's are its usual, so it did run on the device.
 - **`libspert`'s names settle nothing.** `strings` on the board's 0.6.3 names `mem_get`, `mem_free`, `mem_try_wait`, `mem_release` and `mem_force_release`, which is what the loader in `spine_tcm.h` looks up by name in one go, called or not (`ggml/src/ggml-cpu/spacemit/spine_tcm.h:170-174`). So "never `try_wait`" (`k3-hardware.md` §4) stands for 0.6.0's disassembly only, and the prediction came right without that reason being shown.
 - **Decided (the user, 2026-11-06, "agreed to your decisions").** The runner's check is not moved before the release, where it could not fail. It stays, reading what the IME run leaves, and its name should say so. The probe-time warning this plan's design and R3 name was never built (no `tcmrelease` in the core or the plugin, by grep), and what it warns of is the IME path's. `batch-one.md` C14 becomes the real test: what the next run gets after a killed one.
 - **A consequence, not tried (inference).** The mark is how IME threads take turns on a block, and the provider does not take it, so nothing seen here stops an IME process and the provider using one block at once, with results that could go wrong and no error. Proposed for `batch-one.md` C15, with an IME process as the second process. A stale mark from a dead IME run should not stop the provider: `mem_get` worked with all 8 marked (2026-10-07, `k3-hardware.md` §4).
@@ -2158,6 +2159,71 @@ Expected on the K3 (predictions): the build and the check program pass, its `loa
 **Not in S2:** the zero-copy entries and cancel, as decided above; T6 and the rest of `batch-one.md`'s list (9 to 63 tokens first); the batch-size-1 checks; M3 and fusion.
 
 **Time (estimates):** the coder, one short session per step; on the K3, step 0 about 1.5 hours of unattended runs, step 1 about 3 hours (the 4B runner with `--depth`), step 2 about 1 hour, step 3 minutes.
+
+### TTFT harness spec, for review (2026-11-06)
+
+**Status:** written for review, nothing implemented. Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
+
+**For the user's word.**
+1. **A script of its own, `tools/spacemit_ttft.py`, not a flag in the runner, where `batch-one.md` §5 put it.** The runner is pass/fail with its counts recorded run by run, and this is about 2 hours of recording. The script imports the runner's helpers, so nothing is copied and the runner's counts and time stay.
+2. **An IME process alongside the provider, in C15 (recommended, not yet answered).** "S2's exit against the results" says why. It is the `alongside` case below, and leaving it out costs one flag.
+
+**The cases.** Times are Qwen3-4B, my estimates from the rates in `batch-one.md` §2.
+
+| Case | Covers | What it does | Time |
+|---|---|---|---|
+| `grid` | C3, C5 | TTFT by cached depth and tail. Depth 0: 1 to 5, 8, 9, 16, 32, 63, 64, 65, 128, 256, 500, 511 to 513, 575, 576, 1024, 2048 and 4095 tokens (C3's list and the target's 500). Depths 256, 1024, 2048, 4096 and 8192: 1, 2, 3, 4, 8, 12, 26, 38, 63, 64 and 110. 5 repeats, cycling through the tails at each depth | 32 min |
+| `chat` | C6 | 20 fixed user turns through `/v1/chat/completions`, temperature 0, `max_tokens` 512, the client resending the returned content; thinking off, then on, each on a fresh server with the defaults. Per turn: first event, first reasoning, first visible content, `cache_n`, `prompt_n`, `prompt_ms`, `predicted_n` and its speed, and whether it hit `max_tokens` | 20 min |
+| `cancel` | C10 | At depth 4096, a 2048-token tail, the connection closed after 2 s, then at once a 1-token request. The wait is its client time less its `prompt_ms`. 3 repeats | 4 min |
+| `tg512` | C11 | 512 tokens with `ignore_eos` from depths 0, 500 and 4096, ten runs each back to back. Speed per run and per 100 tokens from the stream's times; `/sys/class/thermal` before and after each run | 30 min |
+| `restart` | C14 | `kill -9` 0.5, 1 and 1.5 s into a 2048-token prefill, one round each. Then blocks marked by `tcmtest info`, `tcmrelease`'s dry run saved, and for a new server: start time, "could not get" lines, `/dev/tcm` lines in its maps, first token, and tg64 against the speed before the kill | 2 min |
+| `second` | C15 | Server A up, server B started beside it. B's start time and "could not get" lines; a request to B while A lives (status, seconds, B alive after); A stopped; the same request to B, with its first token and its text against A's. This is the cores' request failing and being retried, which nothing has run | 3 min |
+| `alongside` | C15, proposed | A fixed reply 3 times alone as the reference, 5 times with the upstream IME build's `llama-bench` looping beside it, then once alone. Replies against the reference, and speed. A request is cut off at 300 s, which ends the case | 5 min |
+
+Around them: the commit, by git with `safe.directory` (the binaries print `build: unknown (0)` on the board); `/proc/loadavg` at each case's start and end; the IME build's `llama-bench -p 128 -n 128 -ub 128 -r 3` at the start and the end as `batch-one.md` §6's control, with `tcmrelease --apply` before each IME run as in the runner.
+
+**How it measures, each tried on the Mac (2026-11-06; `build-host`, Qwen3-0.6B, the CPU path unless said; throwaway scripts).**
+- Prompts are token arrays cut from the repo's `README.md`, tokenized once and repeated to length, so lengths are exact: `prompt_n` and `cache_n` came out as asked on every request. Tokenizing is therefore not in the map; `chat` has it.
+- A depth is filled once with `n_predict` 0 and extended to the next (256, then 512: `cache_n` 256, `prompt_n` 256). A tail's first token must differ from what is cached there, so two token sources alternate. Depth 0 takes the same path, `cache_n` 0.
+- TTFT is client-side, from just before the request to the first `data:` line of a streamed reply with `n_predict` 1, and server-side, `prompt_ms` from the last event. They differed by about 0.6 ms.
+- Measuring servers run `-t 8 -np 1 -c 8704 --cache-ram 0` at the default verbosity. `-c 8704` holds depth 8192, the longest tail and the first token. `--cache-ram 0` because the default prompt cache saves the slot before a fresh prompt: 20 to 176 ms on top after 3000 cached positions, 0.5 ms without it. That is C8's subject, not this map's. `chat` runs the server's defaults, as a client finds them.
+- `n_kv` is reported by formula, depth plus tail padded to 256, which gives the values in `batch-one.md` §2.
+- Placement is read once from a short start at `-lv 4`, the default printing none of it (the simulated device: 29/29 layers, the KV buffer on `FlagOS:SpacemiT`, 2 graph splits). Anything else stops the run, unless `--allow-cpu`. Measuring servers stay at the default verbosity: `-lv 4` nearly quadruples the log, and a 1-token tail took 34.6 ms against 31.5 ms, which may be noise.
+- With thinking on, the first event is the role chunk, arriving with the first token, and visible content comes far later (2.1 and 6.3 s on the Mac). Events do not match tokens one to one there, so per-token speed comes from `/completion` only: 301 events for 300 tokens.
+- Closing the connection during a prefill: the next request's client time was 2,050 ms and its `prompt_ms` 58 ms, `cache_n` as before, so the wait reads directly.
+- `kill -9` during a prefill: the client sees a dropped connection and a new server comes up (on the Mac, where no cores are granted).
+- A failed decode gives the client HTTP 500 "Compute error." and the server stays up, rc 0 at its end (the simulated device, `FLAGOS_SPACEMIT_TEST_FAIL_NODE`). I had read the `throw` at `tools/server/server-context.cpp:3696` as ending the server, and the test showed otherwise. So `second` can reach the retry in one process.
+
+**Output.** `<build-dir>/logs-ttft-<model>/`: `ttft.jsonl` with a row per measurement (case, depth, tail, repeat, client ms, `prompt_ms`, `cache_n`, `prompt_n`, `n_kv`, and the case's own fields), `summary.txt`, the servers' logs. The summary has p50 and p95 tables, tails against depths for `grid` (with 5 repeats p95 is the largest), and ends with the agreed targets against the run's figures where it has them: a chat turn at depth 4096 (tails 26, 38 and 110), a fresh 500 tokens, tg512 from depths 0 and 4096. A saved system prompt's target is T3's and is not measured here.
+
+**Checks.** PASS or FAIL only for: placement; each case's rows having `cache_n` and `prompt_n` as asked; requests answering; `restart`'s next server (up, no "could not get", `/dev/tcm` mapped, no block marked, tg64 within 5% of before); `second`'s B answering after A has gone, with A's text. No limit on any speed, this being a baseline. `alongside` reports without a verdict. Exit status 1 if any fail. A failed case stops its server and the next case runs; Ctrl-C leaves no child running.
+
+**Interface.** `spacemit_ttft.py [--build-dir DIR] [--model GGUF] [--cases grid,chat,...] [--repeats N] [--quick] [--ime-build DIR] [--tcm-dir DIR] [--segv SO] [--allow-cpu]`, the defaults as the runner's and all cases in the table's order. `--quick` cuts every case down to minutes, for the Mac and a first look on the K3: depths 0 and 256, a few tails, 2 repeats, 3 chat turns, 64 tokens twice, one `restart` round. Standard library only, like the runner. Where `tcmtest`, the IME build, `/proc` or the thermal files are missing, that part is skipped with an INFO line.
+
+**Also in the commit.** The runner's `no TCM block left held` becomes `no TCM block left marked (the IME path's mark)`, name and header comment only, its count unchanged; usage beside the runner's in `build.md`; `batch-one.md` §5 pointing here.
+
+**Not in it.** Variants interleaved in one session, which T1's spec adds, a loop around these cases; C1 (measured), C2, C4, C7 to C9, C12, C13 and C16 to C19; accuracy, which each lever's rule carries.
+
+**A risk for the board.** `restart` kills a provider process in mid-compute, which no document records being done. If that left the cores stuck, the next server would show "could not get", and the board might need a restart. I rate that low, by inference: aborts with a stream open (exit 134, 2026-11-04) and the crash dumps left nothing stuck, though none was in mid-compute. It runs late in the order so the earlier results are already saved.
+
+**Tests on the Mac (the coder, then rerun by me).**
+- `--quick` with all cases on the simulated device and on the CPU path (`FLAGOS_SPACEMIT_DISABLE=1 --allow-cpu`): rc 0, every row's check passing, the summary's tables and targets filled.
+- With stand-ins for `tcmtest`, `tcmrelease` and the IME build: `restart`, `alongside` and the control run; without them they skip with an INFO line. A stand-in reporting a marked block fails `restart`'s check.
+- `GGML_FLAGOS_DISABLE_OPS=FLASH_ATTN_EXT`: placement fails, the run stops. A missing model: a clean message, rc 1, no server left.
+- The server killed from outside during `grid`: that case fails, the next runs, no hang. A stand-in server answering the wrong `cache_n`: the case's check fails. Ctrl-C during a case: no child left.
+- `second` on the Mac cannot be refused the cores, so the code path runs and the INFO line says B was not refused; the refusal itself is the K3's to show.
+- The runner's renamed check through a stand-in `tcmtest`; its count unchanged.
+
+**On the K3.** No rebuild: only the Python changes, so the binaries stay step 3's.
+1. The runner on both models with `--server-baseline`, about 1 hour. Predicted 48/48 each with all replies equal. This settles the two rows S2 carried over from step 2 by inference, and shows the renamed check.
+2. `--quick` on Qwen3-0.6B, about 10 minutes (estimate), to catch mistakes before the long run.
+3. The full run in tmux on Qwen3-0.6B, about 25 minutes, then Qwen3-4B, about 1 hour 40 (estimates), each `ttft.jsonl` kept as `~/kvh/ttft-base-06.jsonl` and `~/kvh/ttft-base-4b.jsonl`.
+
+**Predictions (Qwen3-4B, from the measured rates in `batch-one.md` §2; a cell off by more than 15% gets explained).** Depth 0: tail 1 about 87 ms, 64 about 549 ms, 512 about 5.3 s. Depth 4096: tail 1 about 129 ms, 4 about 226 ms, 12 about 3.27 s, 63 about 17.2 s, 64 about 1.67 s. `chat` with thinking off: each turn decodes about the last reply plus the new turn. `tg512`: about 10.5 t/s from depth 0, about 7.6 from depth 4096. `cancel`: a wait of up to about 57 s. `restart`: no block marked, nine `/dev/tcm` lines, the same speed. `second`: about 30 s per refused decode, then HTTP 500, and after A goes B answers with A's text. `alongside`: none, it has never been tried.
+
+**Exit:** both models' full runs complete with every check passing or explained, the predictions held or explained, and the baseline recorded in `build.md` §7 and `batch-one.md` §2. T1's rule is then written for the user before its run.
+
+**Time (estimates):** the coder, one session, 500 to 600 lines; on the K3 about 3 hours of unattended runs.
 
 ### Not planned
 

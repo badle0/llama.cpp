@@ -158,7 +158,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 
 **After S2:**
 
-1. A TTFT harness in the runner: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline.
+1. A TTFT harness in the runner: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline (spec for review: `plan.md` "TTFT harness spec", which proposes a script beside the runner).
 2. T1, with T5's result beside it.
 3. T2, T3 and T10, each against the baseline with its accuracy check.
 4. Block 6's per-op figures, then T7.
