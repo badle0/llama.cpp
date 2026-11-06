@@ -55,13 +55,8 @@ bool spacemit_pair_wait(const spacemit_tile & tile) {
 
 namespace {
 
-// test-only: FLAGOS_SPACEMIT_TEST_FAIL_NODE=n makes tile 0 report a failure at step n
-int64_t spacemit_test_fail_step() {
-    const char * value = std::getenv("FLAGOS_SPACEMIT_TEST_FAIL_NODE");
-    return value != nullptr ? std::atoll(value) : -1;
-}
-
-std::atomic<uint64_t> g_steps_launched{ 0 };  // test-only (spacemit_steps_take)
+std::atomic<uint64_t> g_steps_launched{ 0 };    // test-only (spacemit_steps_take)
+std::atomic<uint64_t> g_executors_created{ 0 };  // test-only (spacemit_executors_take)
 
 struct spacemit_launch {
     const spacemit_plugin_step * steps          = nullptr;
@@ -194,10 +189,10 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
 
 class spert_executor final : public spacemit_executor {
   public:
-    spert_executor(spacemit_stream_policy policy, uint32_t n_cores, int64_t fail_step) :
-        policy(policy), n_cores(n_cores), fail_step(fail_step) {}
+    spert_executor(spacemit_stream_policy policy, uint32_t n_cores) : policy(policy), n_cores(n_cores) {}
 
-    bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size) override {
+    bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size,
+             const spacemit_run_options & options) override {
         std::unique_ptr<spert::Stream> per_call_stream;
         spert::Stream *                stream = stream_for_run(per_call_stream);
         if (stream == nullptr) {
@@ -209,9 +204,9 @@ class spert_executor final : public spacemit_executor {
         launch.n_steps        = n_steps;
         launch.workspace      = workspace;
         launch.workspace_size = workspace_size;
-        launch.fail_step      = fail_step;
+        launch.fail_step      = options.fail_step;
         g_steps_launched += n_steps;
-        spacemit_stats_begin(launch, stats, static_cast<uint32_t>(stream->core_count()));
+        spacemit_stats_begin(launch, options.stats, static_cast<uint32_t>(stream->core_count()));
         const spacemit_clock::time_point t      = spacemit_stats_now(launch);
         const spert::Future              future = stream->launch(spert::Grid{ stream->core_count() }, spacemit_tile_main,
                                                                  &launch);
@@ -229,7 +224,7 @@ class spert_executor final : public spacemit_executor {
     }
 
   private:
-    // the stream for one run: the backend's, or one of its own (FLAGOS_SPACEMIT_STREAM=per-call) kept in per_call
+    // the stream for one run: the device's, or one of its own (FLAGOS_SPACEMIT_STREAM=per-call) kept in per_call
     spert::Stream * stream_for_run(std::unique_ptr<spert::Stream> & per_call) {
         spert::Stream * stream = nullptr;
         if (policy == spacemit_stream_policy::per_call) {
@@ -260,7 +255,6 @@ class spert_executor final : public spacemit_executor {
 
     spacemit_stream_policy         policy;
     uint32_t                       n_cores;
-    int64_t                        fail_step;
     std::unique_ptr<spert::Stream> persistent_stream;
 };
 
@@ -311,7 +305,7 @@ class host_barrier {
 // failure protocol, and pair waits that wait
 class host_executor final : public spacemit_executor {
   public:
-    host_executor(uint32_t n_tiles, int64_t fail_step) : n_tiles(n_tiles), fail_step(fail_step) {
+    explicit host_executor(uint32_t n_tiles) : n_tiles(n_tiles) {
         const char * threads_value = std::getenv("FLAGOS_SPACEMIT_TEST_THREADS");
         threaded                   = threads_value != nullptr && std::strcmp(threads_value, "0") != 0;
         const char * value         = std::getenv("FLAGOS_SPACEMIT_TEST_TCM");
@@ -328,13 +322,14 @@ class host_executor final : public spacemit_executor {
         }
     }
 
-    bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size) override {
+    bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size,
+             const spacemit_run_options & options) override {
         spacemit_launch launch;
         launch.steps     = steps;
         launch.n_steps   = n_steps;
-        launch.fail_step = fail_step;
+        launch.fail_step = options.fail_step;
         g_steps_launched += n_steps;
-        spacemit_stats_begin(launch, stats, n_tiles);
+        spacemit_stats_begin(launch, options.stats, n_tiles);
         const spacemit_clock::time_point start = spacemit_stats_now(launch);
         if (threaded) {
             host_barrier             barrier(n_tiles);
@@ -398,7 +393,6 @@ class host_executor final : public spacemit_executor {
     }
 
     uint32_t n_tiles;
-    int64_t  fail_step;
     bool     threaded   = false;
     void *   tcm        = nullptr;
     size_t   tcm_size   = 0;
@@ -414,11 +408,16 @@ uint64_t spacemit_steps_take() {
     return g_steps_launched.exchange(0);
 }
 
+uint64_t spacemit_executors_take() {
+    return g_executors_created.exchange(0);
+}
+
 std::unique_ptr<spacemit_executor> spacemit_executor_create(spacemit_stream_policy policy, uint32_t n_cores) {
+    g_executors_created++;
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
-    return std::make_unique<spert_executor>(policy, n_cores, spacemit_test_fail_step());
+    return std::make_unique<spert_executor>(policy, n_cores);
 #else
     GGML_UNUSED(policy);
-    return std::make_unique<host_executor>(n_cores, spacemit_test_fail_step());
+    return std::make_unique<host_executor>(n_cores);
 #endif
 }

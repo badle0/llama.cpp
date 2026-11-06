@@ -132,7 +132,7 @@ def check_spacemit(bdir, logs, name, log, args, env_extra=None, timeout=300):
     detail = "; ".join(ln for ln in out.splitlines()
                        if ln.startswith(("device", "flagos ", "loader ", "ops ", "matmul   Q4_0", "matmul   Q4_1",
                                          "matmul   Q8_0", "matmul   Q6_K", "gemv ", "rows ", "cache ", "attn ",
-                                         "layer")))
+                                         "layer", "stream ")))
     fails = [ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln]
     report(name, rc == 0, detail if rc == 0 else "; ".join(fails[:3]) or last_line(err))
     for ln in out.splitlines():

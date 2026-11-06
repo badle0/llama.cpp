@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #if defined(__linux__)
@@ -36,10 +37,18 @@
 struct spacemit_plugin_device {
     uint32_t    n_tiles = 0;
     std::string description;
+    // one executor, and with it one core grant, for all the device's streams (plan.md "S2 spec", step 2): the first
+    // stream creates it, the last one's destroy frees it. Its runs need no lock here: the core's run_mutex keeps
+    // them one at a time
+    std::mutex                         streams_mutex;
+    std::unique_ptr<spacemit_executor> executor;
+    uint32_t                           n_streams = 0;
 };
 
 struct spacemit_plugin_stream {
-    std::unique_ptr<spacemit_executor> executor;
+    spacemit_plugin_device * dev      = nullptr;  // outlives its streams
+    spacemit_executor *      executor = nullptr;  // the device's
+    spacemit_run_options     options;             // this backend context's, for its runs
 };
 
 struct spacemit_plugin_buffer {
@@ -301,24 +310,47 @@ spacemit_stream_policy spacemit_stream_policy_from_env() {
                                                                     : spacemit_stream_policy::persistent;
 }
 
+// test-only: FLAGOS_SPACEMIT_TEST_FAIL_NODE=n makes tile 0 report a failure at step n. Read per stream, so one
+// context's forced failure leaves another's runs alone
+int64_t spacemit_test_fail_step() {
+    const char * value = std::getenv("FLAGOS_SPACEMIT_TEST_FAIL_NODE");
+    return value != nullptr ? std::atoll(value) : -1;
+}
+
 enum spacemit_status plugin_stream_create(spacemit_plugin_device * dev, uint32_t n_tiles,
                                           spacemit_plugin_stream ** stream) {
     if (dev == nullptr || stream == nullptr) {
         return SPACEMIT_STATUS_INVALID_ARGUMENT;
     }
-    auto executor = spacemit_executor_create(spacemit_stream_policy_from_env(), n_tiles);
-    if (executor == nullptr) {
-        return SPACEMIT_STATUS_ALLOC_FAILED;
+    std::lock_guard<std::mutex> lock(dev->streams_mutex);
+    // the policy and n_tiles are the first stream's, the core passing the device's count each time
+    if (dev->executor == nullptr) {
+        dev->executor = spacemit_executor_create(spacemit_stream_policy_from_env(), n_tiles);
+        if (dev->executor == nullptr) {
+            return SPACEMIT_STATUS_ALLOC_FAILED;
+        }
     }
-    GGML_LOG_DEBUG("FlagOS SpacemiT: backend uses %s\n", executor->name());
-    auto * s    = new spacemit_plugin_stream;
-    s->executor = std::move(executor);
-    *stream     = s;
+    dev->n_streams++;
+    GGML_LOG_DEBUG("FlagOS SpacemiT: backend uses %s\n", dev->executor->name());
+    auto * s             = new spacemit_plugin_stream;
+    s->dev               = dev;
+    s->executor          = dev->executor.get();
+    s->options.fail_step = spacemit_test_fail_step();
+    *stream              = s;
     return SPACEMIT_STATUS_SUCCESS;
 }
 
 void plugin_stream_destroy(spacemit_plugin_stream * stream) {
+    if (stream == nullptr) {
+        return;
+    }
+    spacemit_plugin_device * dev = stream->dev;
     delete stream;
+    // the reset stays under the mutex, so a stream_create at the same time waits until the grant is released
+    std::lock_guard<std::mutex> lock(dev->streams_mutex);
+    if (--dev->n_streams == 0) {
+        dev->executor.reset();
+    }
 }
 
 // the replay waits for its launches, so there is nothing left to synchronize
@@ -369,10 +401,10 @@ enum spacemit_status plugin_replay(spacemit_plugin_stream * stream, const spacem
             // the same steps in the same order on the same workspace, so the same outputs: a launch ends on every
             // tile before the next starts, as the barrier after a step does inside one launch
             for (uint32_t i = 0; i < n_steps && ok; i++) {
-                ok = stream->executor->run(steps + i, 1, workspace, workspace_size);
+                ok = stream->executor->run(steps + i, 1, workspace, workspace_size, stream->options);
             }
         } else {
-            ok = stream->executor->run(steps, n_steps, workspace, workspace_size);
+            ok = stream->executor->run(steps, n_steps, workspace, workspace_size, stream->options);
         }
     } catch (...) {
         GGML_LOG_ERROR("FlagOS SpacemiT: the launch threw an exception\n");
@@ -384,7 +416,7 @@ enum spacemit_status plugin_replay(spacemit_plugin_stream * stream, const spacem
 // test-only (E3c): where the tiles of this stream's launches note their times, or nullptr
 void spacemit_run_stats_attach(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats) {
     if (stream != nullptr) {
-        stream->executor->stats = stats;
+        stream->options.stats = stats;
     }
 }
 
@@ -395,6 +427,9 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_steps_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_steps_take_fn>(spacemit_steps_take));
+    }
+    if (std::strcmp(name, "spacemit_executors_take") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_executors_take_fn>(spacemit_executors_take));
     }
     if (std::strcmp(name, "spacemit_mm_paths_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_mm_paths_take_fn>(spacemit_mm_paths_take));

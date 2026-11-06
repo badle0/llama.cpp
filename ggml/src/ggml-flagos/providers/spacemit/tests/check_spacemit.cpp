@@ -7,8 +7,8 @@
 //                    the IME
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
 //                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-8192, 128 tokens at n_kv 128
-//                    and 4096, 512 at n_kv 512 and 4608) against the CPU, and the default matmul setting (fit,staged)
-//                    against split at the row counts of --bench-mm
+//                    and 4096, 512 at n_kv 512 and 4608) against the CPU (Q4_1 on the provider only), and the default
+//                    matmul setting (fit,staged) against split at the row counts of --bench-mm
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default; at 1, 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=off
 //                    against 1-8)
@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -72,6 +73,7 @@ static const char * k_device_name = "FlagOS:SpacemiT:0";
 // the plugin's test names this program calls (plan.md "S1 design" A2), looked up once from the device's table
 // (bind_plugin_names); nullptr with no device, where only the "device checks skipped" path runs
 static spacemit_steps_take_fn     g_steps_take     = nullptr;
+static spacemit_executors_take_fn g_executors_take = nullptr;
 static spacemit_mm_paths_take_fn  g_mm_paths_take  = nullptr;
 static spacemit_mm_tail_take_fn   g_mm_tail_take   = nullptr;
 static spacemit_switches_reset_fn g_switches_reset = nullptr;
@@ -80,11 +82,12 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
     g_steps_take     = reinterpret_cast<spacemit_steps_take_fn>(table->get_proc_address("spacemit_steps_take"));
+    g_executors_take = reinterpret_cast<spacemit_executors_take_fn>(table->get_proc_address("spacemit_executors_take"));
     g_mm_paths_take  = reinterpret_cast<spacemit_mm_paths_take_fn>(table->get_proc_address("spacemit_mm_paths_take"));
     g_mm_tail_take   = reinterpret_cast<spacemit_mm_tail_take_fn>(table->get_proc_address("spacemit_mm_tail_take"));
     g_switches_reset = reinterpret_cast<spacemit_switches_reset_fn>(table->get_proc_address("spacemit_switches_reset"));
-    REQUIRE(g_steps_take != nullptr && g_mm_paths_take != nullptr && g_mm_tail_take != nullptr &&
-            g_switches_reset != nullptr);
+    REQUIRE(g_steps_take != nullptr && g_executors_take != nullptr && g_mm_paths_take != nullptr &&
+            g_mm_tail_take != nullptr && g_switches_reset != nullptr);
     return 0;
 }
 
@@ -242,8 +245,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
 
     // what is not contract comes by name (plan.md "S1 design" A2): every name answers, and the behaviour behind each is
     // checked where it is used
-    const char * names[] = { "spacemit_steps_take", "spacemit_mm_paths_take", "spacemit_mm_tail_take",
-                             "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
+    const char * names[] = { "spacemit_steps_take", "spacemit_executors_take", "spacemit_mm_paths_take",
+                             "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
                              "spacemit_switches_reset", "spacemit_switches_generation" };
     size_t       n_names = 0;
     for (const char * name : names) {
@@ -1349,6 +1352,15 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     return 0;
 }
 
+// a backend with a stand-in of the K3's 384 KiB of TCM, its tiles in turn or (threads "1") on threads. The executor
+// reads both settings when it is created and a device's live backends share it, so a backend with other settings
+// must wait until this one is freed
+static ggml_backend_t tcm_backend(ggml_backend_dev_t dev, const char * threads) {
+    env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");
+    env_override on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
+    return ggml_backend_dev_init(dev, nullptr);
+}
+
 // the 1-row path (generation; plan.md, "1-row matmul bandwidth"): the weights staged through TCM in 32-column slabs, the
 // two tiles of a pair taking turns (gemv, flagos-spacemit-ime.cpp). With TCM against the CPU, the output filled with NaN
 // first so skipped columns show. On a host without the AI cores the host executor gets a stand-in of the K3's 384 KiB
@@ -1357,22 +1369,6 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
 // which reads the weights straight from DRAM with the same kernel. The shapes give a pair whose odd tile has one slab
 // fewer (480 and 1056 columns) and a long row
 static int check_gemv(ggml_backend_dev_t dev, bool host) {
-    std::vector<ggml_backend_t> backends;  // with TCM: in turn, then (host) on threads
-    for (const char * threads : { (const char *) nullptr, "1" }) {
-        if (threads != nullptr && !host) {
-            break;
-        }
-        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");
-        env_override on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
-        backends.push_back(ggml_backend_dev_init(dev, nullptr));
-        REQUIRE(backends.back() != nullptr);
-    }
-    ggml_backend_t direct = nullptr;  // host only: no TCM, the weights read straight from DRAM
-    if (host) {
-        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", nullptr);
-        direct = ggml_backend_dev_init(dev, nullptr);
-        REQUIRE(direct != nullptr);
-    }
     ggml_backend_t cpu = ggml_backend_cpu_init();
     REQUIRE(cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
@@ -1395,18 +1391,30 @@ static int check_gemv(ggml_backend_dev_t dev, bool host) {
         REQUIRE(run.init(dev, w, 1, 9));
         std::vector<float>       ref(s.n), out(s.n);
         const std::vector<float> nan(s.n, NAN);
-        if (direct != nullptr) {
+        if (host) {
+            ggml_backend_t direct = nullptr;  // no TCM, the weights read straight from DRAM
+            {
+                env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", nullptr);
+                direct = ggml_backend_dev_init(dev, nullptr);
+            }
+            REQUIRE(direct != nullptr);
             REQUIRE(ggml_backend_graph_compute(direct, run.g_dev) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get(run.y, ref.data(), 0, ggml_nbytes(run.y));
+            ggml_backend_free(direct);
         }
-        for (ggml_backend_t backend : backends) {
+        for (const char * threads : { (const char *) nullptr, "1" }) {  // with TCM: in turn, then (host) on threads
+            if (threads != nullptr && !host) {
+                break;
+            }
+            ggml_backend_t backend = tcm_backend(dev, threads);
+            REQUIRE(backend != nullptr);
             ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
             const double e = run.compare(dev, backend, cpu);
             ggml_backend_tensor_get(run.y, out.data(), 0, ggml_nbytes(run.y));
-            const bool same = direct == nullptr || std::memcmp(out.data(), ref.data(), ggml_nbytes(run.y)) == 0;
+            const bool same = !host || std::memcmp(out.data(), ref.data(), ggml_nbytes(run.y)) == 0;
             if (e < 0.0 || e > k_mul_mat_max_nmse || !same) {
                 std::fprintf(stderr, "FAIL: %s 1-row matmul k=%lld n=%lld with TCM%s: %s %.3e\n", ggml_type_name(s.type),
-                             (long long) s.k, (long long) s.n, backend != backends[0] ? " (tiles on threads)" : "",
+                             (long long) s.k, (long long) s.n, threads != nullptr ? " (tiles on threads)" : "",
                              e < 0.0 ? "refused or failed" : !same ? "differs from the read without TCM, NMSE" : "NMSE",
                              e);
                 g_failures++;
@@ -1415,15 +1423,10 @@ static int check_gemv(ggml_backend_dev_t dev, bool host) {
             }
             worst = std::max(worst, e);
             n_runs++;
+            ggml_backend_free(backend);
         }
     }
 
-    for (ggml_backend_t backend : backends) {
-        ggml_backend_free(backend);
-    }
-    if (direct != nullptr) {
-        ggml_backend_free(direct);
-    }
     ggml_backend_free(cpu);
     std::printf("gemv     the 1-row path at 6 shapes with TCM%s: %d/%d %s; vs CPU max NMSE %.2e (bound %.0e)%s\n",
                 host ? ", tiles in turn and on threads" : "", n_same, n_runs,
@@ -1450,17 +1453,7 @@ static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
 // with their dealing, worked out here again. Paths A and B need TCM: as check_gemv, a stand-in of the K3's 384 KiB on a
 // host without the AI cores, there also with tiles on threads
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
-    env_override                mm("FLAGOS_SPACEMIT_MM", nullptr);
-    std::vector<ggml_backend_t> backends;
-    for (const char * threads : { (const char *) nullptr, "1" }) {
-        if (threads != nullptr && !host) {
-            break;
-        }
-        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");
-        env_override on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
-        backends.push_back(ggml_backend_dev_init(dev, nullptr));
-        REQUIRE(backends.back() != nullptr);
-    }
+    env_override mm("FLAGOS_SPACEMIT_MM", nullptr);
 
     struct mm_case { ggml_type type; int64_t k, n, m; };
     const mm_case cases[] = {
@@ -1530,7 +1523,12 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 tail_dealt[extra++]++;
             }
         }
-        for (ggml_backend_t backend : backends) {
+        for (const char * threads : { (const char *) nullptr, "1" }) {
+            if (threads != nullptr && !host) {
+                break;
+            }
+            ggml_backend_t backend = tcm_backend(dev, threads);
+            REQUIRE(backend != nullptr);
             std::vector<float> out[n_set];
             uint64_t           path_a[n_set] = {}, path_b[n_set] = {}, path_c[n_set] = {};
             uint64_t           tail_rows[n_set][tiles] = {}, tail_calls[n_set][tiles] = {};
@@ -1593,17 +1591,15 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
                 std::fprintf(stderr,
                              "FAIL: %s matmul k=%lld n=%lld rows=%lld: %s (paths A/B/C taken, expected: %s)%s\n",
                              ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) c.m, what.c_str(),
-                             paths.c_str(), backend != backends[0] ? " (tiles on threads)" : "");
+                             paths.c_str(), threads != nullptr ? " (tiles on threads)" : "");
                 g_failures++;
             }
             n_same += same && switched;
             n_runs++;
+            ggml_backend_free(backend);
         }
     }
 
-    for (ggml_backend_t backend : backends) {
-        ggml_backend_free(backend);
-    }
     std::printf("mm       the default (fit,staged: path B where TCM holds the activations, else A from 32 rows, else C) "
                 "against FLAGOS_SPACEMIT_MM=split: Q4_0, Q4_1, Q8_0 and Q6_K at 2-128 rows with TCM%s: %d/%d identical, "
                 "paths and path A's leftover rows by tile, a tile's in one call, as expected%s\n",
@@ -4256,6 +4252,215 @@ static int check_diagnostics(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// how many of rounds runs of l on backend failed or differ from ref; it holds no check, so a thread may call it
+static int bad_runs(plan_layer & l, ggml_backend_t backend, const std::vector<float> & ref, int rounds) {
+    int                bad = 0;
+    std::vector<float> out;
+    for (int r = 0; r < rounds; r++) {
+        bad += !(l.run(backend, out) && same_bytes(out, ref));
+    }
+    return bad;
+}
+
+// plan.md "S2 spec", step 2: a device's backend contexts share one executor, as spacemit_executors_take counts, and two
+// graphs on two contexts give the bytes of each alone: interleaved, with the contexts freed in any order, with one
+// context failing, and from two threads, the core's run_mutex keeping the runs one at a time. Called last, so that a
+// backend an earlier check leaked shows as a count of 0 at the first backend made here
+static int check_shared_stream(ggml_backend_dev_t dev, bool host) {
+    plan_layer a, b, c;  // c: only for the failing graph, whose outputs are left unfinished
+    REQUIRE(a.init(dev, 1, 1e6f));
+    REQUIRE(b.init(dev, 7, 1e4f));
+    REQUIRE(c.init(dev, 1, 1e6f));
+    constexpr int k_rounds = 500;  // of the two-thread case: 1 to 2 s on a Mac
+    int           n_same = 0, n_runs = 0;
+    for (const char * threads : { (const char *) nullptr, "1" }) {
+        if (threads != nullptr && !host) {
+            break;
+        }
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");
+        env_override on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
+        const char * how = threads != nullptr ? " (tiles on threads)" : "";
+
+        const auto count = [&](const char * what, uint64_t want) {
+            const uint64_t got = g_executors_take();
+            if (got != want) {
+                std::fprintf(stderr, "FAIL: shared stream, %s%s: %llu executors created, expected %llu\n", what, how,
+                             (unsigned long long) got, (unsigned long long) want);
+                g_failures++;
+            }
+        };
+        const auto same = [&](const char * what, plan_layer & l, ggml_backend_t backend, const std::vector<float> & ref) {
+            const int bad = bad_runs(l, backend, ref, 1);
+            if (bad != 0) {
+                std::fprintf(stderr, "FAIL: shared stream, %s%s: a run failed or differs from its run alone\n", what, how);
+                g_failures++;
+            }
+            n_same += 1 - bad;
+            n_runs++;
+        };
+        const auto bad_in_thread = [&](const char * what, int bad) {
+            if (bad != 0) {
+                std::fprintf(stderr, "FAIL: shared stream, %s%s: %d runs failed or differ from their run alone\n", what,
+                             how, bad);
+                g_failures++;
+            }
+        };
+        const auto finite = [](const std::vector<float> & v) {
+            return std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); });
+        };
+        g_executors_take();
+
+        // each graph alone: the references
+        std::vector<float> ref_a, ref_b;
+        {
+            ggml_backend_t x = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(x != nullptr);
+            count("the first backend, alone", 1);
+            REQUIRE(a.run(x, ref_a) && finite(ref_a));
+            ggml_backend_free(x);
+            ggml_backend_t y = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(y != nullptr);
+            count("the second backend, alone", 1);
+            REQUIRE(b.run(y, ref_b) && finite(ref_b));
+            ggml_backend_free(y);
+        }
+
+        // two live, then their lifetimes
+        {
+            ggml_backend_t ctx_a = ggml_backend_dev_init(dev, nullptr);
+            ggml_backend_t ctx_b = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_a != nullptr && ctx_b != nullptr);
+            count("two live backends", 1);
+            for (int r = 0; r < 20; r++) {
+                same("two live, interleaved", a, ctx_a, ref_a);
+                same("two live, interleaved", b, ctx_b, ref_b);
+            }
+            for (int r = 0; r < 5; r++) {
+                same("two live, swapped", b, ctx_a, ref_b);
+                same("two live, swapped", a, ctx_b, ref_a);
+            }
+
+            ggml_backend_free(ctx_a);  // the first made
+            for (int r = 0; r < 5; r++) {
+                same("the first freed", b, ctx_b, ref_b);
+            }
+            ggml_backend_t ctx_c = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_c != nullptr);
+            count("a backend made while another lives", 0);
+            same("a backend made while another lives", a, ctx_c, ref_a);
+            ggml_backend_free(ctx_c);  // the newest
+            same("the newest freed", b, ctx_b, ref_b);
+            ggml_backend_free(ctx_b);
+            ggml_backend_t ctx_d = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_d != nullptr);
+            count("a backend after the last was freed", 1);
+            same("a backend after the last was freed", a, ctx_d, ref_a);
+            ggml_backend_free(ctx_d);
+        }
+
+        // one context's failure stays its own
+        {
+            ggml_backend_t ctx_a = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_a != nullptr);
+            count("a backend beside a failing one", 1);
+            set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", "0");
+            ggml_backend_t failing = ggml_backend_dev_init(dev, nullptr);
+            set_env("FLAGOS_SPACEMIT_TEST_FAIL_NODE", nullptr);
+            REQUIRE(failing != nullptr);
+            count("the failing backend", 0);
+            int n_failed = 0;
+            for (int r = 0; r < 10; r++) {
+                n_failed += ggml_backend_graph_compute(failing, c.gd) == GGML_STATUS_FAILED;
+                same("beside a failing backend", a, ctx_a, ref_a);
+            }
+            if (n_failed != 10) {
+                std::fprintf(stderr, "FAIL: shared stream, a forced failure%s: %d of 10 runs failed\n", how, n_failed);
+                g_failures++;
+            }
+            ggml_backend_free(failing);
+            same("after the failing backend was freed", a, ctx_a, ref_a);
+            ggml_backend_t ctx_g = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_g != nullptr);
+            count("a backend after the failure", 0);
+            same("a backend after the failure", b, ctx_g, ref_b);
+            ggml_backend_free(ctx_g);
+            ggml_backend_free(ctx_a);
+        }
+
+        // one thread per context
+        {
+            ggml_backend_t ctx_a = ggml_backend_dev_init(dev, nullptr);
+            ggml_backend_t ctx_b = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_a != nullptr && ctx_b != nullptr);
+            count("two backends on two threads", 1);
+            int         bad_a = 0, bad_b = 0;
+            std::thread on_a([&] { bad_a = bad_runs(a, ctx_a, ref_a, k_rounds); });
+            std::thread on_b([&] { bad_b = bad_runs(b, ctx_b, ref_b, k_rounds); });
+            on_a.join();
+            on_b.join();
+            bad_in_thread("two threads, the first", bad_a);
+            bad_in_thread("two threads, the second", bad_b);
+            n_same += 2 * k_rounds - bad_a - bad_b;
+            n_runs += 2 * k_rounds;
+            ggml_backend_free(ctx_a);
+            ggml_backend_free(ctx_b);
+        }
+
+        // a context made and freed while another runs; that thread's rounds vary, so they are not in the line's count
+        {
+            ggml_backend_t ctx_a = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(ctx_a != nullptr);
+            count("a backend running on a thread", 1);
+            std::atomic<bool> stop{ false };
+            int               bad_a = 0;
+            std::thread       on_a([&] {
+                do {
+                    bad_a += bad_runs(a, ctx_a, ref_a, 1);
+                } while (!stop.load());
+            });
+            int n_made = 0;
+            for (int cycle = 0; cycle < 20; cycle++) {
+                ggml_backend_t ctx_b = ggml_backend_dev_init(dev, nullptr);
+                if (ctx_b != nullptr) {  // no REQUIRE: the thread must be joined
+                    n_made++;
+                    same("made and freed while another runs", b, ctx_b, ref_b);
+                    ggml_backend_free(ctx_b);
+                }
+            }
+            stop.store(true);
+            on_a.join();
+            count("backends made and freed while another runs", 0);
+            CHECK(n_made == 20);
+            bad_in_thread("the backend running on a thread", bad_a);
+            ggml_backend_free(ctx_a);
+        }
+
+        // the test switch: the same sharing, a new core grant per run on the AI cores
+        {
+            ggml_backend_t ctx_a = nullptr, ctx_b = nullptr;
+            {
+                env_override per_call("FLAGOS_SPACEMIT_STREAM", "per-call");
+                ctx_a = ggml_backend_dev_init(dev, nullptr);
+                ctx_b = ggml_backend_dev_init(dev, nullptr);
+            }
+            REQUIRE(ctx_a != nullptr && ctx_b != nullptr);
+            count("FLAGOS_SPACEMIT_STREAM=per-call", 1);
+            for (int r = 0; r < 3; r++) {
+                same("FLAGOS_SPACEMIT_STREAM=per-call", a, ctx_a, ref_a);
+                same("FLAGOS_SPACEMIT_STREAM=per-call", b, ctx_b, ref_b);
+            }
+            ggml_backend_free(ctx_a);
+            same("FLAGOS_SPACEMIT_STREAM=per-call, the first freed", b, ctx_b, ref_b);
+            ggml_backend_free(ctx_b);
+        }
+    }
+    std::printf("stream   one executor per device (backends alone, two live interleaved and swapped, freed in any order, "
+                "the last free releasing it, a forced failure on one, one thread per backend, one made and freed while "
+                "another runs, FLAGOS_SPACEMIT_STREAM=per-call)%s: %d/%d runs identical to their run alone%s\n",
+                host ? ", tiles in turn and on threads" : "", n_same, n_runs, reference_label());
+    return 0;
+}
+
 // eight 1-row matmuls of one weight on one input (sixteen steps: the activations quantized, then the matmul, each
 // time), their outputs one after another; false if the provider failed
 static bool matmuls_out(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_type type, std::vector<float> & out) {
@@ -4618,7 +4823,9 @@ static int bench(ggml_backend_dev_t dev) {
     // for gate and up, 4 and 16 for down, 4 for the Q4_1 down; else path A from 32 rows, else path C), 128 rows (path
     // A; split, the default until 2026-10-25, kept gate and up on path C there, fusion-and-splitting.md §7.3,
     // bench_mm). Q6_K (run as Q8_0, against the CPU's Q6_K) at its output head, whose 1 row is a generated token's: up
-    // to 16 rows (path B) and fewer iterations, as the head holds 15x an FFN matrix's weights
+    // to 16 rows (path B) and fewer iterations, as the head holds 15x an FFN matrix's weights. Q4_1 has no CPU timing:
+    // ggml-cpu's Q4_1 matmul under 8 threads is where question 8's fault strikes (build.md section 7, the eighth
+    // dump), and no check reads the figure
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu8    = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu8 != nullptr);
@@ -4638,9 +4845,16 @@ static int bench(ggml_backend_dev_t dev) {
             bool         ok    = true;
             const int    iters = head ? 5 : m <= 16 ? 20 : 5;
             const double t_dev = time_us([&] { ok &= ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS; }, iters);
+            const double flop  = 2.0 * s.k * s.n * m;
+            if (s.type == GGML_TYPE_Q4_1) {
+                CHECK(ok);
+                std::printf("bench    %s matmul %lldx%lld rows %3lld: provider %8.0f us (%6.1f GFLOP/s)\n",
+                            ggml_type_name(s.type), (long long) s.k, (long long) s.n, (long long) m, t_dev,
+                            flop / t_dev / 1e3);
+                continue;
+            }
             const double t_cpu = time_us([&] { ggml_backend_graph_compute(cpu8, run.g_cpu); }, iters);
             CHECK(ok);
-            const double flop = 2.0 * s.k * s.n * m;
             std::printf("bench    %s matmul %lldx%lld rows %3lld: provider %8.0f us (%6.1f GFLOP/s), cpu %8.0f us (%6.1f GFLOP/s)\n",
                         ggml_type_name(s.type), (long long) s.k, (long long) s.n, (long long) m, t_dev,
                         flop / t_dev / 1e3, t_cpu, flop / t_cpu / 1e3);
@@ -4719,7 +4933,7 @@ int main(int argc, char ** argv) {
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0 ||
-        check_plan(dev) != 0 || check_diagnostics(dev) != 0) {
+        check_plan(dev) != 0 || check_diagnostics(dev) != 0 || check_shared_stream(dev, host) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 : (run_attn && bench_attn(dev) != 0) || (run_mm && bench_mm(dev) != 0)) {

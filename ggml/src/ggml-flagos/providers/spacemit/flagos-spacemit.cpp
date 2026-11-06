@@ -47,7 +47,7 @@ struct spacemit_device_context {
     spacemit_ops               ops;  // the core's contracts bound to this plugin's kernels (spacemit_ops_bind)
     ggml_backend_device        device     = {};
     ggml_backend_buffer_type   buffer_type = {};
-    std::mutex                 run_mutex;  // backends of this device share the same AI cores
+    std::mutex                 run_mutex;  // this device's backends share one executor: one run at a time
 };
 
 struct spacemit_buffer_context {
@@ -526,8 +526,8 @@ void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
     };
 }
 
-// one stream per backend context; the plugin holds the core grant until it is destroyed (FLAGOS_SPACEMIT_STREAM is the
-// plugin's switch now)
+// one stream handle per backend context; the plugin shares one executor and core grant among a device's handles until
+// the last is destroyed (FLAGOS_SPACEMIT_STREAM is the plugin's switch)
 ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
     auto *                   dctx   = spacemit_device_from_dev(dev);
     spacemit_plugin_stream * stream = nullptr;

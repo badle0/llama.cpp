@@ -101,6 +101,8 @@ struct spacemit_run_stats;  // test-only (E3c): the core's per-step clock reads,
 // what is not contract (plan.md "S1 design" §2, A2): the test counters and the per-tile clock reads, by their current
 // names through get_proc_address, one typedef per name. NULL for every name in a release plugin
 typedef uint64_t (*spacemit_steps_take_fn)(void);
+// test-only: the executors created since the last call; a device's streams share one
+typedef uint64_t (*spacemit_executors_take_fn)(void);
 typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
@@ -133,7 +135,8 @@ typedef struct {
     enum spacemit_status (*tensor_set)(struct ggml_tensor * t, const void * data, size_t offset, size_t size);
     enum spacemit_status (*tensor_get)(const struct ggml_tensor * t, void * data, size_t offset, size_t size);
     enum spacemit_status (*tensor_fill)(struct ggml_tensor * t, uint8_t value, size_t offset, size_t size);
-    /* stream: one per backend context, the core grant held until destroyed */
+    /* stream: one handle per backend context, sharing the device's executor and core grant, held until the last
+       handle is destroyed; a device outlives its streams */
     enum spacemit_status (*stream_create)(spacemit_plugin_device * dev, uint32_t n_tiles,
                                           spacemit_plugin_stream ** stream);
     void (*stream_destroy)(spacemit_plugin_stream * stream);
