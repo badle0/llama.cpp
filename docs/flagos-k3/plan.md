@@ -1987,7 +1987,7 @@ Against the predictions: the weights stage the largest and mostly user time, hel
 
 ### S2 spec, for review (2026-11-05)
 
-**Status:** step 0 done on the Mac and the K3; the two decisions taken (2026-11-05); steps 1 and 2 done on the Mac and the K3 (2026-11-06); step 3 built on the Mac, its K3 run next (2026-11-06). S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
+**Status:** step 0 done on the Mac and the K3; the two decisions taken (2026-11-05); steps 1, 2 and 3 done on the Mac and the K3 (2026-11-06); one reading of S2's exit left, TCM after a failure ("S2's exit against the results" below). S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
 - **The boundary is already clean.** From the Mac's objects: no core object uses a symbol the plugin side defines, or the reverse. The plugin side needs 18 functions of `ggml-base` and nothing else of ours. The check program calls 6 plugin-side functions directly, all of them answered by name by `get_proc_address`. No build definition of the plugin (`GGML_FLAGOS_SPACEMIT_SPERT`, `_IME2`, `_RVV`, `_HOST_TEST_DEVICE`) is read by a core file. Corrected by step 1 (2026-11-06): the first two statements hold for what the Mac compiles. Under `_RVV`, one plugin function called a core function (below, step 1's result), and the check program called 4 names and only compared the addresses of 2 more.
 - **Runs are already one at a time per device** (`run_mutex`, `flagos-spacemit.cpp:50`, `:395`), so sharing a stream needs no new locking around a run.
 - **The zero-copy entries do not help start-up** ("The start-up split").
@@ -2094,7 +2094,7 @@ In all 24 runs the accepted counts equal the stored ones, each case's text is th
 - **The runner** under the crash reporter, with `--server-baseline`: Qwen3-0.6B with `--build` 50/50, Qwen3-4B without `--depth` 48/48, no FAIL line, TCM hygiene and `benchmark ran` among them, the latter now without the Q4_1 CPU timing. All 16 replies equal S2's baselines on both models. The 5 perplexity and KLD lines of each model equal step 1's, the log timestamps left out of the comparison.
 - **Not exercised anywhere:** the cores' request failing and being retried, whose code is unchanged.
 
-Of S2's exit, only the move (step 3) is left to run. That the plugin alone links `libspert` was read at step 1, and this step did not change the link.
+Of S2's exit, only the move (step 3) is left to run (corrected 2026-11-06: and TCM after a failure, "S2's exit against the results" below). That the plugin alone links `libspert` was read at step 1, and this step did not change the link.
 
 **Step 3, the directory move.** `git mv` only, so that steps 1 and 2 read against the paths the docs cite: the core's files under `core/`, the plugin's under `plugin/`, include paths, `provider.cmake`, `plugin.cmake`, `scripts/rvv-syntax-check.sh`. Old line references in the docs stay as history of their commits. Mac: the build, the check program and `rvv-syntax-check.sh`. K3: the build and the check program.
 
@@ -2110,7 +2110,30 @@ Not run: Ninja, the K3's generator, which this Mac lacks, so the K3's incrementa
 
 Expected on the K3 (predictions): the build and the check program pass, its `loader` line with 8 names, its `stream` line 1097/1097, no "could not get" line. Added to the spec's two, because only the K3 has GCC's output and Ninja's rules: the same instructions as before the move in all 14 provider objects, `-march` on the same 5 files, `libspert` needed by the plugin and not the core.
 
+**Result of step 3 on the K3 (2026-11-06; the user; on `8b087ad4a`).** As expected, every reading.
+- **The build.** Ninja's incremental build across the move, the runner's targets and `llama-speculative`: rc 0, no `error:` or `FAILED` line. This was Ninja's first run of the move, the Mac having none. Its warnings were not read.
+- **The same code from GCC.** `objdump -d` on all 14 provider objects (the 10 moved, `plugin/flagos-spacemit-plugin`, and `core/`'s `-diagnostics`, `-loader` and `-plan`) against copies kept before the build: the same instructions in all 14. This compares objects, not the linked libraries' layout, which on the Mac moved with the plugin's `__FILE__` strings.
+- **The rules, from `build.ninja`.** 5 of the 14 files have a `-march` of their own: `-attn`, `-kernels`, `-rvv-attn` and `-rvv-kernels` `rv64gcv_zfh_zvfh_zba`, `-ime-kernels` `rv64gcv_zfh_zvfh_zba_zicbop_xsmtvdotii`. By `readelf -d`, `libspert` is needed by the plugin and not the core.
+- **The check program** under the crash reporter, `--expect-device`: rc 0, all checks passed, the `loader` line's 8 names, the `stream` line 1097/1097, no FAIL line, no crash dump, no "could not get" line.
+
 **Exit:** S2's as proposed above: the plugin loads through S1's loader; the same checks and acceptance runs pass with identical replies and speed within 1%; the plugin alone links `libspert` and needs the IME2 toolchain; TCM hygiene unchanged; and new, two live contexts work with no switch.
+
+**S2's exit against the results (2026-11-06).**
+
+| Exit item | Reading | Build |
+|---|---|---|
+| The plugin loads through S1's loader | the check program's `loader` line | step 3's |
+| The same checks and runs, identical replies | the runner 50/50 and 48/48, all 16 replies, the 5 perplexity and KLD lines of each model | step 2's |
+| Speed within 1% | `llama-bench` +0.30% to +0.70% against the kept build | step 2's |
+| The plugin alone links `libspert` and needs the IME2 toolchain | `readelf -d`; the IME `-march` on one plugin file, no core file with a `-march` of its own | step 3's |
+| Two live contexts, no switch | the `stream` line; `llama-speculative` and a server with `-md` at step 2 | both |
+| TCM hygiene unchanged | **not settled**, below | |
+
+- **Step 2's rows hold for step 3's build by inference,** from the same instructions in all 14 provider objects. The spec did not ask for the runner or `llama-bench` on this build, and they did not run; running them would settle it. Qwen3-4B's `--depth` last ran at step 1.
+- **The IME2 row is a reading of the rules:** `plugin.cmake` holds the checks and the IME `-march`. No riscv64 compiler without IME2 was tried.
+- **TCM hygiene: the passes at steps 1 and 2 show less than I reported.** The runner's `no TCM block left held` passed, but read in the code on 2026-11-06, with `build-ime` on the board `llama_bench` runs `tcmrelease --apply` before the IME `llama-bench` (`tools/spacemit_check.py:779-780`, since `6671c592e`, 2026-10-09). The check comes after that, so it sees what the IME run left and not the provider's runs. "Nothing held after a run, failures included" needs `tcmtest info` straight after a run with forced failures. That reading, after step 3's check program, is next, with the `tcm-release-ime` logs of step 2's runs. The probe-time warning that this plan's design and R3 name is not in today's source (no `tcmrelease` in the core or the plugin, by grep), so nothing at run time reports a held block either.
+- **A clause this spec's exit left out without saying so.** "S2 - The K3 plugin" also asks that "unloading releases the stream (the core grant) and TCM". Step 1 decided that the plugin is not unloaded at teardown, as upstream's registry, and `dlclose` remains only on the failed-probe paths, where no stream is open, so as worded it applies to nothing. What it was for is the grant, which the last `stream_destroy` frees. On the K3 the check program makes and frees backends in turn, each new one a new executor by the count and so a new `spert::Stream`, and no "could not get" line prints, while a second stream cannot get the cores as long as the first lives (2026-11-04). That the last free releases the grant is an inference from those two readings. By reading, the plugin holds no TCM of its own, the tile being granted it only while it runs (`plugin/flagos-spacemit-exec.cpp:137-139`), so TCM falls under the row above.
+- **Not exercised anywhere:** the cores' request failing and being retried. No race detector ran on step 2's code.
 
 **Not in S2:** the zero-copy entries and cancel, as decided above; T6 and the rest of `batch-one.md`'s list (9 to 63 tokens first); the batch-size-1 checks; M3 and fusion.
 
