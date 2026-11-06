@@ -8,22 +8,22 @@
 
 add_library(flagos-provider-spacemit SHARED
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-plugin.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-exec.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-exec.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-weights.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-weights.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-attn.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-attn.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.cpp")
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-exec.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-exec.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-kernels.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-kernels.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-kernels.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-kernels.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-weights.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-weights.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-attn.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-attn.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-attn.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-attn.cpp")
 target_link_libraries(flagos-provider-spacemit PRIVATE ggml-base)
 target_include_directories(flagos-provider-spacemit PRIVATE ..)
 # no version suffix, the name the loader opens; beside libggml-flagos, as ggml_add_backend_library places a module; only
@@ -76,12 +76,12 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     target_compile_definitions(flagos-provider-spacemit PRIVATE GGML_FLAGOS_SPACEMIT_IME2 GGML_FLAGOS_SPACEMIT_RVV)
 
     # only the kernels need the vector ISA; they run on the A100 cores (RVV 1024)
-    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-kernels.cpp"
-                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-kernels.cpp"
-                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-attn.cpp"
-                                "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-rvv-attn.cpp" PROPERTIES
+    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-kernels.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-kernels.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-attn.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-attn.cpp" PROPERTIES
         COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba;-mabi=lp64d")
-    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ime-kernels.cpp" PROPERTIES
+    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.cpp" PROPERTIES
         COMPILE_OPTIONS "${FLAGOS_SPACEMIT_IME_MARCH};-mabi=lp64d")
     message(STATUS "FlagOS: enabling SpacemiT K3 provider with spine-runtime at ${FLAGOS_SPACEMIT_SPERT_DIR} and IME2 kernels")
 else()

@@ -4,7 +4,7 @@
 // tiles write into, so that the core's diagnostics need no plugin header. Moved here unchanged from
 // flagos-spacemit-exec.h 2026-11-02 (S1 step 5); the executor includes this file.
 
-#include "../flagos-spacemit-ops.h"  // SPACEMIT_MAX_TILES
+#include "flagos-spacemit-ops.h"  // SPACEMIT_MAX_TILES
 
 #include <algorithm>
 #include <cstddef>

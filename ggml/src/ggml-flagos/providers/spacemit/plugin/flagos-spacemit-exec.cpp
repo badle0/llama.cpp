@@ -1,6 +1,6 @@
 #include "flagos-spacemit-exec.h"
 
-#include "../../../ggml-impl.h"
+#include "../../../../ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

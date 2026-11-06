@@ -6,7 +6,7 @@
 
 #include "flagos-spacemit-diagnostics.h"  // spacemit_renamed
 
-#include "../flagos-spacemit-api.h"  // flagos_spacemit_provider: the core symbol dladdr locates
+#include "flagos-spacemit-api.h"  // flagos_spacemit_provider: the core symbol dladdr locates
 
 #include <cstddef>
 #include <cstdlib>

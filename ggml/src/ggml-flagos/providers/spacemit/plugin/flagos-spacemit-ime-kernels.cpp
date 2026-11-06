@@ -31,8 +31,8 @@
 // (*_ref, plain C++) are built everywhere, so hosts without the AI cores can run the whole path.
 
 #define GGML_COMMON_DECL_CPP
-#include "../../../ggml-common.h"
-#include "../../../ggml-impl.h"
+#include "../../../../ggml-common.h"
+#include "../../../../ggml-impl.h"
 #include "flagos-spacemit-ime-kernels.h"
 
 #include <algorithm>

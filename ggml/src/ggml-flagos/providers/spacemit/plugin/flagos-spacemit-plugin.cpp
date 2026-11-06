@@ -5,12 +5,12 @@
 
 #include "../core/flagos-spacemit-plugin.h"
 
-#include "../flagos-spacemit-attn.h"
-#include "../flagos-spacemit-exec.h"
-#include "../flagos-spacemit-ime.h"
-#include "../flagos-spacemit-kernels.h"
-#include "../flagos-spacemit-ops.h"
-#include "../flagos-spacemit-weights.h"
+#include "flagos-spacemit-attn.h"
+#include "flagos-spacemit-exec.h"
+#include "flagos-spacemit-ime.h"
+#include "flagos-spacemit-kernels.h"
+#include "../core/flagos-spacemit-ops.h"
+#include "flagos-spacemit-weights.h"
 
 #include "../../../../ggml-impl.h"
 

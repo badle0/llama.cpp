@@ -17,8 +17,8 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" AND GGML_CPU_RISCV64_SPACEMIT)
 endif()
 
 list(APPEND FLAGOS_SOURCES
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-api.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-api.h"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit.cpp"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plugin.h"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-stats.h"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-diagnostics.h"
@@ -27,8 +27,8 @@ list(APPEND FLAGOS_SOURCES
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-loader.cpp"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plan.h"
     "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-plan.cpp"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ops.h"
-    "${FLAGOS_SPACEMIT_DIR}/flagos-spacemit-ops.cpp")
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-ops.h"
+    "${FLAGOS_SPACEMIT_DIR}/core/flagos-spacemit-ops.cpp")
 list(APPEND FLAGOS_PRIVATE_DEFINITIONS GGML_FLAGOS_HAVE_SPACEMIT)
 # the core's loader calls dlopen itself (ggml's dl_load_library lives in libggml, which a backend must not depend on)
 list(APPEND FLAGOS_PRIVATE_LIBRARIES ${CMAKE_DL_LIBS})

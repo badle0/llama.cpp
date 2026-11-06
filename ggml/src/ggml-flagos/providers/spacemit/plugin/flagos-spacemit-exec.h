@@ -1,7 +1,7 @@
 #pragma once
 
-#include "flagos-spacemit-ops.h"
-#include "core/flagos-spacemit-stats.h"  // spacemit_run_stats (the core's; S1 step 5)
+#include "../core/flagos-spacemit-ops.h"
+#include "../core/flagos-spacemit-stats.h"  // spacemit_run_stats (the core's; S1 step 5)
 
 #include <cstdint>
 #include <memory>

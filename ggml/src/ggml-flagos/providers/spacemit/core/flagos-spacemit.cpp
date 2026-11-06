@@ -5,13 +5,13 @@
 
 #include "flagos-spacemit-api.h"
 #include "flagos-spacemit-ops.h"
-#include "core/flagos-spacemit-diagnostics.h"  // the switches and the counter files (S1 step 5)
-#include "core/flagos-spacemit-loader.h"
-#include "core/flagos-spacemit-plan.h"
-#include "core/flagos-spacemit-stats.h"  // spacemit_run_stats (test-only, E3c)
+#include "flagos-spacemit-diagnostics.h"  // the switches and the counter files (S1 step 5)
+#include "flagos-spacemit-loader.h"
+#include "flagos-spacemit-plan.h"
+#include "flagos-spacemit-stats.h"  // spacemit_run_stats (test-only, E3c)
 
-#include "../../../ggml-backend-impl.h"
-#include "../../../ggml-impl.h"
+#include "../../../../ggml-backend-impl.h"
+#include "../../../../ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

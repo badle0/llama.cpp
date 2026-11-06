@@ -4,7 +4,7 @@
 #    include "flagos-spacemit-rvv-kernels.h"
 #endif
 
-#include "../../../ggml-impl.h"
+#include "../../../../ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

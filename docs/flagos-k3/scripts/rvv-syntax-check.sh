@@ -4,11 +4,12 @@
 # and the macOS SDK headers presented as Apple's. It checks types, intrinsic names and signatures and template
 # instantiations; nothing is assembled or linked, so the K3 build (GCC 15) is still the real test.
 # Usage (any directory): docs/flagos-k3/scripts/rvv-syntax-check.sh [file.cpp ...]   (default: the kernel files)
+# File names are relative to the provider directory, as plugin/flagos-spacemit-exec.cpp.
 cd "$(dirname "$0")/../../.." || exit 1
 INC="docs/flagos-k3/scripts/rvv-syntax"
 SDK=$(xcrun --show-sdk-path) || exit 1
 LOGS=${TMPDIR:-/tmp}
-[ $# -gt 0 ] || set -- flagos-spacemit-rvv-kernels.cpp flagos-spacemit-kernels.cpp flagos-spacemit-ime-kernels.cpp flagos-spacemit-ime.cpp flagos-spacemit-rvv-attn.cpp flagos-spacemit-attn.cpp
+[ $# -gt 0 ] || set -- plugin/flagos-spacemit-rvv-kernels.cpp plugin/flagos-spacemit-kernels.cpp plugin/flagos-spacemit-ime-kernels.cpp plugin/flagos-spacemit-ime.cpp plugin/flagos-spacemit-rvv-attn.cpp plugin/flagos-spacemit-attn.cpp
 status=0
 for f in "$@"; do
   log="$LOGS/rvv-syntax-$(basename "$f").log"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "flagos-spacemit-ops.h"
+#include "../core/flagos-spacemit-ops.h"
 
 // FLASH_ATTN_EXT on the AI cores (plan.md, M2e design): one step; the rows (query head x token x stream) are split
 // statically over the tiles. On the K3 the VLEN-1024 kernels of flagos-spacemit-rvv-attn.cpp, elsewhere (and with

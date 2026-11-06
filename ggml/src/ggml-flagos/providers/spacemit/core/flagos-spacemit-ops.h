@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/flagos-spacemit-plugin.h"  // spacemit_tile, spacemit_step_fn, spacemit_plugin_step
+#include "flagos-spacemit-plugin.h"  // spacemit_tile, spacemit_step_fn, spacemit_plugin_step
 
 #include "ggml-backend.h"
 #include "ggml.h"

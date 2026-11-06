@@ -1,6 +1,6 @@
 #pragma once
 
-#include "flagos-spacemit-ops.h"
+#include "../core/flagos-spacemit-ops.h"
 
 // quantized MUL_MAT on the IME, weights in an IME layout (flagos-spacemit-weights.h: Q4_0 32x256; Q8_0, and Q4_1 and
 // Q6_K requantized, in q8_0 32x32): step 1 quantizes the activations into the workspace, step 2 multiplies. Ported

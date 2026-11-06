@@ -2,7 +2,7 @@
 
 #include "flagos-spacemit-ime-kernels.h"
 
-#include "../../../ggml-impl.h"
+#include "../../../../ggml-impl.h"
 
 #include <cstdlib>
 #include <cstring>

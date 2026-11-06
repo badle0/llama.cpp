@@ -26,7 +26,7 @@
 #include "providers/spacemit/core/flagos-spacemit-diagnostics.h"  // the diagnostics under the deck's names (S1 step 5)
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
 #include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
-#include "providers/spacemit/flagos-spacemit-api.h"   // spacemit_device_plugin
+#include "providers/spacemit/core/flagos-spacemit-api.h"   // spacemit_device_plugin
 
 #include <algorithm>
 #include <array>

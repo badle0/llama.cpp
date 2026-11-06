@@ -133,7 +133,7 @@ Why copy (D6, decided 2026-10-09; options and evidence compared in the M2b revie
 
 ### 2.7 Files
 
-New, in `ggml/src/ggml-flagos/providers/spacemit/` (layout from Design §13.2):
+New, in `ggml/src/ggml-flagos/providers/spacemit/` (layout from Design §13.2). Since S2's step 3 (2026-11-06) the core's files are in its `core/` and the plugin's in its `plugin/`, under these names; paths and line numbers elsewhere in this file are those of their commits:
 
 | File | Content | From |
 |---|---|---|
@@ -1987,7 +1987,7 @@ Against the predictions: the weights stage the largest and mostly user time, hel
 
 ### S2 spec, for review (2026-11-05)
 
-**Status:** step 0 done on the Mac and the K3; the two decisions taken (2026-11-05); steps 1 and 2 done on the Mac and the K3 (2026-11-06); step 3 waits for the user's go. S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
+**Status:** step 0 done on the Mac and the K3; the two decisions taken (2026-11-05); steps 1 and 2 done on the Mac and the K3 (2026-11-06); step 3 built on the Mac, its K3 run next (2026-11-06). S2's scope and proposed exit are "S2 - The K3 plugin" above. Three findings make it smaller than it was scoped.
 - **The boundary is already clean.** From the Mac's objects: no core object uses a symbol the plugin side defines, or the reverse. The plugin side needs 18 functions of `ggml-base` and nothing else of ours. The check program calls 6 plugin-side functions directly, all of them answered by name by `get_proc_address`. No build definition of the plugin (`GGML_FLAGOS_SPACEMIT_SPERT`, `_IME2`, `_RVV`, `_HOST_TEST_DEVICE`) is read by a core file. Corrected by step 1 (2026-11-06): the first two statements hold for what the Mac compiles. Under `_RVV`, one plugin function called a core function (below, step 1's result), and the check program called 4 names and only compared the addresses of 2 more.
 - **Runs are already one at a time per device** (`run_mutex`, `flagos-spacemit.cpp:50`, `:395`), so sharing a stream needs no new locking around a run.
 - **The zero-copy entries do not help start-up** ("The start-up split").
@@ -2097,6 +2097,18 @@ In all 24 runs the accepted counts equal the stored ones, each case's text is th
 Of S2's exit, only the move (step 3) is left to run. That the plugin alone links `libspert` was read at step 1, and this step did not change the link.
 
 **Step 3, the directory move.** `git mv` only, so that steps 1 and 2 read against the paths the docs cite: the core's files under `core/`, the plugin's under `plugin/`, include paths, `provider.cmake`, `plugin.cmake`, `scripts/rvv-syntax-check.sh`. Old line references in the docs stay as history of their commits. Mac: the build, the check program and `rvv-syntax-check.sh`. K3: the build and the check program.
+
+**Result of step 3 on the Mac (2026-11-06; the coder from this spec; read and rerun in the main session).** A move and nothing else. With `git mv`: `flagos-spacemit-api.h`, `flagos-spacemit.cpp` and `flagos-spacemit-ops.{h,cpp}` to `core/`; `flagos-spacemit-{attn,exec,ime,ime-kernels,kernels,rvv-attn,rvv-kernels,weights}.{h,cpp}` to `plugin/`. `-ops.h` joins the two other headers both sides include, `-plugin.h` and `-stats.h`. The provider's root keeps the three `.cmake` files and the folders. The other changes are the quoted include paths, each replaced on its own line, so no source file's line numbers change; the paths in `provider.cmake` and `plugin.cmake`, their order kept; and the default list and usage of `rvv-syntax-check.sh`. Nothing outside the provider and the docs changes, so `upstream-changes.md` has no entry.
+- **The boundary now shows in the paths.** Read from all 87 quoted includes in 36 files, `#if` branches included: all resolve, none in `core/` reaches `plugin/`, and `plugin/` reaches `core/` for those three headers only.
+- **The same code, with one prediction wrong.** I predicted the same text symbols at the same addresses. The core's 255 are identical. The plugin's 118 keep their names and order but all sit 0x20 lower. Its `__FILE__` strings are why: five gained `plugin/`, 35 more bytes of `__cstring`, with `__text` the same size. The coder isolated this with three builds from scratch under `-fmacro-prefix-map`: with the moved files' `__FILE__` mapped back to their old names, `__text`, `__stubs`, `__const`, `__cstring`, `__gcc_except_tab` and `__unwind_info` are byte-identical to HEAD's in both libraries. The linker rule behind the shift is a reading, not tested. In the main session, against the objects left by the build before the move: `objdump -d` gives the same instructions in all 10 moved objects, and the comparison catches another object under the same name.
+- **Builds.** `build-host`, incrementally as the K3 will: no warnings or errors. A new build directory from scratch: no warnings, the check program passes, so no stale file hides a missing include. `build-nohost`: `--expect-none` passes. `build-host-dl`: 29/29 layers on the device; it has no check program (`ggml/src/ggml-flagos/CMakeLists.txt:159`).
+- **Behaviour.** The check program passes under step 2's 8 settings, its `stream` line 2194/2194; against the default run before the move one timing differs, and stderr not at all. test-backend-ops `FLASH_ATTN_EXT` 1324/1324. The server on Qwen3-0.6B: 7/7, all 16 replies equal to step 0's Mac baseline. The plugin exports the entry alone.
+- **riscv64, a configure with stand-ins, nothing compiled.** All 21 provider files have the target and flags they had before the move. `-march` is on exactly `-kernels`, `-rvv-kernels`, `-attn`, `-rvv-attn` and, the IME one, `-ime-kernels`. `libspert` is on the plugin's link line only, and both link lines are otherwise unchanged. `rvv-syntax-check.sh` gives the counts from before the move, 0 errors, and an old-style name now fails it. The spine-runtime branch against the stand-in `spert.hpp`: 0 errors.
+- **Two mutations, each caught and reverted.** An old path left in a `set_source_files_properties` call: CMake says nothing and the file loses its `-march`, and the flag comparison caught it. An old include path in a `#if` block the Mac does not compile: the include check caught it.
+
+Not run: Ninja, the K3's generator, which this Mac lacks, so the K3's incremental build is its first; anything compiled for riscv64; the real spine-runtime.
+
+Expected on the K3 (predictions): the build and the check program pass, its `loader` line with 8 names, its `stream` line 1097/1097, no "could not get" line. Added to the spec's two, because only the K3 has GCC's output and Ninja's rules: the same instructions as before the move in all 14 provider objects, `-march` on the same 5 files, `libspert` needed by the plugin and not the core.
 
 **Exit:** S2's as proposed above: the plugin loads through S1's loader; the same checks and acceptance runs pass with identical replies and speed within 1%; the plugin alone links `libspert` and needs the IME2 toolchain; TCM hygiene unchanged; and new, two live contexts work with no switch.
 

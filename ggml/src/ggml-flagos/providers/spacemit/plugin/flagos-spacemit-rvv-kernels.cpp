@@ -16,7 +16,7 @@
 
 #    include "flagos-spacemit-ime-kernels.h"
 
-#    include "../../../ggml-impl.h"
+#    include "../../../../ggml-impl.h"
 
 #    include <riscv_vector.h>
 

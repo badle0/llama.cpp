@@ -8,7 +8,7 @@
 #include "flagos-spacemit-kernels.h"
 #include "flagos-spacemit-rvv-attn.h"
 
-#include "../../../ggml-impl.h"
+#include "../../../../ggml-impl.h"
 
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 #    include <riscv_vector.h>
