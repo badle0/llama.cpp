@@ -1,8 +1,7 @@
 // The SpacemiT K3 plugin's table (plan.md "S1 step 1 spec" §3): the device, the buffers on huge pages with the repack
 // inside set and get, the stream, the capture replay and the kernels, each member a thin wrapper over the code that
-// was in flagos-spacemit.cpp or is in the files beside this one. In this step the plugin is still compiled into
-// libggml-flagos and the core loads that library through its entry symbol (S2 builds it as
-// libflagos-provider-spacemit.so).
+// was in flagos-spacemit.cpp or is in the files beside this one. Built as its own library,
+// libflagos-provider-spacemit.so (plugin.cmake), which the core loads through its entry symbol.
 
 #include "../core/flagos-spacemit-plugin.h"
 
@@ -419,9 +418,9 @@ void * plugin_get_proc_address(const char * name) {
     return nullptr;
 }
 
-// kept for S2, where the plugin logs through the core; copied, never a pointer to the caller's table, which may be a
-// local of the caller (the check program's second load). Only the first call sets them: the core's own load at
-// registration is always the first caller
+// the host's, unused so far: the plugin logs through ggml-base's logger, one in the process with the core's; copied,
+// never a pointer to the caller's table, which may be a local of the caller (the check program's second load). Only
+// the first call sets them: the core's own load at registration is always the first caller
 void (*g_log)(int level, const char * text) = nullptr;
 std::string g_host_dir;
 
@@ -458,7 +457,7 @@ const spacemit_plugin_v1 * flagos_spacemit_plugin_v1(const spacemit_host_v1 * ho
         /* .kernels            = */ plugin_kernels,
         /* .replay             = */ plugin_replay,
         /* .get_proc_address   = */ plugin_get_proc_address,
-        /* .register_host_ptr  = */ nullptr,  // zero copy: S2 (plan.md "S1 design" A6)
+        /* .register_host_ptr  = */ nullptr,  // zero copy: not built (plan.md "S2 spec", decision 1)
         /* .tensor_prepare     = */ nullptr,
     };
     return &plugin;

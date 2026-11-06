@@ -27,9 +27,6 @@
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
 #include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
 #include "providers/spacemit/flagos-spacemit-api.h"   // spacemit_device_plugin
-#include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_steps_take
-#include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
-#include "providers/spacemit/flagos-spacemit-kernels.h"  // spacemit_switches_reset (env_override)
 
 #include <algorithm>
 #include <array>
@@ -72,9 +69,28 @@ static int g_failures = 0;
 
 static const char * k_device_name = "FlagOS:SpacemiT:0";
 
+// the plugin's test names this program calls (plan.md "S1 design" A2), looked up once from the device's table
+// (bind_plugin_names); nullptr with no device, where only the "device checks skipped" path runs
+static spacemit_steps_take_fn     g_steps_take     = nullptr;
+static spacemit_mm_paths_take_fn  g_mm_paths_take  = nullptr;
+static spacemit_mm_tail_take_fn   g_mm_tail_take   = nullptr;
+static spacemit_switches_reset_fn g_switches_reset = nullptr;
+
+static int bind_plugin_names(ggml_backend_dev_t dev) {
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    g_steps_take     = reinterpret_cast<spacemit_steps_take_fn>(table->get_proc_address("spacemit_steps_take"));
+    g_mm_paths_take  = reinterpret_cast<spacemit_mm_paths_take_fn>(table->get_proc_address("spacemit_mm_paths_take"));
+    g_mm_tail_take   = reinterpret_cast<spacemit_mm_tail_take_fn>(table->get_proc_address("spacemit_mm_tail_take"));
+    g_switches_reset = reinterpret_cast<spacemit_switches_reset_fn>(table->get_proc_address("spacemit_switches_reset"));
+    REQUIRE(g_steps_take != nullptr && g_mm_paths_take != nullptr && g_mm_tail_take != nullptr &&
+            g_switches_reset != nullptr);
+    return 0;
+}
+
 // sets or unsets a switch for this process. The kernels parse their switches once (spacemit_cached_switch), so every
-// change tells them to parse again (spacemit_switches_reset; the same function the plugin serves by name), and so do
-// the core's parsed-once diagnostics (GGML_FLAGOS_DISABLE_OPS, TRACE_LAUNCH and the replaced switches' warnings:
+// change tells them to parse again (spacemit_switches_reset, by name from the plugin; no device, nothing to tell), and
+// so do the core's parsed-once diagnostics (GGML_FLAGOS_DISABLE_OPS, TRACE_LAUNCH and the replaced switches' warnings:
 // spacemit_diagnostics_reset). Every switch change in this program goes through here, directly or through env_override
 static void set_env(const char * name, const char * value) {
 #if defined(_WIN32)
@@ -86,7 +102,9 @@ static void set_env(const char * name, const char * value) {
         unsetenv(name);
     }
 #endif
-    spacemit_switches_reset();
+    if (g_switches_reset != nullptr) {
+        g_switches_reset();
+    }
     spacemit_diagnostics_reset();
 }
 
@@ -207,7 +225,7 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     REQUIRE(table != nullptr);
     CHECK(table->api_version == FLAGOS_SPACEMIT_PLUGIN_API_VERSION);
     CHECK(table->struct_size == sizeof(spacemit_plugin_v1));
-    CHECK(table->register_host_ptr == nullptr && table->tensor_prepare == nullptr);  // zero copy: S2
+    CHECK(table->register_host_ptr == nullptr && table->tensor_prepare == nullptr);  // zero copy: not built
 
     uint32_t                       n_kernels = 0;
     const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
@@ -222,8 +240,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
         CHECK(found);
     }
 
-    // what is not contract comes by name (plan.md "S1 design" A2); this build is one library, so the names the check
-    // program can call itself must answer with those very functions
+    // what is not contract comes by name (plan.md "S1 design" A2): every name answers, and the behaviour behind each is
+    // checked where it is used
     const char * names[] = { "spacemit_steps_take", "spacemit_mm_paths_take", "spacemit_mm_tail_take",
                              "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
                              "spacemit_switches_reset", "spacemit_switches_generation" };
@@ -232,19 +250,6 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
     }
     CHECK(n_names == sizeof(names) / sizeof(names[0]));
-    CHECK(table->get_proc_address("spacemit_steps_take") ==
-          reinterpret_cast<void *>(static_cast<spacemit_steps_take_fn>(spacemit_steps_take)));
-    CHECK(table->get_proc_address("spacemit_mm_paths_take") ==
-          reinterpret_cast<void *>(static_cast<spacemit_mm_paths_take_fn>(spacemit_mm_paths_take)));
-    CHECK(table->get_proc_address("spacemit_mm_tail_take") ==
-          reinterpret_cast<void *>(static_cast<spacemit_mm_tail_take_fn>(spacemit_mm_tail_take)));
-    CHECK(table->get_proc_address("spacemit_mul_mat_same_activations") ==
-          reinterpret_cast<void *>(
-              static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations)));
-    CHECK(table->get_proc_address("spacemit_switches_reset") ==
-          reinterpret_cast<void *>(static_cast<spacemit_switches_reset_fn>(spacemit_switches_reset)));
-    CHECK(table->get_proc_address("spacemit_switches_generation") ==
-          reinterpret_cast<void *>(static_cast<spacemit_switches_generation_fn>(spacemit_switches_generation)));
     CHECK(table->get_proc_address("nonexistent") == nullptr);
 
     // the device facts the core reports come from the plugin's props
@@ -1533,11 +1538,11 @@ static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
             for (int s = 0; s < n_set; s++) {
                 set_env("FLAGOS_SPACEMIT_MM", settings[s]);
                 ggml_backend_tensor_set(run.y, nan.data(), 0, ggml_nbytes(run.y));
-                spacemit_mm_paths_take(&path_a[s], &path_b[s], &path_c[s]);
-                spacemit_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
+                g_mm_paths_take(&path_a[s], &path_b[s], &path_c[s]);
+                g_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
                 ok = ok && ggml_backend_graph_compute(backend, run.g_dev) == GGML_STATUS_SUCCESS;
-                spacemit_mm_paths_take(&path_a[s], &path_b[s], &path_c[s]);
-                spacemit_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
+                g_mm_paths_take(&path_a[s], &path_b[s], &path_c[s]);
+                g_mm_tail_take(tail_rows[s], tail_calls[s], tiles);
                 out[s].resize(ggml_nelements(run.y));
                 ggml_backend_tensor_get(run.y, out[s].data(), 0, ggml_nbytes(run.y));
             }
@@ -3175,9 +3180,9 @@ static int check_layer(ggml_backend_dev_t dev) {
             for (int s = 0; s < 3; s++) {
                 env_override quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", settings[s][0]);
                 env_override launch_switch("GGML_FLAGOS_SYNC_LAUNCH", settings[s][1]);
-                spacemit_steps_take();
+                g_steps_take();
                 e[s]     = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[s]);
-                steps[s] = spacemit_steps_take();
+                steps[s] = g_steps_take();
             }
             bool same = e[0] >= 0.0;
             for (int s = 1; s < 3; s++) {
@@ -3652,19 +3657,19 @@ static int check_plan(ggml_backend_dev_t dev) {
             {
                 env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
                 take();
-                spacemit_steps_take();
+                g_steps_take();
                 ran       = r.dev_output(backend, one_chunk);
-                steps_one = spacemit_steps_take();
+                steps_one = g_steps_take();
                 cnt       = expect("(f) one-chunk", 0, 1);
                 ran       = ran && r.dev_output(backend, one_chunk2);
-                steps_one2 = spacemit_steps_take();
+                steps_one2 = g_steps_take();
                 cnt        = expect("(f) one-chunk again", 1, 0) && cnt;
             }
             {
                 env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);  // the default: the split, with the turns
                 take();
                 ran         = ran && r.dev_output(backend, split);
-                steps_split = spacemit_steps_take();
+                steps_split = g_steps_take();
                 cnt         = expect("(f) split", 0, 1) && cnt;
             }
             const bool steps_ok = steps_one == 1 && steps_one2 == 1 && steps_split == 2;
@@ -3687,13 +3692,13 @@ static int check_plan(ggml_backend_dev_t dev) {
             {
                 env_override attn_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
                 take();
-                spacemit_steps_take();
+                g_steps_take();
                 ran         = r.dev_output(backend, again);
-                steps_again = spacemit_steps_take();
+                steps_again = g_steps_take();
                 cnt         = expect("(l) one-chunk after the split", 0, 1);
                 set_env("FLAGOS_SPACEMIT_ATTN", "one-chunk");
                 ran        = ran && r.dev_output(backend, same);
-                steps_same = spacemit_steps_take();
+                steps_same = g_steps_take();
                 cnt        = expect("(l) the same value set again", 0, 1) && cnt;
             }
             const bool steps_l = steps_again == 1 && steps_same == 1;
@@ -3744,13 +3749,13 @@ static int check_plan(ggml_backend_dev_t dev) {
             REQUIRE(unflagged != nullptr);
             std::vector<float> out_o, out_o2;
             take();
-            spacemit_steps_take();
+            g_steps_take();
             ran                      = a.run(backend, out_o);
-            const uint64_t steps_all = spacemit_steps_take();
+            const uint64_t steps_all = g_steps_take();
             cnt                      = expect("(o) the first layer", 1, 0);
             unflagged->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
             ran                      = ran && a.run(backend, out_o2);
-            const uint64_t steps_now = spacemit_steps_take();
+            const uint64_t steps_now = g_steps_take();
             unflagged->flags |= GGML_TENSOR_FLAG_COMPUTE;
             cnt                    = expect("(o) a node unflagged after the store", 1, 0) && cnt;
             const uint64_t want    = on ? steps_all : steps_all - 2;
@@ -4093,9 +4098,9 @@ static int check_diagnostics(ggml_backend_dev_t dev) {
             env_override       sync_switch("GGML_FLAGOS_SYNC_LAUNCH", sync == 1 ? "1" : nullptr);
             std::vector<float> out;
             log_capture        log;
-            spacemit_steps_take();
+            g_steps_take();
             const bool        ran   = l.run(backend, out);
-            const uint64_t    steps = spacemit_steps_take();
+            const uint64_t    steps = g_steps_take();
             const std::string text  = log.take();
             const int         lines = count_lines(text, "FlagOS SpacemiT: step ");
             const int         status = count_lines(text, "FlagOS SpacemiT: launch step ");
@@ -4383,11 +4388,11 @@ static int bench_mm(ggml_backend_dev_t dev) {
                 bool     ok   = true;
                 size_t   next = 0;
                 uint64_t path_a, path_b, path_c;
-                spacemit_mm_paths_take(&path_a, &path_b, &path_c);
+                g_mm_paths_take(&path_a, &path_b, &path_c);
                 t[k] = time_us(
                     [&] { ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS; },
                     iters);
-                spacemit_mm_paths_take(&path_a, &path_b, &path_c);
+                g_mm_paths_take(&path_a, &path_b, &path_c);
                 const std::pair<uint64_t, const char *> taken[] = { { path_a, "A" }, { path_b, "B" }, { path_c, "C" } };
                 for (const auto & [count, name] : taken) {
                     if (count > 0) {
@@ -4702,6 +4707,9 @@ int main(int argc, char ** argv) {
     }
     REQUIRE(!expect_none);
     CHECK(n_spacemit == 1);
+    if (bind_plugin_names(dev) != 0) {
+        return 1;
+    }
 
     // without spine-runtime the provider runs on the host executor (simulated device)
     flagos_device_info info;

@@ -51,6 +51,9 @@ ggml_add_backend_library(ggml-flagos ${FLAGOS_SOURCES})
 target_include_directories(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
 target_link_libraries(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_LIBRARIES})
 target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
+if (GGML_FLAGOS_SPACEMIT)
+    include(providers/spacemit/plugin.cmake)
+endif()
 
 # In static mode ggml-backend-reg.cpp includes the backend's public registry
 # header while compiling the core ggml target.  Keep that include path private

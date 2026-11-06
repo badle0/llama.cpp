@@ -121,7 +121,7 @@ Gains are estimates unless marked. Each needs a rule set before its run, as the 
 | T8 | Head-contiguous KV layout inside the provider's buffer | Attention at 4096 from 40.8 to at best 21.6 ms per token, tg there +17% at most; few-token tails too | One-chunk kernels read 17.9 GB/s contiguous, 9.7 GB/s on the real layout (measured) | High: a third layout through state save, restore and shift. On huge pages the heads must not sit a power of two apart (`k3-hardware.md` §2) |
 | T9 | Q8_0 KV cache with rotation, new kernels | Half the bytes read and half the memory; perhaps IME for the scores (theory, untested) | Accuracy usable on both models: 0.0042 and 0.0013 (Mac); 4-bit ruled out | High: new kernels, rotation at store |
 | T10 | `-b 64 -ub 64` | pp +21% at depth 0, +7% at 4096; cancel wait at most about 1.7 s at 4096 | Rows table; pp64 against pp512 | One flag, but only after T1: every tail is then below 64 |
-| T11 | Cancel check in the replay loop | Cancel within a step instead of a whole decode | By reading, §5 | Small in the plugin; the server needs an abort callback (an `upstream-changes.md` entry) |
+| T11 | Cancel check in the replay loop | Cancel within a step instead of a whole decode | By reading, §5 | Small in the plugin; the server needs an abort callback and must handle an aborted decode, a TODO today (`tools/server/server-context.cpp:3679`; `upstream-changes.md` entries) |
 
 **For pp**
 
@@ -153,7 +153,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 **Inputs to S2's design, cheap and worth having before its spec:**
 
 1. **C1, the split of the 11.0 s** (no code: `scripts/startup-split.py`; `plan.md` "The start-up split"). My reading rated the zero-copy entries low value, and 3 s per GB might have changed that. The bytes settle that part (2026-11-05): plain tensors are 0.06% of what the provider loads on Qwen3-0.6B, so option A cannot shorten start-up. The split, measured the same day, keeps T6 and rules out the flags.
-2. **Cancel (T11).** S2 moves the replay loop and the plugin table. If cancel is wanted, one flag read at each barrier belongs in that design, not in a later interface change. The alternative is T10's small `-b`, with no code. This is the user's decision when the S2 spec is written.
+2. **Cancel (T11).** S2 moves the replay loop and the plugin table. If cancel is wanted, one flag read at each barrier belongs in that design, not in a later interface change. The alternative is T10's small `-b`, with no code. This is the user's decision when the S2 spec is written. Decided 2026-11-05: out of S2 for now (`plan.md` "S2 spec", decision 2, with what the server would need).
 3. **A short tail in the server check.** S2's baseline ran the KV-head path only on an almost empty cache (the warm-up and request A), with only A's text compared (corrected 2026-11-05; `plan.md`). A follow-up ending in 2 to 8 tokens is S2's step 0, done 2026-11-05: 4 tokens after 19 cached, passing on the K3 on both models, with new baselines (`plan.md`).
 
 **After S2:**

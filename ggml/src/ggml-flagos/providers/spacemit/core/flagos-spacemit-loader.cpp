@@ -9,7 +9,6 @@
 #include "../flagos-spacemit-api.h"  // flagos_spacemit_provider: the core symbol dladdr locates
 
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -54,18 +53,6 @@ std::string dl_error() {
 #endif
 }
 
-bool file_exists(const std::string & path) {
-    if (path.empty()) {
-        return false;
-    }
-    FILE * f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        return false;
-    }
-    std::fclose(f);
-    return true;
-}
-
 // every member of the table before the optional zero-copy tail, in order, with its name for the detail text
 struct member {
     const char * name;
@@ -74,10 +61,7 @@ struct member {
 
 }  // namespace
 
-std::string spacemit_plugin_default_path(bool * self) {
-    if (self != nullptr) {
-        *self = false;
-    }
+std::string spacemit_plugin_default_path() {
     spacemit_renamed("FLAGOS_SPACEMIT_PLUGIN", "GGML_FLAGOS_PROVIDER_PATH");
     const char * from_env = std::getenv("GGML_FLAGOS_PROVIDER_PATH");
     if (from_env != nullptr && *from_env != '\0') {
@@ -97,16 +81,7 @@ std::string spacemit_plugin_default_path(bool * self) {
 #    else
     const char * name = "libflagos-provider-spacemit.so";
 #    endif
-    if (cut != std::string::npos) {
-        const std::string beside = own.substr(0, cut + 1) + name;
-        if (file_exists(beside)) {
-            return beside;  // S2's plugin library, searched first
-        }
-    }
-    if (self != nullptr) {
-        *self = true;  // S1: the core's own image holds the entry
-    }
-    return own;
+    return cut != std::string::npos ? own.substr(0, cut + 1) + name : std::string(name);
 #endif
 }
 

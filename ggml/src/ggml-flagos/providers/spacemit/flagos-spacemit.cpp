@@ -616,8 +616,7 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
     // outlive the call whatever a plugin does with them (ours copies what it keeps)
     static std::string      plugin_dir;
     static spacemit_host_v1 host;
-    bool                    self = false;                               // the path is the core's own image (A5)
-    const std::string       path = spacemit_plugin_default_path(&self);  // the same path the loader resolves
+    const std::string       path = spacemit_plugin_default_path();  // the same path the loader resolves
     const size_t            cut  = path.find_last_of('/');
     plugin_dir                   = cut != std::string::npos ? path.substr(0, cut) : std::string(".");
     host.struct_size             = sizeof(spacemit_host_v1);
@@ -632,9 +631,6 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
         if (loaded == spacemit_load_result::no_device) {
             // the ordinary case on a host without the AI cores
             GGML_LOG_DEBUG("FlagOS SpacemiT: no device: %s (%s)\n", detail.c_str(), path.c_str());
-        } else if (loaded == spacemit_load_result::not_found && self) {
-            // a statically linked executable cannot be dlopened: A5's documented consequence, not a fault
-            GGML_LOG_DEBUG("FlagOS SpacemiT: no plugin in this image: %s (%s)\n", detail.c_str(), path.c_str());
         } else {
             GGML_LOG_WARN("FlagOS SpacemiT: the plugin %s was not loaded: %s\n", path.c_str(), detail.c_str());
         }

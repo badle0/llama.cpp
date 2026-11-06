@@ -10,7 +10,7 @@ This file supplements the repository-root `AGENTS.md` for FlagOS and SpacemiT K3
 
 ## Goal and current baseline
 
-- Deliver llama.cpp inference on SpacemiT K3 through a provider compiled into `libggml-flagos` at `ggml/src/ggml-flagos/providers/spacemit/`. The old standalone `ggml-plugin-FL` scaffold is retired.
+- Deliver llama.cpp inference on SpacemiT K3 through a provider at `ggml/src/ggml-flagos/providers/spacemit/`: its core compiled into `libggml-flagos`, its K3 plugin its own library, `libflagos-provider-spacemit` (since S2 step 1). The old standalone `ggml-plugin-FL` scaffold is retired.
 - The active fork is based on the mentor's `feature/flagos-amd-890-opt` branch at `5794e12`; K3 work is on `feature/flagos-spacemit`. Keep the mentor fork as a read-only reference and work in the user's fork.
 - As recorded on 2026-09-24, the provider-neutral FlagOS build and upstream SpacemiT IME baseline built on the K3. No SpacemiT FlagOS provider code had been written. The separate SpacemiT `ggml-spacemit` backend had not yet been run on this board. Recheck `PROJECT.md` and the tree for newer progress.
 - The mentor requested a design review of kernel fusion and the Common/provider shim. Findings and proposed directions are in `upstream-review.md`; do not treat proposed changes as approved design decisions.

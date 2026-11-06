@@ -144,7 +144,7 @@ typedef struct {
                                    uint32_t n_steps, void * workspace, size_t workspace_size, uint32_t flags);
     /* what is not contract: the names above. A required member, like every one before it; it may answer NULL */
     void * (*get_proc_address)(const char * name);
-    /* zero copy (plan.md "S1 design" A6): the optional tail under struct_size, NULL until S2 implements them */
+    /* zero copy (plan.md "S1 design" A6): the optional tail under struct_size, NULL: not built ("S2 spec", decision 1) */
     enum spacemit_status (*register_host_ptr)(spacemit_plugin_device * dev, void * ptr, size_t size,
                                               spacemit_plugin_buffer ** buf);
     enum spacemit_status (*tensor_prepare)(struct ggml_tensor * t);  // the IME copy beside a mapped weight, in t->extra
