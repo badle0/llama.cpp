@@ -96,7 +96,7 @@ None of these is an acceptance check today except where noted. Grid sizes are pr
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
 | C14 | `kill -9` during prefill, restart, first token | Whether anything outlives a killed process. Not the TCM mark, which the provider does not hold while computing (2026-11-06, `plan.md` "S2's exit against the results"), so read what the next run gets: the cores, `/dev/tcm` mapped, the same speed, `libspert` falling back to the heap silently | Not measured |
-| C15 | A second process wanting the AI cores (a second context needs none since S2's step 2). Proposed 2026-11-06: an IME process as the second, which does not ask spine-runtime and takes a TCM mark the provider ignores | Each failure costs about 30 s, then an abort, retried on the next run; replies going wrong with no error (inference, `plan.md`) | Seen with speculation; the wait is inferred to be spine-runtime's. The retry and an IME process alongside never run |
+| C15 | A second process wanting the AI cores (a second context needs none since S2's step 2). Proposed 2026-11-06: an IME process as the second, which does not ask spine-runtime and takes a TCM mark the provider ignores | Each failure costs about 30 s, then an abort, retried on the next run; replies going wrong with no error (inference, `plan.md`) | Seen with speculation; the wait is inferred to be spine-runtime's. On the K3 2026-11-08 (`--quick`; `plan.md` "TTFT harness spec", first K3 run): a refused decode took 30.0 s and reached the streaming client as "Compute error." after a 200, and once A stopped B answered with A's text. Beside the IME build's `llama-bench`, 0 of 2 replies at temperature 0 equal the reference, with no error; the cause is being tested |
 | C15b | 1, 2, 4 and 8 AI cores on the one-row matmuls and on attention at depth | Whether the weight stream saturates before 8 cores (Codex's point, §8) | Not measured; needs a test-only core count |
 | C16 | A fixed memory load on the X100 cores | The weight stream shares DRAM with a shared board's other work | Not measured |
 | C17 | `-c` 8192 to 32768 | KV at 144 KiB per position, prompt cache 8 GiB by default, 31 GiB RAM and no swap | Attention extrapolates to about 280 ms per token at 32768 (estimate) |
@@ -158,7 +158,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 
 **After S2:**
 
-1. A TTFT harness: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline. Built 2026-11-08 as a script beside the runner, `tools/spacemit_ttft.py` (`plan.md` "TTFT harness spec" and its result; usage in `build.md` §6). The K3 runs are pending.
+1. A TTFT harness: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline. Built 2026-11-08 as a script beside the runner, `tools/spacemit_ttft.py` (`plan.md` "TTFT harness spec" and its result; usage in `build.md` §6). First K3 run the same day, `--quick`, 11/11; the full runs are next.
 2. T1, with T5's result beside it.
 3. T2, T3 and T10, each against the baseline with its accuracy check.
 4. Block 6's per-op figures, then T7.

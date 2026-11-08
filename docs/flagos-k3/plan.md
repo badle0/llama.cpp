@@ -2162,7 +2162,7 @@ Expected on the K3 (predictions): the build and the check program pass, its `loa
 
 ### TTFT harness spec, for review (2026-11-06)
 
-**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section); the K3 runs are pending. Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
+**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section). First K3 run the same day, `--quick`, 11/11: the result after the Mac's, with the fixes it led to. The full runs are next. Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
 
 **For the user's word.**
 1. **A script of its own, `tools/spacemit_ttft.py`, not a flag in the runner, where `batch-one.md` §5 put it.** The runner is pass/fail with its counts recorded run by run, and this is about 2 hours of recording. The script imports the runner's helpers, so nothing is copied and the runner's counts and time stay.
@@ -2272,6 +2272,59 @@ My reruns after the corrections:
 - With two runs, `restart` with the stand-ins passed at -1.7%, and the forced failure still failed on the first request and on tg64.
 
 Not run: the K3, and a full run anywhere. On the Mac's simulated device a 3,000-token prefill takes about 100 s, so the full grid would take hours.
+
+**First K3 run (2026-11-08, `--quick`).** Qwen3-0.6B, from the bundle of `4c9d6e4e2`: 11/11 checks passed. The runner's two runs went first. Their verdicts and the summary's first part (the commit, placement, the control, the grid) were not in the output I received, so they are still to be read.
+
+Against the predictions:
+- **`restart`**, one round at 1.0 s, as predicted.
+  - The client saw a 200, then the connection dropped (IncompleteRead, 0 bytes). No block was marked.
+  - The new server was up after 5.0 s, with nine `/dev/tcm` lines and no "could not get". Its first token came in 64.1 ms, and tg64 ran at 55.53 against 55.65 t/s before the kill (-0.2%).
+  - So a `kill -9` in mid-compute left the cores usable, the risk this section rated low.
+- **`second`**, as predicted.
+  - B's request while A lived got a 200, then "Compute error." in the stream 30.0 s later. B stayed alive.
+  - Once A stopped, B answered with A's text, first token 105.5 ms.
+  - Not predicted: B took 65.1 s to come up beside A, with 2 "could not get" lines by then. By inference, two refusals of about 30 s each in its start.
+- **`alongside`**, never run before: 0 of 2 replies beside the IME build's `llama-bench` equal the reference.
+  - The request is fixed: 64 prompt tokens, temperature 0, `cache_prompt` false. Alone, it gave the same text before the loop and after it.
+  - Speeds: 54.27 t/s alone, 9.66 and 5.77 beside, 53.99 after. First tokens: 98.9 ms alone, 194.5 and 211.1 ms beside, 100.0 ms after.
+  - The IME `llama-bench` gave pp128 545.07 and tg128 54.39 t/s in its first iteration, and 244.57 and 38.84 in its second. By inference from the times, only the second overlapped the replies: the first lasted 11.5 s, and the case waits 15 s from the loop's start.
+  - So the inference above ("results that could go wrong and no error") now has an observation: replies changed with no error.
+  - The cause is not settled: the TCM blocks both processes use with no shared mark, or the timing of shared cores. The texts were not kept, so whether the replies are wrong or merely different is unknown.
+  - The Mac's stand-in, a CPU `llama-bench` beside the simulated device, gave 2 of 2 equal. That rules out neither cause on the K3: no TCM is shared there, and no spine-runtime runs.
+
+Other readings:
+- **`chat`, thinking off.** Turn 2 kept 27 tokens and decoded 148; turn 3 kept 171 and decoded 92. The last reply is decoded again, as `batch-one.md` conclusion 3 says (T2's subject). The Mac gave the same pattern: 27 and 148, then 171 and 93.
+- **`chat`, thinking on.** All 128 tokens of each turn went to reasoning, so no reply had visible text, and the history grew by the user turns only. The full run's 512 tokens may leave room for an answer.
+- **Time outside `prompt_ms` on chat requests.** The client's first event came 35 to 57 ms later than `prompt_ms` (35 ms on both first turns). `cancel`'s `/completion` follow-ups differed by 1.4 and 1.5 ms. On the Mac it was 6 to 11 ms against 0.5.
+  - Where the time goes is not measured. Candidates:
+    - the template and tokenizing, before the slot starts;
+    - the prompt cache's save, on turns that keep little of the cache: the Mac's log has 4.7 ms between the slot's choice and its start on turn 2 (`f_keep` 0.171) and none on turn 3;
+    - the chat parser, after the first token.
+  - `batch-one.md` §2's "the server adds nothing measurable" was measured through `/completion`.
+- **`tg512`**, 64 tokens: 56.19 t/s from depth 0 and 42.70 from depth 256 (p50 of 2).
+- **`cancel` cancelled nothing in `--quick`.** The 512-token prefill at depth 256 took about 1.2 s, so the reply came before the close at 2 s. The follow-ups' 1.4 and 1.5 ms are therefore no cancel's wait. On the Mac, whose prefill is slower, the same case closed mid-prefill.
+
+**Fixes after it (2026-11-08).**
+- `cancel` closes at 0.5 s in `--quick` (2 s in the full run). An INFO line, and the summary's wording, say when the reply came first and nothing was cancelled.
+- `alongside` keeps each reply's text in its row, and the summary shows where a reply first differs from the reference.
+- `--alongside-no-tcm` runs `alongside`'s IME loop with `SPACEMIT_DISABLE_TCM=1`.
+  - Without TCM, the IME path skips its TCM set-up and the wait on its block's mark (`ggml-cpu/spacemit/ime_env.cpp:265`, `ime.cpp:1692-1729`). Its threads still go to the AI cores (`bind_ai_thread`), just not pinned one to a core.
+  - So that run keeps the shared cores and drops the shared TCM. The control keeps TCM.
+- `tg512`'s per-100-token speeds read "none" when a run has no 100-token window.
+
+Tested on the Mac (the coder, then rerun by me):
+- My `--quick` on the final code: 11/11, rc 0, no process left. It took 8 min 9 s, the Mac being slower than for the earlier runs (tg64 15.94 against 28.99 t/s).
+- `cancel` closed at 503 and 505 ms, before the reply. The follow-ups waited 44.0 and 45.1 s: the server logged the cancel about 1 s after the close, and took the next request only after the running decode ended. That is the wait C10 measures.
+- The rows of `alongside` carry their texts.
+- With a stand-in IME build that records its environment: `SPACEMIT_DISABLE_TCM=1` reached the loop's runs only with the switch, and the control's never.
+- `alongside`'s lines on made-up rows: a reply longer than the reference, a failed one, an equal one.
+
+Not run: the fixes on the K3.
+
+**Next on the K3.** `alongside` with `--alongside-no-tcm`, then the full runs on both models, each with `alongside` with TCM. Predictions (inference):
+- If shared TCM is the cause, the replies beside the IME loop without TCM equal the reference, while the speeds still drop. With TCM, they differ again.
+- If shared cores are the cause, replies differ in both. That would point at a race, or an order that depends on timing, in the provider's own synchronisation.
+- Either way, the texts show whether a reply is garbled (data overwritten) or turns into other plausible text.
 
 ### Not planned
 

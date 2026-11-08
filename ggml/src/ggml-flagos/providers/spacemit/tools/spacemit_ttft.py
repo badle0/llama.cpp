@@ -13,7 +13,7 @@
 # gone. No limit on any speed. Rows go to ttft.jsonl, every line and the tables to summary.txt, in
 # <build-dir>/logs-ttft-<model>/. --quick cuts every case down to minutes.
 # Usage: spacemit_ttft.py [--build-dir DIR] [--model GGUF] [--cases LIST] [--repeats N] [--quick] [--ime-build DIR]
-#                         [--tcm-dir DIR] [--segv SO] [--allow-cpu]
+#                         [--tcm-dir DIR] [--segv SO] [--allow-cpu] [--alongside-no-tcm]
 import argparse
 import csv
 import glob
@@ -415,6 +415,8 @@ class ImeLoop(threading.Thread):
         ctx, release = self.ctx, sc.tcm_tool(self.ctx.tcm_dir, "tcmrelease")
         env = dict(os.environ)
         env.update(sc.preload)
+        if ctx.alongside_no_tcm:
+            env["SPACEMIT_DISABLE_TCM"] = "1"
         try:
             i = 0
             while not self.stop_event.is_set():
@@ -560,8 +562,9 @@ def case_chat(ctx):
 
 def cancel_request(url, body, wait_s):
     """Send body, wait until wait_s after the send or the first data line, whichever comes first, then close the
-    socket. Headers come at once, so the raw socket is read for "data: ". Returns (answered first, ms at the close,
-    status line or None, error or None)."""
+    socket. The status line comes as the slot starts, before the prefill (server-context.cpp, "signal HTTP to send the
+    headers"), so the raw socket is read for "data: ". Returns (answered first, ms at the close, status line or None,
+    error or None)."""
     conn = connect(url, 30)
     finished, status, err, buf = False, None, None, b""
     t0 = time.perf_counter()
@@ -595,6 +598,7 @@ def case_cancel(ctx):
     depth = 256 if ctx.quick else 4096
     tail_n = 512 if ctx.quick else 2048
     repeats = 2 if ctx.quick else 3
+    close_s = 0.5 if ctx.quick else 2.0
     mine, failed, answered, waits = [], None, 0, []
     proc, url, secs, why = start_server(ctx, "cancel", MEASURE_FLAGS)
     try:
@@ -610,9 +614,12 @@ def case_cancel(ctx):
                 if failed:
                     break
                 done, closed_ms, status, err = cancel_request(
-                    url, completion(ctx.base[:depth] + tails(depth, tail_n), 1), 2.0)
+                    url, completion(ctx.base[:depth] + tails(depth, tail_n), 1), close_s)
                 row("cancel", kind="cancelled", depth=depth, tail=tail_n, repeat=rep, finished_before_close=done,
-                    closed_ms=closed_ms, status=status, error=err)
+                    closed_ms=closed_ms, close_s=close_s, status=status, error=err)
+                if done:
+                    sc.info("cancel", f"repeat {rep}: the reply came {fmt(closed_ms)} ms after the send, before the "
+                                      f"close at {close_s} s: nothing was cancelled")
                 status, first, _, t, err = stream(url, "/completion", completion(ctx.base[:depth] + tails(depth, 1), 1),
                                                   900)
                 m = measured(t, depth, 1)
@@ -691,7 +698,9 @@ def case_tg512(ctx):
 
 
 def per100_text(r):
-    return "[" + ", ".join(f"{v:.2f}" for v in r.get("per_100") or []) + "] t/s"
+    if not r.get("per_100"):
+        return "none"
+    return "[" + ", ".join(f"{v:.2f}" for v in r["per_100"]) + "] t/s"
 
 
 def tg64(ctx, url):
@@ -870,6 +879,9 @@ def case_alongside(ctx):
     if not ctx.ime_bench.is_file():
         sc.info("alongside", f"skipped: no {ctx.ime_bench}")
         return
+    if ctx.alongside_no_tcm:
+        sc.info("alongside", "the IME loop runs with SPACEMIT_DISABLE_TCM=1: the IME path without TCM, its threads "
+                             "still on the AI cores")
     req = {"prompt": ctx.base[:64], "cache_prompt": False, "n_predict": 64, "stream": True, "temperature": 0}
     n_alone, n_beside = (1, 2) if ctx.quick else (3, 5)
     release = sc.tcm_tool(ctx.tcm_dir, "tcmrelease")
@@ -878,8 +890,11 @@ def case_alongside(ctx):
     def ask(phase, i):
         status, first, events, t, err = stream(url, "/completion", req, 300)
         text = stream_text(events)
+        diff_at = None if ref is None or text == ref else next(
+            (k for k, (x, y) in enumerate(zip(text, ref)) if x != y), min(len(text), len(ref)))
         r = row("alongside", kind="q", phase=phase, i=i, status=status, first_ms=first,
-                predicted_per_second=t.get("predicted_per_second"), equal=ref is None or text == ref, error=err)
+                predicted_per_second=t.get("predicted_per_second"), equal=ref is None or text == ref, text=text,
+                diff_at=diff_at, error=err)
         mine.append(r)
         return text, err
 
@@ -928,23 +943,32 @@ def case_alongside(ctx):
         if ended:
             sc.info("alongside", f"ended: {ended}")
         if mine:
-            for line in alongside_lines(rows):
+            for line in alongside_lines(rows, ctx.alongside_no_tcm):
                 sc.info("alongside", line)
 
 
-def alongside_lines(all_rows):
+def alongside_lines(all_rows, no_tcm=False):
     qs = [r for r in all_rows if r["case"] == "alongside" and r.get("kind") == "q"]
     ime = [r for r in all_rows if r["case"] == "alongside" and r.get("kind") == "ime"]
     beside = [r for r in qs if r["phase"] == "beside"]
+    reference = next((r.get("text") for r in qs if r["phase"] == "alone"), None)
     lines = [f"{sum(1 for r in beside if r['equal'] and not r['error'])} of {len(beside)} beside equal the reference"]
     for phase in ("alone", "beside", "after"):
         rs = [r for r in qs if r["phase"] == phase]
-        lines.append(f"{phase}: " + (", ".join(f"{fmt(r['predicted_per_second'], 2)} t/s (first token "
-                                               f"{fmt(r['first_ms'])} ms{'' if r['equal'] else ', text differs'}"
-                                               f"{', ' + r['error'] if r['error'] else ''})" for r in rs) or "none"))
-    lines.append("IME iterations: " + ("; ".join(f"{r['iteration']}: rc={r['rc']}, {r['seconds']} s, "
-                                                 f"{speeds_text({k: r[k] for k in ('pp128', 'tg128') if k in r})}"
-                                                 for r in ime) or "none"))
+        lines.append(f"{phase}: " + (", ".join(
+            f"{fmt(r['predicted_per_second'], 2)} t/s (first token {fmt(r['first_ms'])} ms" +
+            ("" if r["equal"] else f", text differs at character {r.get('diff_at')}") +
+            f"{', ' + r['error'] if r['error'] else ''})" for r in rs) or "none"))
+    ref = reference or ""
+    for r in qs:
+        if not r["equal"]:
+            t, d = r.get("text") or "", r.get("diff_at") or 0
+            lines.append(f"{r['phase']} {r['i']}: from character {d}, {t[d:d + 40]!r} against the reference's "
+                         f"{ref[d:d + 40]!r}")
+    prefix = "IME iterations (SPACEMIT_DISABLE_TCM=1): " if no_tcm else "IME iterations: "
+    lines.append(prefix + ("; ".join(f"{r['iteration']}: rc={r['rc']}, {r['seconds']} s, "
+                                     f"{speeds_text({k: r[k] for k in ('pp128', 'tg128') if k in r})}"
+                                     for r in ime) or "none"))
     return lines
 
 
@@ -979,10 +1003,11 @@ def summary(ctx):
     for r in case_rows["cancel"]:
         if r.get("kind") == "followup":
             c = cancelled.get(r["repeat"], {})
-            sc.say(f"  repeat {r['repeat']}: closed after {fmt(c.get('closed_ms'))} ms (answered first: "
-                   f"{c.get('finished_before_close')}); follow-up client {fmt(r['client_ms'])} ms, prompt_ms "
-                   f"{fmt(r['prompt_ms'])}, wait {fmt(r['wait_ms'])} ms, cache_n {r['cache_n']}, prompt_n "
-                   f"{r['prompt_n']}" +
+            when = ("-" if not c else "after the reply came: nothing cancelled" if c.get("finished_before_close")
+                    else "before the reply")
+            sc.say(f"  repeat {r['repeat']}: closed after {fmt(c.get('closed_ms'))} ms, {when}; follow-up client "
+                   f"{fmt(r['client_ms'])} ms, prompt_ms {fmt(r['prompt_ms'])}, wait {fmt(r['wait_ms'])} ms, cache_n "
+                   f"{r['cache_n']}, prompt_n {r['prompt_n']}" +
                    (f"; {r['error']}" if r["error"] else ""))
     tg = [r for r in case_rows["tg512"] if r.get("kind") == "run" and not r["error"]]
     if tg:
@@ -1008,7 +1033,7 @@ def summary(ctx):
                ", ".join(f"{k} {fmt(v) if isinstance(v, float) else v}" for k, v in fields.items()))
     if case_rows["alongside"]:
         sc.say("\nalongside")
-        for line in alongside_lines(rows):
+        for line in alongside_lines(rows, ctx.alongside_no_tcm):
             sc.say(f"  {line}")
 
     sc.say("\nTargets (batch-one.md section 5, agreed 2026-11-06) against this run")
@@ -1093,6 +1118,9 @@ def main():
                     help="crash reporter (scripts/segv.c built as .so) to preload into the servers and llama-bench")
     ap.add_argument("--allow-cpu", action="store_true",
                     help="report placement off the provider without stopping the run")
+    ap.add_argument("--alongside-no-tcm", action="store_true",
+                    help="run alongside's IME loop with SPACEMIT_DISABLE_TCM=1: the IME path without TCM, its threads "
+                         "still on the AI cores, to tell a TCM clash from sharing the cores (the control keeps TCM)")
     args = ap.parse_args()
     if args.repeats is not None and args.repeats < 1:
         ap.error("--repeats must be at least 1")
@@ -1105,7 +1133,8 @@ def main():
     ctx = SimpleNamespace(model=args.model, server=bdir / "bin" / "llama-server", quick=args.quick,
                           repeats=args.repeats if args.repeats is not None else (2 if args.quick else 5),
                           ime_bench=Path(args.ime_build) / "bin" / "llama-bench", tcm_dir=args.tcm_dir,
-                          allow_cpu=args.allow_cpu, base=None, logs=bdir / f"logs-ttft-{Path(args.model).stem}")
+                          allow_cpu=args.allow_cpu, alongside_no_tcm=args.alongside_no_tcm, base=None,
+                          logs=bdir / f"logs-ttft-{Path(args.model).stem}")
     problem = (f"model not found: {args.model}" if not Path(args.model).is_file() else
                f"not found: {ctx.server}" if not ctx.server.is_file() else "")
     if problem:
