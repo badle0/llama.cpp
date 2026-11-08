@@ -2162,7 +2162,7 @@ Expected on the K3 (predictions): the build and the check program pass, its `loa
 
 ### TTFT harness spec, for review (2026-11-06)
 
-**Status:** written for review, nothing implemented. Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
+**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section); the K3 runs are pending. Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
 
 **For the user's word.**
 1. **A script of its own, `tools/spacemit_ttft.py`, not a flag in the runner, where `batch-one.md` §5 put it.** The runner is pass/fail with its counts recorded run by run, and this is about 2 hours of recording. The script imports the runner's helpers, so nothing is copied and the runner's counts and time stay.
@@ -2192,7 +2192,7 @@ Around them: the commit, by git with `safe.directory` (the binaries print `build
 - With thinking on, the first event is the role chunk, arriving with the first token, and visible content comes far later (2.1 and 6.3 s on the Mac). Events do not match tokens one to one there, so per-token speed comes from `/completion` only: 301 events for 300 tokens.
 - Closing the connection during a prefill: the next request's client time was 2,050 ms and its `prompt_ms` 58 ms, `cache_n` as before, so the wait reads directly.
 - `kill -9` during a prefill: the client sees a dropped connection and a new server comes up (on the Mac, where no cores are granted).
-- A failed decode gives the client HTTP 500 "Compute error." and the server stays up, rc 0 at its end (the simulated device, `FLAGOS_SPACEMIT_TEST_FAIL_NODE`). I had read the `throw` at `tools/server/server-context.cpp:3696` as ending the server, and the test showed otherwise. So `second` can reach the retry in one process.
+- A failed decode gives the client HTTP 500 "Compute error." and the server stays up, rc 0 at its end (the simulated device, `FLAGOS_SPACEMIT_TEST_FAIL_NODE`). That holds for a plain request. A streamed one gets a 200 and then the error as an event in the stream (2026-11-08; the result below). I had read the `throw` at `tools/server/server-context.cpp:3696` as ending the server, and the test showed otherwise. So `second` can reach the retry in one process.
 
 **Output.** `<build-dir>/logs-ttft-<model>/`: `ttft.jsonl` with a row per measurement (case, depth, tail, repeat, client ms, `prompt_ms`, `cache_n`, `prompt_n`, `n_kv`, and the case's own fields), `summary.txt`, the servers' logs. The summary has p50 and p95 tables, tails against depths for `grid` (with 5 repeats p95 is the largest), and ends with the agreed targets against the run's figures where it has them: a chat turn at depth 4096 (tails 26, 38 and 110), a fresh 500 tokens, tg512 from depths 0 and 4096. A saved system prompt's target is T3's and is not measured here.
 
@@ -2219,11 +2219,59 @@ Around them: the commit, by git with `safe.directory` (the binaries print `build
 2. `--quick` on Qwen3-0.6B, about 10 minutes (estimate), to catch mistakes before the long run.
 3. The full run in tmux on Qwen3-0.6B, about 25 minutes, then Qwen3-4B, about 1 hour 40 (estimates), each `ttft.jsonl` kept as `~/kvh/ttft-base-06.jsonl` and `~/kvh/ttft-base-4b.jsonl`.
 
-**Predictions (Qwen3-4B, from the measured rates in `batch-one.md` §2; a cell off by more than 15% gets explained).** Depth 0: tail 1 about 87 ms, 64 about 549 ms, 512 about 5.3 s. Depth 4096: tail 1 about 129 ms, 4 about 226 ms, 12 about 3.27 s, 63 about 17.2 s, 64 about 1.67 s. `chat` with thinking off: each turn decodes about the last reply plus the new turn. `tg512`: about 10.5 t/s from depth 0, about 7.6 from depth 4096. `cancel`: a wait of up to about 57 s. `restart`: no block marked, nine `/dev/tcm` lines, the same speed. `second`: about 30 s per refused decode, then HTTP 500, and after A goes B answers with A's text. `alongside`: none, it has never been tried.
+**Predictions (Qwen3-4B, from the measured rates in `batch-one.md` §2; a cell off by more than 15% gets explained).** Depth 0: tail 1 about 87 ms, 64 about 549 ms, 512 about 5.3 s. Depth 4096: tail 1 about 129 ms, 4 about 226 ms, 12 about 3.27 s, 63 about 17.2 s, 64 about 1.67 s. `chat` with thinking off: each turn decodes about the last reply plus the new turn. `tg512`: about 10.5 t/s from depth 0, about 7.6 from depth 4096. `cancel`: a wait of up to about 57 s. `restart`: no block marked, nine `/dev/tcm` lines, the same speed. `second`: about 30 s per refused decode, then HTTP 500, and after A goes B answers with A's text. The harness's request is streamed, so it sees a 200 and then the error in the stream (2026-11-08, the result below). `alongside`: none, it has never been tried.
 
 **Exit:** both models' full runs complete with every check passing or explained, the predictions held or explained, and the baseline recorded in `build.md` §7 and `batch-one.md` §2. T1's rule is then written for the user before its run.
 
 **Time (estimates):** the coder, one session, 500 to 600 lines; on the K3 about 3 hours of unattended runs.
+
+**Result on the Mac (2026-11-08).** The coder built it from my brief, which filled in the server flags, the tails, the `--quick` sizes and the rows' fields. I read the code and corrected it in the main session.
+
+What was built:
+- `tools/spacemit_ttft.py`, 1,156 lines against the estimate of 500 to 600: standard library only, importing the runner's helpers.
+- The runner's check renamed to `no TCM block left marked (the IME path's mark)`, its count unchanged.
+
+Choices the spec left open:
+- **Tails.** README.md's tokens (2,320 on Qwen3's tokenizer, repeated to 18,560) taken from offset 1000 or 2000 in turn. The offset moves on until the first token differs from the cached one at that depth, so `cache_n` comes out as asked.
+- **Chat servers.** `-t 8 -c 8704` and the server's defaults otherwise: its slots, the prompt cache, no `--cache-reuse`.
+- **Requests.** Every request runs at temperature 0. The fixed request of `second` and `alongside` is README's first 64 tokens.
+- **`restart`'s speed rule.** It fails when the faster of two tg64 runs on the new server is more than 5% below the same on the server before the kill (a faster one passes), and on a failed first request. Two runs, not one, after my CPU-path rerun on the Mac failed at -6.1% on a single run: one slow run no longer fails the check, while a server slow throughout still does.
+- **`--quick`.**
+  - `grid`: depths 0 and 256, 5 tails each, 2 repeats.
+  - `chat`: 3 turns of at most 128 tokens.
+  - `cancel`: depth 256 with a 512-token tail, twice.
+  - `tg512`: 64 tokens twice from depths 0 and 256.
+  - `restart`: one round, at 1.0 s.
+  - `alongside`: 1 request alone, 2 beside.
+- **Header.** It leaves out the host's node name.
+
+Found on the way:
+- **The 200 comes before any token.** The server sends a streamed reply's 200 as soon as the slot starts (`server-context.cpp:3411-3421`, without `return_progress`). Three consequences:
+  - The first `data:` line is the first token, as the TTFT definition needs.
+  - `cancel` reads the socket for that line, not for the headers.
+  - A failed decode reaches a streaming client as an error event after the 200. On the Mac with `FLAGOS_SPACEMIT_TEST_FAIL_NODE`, a streamed request got a 200 and "Compute error." in the stream, a plain one HTTP 500, and the server stayed up after both. On the K3 a refused B should therefore show as "HTTP 200 ... error in the stream", which the harness reports as refused.
+- **`restart`'s 5% is noisy on the Mac.** With one tg64 run per server, the coder saw -8.4% and -10.6% at load averages of 20 to 40 from its own runs, and -0.2% to +7.8% otherwise; my runs gave -4.3%, +5.0%, +1.4% and, on the CPU path, -6.1%. Hence the two runs above. Whether 5% holds is for the K3's run to show.
+- **Client and server TTFT agree.** A grid row's client time is its `prompt_ms` plus 0.47 to 0.65 ms.
+
+Tests on the Mac. The coder ran the spec's list:
+- `--quick` with all cases on the simulated device: 11/11 checks passed in 113 s. On the CPU path with `--allow-cpu`: 10/10 in 72 s.
+- The stand-ins: `restart`, `alongside` and the control ran. A marked block failed `restart`.
+- `GGML_FLAGOS_DISABLE_OPS=FLASH_ATTN_EXT`: placement failed with 58 splits and the run stopped.
+- A missing model: rc 1, no server started.
+- The grid's server killed from outside: grid failed and `tg512` passed after it.
+- A proxy reporting `cache_n` one too high: grid's check failed.
+- `kill -INT` of the harness alone: rc 130, the summary written, no child left. SIGTERM during `alongside` gave the same.
+- The runner's renamed check: through a stand-in `tcmtest`.
+
+My reruns after the corrections:
+- `--quick` on the simulated device: 11/11 in 112 s. Again on the final code, after the two-run change below: 11/11 in 113 s, `restart` at -0.5%.
+- The stand-ins: 3/3, the control at both ends, 2 of 2 replies beside the IME loop equal to the reference.
+- A marked block: `restart` failed on "blocks marked" only.
+- `FLAGOS_SPACEMIT_TEST_FAIL_NODE`: `restart` failed on "the first request failed".
+- The CPU path with `--allow-cpu`: first 9/10, `restart` failing at -6.1% on its single tg64 run. With the faster of two runs: 10/10 (+14.2%).
+- With two runs, `restart` with the stand-ins passed at -1.7%, and the forced failure still failed on the first request and on tg64.
+
+Not run: the K3, and a full run anywhere. On the Mac's simulated device a 3,000-token prefill takes about 100 s, so the full grid would take hours.
 
 ### Not planned
 

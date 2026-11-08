@@ -22,7 +22,7 @@
 #   perplexity over 2 chunks within 1% of the enabled run's; mean KLD against the CPU's logits with 512-token batches
 #   (the tiled kernel) and -ub 1 -b 512 (one token per ubatch: the 1-row matmuls, from n_kv 512 the split over the
 #   tiles), to compare by hand with build.md §7; llama-bench pp128 and tg128 for the provider, the CPU and (if built)
-#   the upstream IME build; no TCM block left held.
+#   the upstream IME build; no TCM block left marked (the IME path's mark).
 #   --depth: after the other llama-bench runs, tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 for the same
 #   modes; FAIL if the provider's runs miss one
 # Usage: spacemit_check.py [--build] [--build-dir DIR] [--model GGUF] [--ppl-text FILE] [--ime-build DIR]
@@ -218,8 +218,9 @@ def tcm_hygiene(tcm_dir, logs):
         info("TCM blocks", f"skipped: no tcmtest in {tcm_dir}")
         return
     rc, out, _ = run([tool, "info"], logs / "tcm-info", timeout=120)
-    held = sum("is_acquired=1" in ln for ln in out.splitlines())
-    report("no TCM block left held", rc == 0 and held == 0, f"{held} of 8 blocks held" + ("" if rc == 0 else f" (rc={rc})"))
+    marked = sum("is_acquired=1" in ln for ln in out.splitlines())
+    report("no TCM block left marked (the IME path's mark)", rc == 0 and marked == 0,
+           f"{marked} of 8 blocks marked" + ("" if rc == 0 else f" (rc={rc})"))
 
 
 def tokens_per_second(log):
