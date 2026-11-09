@@ -962,14 +962,15 @@ Manual checks:
 **S2's step 3 on the K3, 2026-11-06** (`plan.md` "S2 spec", the step's results; `progress.md` item 48). On `8b087ad4a`, the sources moved to `core/` and `plugin/`. Ninja's incremental build across the move: rc 0. `objdump -d` on the 14 provider objects against copies from before the build: the same instructions in all 14. A `-march` of their own on 5 of the 14 files, by `build.ninja`; `libspert` needed by the plugin and not the core. The check program under the crash reporter: all checks passed, its `loader` line 8 names, its `stream` line 1097/1097, no "could not get" line. `tcmtest info` straight after that check program and its forced failures: **0 of 8 blocks held**; the runner's own TCM check reads after a `tcmrelease`, `build-ime` being on the board, so it does not see the provider's runs. Nor does `is_acquired` at all: read while each computes, the provider 0 of 8 marked on 12 of 12 reads, the IME build 8 of 8 on 13 of 13, so this reading shows nothing about the provider (`plan.md` "S2's exit against the results"). The runner and `llama-bench` did not run on this build, so step 2's figures above stand for it by the same instructions, an inference.
 
 **The TTFT baseline on the K3, 2026-11-08 and 09** (`plan.md` "TTFT harness spec", full K3 runs; `progress.md` item 52). The harness from `838552a49`'s bundle, on step 3's binaries; the logs on the board in `~/kvh/ttft-base-06/` and `~/kvh/ttft-base-4b/`.
-- Qwen3-0.6B **13/13**. Qwen3-4B **12/13**: its chat servers' context, the harness's fault, fixed; that case is to run again.
+- Qwen3-0.6B **13/13**. Qwen3-4B **12/13**: its chat servers' context, the harness's fault, fixed. That case ran again the same day from `17973bee0`'s bundle, with Qwen3-4B's `alongside` without TCM: **3/3**, the logs in `~/kvh/ttft-chat-4b/` (`progress.md` item 53).
+- Chat with thinking off, Qwen3-4B: 20 of 20 turns, the first event 0.44 s at turn 1, 22.7 s at turn 10 and 42.0 s at turn 19 (536 tokens after 9,048), then 7.9 s at turn 20 (149 tokens, after a reply that ended at 127). With thinking on, every count as in the full run.
 - The runner before them (block A): 48/48 on both, 16/16 replies equal to S2's baselines.
 - Client ms p50 at depth 4096, Qwen3-4B / Qwen3-0.6B: 1 token 136 / 57, 12 tokens 3,342 / 1,285, 26 7,255 / 2,797, 63 17,585 / 6,878, 64 1,673 / 535, 110 3,000 / 940.
 - Fresh prompts: 500 tokens 5,211 / 955 ms, 4,095 tokens 73,191 / 19,618 ms.
 - tg512 p50 from depths 0, 500 and 4096: 10.56, 9.83 and 7.53 / 46.58, 36.98 and 19.16 t/s.
 - Cancel waits: 61.4 / 18.4 s. `restart`: 3 rounds on each, all passing.
 - The control at the start, IME pp128 and tg128: 79.19 and 10.93 t/s on Qwen3-4B, 543.62 and 54.33 on Qwen3-0.6B.
-- Beside the IME build's `llama-bench` with TCM, 0 of 5 replies equal on both models; with its TCM off, 5 of 5 (Qwen3-0.6B). A TCM clash (`k3-hardware.md` §4).
+- Beside the IME build's `llama-bench` with TCM, 0 of 5 replies equal on both models; with its TCM off, 5 of 5 on both, at about half speed (Qwen3-4B 5.56 to 5.65 t/s against 11.10 to 11.14 alone). A TCM clash (`k3-hardware.md` §4).
 
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 

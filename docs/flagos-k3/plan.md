@@ -2162,7 +2162,7 @@ Expected on the K3 (predictions): the build and the check program pass, its `loa
 
 ### TTFT harness spec, for review (2026-11-06)
 
-**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section). First K3 run the same day, `--quick`, 11/11: the result after the Mac's, with the fixes it led to. The full runs the same night: Qwen3-0.6B 13/13, Qwen3-4B 12/13, the failure the harness's own, fixed 2026-11-09; the replies beside the IME build settled as a TCM clash (the result after the first run's). Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
+**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section). First K3 run the same day, `--quick`, 11/11: the result after the Mac's, with the fixes it led to. The full runs the same night: Qwen3-0.6B 13/13, Qwen3-4B 12/13, the failure the harness's own, fixed 2026-11-09; the replies beside the IME build settled as a TCM clash (the result after the first run's). Qwen3-4B's `chat` and its `alongside` without TCM ran again on the K3 the same day, 3/3, which completes the baseline (the result at the end of this section). Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
 
 **For the user's word.**
 1. **A script of its own, `tools/spacemit_ttft.py`, not a flag in the runner, where `batch-one.md` §5 put it.** The runner is pass/fail with its counts recorded run by run, and this is about 2 hours of recording. The script imports the runner's helpers, so nothing is copied and the runner's counts and time stay.
@@ -2409,7 +2409,7 @@ Tested on the Mac (the coder, then rerun by me):
 - `--quick --cases chat`: both servers at `n_ctx_slot = 12288`, 3/3.
 - `--quick --cases alongside` with the stand-in IME build: 2 of 2 equal, the reply after the loop asked, 1/1, no process left.
 
-Not run: the fixes on the K3.
+Not run then: the fixes on the K3 (run the same day: the result at the end of this section).
 
 **Next on the K3.** Qwen3-4B's `chat` again, and its `alongside` with `--alongside-no-tcm`, in one run of about an hour (estimate). Predictions (inference):
 - thinking off: 20 of 20 turns, turn 17's reply no longer cut at 185 tokens, and the first event growing to about 42 s at turn 20;
@@ -2422,6 +2422,28 @@ That completes the baseline. `batch-one.md` §5's order then goes on: the embedd
 - Our runs are kept apart from IME runs with TCM. Every K3 block that starts the provider first lists the processes with `/dev/tcm` mapped, and starts nothing if there is one (`PROJECT.md` §6). That cannot catch an IME run starting during ours.
 - The clash goes to SpacemiT through the mentor (§7, question 8). The note was drafted the same day.
 - Not now: the provider taking the IME path's marks around its compute, so that the two take turns on a block. That needs a spec. A provider killed in mid-compute would leave its marks held, so the provider would also have to clear dead owners, which changes shared board state.
+
+**Result on the K3 (2026-11-09).** From `17973bee0`'s bundle (the fixes above, with the decision recorded), in tmux, the user's block: the `/dev/tcm` check, then `--cases chat,alongside --alongside-no-tcm` on Qwen3-4B. The logs are `~/kvh/ttft-chat-4b/` on the board and `~/k3-logs/ttft-chat-4b/` on the Mac. The only uncommitted files on the board were its 14 untracked result files, as in the full runs.
+- The check printed "none", so the run started. That was its first run on the board; it has not yet met a process with `/dev/tcm` mapped.
+- **3/3.** Against the predictions above:
+  - Thinking off, 20 of 20 turns: met. Turns 1 to 16 equal the full run's in every count (`cache_n`, `prompt_n`, `predicted_n`, finish, characters), with first events within 1%. Turn 17's reply ran to 512 tokens instead of 185: met.
+  - Turn 20 at about 42 s: not testable as made. Turn 19, which decoded the last reply as the turns before it had (536 tokens after 9,048), came at 42.0 s. But its reply ended by itself at 127 tokens, so turn 20 decoded 149 tokens and came at 7.9 s.
+  - Thinking on, the same replies: met by every count. All 20 turns equal the full run's, with first events within 1.2% and the first visible text within 0.1 s. The case keeps no reply text, so this rests on the counts.
+  - `alongside` without TCM, 5 of 5 equal: met. So with the IME loop's TCM off the replies are right on both models, and with it on they are wrong on both.
+- **Beside the IME loop without TCM**, our server ran at 5.56 to 5.65 t/s, its first token at 1.10 to 1.12 s. Alone it ran at 11.10 to 11.14 t/s and 0.55 to 0.56 s, and after the loop at 11.10 t/s and 0.56 s. That is about half, as on Qwen3-0.6B, which sharing the cores explains.
+  - The IME loop ran one iteration meanwhile: 91.7 s, pp128 65.67 and tg128 6.03 t/s. Its controls, alone with TCM, gave pp128 79.05 and 79.52 and tg128 10.97 and 10.93 at the start and the end. With no TCM and shared cores at once, the two effects are not told apart.
+  - The controls agree with the full run's (79.19 and 10.93), so the board held steady.
+- **Deep in a chat, a turn spends about a third of its time or more on its last 21 to 25 tokens** (thinking off; T1's subject).
+  - From turn 3 to turn 19, a turn decodes the last reply plus the new message, 533 to 537 tokens. The server's default ubatch of 512 (`common/common.h:444`; the chat servers do not set `-ub`) splits that into 512 tokens and a tail of 21 to 25.
+  - The full run's grid accounts for every turn from 2 to 20 within 4%, and for turns 9 to 19 within 1%. The model uses the grid's times at depth 0 and its rates per token and cached position: 70.7 µs below 64 rows, 4.31 µs from 64 ("Other readings" above).
+  - By that model the tail takes 22 to 30% of turns 2 to 6 and 32 to 40% of turns 7 to 19: at turn 19, 16.5 of 41.9 s (inference; nothing measures the ubatches apart).
+  - Estimates from the same rates and T1's own range (`batch-one.md` §4: a 26-token tail at 4096 from about 7 s to 0.7-1.4 s; inference):
+    - T1 alone would take turn 19 to about 27 s, or 28 s at the range's high end.
+    - T2 alone, decoding only the new message, would take it to about 16.5 s.
+    - T1 and T2 together would take it to 1.2 to 2.8 s, and a turn at depth 4096 to 0.7 to 1.4 s, against the 1 s target.
+  - Not tried: a ubatch of 1024 would make such a turn one ubatch, about 27 s at turn 19 by the same rates, with no code. Its memory cost, and whether the provider's kernels take 1024 rows, are not checked.
+
+That completes the baseline. Next, by the to-do order the user agreed 2026-11-08: the token embedding lookup on the AI cores, then T1 and T6. Nothing starts without the user's word.
 
 ### Not planned
 
