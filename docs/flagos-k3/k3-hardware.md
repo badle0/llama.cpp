@@ -54,7 +54,14 @@ TCM = tightly coupled memory: a per-core, software-managed SRAM scratchpad (like
 
 With both: `OMP_THREAD_LIMIT=8 ./build-ime/bin/test-backend-ops -o MUL_MAT -b CPU` → **1198/1198 passed, TCM enabled**, 0 blocks left acquired. Details and evidence below. Scope: `test-backend-ops` allocates every tensor, weights included, in the backend's default buffer (`tests/test-backend-ops.cpp:1384-1393`), i.e. the plain CPU buffer, never the IME extra buffer type. So this run validates thread pinning and TCM acquire/release on A100 cores, not the IME kernels.
 
-**`is_acquired` says nothing about the provider (K3, 2026-11-06; `plan.md` "S2's exit against the results").** Read while each computes, the provider shows 0 of 8 marked on 12 of 12 reads with `/dev/tcm` mapped, the IME build 8 of 8 on 13 of 13. So `tcmtest info` and `tcmrelease` concern the IME path, and "0 blocks left acquired" after a provider or spine-runtime run, here and elsewhere, shows nothing about that run. The provider's process does map the same library (`/usr/lib/libspine_tcm.so.0.2.0`, the board's only copy) and the same `/dev/shm/tcm_sync_standalone`. `/dev/tcm` appears as nine mappings: the whole 3 MiB and one per 384 KiB block. Beside the IME build's `llama-bench`, the provider's replies at temperature 0 changed with no error (0 of 2 equal, 2026-11-08; `plan.md` "TTFT harness spec", first K3 run). Whether through TCM is being tested.
+**`is_acquired` says nothing about the provider (K3, 2026-11-06; `plan.md` "S2's exit against the results").** Read while each computes, the provider shows 0 of 8 marked on 12 of 12 reads with `/dev/tcm` mapped, the IME build 8 of 8 on 13 of 13. So `tcmtest info` and `tcmrelease` concern the IME path, and "0 blocks left acquired" after a provider or spine-runtime run, here and elsewhere, shows nothing about that run. The provider's process does map the same library (`/usr/lib/libspine_tcm.so.0.2.0`, the board's only copy) and the same `/dev/shm/tcm_sync_standalone`. `/dev/tcm` appears as nine mappings: the whole 3 MiB and one per 384 KiB block. Beside the IME build's `llama-bench`, the provider's replies at temperature 0 changed with no error (0 of 2 equal, 2026-11-08; `plan.md` "TTFT harness spec", first K3 run).
+
+**It is TCM (2026-11-09; the full runs, same section).**
+- With the IME loop under `SPACEMIT_DISABLE_TCM=1`, 5 of 5 replies equal. That switch means no TCM and no pinning, but the loop's threads still run on the AI cores.
+- With TCM, 0 of 5 on both models: garbled from the first characters, and right again once the IME process ended.
+- The IME path marks a block while it computes on it. The provider writes the same blocks through spine-runtime without the mark, so each process overwrites the other's data.
+- Until that changes, a provider process and an IME process with TCM running on the board at the same time give wrong results with no error. By inference, the IME process's results are wrong too.
+- So our runs are kept apart from IME runs with TCM (the user, 2026-11-09; the check is in `PROJECT.md` §6).
 
 Symptom (upstream IME path, `build-ime/`):
 ```
@@ -84,7 +91,7 @@ Offline findings (2026-09-25, from `spacemit-com/llama.cpp` @ `4e782bc` source; 
 Remaining (non-blocking):
 1. `diff -w /usr/include/spine_tcm.h ggml/src/ggml-cpu/spacemit/spine_tcm.h` from the repo root (first attempt ran from `~`).
 2. ~~Does spine-runtime's `shared_buffer()` get real TCM?~~ Yes (2026-10-07, spine-runtime 0.6.3, `scripts/spert-info.cpp`): the library maps all 8 blocks (`MakeDriverBuffer (v2)`), tile *i* runs on CPU 8+*i* and its `shared_buffer()` (384 KiB) lies inside a `/dev/tcm` mapping; 0 blocks left acquired afterwards. Block affinity masks are per core pair: blocks 0-1 `0x300` (CPUs 8-9), 2-3 `0xc00`, 4-5 `0x3000`, 6-7 `0xc000`.
-3. Report to SpacemiT: no dead-owner recovery in the sync file; `try_wait` timeout unit is ~12 µs, not the `timeout_us` the header names.
+3. Report to SpacemiT: no dead-owner recovery in the sync file; `try_wait` timeout unit is ~12 µs, not the `timeout_us` the header names. Added 2026-11-09, to report now by the user's decision: spine-runtime's TCM (`shared_buffer()`) takes no libspine_tcm mark, so it and the IME path overwrite each other's blocks. The note was drafted the same day.
 4. Upstream IME path: aborting for threads ≥ 8 instead of capping or running them without TCM is worth a fix or an upstream issue (not our file — discuss with the mentor first).
 
 Standalone probe: [`tcmtest.c`](tcmtest.c) (build/run lines in its header; cases A–F).

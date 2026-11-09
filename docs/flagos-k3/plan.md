@@ -2162,7 +2162,7 @@ Expected on the K3 (predictions): the build and the check program pass, its `loa
 
 ### TTFT harness spec, for review (2026-11-06)
 
-**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section). First K3 run the same day, `--quick`, 11/11: the result after the Mac's, with the fixes it led to. The full runs are next. Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
+**Status:** written for review 2026-11-06. Implemented 2026-11-08 on the user's word ("agreed, can you start working on the ttft harness implementation?", after the to-do order I recommended: the harness, the embedding lookup on the AI cores, T1 and T6, the larger model as a probe). I took the two points below as proposed and told the user so. Checked on the Mac the same day (the result at the end of this section). First K3 run the same day, `--quick`, 11/11: the result after the Mac's, with the fixes it led to. The full runs the same night: Qwen3-0.6B 13/13, Qwen3-4B 12/13, the failure the harness's own, fixed 2026-11-09; the replies beside the IME build settled as a TCM clash (the result after the first run's). Item 1 of `batch-one.md` §5's order (agreed by the user, 2026-11-06, with C11 and C15 added): the baseline that T1 and the later levers are measured against. One coder session, one commit, no provider code.
 
 **For the user's word.**
 1. **A script of its own, `tools/spacemit_ttft.py`, not a flag in the runner, where `batch-one.md` §5 put it.** The runner is pass/fail with its counts recorded run by run, and this is about 2 hours of recording. The script imports the runner's helpers, so nothing is copied and the runner's counts and time stay.
@@ -2273,7 +2273,7 @@ My reruns after the corrections:
 
 Not run: the K3, and a full run anywhere. On the Mac's simulated device a 3,000-token prefill takes about 100 s, so the full grid would take hours.
 
-**First K3 run (2026-11-08, `--quick`).** Qwen3-0.6B, from the bundle of `4c9d6e4e2`: 11/11 checks passed. The runner's two runs went first. Their verdicts and the summary's first part (the commit, placement, the control, the grid) were not in the output I received, so they are still to be read.
+**First K3 run (2026-11-08, `--quick`).** Qwen3-0.6B, from the bundle of `4c9d6e4e2`: 11/11 checks passed. The runner's two runs went first. Their verdicts and the summary's first part (the commit, placement, the control, the grid) were not in the output I received, so they are still to be read (read 2026-11-09: the full runs below).
 
 Against the predictions:
 - **`restart`**, one round at 1.0 s, as predicted.
@@ -2325,6 +2325,103 @@ Not run: the fixes on the K3.
 - If shared TCM is the cause, the replies beside the IME loop without TCM equal the reference, while the speeds still drop. With TCM, they differ again.
 - If shared cores are the cause, replies differ in both. That would point at a race, or an order that depends on timing, in the provider's own synchronisation.
 - Either way, the texts show whether a reply is garbled (data overwritten) or turns into other plausible text.
+
+**Full K3 runs (2026-11-08 and 09).** From the bundle of `838552a49` (the fixes above), in tmux, the user's block C:
+- `alongside --alongside-no-tcm` on Qwen3-0.6B;
+- then the full runs on Qwen3-0.6B and Qwen3-4B.
+
+The logs are on the board in `~/kvh/` and on the Mac in `~/k3-logs/`: `ttft-notcm-06`, `ttft-base-06`, `ttft-base-4b`.
+- The no-TCM run: 1/1, placement only. Qwen3-0.6B: 13/13 in 39 minutes. Qwen3-4B: 12/13 in 1 hour 57, against estimates of 25 minutes and 1 hour 40. The failure is the harness's own (below).
+- The runner's two runs of block A, read now: 48/48 on both models, 16/16 replies equal to S2's baselines, as predicted. Their summaries name no commit. By the block's order they ran from `4c9d6e4e2`'s bundle, on step 3's binaries (inference).
+- `ttft-notcm-06` also holds the server logs of an earlier full Qwen3-0.6B run, written between 22:44 and 23:12, which the no-TCM run found in the same folder. Its summary was overwritten, so nothing here uses it.
+
+The TCM question, settled:
+- With the IME loop's TCM off, 5 of 5 replies beside it equal the reference (Qwen3-0.6B). With TCM on: 0 of 5 on Qwen3-0.6B and 0 of 5 on Qwen3-4B, after 0 of 2 in the quick run.
+- With TCM on, every reply is garbage from its first or second character, on both models. Where the reference reads ` MIT](https://img.shields...`, they hold fragments in several scripts and runs of "G".
+  - The fifth on Qwen3-0.6B broke the server's chat parser, which runs on `/completion` output too: "The model produced output that does not match the expected Content-only format" in the stream (`common/chat.cpp:3642`).
+- Once the IME loop had stopped, the reply equals the reference again (Qwen3-4B). On Qwen3-0.6B that reply was not asked: the case ended at the parser's error (fixed below).
+- Speeds beside the loop, against 54.2 to 54.3 t/s alone:
+  - without TCM, 27.1 to 30.1 t/s, which sharing the cores explains;
+  - with TCM, 2.7 to 17.8 t/s, and on Qwen3-4B 2.2 to 2.9 against 11.1 alone. Why TCM slows them further is not known.
+- `SPACEMIT_DISABLE_TCM=1` turns off two things in the IME path: its TCM with the wait on the mark, and the pinning of thread *i* to core 8+*i* (`ime.cpp:1700-1730`). Its threads still opt in to the AI cores (`bind_ai_thread`, `ime.cpp:1694-1698`). So both runs shared the cores, and only the TCM writes are left to explain the garbage (inference).
+- The mechanism, by reading (`k3-hardware.md` §4):
+  - The IME path marks a block while it computes on it, and waits on that mark.
+  - The provider maps the same blocks through spine-runtime and takes no mark.
+  - So each process overwrites the other's data in a shared block.
+- So the prediction held: TCM is the cause, and the replies are garbled, not other plausible text. By inference, the IME process's results beside the provider are wrong too; `llama-bench` does not check them.
+- What to do about it is the user's decision ("Next on the K3" below).
+
+Against the predictions (Qwen3-4B, client ms p50; none off by more than 15%):
+- Depth 0: tail 1 94.1 ms (about 87 predicted, +8%), 64 556 ms (549), 512 5.36 s (5.3).
+- Depth 4096: tail 1 135.6 ms (129), 4 238 ms (226), 12 3.34 s (3.27), 63 17.58 s (17.2), 64 1.67 s (1.67).
+- `tg512`: 10.56 t/s from depth 0 (10.5), 7.53 from depth 4096 (7.6).
+- `cancel`: waits of 61.4 s (up to about 57, +8%).
+- `chat`, thinking off: from turn 3, each turn decoded the last reply plus the new turn, 533 to 537 tokens.
+- `restart`, three rounds on each model:
+  - no block marked, nine `/dev/tcm` lines, no "could not get";
+  - the new server up after 5.0 s (0.6B) and 11.0 s (4B), tg64 within 0.8% of before.
+- `second` on both models:
+  - B's request was refused after 30.0 s, with "Compute error." in the stream. After A, B answered with A's text.
+  - B came up after 65.1 s (0.6B) and 71.1 s (4B) beside A, as in the quick run.
+
+Other readings:
+- **Few-token tails at depth: T1's subject, now as TTFT.** At depth 4096 on Qwen3-4B, 26 tokens take 7.25 s, 38 take 10.56 s and 63 take 17.58 s. 64 take 1.67 s and 110 take 3.00 s. On Qwen3-0.6B: 2.80, 4.11 and 6.88 s, against 0.54 and 0.94 s.
+  - Per token and cached position, from depth 256 to 8192: tails of 12 to 63 cost about 71 µs on Qwen3-4B and 27 µs on Qwen3-0.6B. Tails of 64 and 110 cost 4.3 µs and 1.7 µs on the same two models. That is about 16 times, on both.
+  - Between the models the ratio is 2.6, their attention work per position (36 layers of 32 query heads against 28 of 16: 2.57). So the cost is attention: the one-chunk kernels below 64 rows (`batch-one.md` §2; inference).
+- **Small tails follow the KV-head split's rule.** The split reads a chunk once for all tokens only when query heads × tokens is 2, 4, 8 or 16 (`build.md` §7, the switch table). Qwen3-4B has 4 query heads per KV head, Qwen3-0.6B 2.
+  - So 3 tokens on both models, and 8 on Qwen3-4B, take one pass per token.
+  - At depth 8192, 3 tokens take 491 ms against 345 for 4 on Qwen3-4B, and 340 against 174 on Qwen3-0.6B. 8 tokens take 1.20 s on Qwen3-4B and 210 ms on Qwen3-0.6B.
+- **`chat`, thinking off.**
+  - Turn 2 kept nothing. No slot's common prefix reached the server's 0.1 similarity threshold, so turn 2 took an unused slot by LRU (the servers' logs; 4 slots in one unified cache). It stayed on that slot from turn 3.
+  - The first event grew to 12.5 s at turn 19 (0.6B) and 36.7 s at turn 17 (4B).
+  - On Qwen3-4B, turn 17's reply stopped at 185 tokens, where the context was full (7,985 + 534 + 185 = 8,704). Turn 18 was refused (below).
+- **`chat`, thinking on.** The history keeps only the visible answers, so a turn decoded 16 to 195 tokens on Qwen3-4B, and 21 to 335 on Qwen3-0.6B.
+  - On Qwen3-4B most of them are few-token tails at depth: turn 16 decoded 19 tokens after 624 cached in 935 ms. On Qwen3-0.6B, turn 18 decoded 21 tokens after 3,539 in 1.92 s.
+  - On Qwen3-4B, 12 of 20 turns spent all 512 tokens reasoning. Where there was visible text, it came 6.3 to 19.7 s after the request on Qwen3-0.6B and 34.2 to 55.0 s on Qwen3-4B.
+- **Time outside `prompt_ms` on chat requests.** It grows from 35 ms at turn 1 to between 109 and 148 ms at turn 20, on both models and in both modes.
+  - The servers' logs show part of it: 44 to 90 ms between choosing the slot and starting it, on turns that keep less than half the slot's cache (thinking on, until the history grows). That is the prompt cache saving the slot's state; on every other turn the gap is 0.1 ms.
+  - The rest grows by about 4 to 7 ms per turn. By inference it is the template and tokenizing of the whole history, before the slot is chosen; it is not measured.
+  - Turn 2 with thinking off, on a fresh slot, has 40 to 50 ms more. That is not explained.
+- **`cancel`: C10's wait, as read.** The follow-up waited 18.4 s (0.6B) and 61.4 s (4B) after a close 2 s into a 2048-token tail at depth 4096.
+  - The server reads its queue only between `llama_decode` calls, and `-b` 2048 makes the tail one call, so the whole tail ran.
+  - These are the figures that T10 and T11 are measured against.
+- **`tg512`.** p50 10.56, 9.83 and 7.53 t/s from depths 0, 500 and 4096 on Qwen3-4B; 46.58, 36.98 and 19.16 on Qwen3-0.6B. The ten runs at each depth lie within 0.4%, with the thermal zones at 64 to 78 °C, so no throttling showed.
+- **The targets** (`batch-one.md` §5), Qwen3-4B / Qwen3-0.6B:
+  - a chat turn at depth 4096: 3.00 to 10.56 s / 0.94 to 4.11 s by tail;
+  - a fresh 500-token prompt: 5.21 / 0.95 s;
+  - tg512 from depth 4096: 7.53 / 19.16 t/s;
+  - tg512 from depth 0 is the baseline itself.
+
+  So Qwen3-4B misses all three targets it is measured on. Qwen3-0.6B meets all but the chat turns of 26 and 38 tokens.
+
+The harness's own faults:
+- **`chat`'s servers ran `-c 8704`**, the measuring servers' size, which holds depth 8192 and a tail. 20 turns of up to 512 tokens need about 10.3k positions, so Qwen3-4B's thinking-off run ran out: HTTP 400 at turn 18 (8,725 tokens).
+- **`alongside` ended at the first error**, so on Qwen3-0.6B the reply after the loop was never asked.
+
+**Fixes after them (2026-11-09).**
+- `chat`'s servers run `-c 12288` (`CHAT_N_CTX`); the measuring servers keep 8704.
+- `alongside` keeps an error in the stream in its row, and goes on to the next request and the reply after the loop. Any other error still ends the case.
+
+Tested on the Mac (the coder, then rerun by me):
+- `alongside` with stand-ins for the server, the stream and the IME loop:
+  - with an error in the stream at beside 2, all 9 requests were asked, "3 of 5 beside equal", and the reply after the loop was there;
+  - with a refused connection at beside 2, the case ended there, with "after: none".
+- `--quick --cases chat`: both servers at `n_ctx_slot = 12288`, 3/3.
+- `--quick --cases alongside` with the stand-in IME build: 2 of 2 equal, the reply after the loop asked, 1/1, no process left.
+
+Not run: the fixes on the K3.
+
+**Next on the K3.** Qwen3-4B's `chat` again, and its `alongside` with `--alongside-no-tcm`, in one run of about an hour (estimate). Predictions (inference):
+- thinking off: 20 of 20 turns, turn 17's reply no longer cut at 185 tokens, and the first event growing to about 42 s at turn 20;
+- thinking on: the same replies as this run, since the context never reached it;
+- `alongside` without TCM: 5 of 5 equal, as on Qwen3-0.6B.
+
+That completes the baseline. `batch-one.md` §5's order then goes on: the embedding lookup, then T1.
+
+**The TCM clash, decided by the user 2026-11-09** ("agreed 1 and 3 now", of the three options I gave):
+- Our runs are kept apart from IME runs with TCM. Every K3 block that starts the provider first lists the processes with `/dev/tcm` mapped, and starts nothing if there is one (`PROJECT.md` §6). That cannot catch an IME run starting during ours.
+- The clash goes to SpacemiT through the mentor (§7, question 8). The note was drafted the same day.
+- Not now: the provider taking the IME path's marks around its compute, so that the two take turns on a block. That needs a spec. A provider killed in mid-compute would leave its marks held, so the provider would also have to clear dead owners, which changes shared board state.
 
 ### Not planned
 
@@ -2379,6 +2476,6 @@ Outside FlagOS (approved by the mentor as fork patches, 2026-10-14; `upstream-ch
 5. Target for Phase 0: Qwen3-4B Q4_0 (SpacemiT has reference numbers) or Qwen3.5-4B Q4_K_M (comparable with AMD, but needs lossy Q4_K/Q6_K repacks and gated-delta-net ops early)?
 6. Is FlagTree AOT (M3) in scope, and should it be cross-compiled on x86 or built on the K3? Refined with the M3 design (2026-10-14): which compiler, FlagTree's copy of the SpacemiT backend or SpacemiT's more mature `spine-triton`? Compile on x86 in FlagTree CI's Docker image, or on the K3? Manifest: AMD's format 2 extended to the §9.4 envelope, or the mentor design's v3 (semantic op, constraints, `kernel_abi_hash`)? Packages out of git, as AMD's? And is success an AOT op that runs (the FlagOS path shown on the K3), or only AOT ops that are at least as fast as the hand-written kernels?
 7. Is co-building in `providers/spacemit` agreed with SpacemiT, given they ship ggml-spacemit as an `ACCEL` backend?
-8. Should we report the TCM issues to SpacemiT (no dead-owner recovery; `try_wait` timeout unit about 12 µs, not 1 µs)? Also a CPU-backend crash whose register state the program cannot produce, now seen twice at the same instruction (2026-10-09 and 2026-10-13, both in long CPU-only runs; targeted tests with about 80 million page faults did not reproduce it). The second time the crash reporter captured the registers: every register matches the loop's state except `a2`, which is 0 where the code had just set it to a valid pointer, so something outside the program cleared it (kernel or core; `build.md` §7). And, found by reading: the 1-row Q4_1 IME kernel's active branch multiplies zero point and activation sum in 16 bits (R12).
+8. Should we report the TCM issues to SpacemiT (no dead-owner recovery; `try_wait` timeout unit about 12 µs, not 1 µs)? Also a CPU-backend crash whose register state the program cannot produce, now seen twice at the same instruction (2026-10-09 and 2026-10-13, both in long CPU-only runs; targeted tests with about 80 million page faults did not reproduce it). The second time the crash reporter captured the registers: every register matches the loop's state except `a2`, which is 0 where the code had just set it to a valid pointer, so something outside the program cleared it (kernel or core; `build.md` §7). And, found by reading: the 1-row Q4_1 IME kernel's active branch multiplies zero point and activation sum in 16 bits (R12). New 2026-11-09, to report now by the user's decision (`k3-hardware.md` §4; "TTFT harness spec", full K3 runs): spine-runtime's TCM takes no libspine_tcm mark, so a spine-runtime process and an IME-path process with TCM overwrite each other's blocks. The spine-runtime side's results are then wrong with no error: 0 of 5 replies equal on both models, against 5 of 5 with the IME side's TCM off. The note for SpacemiT, drafted the same day, asks whether spine-runtime should take the mark or how the two should share the board, and repeats the two TCM points above.
 9. ~~ACCEL gaps in llama.cpp (C5, §6)~~ decided: the mentor approved both fork patches, (a) the automatic flash-attention check (`64e6cbd`) and (b) norm pinning (`f1cf809`), 2026-10-14 (reported by the user), so M2e.2 is not needed. The question was: patch both in our fork, or raise an upstream llama.cpp issue? Without them ACCEL needs `-fa on` and generates 30-39% slower (`device-type.md` §5, X3b).
 10. ~~Order after M2d~~ decided by the user 2026-10-10: M2c first, starting with the Q4_1 matmuls (M2c.1), then the Q6_K head (M2c.2), then M2e. The question was: M2c (Q4_1 and Q6_K on the AI cores), then M2e (attention)? Measured on the K3 (`build.md` §7, M2d): moving the 4 Q4_1 `ffn_down` matmuls alone raises pp128 from 53 to 83 t/s, past the pp128 target, and moving the head saves about 12-25 ms per token; attention on the X100 cores costs +445 ms per token at a context of 4096 tokens (IME: +68 ms), so M2e decides generation speed at long context. M2e brings the flash-attention question of item 9 (C5a) back.

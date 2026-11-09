@@ -9,7 +9,7 @@ Written 2026-11-04 on the user's request. This is analysis: nothing here is impl
 ## 1. Conclusions
 
 1. **A batch-one request crosses three regimes with three different bounds** (§2), so one optimization does not serve all three criteria: tg512 is bound by DRAM bandwidth, a chat turn's TTFT by one-chunk attention at depth, and a fresh prompt's TTFT and pp by compute.
-2. **TTFT is not monotonic in prompt length today.** At 4096 cached positions 63 tokens take 17.2 s and 64 tokens 1.67 s (measured rates). Below 64 tokens, decoding less can cost more.
+2. **TTFT is not monotonic in prompt length today.** At 4096 cached positions 63 tokens take 17.2 s and 64 tokens 1.67 s (measured rates). Below 64 tokens, decoding less can cost more. Measured as the time to the first token by the TTFT harness, 2026-11-09: 17.6 s and 1.67 s (`plan.md` "TTFT harness spec", full K3 runs).
 3. **A real Qwen3 chat turn does not decode "12 tokens".** Qwen3's template drops the think block from earlier assistant turns, so the cached prefix breaks at the start of the last reply and the server re-decodes that whole reply (measured on the Mac, §7): with thinking off 109 tokens where the new turn is 26, with it on 138 where the new turn is 22. Earlier notes' "12-token turn, 3.3 s" holds only when the prefix is kept. The runner's follow-ups use `/completion`, so no acceptance check sees this.
 4. **The tails that matter are about 20 to 130 tokens, and the KV-head split does not reach most of them.** On Qwen3-4B it takes 1, 2 or 4 tokens in one read per call, and 3 and 5 to 8 with one read per token, a quarter of today's reads. The threshold experiment for 9 to 63 tokens is therefore the top kernel item for TTFT, ahead of the KV-head result.
 5. **The largest TTFT wins need no kernel work.** Restoring a saved system prompt turned 21.6 s into 1.73 s on the Mac's simulated device with the same reply text (§7).
@@ -50,7 +50,13 @@ TTFT today:
 | Prompt tail | 64 | 4,096 | 1.67 s | measured rate, pp64 |
 | Chat turn after a longer reply, default server | 110 | 4,096 | about 2.9 s | estimate at pp64's rate |
 
-Generation against depth (tg32, measured): 89.3, 102.6, 111.4, 129.0 and 164.2 ms per token at 0, 1,024, 2,048, 4,096 and 8,192 cached positions. tg512 itself has never been run; from depth 0 it should be about 10.5 t/s and from depth 4096 about 7.6 (estimates, integrating this line).
+Measured by the TTFT harness, 2026-11-09 (client ms p50; `plan.md` "TTFT harness spec", full K3 runs):
+- fresh prompts: 500 tokens 5.21 s, 4,095 tokens 73.2 s;
+- at depth 4096: 1 token 136 ms, 12 3.34 s, 26 7.25 s, 38 10.56 s, 63 17.58 s, 64 1.67 s, 110 3.00 s.
+
+Every estimate in the table is within 6% of these figures.
+
+Generation against depth (tg32, measured): 89.3, 102.6, 111.4, 129.0 and 164.2 ms per token at 0, 1,024, 2,048, 4,096 and 8,192 cached positions. tg512 itself has never been run; from depth 0 it should be about 10.5 t/s and from depth 4096 about 7.6 (estimates, integrating this line). Measured 2026-11-09: 10.56 and 7.53 t/s, the p50 of ten runs each.
 
 Depth's cost, measured by the op counters (2026-11-05, `plan.md` "attention at depth by the op counters"): attention is 13.9%, 31.5% and 46.3% of a one-row graph at n_kv 1,280, 4,352 and 8,448, and 37.0%, 67.4% and 79.8% of a 512-row graph at n_kv 1,536, 4,608 and 8,704; everything else stays at 88 ms and about 4.65 s. The KV-head split, the default since 2026-11-05, takes 2 to 8 tokens at depth 4096 from 3.18 to 3.51 t/s to 9.44 to 17.71 t/s (pp4: a graph of 1,166 to 226 ms; `plan.md`); the table above predates it, and 9 to 63 tokens stay as they are.
 
@@ -69,25 +75,25 @@ None of these is an acceptance check today except where noted. Grid sizes are pr
 
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
-| C3 | TTFT against prompt length: 1 to 5, 8, 9, 16, 32, 63, 64, 65, 128, 256, 511 to 513, 575, 576, 1024, 2048, 4095 | Path thresholds, n_kv steps at multiples of 256, ubatch tails | Rows table at depth 0; not swept as TTFT |
+| C3 | TTFT against prompt length: 1 to 5, 8, 9, 16, 32, 63, 64, 65, 128, 256, 511 to 513, 575, 576, 1024, 2048, 4095 | Path thresholds, n_kv steps at multiples of 256, ubatch tails | Measured 2026-11-09 by the TTFT harness (`plan.md`). At depth 0 on Qwen3-4B: 1 token 94 ms, 63 676 ms against 556 ms for 64, 500 5.21 s, 4,095 73.2 s. On Qwen3-0.6B: 23 ms, 121 against 98 ms, 955 ms, 19.6 s |
 | C4 | New conversations sharing a system prompt, decoded against restored | The snapshot lever | Mac only, §7 |
 
 **Depth and chat**
 
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
-| C5 | Grid: tails of 1, 2, 3, 4, 8, 12, 26, 38, 63, 64, 110 × depths 0, 256, 1024, 2048, 4096, 8192 | The few-token regime; the main TTFT map | pp12, pp63, pp64 at 4096; blocks 3 and 4 add 2, 3, 4, 8 |
-| C6 | A real client: 20 turns through `/v1/chat/completions`, thinking on and off, reading `cache_n` and `prompt_n` per turn | Prefix breaks, TTFT growth over a conversation | 3 turns on the Mac, §7; none on the K3 |
+| C5 | Grid: tails of 1, 2, 3, 4, 8, 12, 26, 38, 63, 64, 110 × depths 0, 256, 1024, 2048, 4096, 8192 | The few-token regime; the main TTFT map | Measured 2026-11-09 on both models (the harness; `plan.md`). At depth 4096 on Qwen3-4B: 12 tokens 3.34 s, 26 7.25 s, 38 10.56 s, 63 17.58 s, against 1.67 s for 64 and 3.00 s for 110. Per cached position, 12 to 63 tokens cost about 16 times what 64 and 110 do, on both models. 3 tokens on both, and 8 on Qwen3-4B, take one pass per token (the KV-head split's rule) |
+| C6 | A real client: 20 turns through `/v1/chat/completions`, thinking on and off, reading `cache_n` and `prompt_n` per turn | Prefix breaks, TTFT growth over a conversation | Measured on the K3 2026-11-09 (`plan.md`). Thinking off decodes the last reply again every turn (533 to 537 tokens on Qwen3-4B); the first event reached 36.7 s at turn 17 on Qwen3-4B and 12.5 s at turn 19 on Qwen3-0.6B. Qwen3-4B's run stopped at turn 18 on the harness's context (fixed, to run again). Thinking on, turns decode 16 to 335 tokens, few-token tails at depth: 19 tokens after 624 took 935 ms on Qwen3-4B. Outside `prompt_ms`: 35 ms at turn 1 and 109 to 148 ms at turn 20, growing 4 to 7 ms a turn; on turns keeping under half the cache, 44 to 90 ms more for the prompt cache's save |
 | C7 | Regenerate; edit an early message; branch back | Prefix loss, `--cache-reuse` under edits | One shift check, depth about 100 |
 | C8 | Two conversations interleaved at depth | Prompt-cache save and load of up to 576 MiB of KV | Only at about 60 positions |
 | C9 | Context full | Shift, truncation or refusal: a TTFT spike or an error | Not measured in the server |
-| C10 | Cancel during prefill at depth, then a new request | Time the next request waits | By reading, no abort path: the provider exposes no `ggml_backend_set_abort_callback`, the server sets none, and it reads its queue between `llama_decode` calls of up to `-b` 2048 tokens, so up to about 57 s at depth 4096 (estimate) |
+| C10 | Cancel during prefill at depth, then a new request | Time the next request waits | By reading, no abort path: the provider exposes no `ggml_backend_set_abort_callback`, the server sets none, and it reads its queue between `llama_decode` calls of up to `-b` 2048 tokens, so up to about 57 s at depth 4096 (estimate). Measured 2026-11-09 (`plan.md`): 61.4 s on Qwen3-4B and 18.4 s on Qwen3-0.6B, after a close 2 s into a 2048-token tail at depth 4096 |
 
 **Generation**
 
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
-| C11 | tg512 from depths 0, 500, 4096, ten runs back to back, speed per 100 tokens, reading the thermal sensors | The criterion itself, sustained load, throttling | tg128 and tg32 only |
+| C11 | tg512 from depths 0, 500, 4096, ten runs back to back, speed per 100 tokens, reading the thermal sensors | The criterion itself, sustained load, throttling | Measured 2026-11-09 (`plan.md`): p50 10.56, 9.83 and 7.53 t/s from depths 0, 500 and 4096 on Qwen3-4B; 46.58, 36.98 and 19.16 on Qwen3-0.6B. The ten runs lie within 0.4%, at 64 to 78 °C: no throttling seen |
 | C12 | Sampling: top-k and top-p, repetition penalty, grammar, `n_probs` | Host work per token on 151,936 logits | Default sampling only |
 | C13 | Speculation by prompt type (code, prose, question, repetitive), n-gram and draft model | Whether a gain survives real text and depth | Draft model only: 1.30 to 1.61 on code, at most 1.07 on prose |
 
@@ -95,8 +101,8 @@ None of these is an acceptance check today except where noted. Grid sizes are pr
 
 | # | Case | What it challenges | Known today |
 |---|---|---|---|
-| C14 | `kill -9` during prefill, restart, first token | Whether anything outlives a killed process. Not the TCM mark, which the provider does not hold while computing (2026-11-06, `plan.md` "S2's exit against the results"), so read what the next run gets: the cores, `/dev/tcm` mapped, the same speed, `libspert` falling back to the heap silently | Not measured |
-| C15 | A second process wanting the AI cores (a second context needs none since S2's step 2). Proposed 2026-11-06: an IME process as the second, which does not ask spine-runtime and takes a TCM mark the provider ignores | Each failure costs about 30 s, then an abort, retried on the next run; replies going wrong with no error (inference, `plan.md`) | Seen with speculation; the wait is inferred to be spine-runtime's. On the K3 2026-11-08 (`--quick`; `plan.md` "TTFT harness spec", first K3 run): a refused decode took 30.0 s and reached the streaming client as "Compute error." after a 200, and once A stopped B answered with A's text. Beside the IME build's `llama-bench`, 0 of 2 replies at temperature 0 equal the reference, with no error; the cause is being tested |
+| C14 | `kill -9` during prefill, restart, first token | Whether anything outlives a killed process. Not the TCM mark, which the provider does not hold while computing (2026-11-06, `plan.md` "S2's exit against the results"), so read what the next run gets: the cores, `/dev/tcm` mapped, the same speed, `libspert` falling back to the heap silently | Measured 2026-11-08/09 (`plan.md`): 3 rounds on each model. The new server came up after 5.0 s and 11.0 s, with no block marked, nine `/dev/tcm` lines, no "could not get", and tg64 within 0.8% of before: nothing outlived the killed process |
+| C15 | A second process wanting the AI cores (a second context needs none since S2's step 2). Proposed 2026-11-06: an IME process as the second, which does not ask spine-runtime and takes a TCM mark the provider ignores | Each failure costs about 30 s, then an abort, retried on the next run; replies going wrong with no error (inference, `plan.md`) | Seen with speculation; the wait is inferred to be spine-runtime's. On the K3 2026-11-08 (`--quick`; `plan.md` "TTFT harness spec", first K3 run): a refused decode took 30.0 s and reached the streaming client as "Compute error." after a 200, and once A stopped B answered with A's text. Beside the IME build's `llama-bench`, 0 of 2 replies at temperature 0 equal the reference, with no error. The cause is TCM (the full runs, 2026-11-09): with the IME loop's TCM off, 5 of 5 equal; with it on, 0 of 5 on both models, garbled from the first characters and right again once the loop stopped. The full runs repeated the 30.0 s refusal on both models |
 | C15b | 1, 2, 4 and 8 AI cores on the one-row matmuls and on attention at depth | Whether the weight stream saturates before 8 cores (Codex's point, §8) | Not measured; needs a test-only core count |
 | C16 | A fixed memory load on the X100 cores | The weight stream shares DRAM with a shared board's other work | Not measured |
 | C17 | `-c` 8192 to 32768 | KV at 144 KiB per position, prompt cache 8 GiB by default, 31 GiB RAM and no swap | Attention extrapolates to about 280 ms per token at 32768 (estimate) |
@@ -158,7 +164,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 
 **After S2:**
 
-1. A TTFT harness: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline. Built 2026-11-08 as a script beside the runner, `tools/spacemit_ttft.py` (`plan.md` "TTFT harness spec" and its result; usage in `build.md` §6). First K3 run the same day, `--quick`, 11/11; the full runs are next.
+1. A TTFT harness: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline. Built 2026-11-08 as a script beside the runner, `tools/spacemit_ttft.py` (`plan.md` "TTFT harness spec" and its result; usage in `build.md` §6). First K3 run the same day, `--quick`, 11/11. The full runs followed that night: 13/13 on Qwen3-0.6B and 12/13 on Qwen3-4B, its one failure the harness's chat context (fixed 2026-11-09; that case to run again).
 2. T1, with T5's result beside it.
 3. T2, T3 and T10, each against the baseline with its accuracy check.
 4. Block 6's per-op figures, then T7.
@@ -166,7 +172,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 6. T6, if cold start matters to the deployment.
 7. T8 or T9, only if attention at depth is still the largest cost at the depths that matter.
 
-**Targets, agreed by the user 2026-11-06:** chat turn at depth 4096 at most 1 s; new conversation with a saved system prompt at most 0.5 s; fresh 500-token prompt at most 4 s; tg512 from depth 0 no worse than today, and from depth 4096 at least 9 t/s.
+**Targets, agreed by the user 2026-11-06:** chat turn at depth 4096 at most 1 s; new conversation with a saved system prompt at most 0.5 s; fresh 500-token prompt at most 4 s; tg512 from depth 0 no worse than today, and from depth 4096 at least 9 t/s. Against the baseline (2026-11-09, `plan.md`), Qwen3-4B: a chat turn at depth 4096 takes 3.00 to 10.56 s by tail, a fresh 500 tokens 5.21 s, and tg512 from depth 4096 runs at 7.53 t/s. Qwen3-0.6B meets every target but the chat turns of 26 and 38 tokens (2.80 and 4.11 s).
 
 ## 6. How to measure so the results hold
 

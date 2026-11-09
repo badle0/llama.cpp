@@ -38,8 +38,10 @@ import spacemit_check as sc
 
 CASES = ["grid", "chat", "cancel", "tg512", "restart", "second", "alongside"]
 N_CTX = 8704
+# chat: 20 turns of up to 512 tokens fill about 10.3k positions; 8704 ran out at turn 18 on Qwen3-4B
+CHAT_N_CTX = 12288
 MEASURE_FLAGS = ["-t", "8", "-np", "1", "-c", str(N_CTX), "--cache-ram", "0"]
-CHAT_FLAGS = ["-t", "8", "-c", str(N_CTX)]
+CHAT_FLAGS = ["-t", "8", "-c", str(CHAT_N_CTX)]
 BASE_MIN = 16384
 GRID_DEPTH0 = [1, 2, 3, 4, 5, 8, 9, 16, 32, 63, 64, 65, 128, 256, 500, 511, 512, 513, 575, 576, 1024, 2048, 4095]
 GRID_DEPTH0_QUICK = [1, 4, 9, 64, 65]
@@ -917,7 +919,8 @@ def case_alongside(ctx):
             time.sleep(0.2)
         for i in range(1, n_beside + 1):
             _, err = ask("beside", i)
-            if err:
+            # an error in the stream came after the 200: the server answered, wrongly, so the next requests still ask
+            if err and not err.startswith("error in the stream"):
                 ended = f"beside {i}: {err}"
                 return
         loop.finish(600)
