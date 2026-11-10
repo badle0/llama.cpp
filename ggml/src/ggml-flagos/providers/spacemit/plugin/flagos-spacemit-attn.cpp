@@ -26,10 +26,44 @@ namespace {
 // largest DK and DV: one register group of the RVV kernels at VLEN 1024, and the reference's local arrays
 constexpr int64_t max_head_size = 128;
 
-#if defined(GGML_FLAGOS_SPACEMIT_RVV)
-// from this many tokens per head the tiled kernel runs (ggml-cpu's ggml_fa_tile_config::Q, as in ime.cpp)
+// from this many tokens per head the tiled kernel runs (ggml-cpu's ggml_fa_tile_config::Q, as in ime.cpp);
+// FLAGOS_SPACEMIT_ATTN_TILED overrides it for tests
 constexpr int64_t tiled_min_rows = 64;
-#endif
+
+// test-only (plan.md "T1 spec"): FLAGOS_SPACEMIT_ATTN_TILED=<n>, the tiled kernel from n tokens per call, n decimal
+// digits only, 1 to 64; unset or empty: tiled_min_rows. Parsed once (spacemit_cached_switch); anything else keeps the
+// default with a warning, once per parse generation rather than per process, so that the check program sees each bad
+// value's, and once only when two tiles parse in the same generation
+int parse_tiled_setting() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN_TILED");
+    if (v == nullptr || *v == '\0') {
+        return (int) tiled_min_rows;
+    }
+    int64_t      n = 0;
+    const char * c = v;
+    for (; *c >= '0' && *c <= '9' && n <= tiled_min_rows; ++c) {  // stops past 64, so no overflow
+        n = n * 10 + (*c - '0');
+    }
+    if (*c == '\0' && n >= 1 && n <= tiled_min_rows) {
+        return (int) n;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };  // the generation last warned in; generations start at 1
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN_TILED=%s: not a token count from 1 to 64, the default %lld kept\n",
+                      __func__, v, (long long) tiled_min_rows);
+    }
+    return (int) tiled_min_rows;
+}
+
+int tiled_setting_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_tiled_setting);
+}
+
+// test-only (spacemit_attn_paths_take): the calls of spacemit_kernel_flash_attn by the kernel its tile 0 ran
+std::atomic<uint64_t> g_attn_tiled{ 0 }, g_attn_one_chunk{ 0 }, g_attn_reference{ 0 };
 
 bool divides(int64_t d, int64_t n) {
     return d > 0 && n % d == 0;
@@ -581,21 +615,34 @@ bool spacemit_kernel_flash_attn(const spacemit_tile * tile_p, ggml_tensor * dst)
     if (ir0 >= ir1) {
         return true;
     }
+    // read on the reference path too, so that a bad value is reported there (the check program's values on the Mac)
+    const int64_t tiled_from = tiled_setting_from_env();
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     // the copied kernels need VLEN 1024, read on the core that runs them (ime.cpp checks the same); the tiled kernel
     // keeps its scratch in TCM, the one-chunk kernels use TCM when there is some and otherwise go row by row
     const int64_t DK = dst->src[1]->ne[0];
     const int64_t DV = dst->src[2]->ne[0];
     if (!spacemit_use_reference() && __riscv_vlenb() == 128 && spacemit_rvv_attn::supported_shape(DK, DV)) {
-        if (q->ne[1] >= tiled_min_rows && tile.tcm != nullptr &&
+        if (q->ne[1] >= tiled_from && tile.tcm != nullptr &&
             tile.tcm_size >= spacemit_rvv_attn::tiled_scratch_bytes(DK, DV)) {
+            if (tile.ith == 0) {
+                g_attn_tiled.fetch_add(1, std::memory_order_relaxed);
+            }
             spacemit_rvv_attn::forward_tiled(dst, ir0, ir1, tile.tcm, tile.tcm_size);
         } else {
+            if (tile.ith == 0) {
+                g_attn_one_chunk.fetch_add(1, std::memory_order_relaxed);
+            }
             spacemit_rvv_attn::forward_one_chunk(dst, ir0, ir1, tile.tcm, tile.tcm_size);
         }
         return true;
     }
+#else
+    (void) tiled_from;
 #endif
+    if (tile.ith == 0) {
+        g_attn_reference.fetch_add(1, std::memory_order_relaxed);
+    }
     flash_attn_ref(dst, ir0, ir1);
     return true;
 }
@@ -608,6 +655,13 @@ int spacemit_flash_attn_split(const ggml_tensor * op) {
 void spacemit_flash_attn_read_switch() {
     (void) split_setting_from_env();
     (void) kvh_setting_from_env();
+    (void) tiled_setting_from_env();
+}
+
+void spacemit_attn_paths_take(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference) {
+    *tiled     = g_attn_tiled.exchange(0);
+    *one_chunk = g_attn_one_chunk.exchange(0);
+    *reference = g_attn_reference.exchange(0);
 }
 
 bool spacemit_flash_attn_one_step_supported(const ggml_tensor * op) {

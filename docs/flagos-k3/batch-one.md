@@ -165,7 +165,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 **After S2:**
 
 1. A TTFT harness: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline. Built 2026-11-08 as a script beside the runner, `tools/spacemit_ttft.py` (`plan.md` "TTFT harness spec" and its result; usage in `build.md` §6). First K3 run the same day, `--quick`, 11/11. The full runs followed that night: 13/13 on Qwen3-0.6B and 12/13 on Qwen3-4B, its one failure the harness's chat context (fixed 2026-11-09). That case and Qwen3-4B's `alongside` without TCM ran again the same day, 3/3, which completes the baseline.
-2. T1, with T5's result beside it. Next (the user, 2026-11-09, ahead of the embedding lookup); its spec in `plan.md` "T1 spec".
+2. T1, with T5's result beside it. Next (the user, 2026-11-09, ahead of the embedding lookup); its spec in `plan.md` "T1 spec". Step 1 (the switch, the checks, the K3 script) built 2026-11-10; its K3 run next.
 3. T2, T3 and T10, each against the baseline with its accuracy check.
 4. Block 6's per-op figures, then T7.
 5. G1 (could run any time, it needs no provider change), G3 and G2's KLD.

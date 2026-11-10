@@ -18,9 +18,12 @@ bool spacemit_kernel_flash_attn(const spacemit_tile * tile, ggml_tensor * dst);
 // spacemit_flash_attn_split tells the contracts apart: 2 the split with the turns (the default), 1 the split without
 // them, 0 the one-step op above (other calls, or FLAGOS_SPACEMIT_ATTN=one-chunk)
 int    spacemit_flash_attn_split(const ggml_tensor * op);
-// reads FLAGOS_SPACEMIT_ATTN and FLAGOS_SPACEMIT_ATTN_KVH at registration, so that their warnings are not lost in
-// llama.cpp's trial load (common/fit.cpp)
+// reads FLAGOS_SPACEMIT_ATTN, FLAGOS_SPACEMIT_ATTN_KVH and FLAGOS_SPACEMIT_ATTN_TILED at registration, so that their
+// warnings are not lost in llama.cpp's trial load (common/fit.cpp)
 void   spacemit_flash_attn_read_switch();
+// test-only: the calls of spacemit_kernel_flash_attn since the last call by the kernel that ran (counted by tile 0):
+// the tiled kernel, the one-chunk kernels, the reference. flagos-check-spacemit checks FLAGOS_SPACEMIT_ATTN_TILED by it
+void   spacemit_attn_paths_take(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference);
 size_t spacemit_flash_attn_split_workspace(const ggml_tensor * node);
 bool   spacemit_kernel_flash_attn_split_partial(const spacemit_tile * tile, ggml_tensor * dst);
 bool   spacemit_kernel_flash_attn_split_partial_paired(const spacemit_tile * tile, ggml_tensor * dst);

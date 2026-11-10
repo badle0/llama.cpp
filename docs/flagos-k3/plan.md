@@ -2488,9 +2488,11 @@ Also `tests/check_spacemit.cpp` 4948 -> 4881, a comment in `core/flagos-spacemit
 - perplexity and KLD to the last digit;
 - speed within spread.
 
+**Result on the K3 (2026-11-10; `build.md` §7 "The cleanup before T1 on the K3"):** all four as predicted. 49/49 and 47/47; 16/16 replies equal on both models; every perplexity and KLD line to the last digit; Qwen3-4B pp128 106.80 and tg128 11.07 against block A's 106.24 and 11.09, Qwen3-0.6B pp128 -1.5%, within the board's spread. Line by line against block A, only the removal's own parts of the check program's line differ (the KV-head split on 30 cases, its figures as before; the stream line 1090/1090). Closed.
+
 ### T1 spec: the tiled kernel below 64 tokens, for review (2026-11-09)
 
-**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Nothing implemented. Step 1 adds a test-only switch and leaves every default path bit for bit today's; step 2, the new default, follows only if the rule below passes. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above).
+**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Step 1 implemented 2026-11-10 (the user: "start working on t1") and checked on the Mac ("Step 1 as built" below); its K3 run is the user's. Step 1 adds a test-only switch and leaves every default path bit for bit today's; step 2, the new default, follows only if the rule below passes. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above), before step 1's changes.
 
 **Why.** From 9 to 63 tokens per call, attention takes the one-chunk kernels, which read a KV head's whole cache once per token and query head. From 64 tokens the tiled kernel reads it once per query head for a tile of up to 64 tokens. The switch-over is one comparison against `tiled_min_rows = 64` (`plugin/flagos-spacemit-attn.cpp:31`, used at `:590`), ggml-cpu's tile size, never measured on the K3. The full runs' grid (above; Qwen3-4B, client p50, ms):
 
@@ -2554,6 +2556,27 @@ Also `tests/check_spacemit.cpp` 4948 -> 4881, a comment in `core/flagos-spacemit
 **Time:** step 1 is one coder session and my check on the Mac, then on the K3 one build and about 1.5 hours of runs (estimate: the benchmark about 5 minutes, llama-bench about 20 on Qwen3-4B and 7 on Qwen3-0.6B, the four KLD passes about 26). Step 2: a small change and about 2 hours of runs (estimate).
 
 **Not covered:** 2 to 8 tokens (the KV-head split stays; the tiled kernel against it at 5 to 8 tokens, where the split takes one pass per token on Qwen3-4B, is a later comparison); a faster tiled kernel (T7, or one KV head per tile); 64 tokens and up (unchanged); Qwen3-0.6B's KLD at 4096 (no base on the board; its runner's KLDs use 512-row ubatches).
+
+**Step 1 as built (2026-11-10).** The coder from my brief, which added four decisions to the spec:
+- A bad value warns once per parse generation (`spacemit_switches_generation`), not once per process as the other switches do. The check program changes the switch inside one process and must see each bad value's warning, or the mutation "65 taken" goes uncaught. Outside the check program the generation never changes, so it warns once, at registration.
+- The kernel reads the switch before its RVV branch, so the reference path (the Mac, `GGML_FLAGOS_KERNEL_VARIANTS=0`) parses it too and the values check works there: one cached read per call and tile.
+- The benchmark is `bench_attn_tiled`, under `--bench-attn` only, so the runner's `--bench` pass keeps its length (900 s limit).
+- The K3 runs are one script, `scripts/t1-experiments.sh` (`run [out]`, `summary <out>`): the build, the checks (a failure stops it), `--bench-attn`, llama-bench on both models (`64` and `9`, two turns, the order reversed on the second), the four KLD runs. The base is only read: every run passes both `--kl-divergence-base` and `--kl-divergence`, and its size and sha256 are recorded before and after. The summary gives the tables; the rule is applied by hand.
+
+The block has the 33 cases listed above. The changes: `plugin/flagos-spacemit-attn.cpp` (the switch and its parser, `tiled_min_rows` out of the RVV `#if`, the counter), `-attn.h`, `-plugin.cpp` (the ninth name), `core/flagos-spacemit-plugin.h` (its typedef), `tests/check_spacemit.cpp` (the pin, the block, the values, `bench_attn_tiled`; `log_capture` moved up), and the script.
+
+**Step 1 on the Mac (2026-11-10; the coder, then I again):**
+- `build-host` and `build-nohost` without warnings; the riscv64 syntax check of `flagos-spacemit-attn.cpp` and the spine-runtime branch against the stub: 0 errors.
+- The check program: all checks pass. Against its output before the change only the loader line (9 names, were 8), the two new `attn` lines and the plan line's wall clock differ. The block: against the CPU max NMSE 8.78e-05 and worst row 2.36e-04; against the CPU's tiled kernel on 64 tokens worst row 4.42e-07 (bound 1e-5); the reference by the counter in 33/33; two runs identical in 33/33. The values: one warning for each of `0`, `65`, `9x` and `x`, none for the others, 10/10. All checks pass also under `GGML_FLAGOS_KERNEL_VARIANTS=0`, `FLAGOS_SPACEMIT_ATTN=split`, `MM=split`, `QUANTIZE=shared`, `PLAN=none` and `GGML_FLAGOS_SYNC_LAUNCH=1`. The whole program took 41.6 s against 18.8 s before.
+- test-backend-ops `FLASH_ATTN_EXT`: 1324/1324 unset and under `FLAGOS_SPACEMIT_ATTN_KVH=off FLAGOS_SPACEMIT_ATTN_TILED=1`.
+- `--bench-attn` runs to its end (1707 s on the Mac's reference kernels, whose times say nothing).
+- Mutations caught: the parser taking 65 (no warning); the 64-token reference drawing q from another seed (32 of 33 cases over the tight bound; the hidden-cells case does not depend on q). The choice ignoring the switch can fail only on the K3.
+- The script: `bash -n`, a dry run, and a quick run on the Mac (Qwen3-0.6B, `-p 9,64 -d 0,256 -r 1`, two turns; the KLD at `-c 256` on a scratch base, its sha256 the same after), whose summary filled every part.
+
+**On the K3 (the user's run):** `scripts/t1-experiments.sh run ~/t1` in tmux after the `/dev/tcm` check, about 1.5 hours (estimate). Predicted, beside the spec's predictions above:
+- The checks pass: the block's counter shows the tiled kernel in 33/33, its rows within 1e-5 of the CPU's tiled kernel; the values give one-chunk for unset, empty, `64`, `27` and the bad values, the tiled kernel for `26` and `1`.
+- The benchmark's kernels: one-chunk under `64` and tiled under `9` below 64 tokens; 64 tokens tiled under both, within spread.
+- The check program takes longer on the K3 than before (inference from the Mac's 18.8 to 41.6 s). The runner's two check passes have 900 s limits; the script's timestamps give the K3 time before step 2's runner.
 
 ### Not planned
 

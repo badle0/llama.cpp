@@ -11,7 +11,8 @@
 //                    matmul setting (fit,staged) against split at the row counts of --bench-mm
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default; at 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=off
-//                    against the default)
+//                    against the default), then at 9-64 tokens FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 (not run by
+//                    --bench)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
@@ -72,11 +73,12 @@ static const char * k_device_name = "FlagOS:SpacemiT:0";
 
 // the plugin's test names this program calls (plan.md "S1 design" A2), looked up once from the device's table
 // (bind_plugin_names); nullptr with no device, where only the "device checks skipped" path runs
-static spacemit_steps_take_fn     g_steps_take     = nullptr;
-static spacemit_executors_take_fn g_executors_take = nullptr;
-static spacemit_mm_paths_take_fn  g_mm_paths_take  = nullptr;
-static spacemit_mm_tail_take_fn   g_mm_tail_take   = nullptr;
-static spacemit_switches_reset_fn g_switches_reset = nullptr;
+static spacemit_steps_take_fn      g_steps_take      = nullptr;
+static spacemit_executors_take_fn  g_executors_take  = nullptr;
+static spacemit_mm_paths_take_fn   g_mm_paths_take   = nullptr;
+static spacemit_mm_tail_take_fn    g_mm_tail_take    = nullptr;
+static spacemit_switches_reset_fn  g_switches_reset  = nullptr;
+static spacemit_attn_paths_take_fn g_attn_paths_take = nullptr;
 
 static int bind_plugin_names(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -86,8 +88,10 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
     g_mm_paths_take  = reinterpret_cast<spacemit_mm_paths_take_fn>(table->get_proc_address("spacemit_mm_paths_take"));
     g_mm_tail_take   = reinterpret_cast<spacemit_mm_tail_take_fn>(table->get_proc_address("spacemit_mm_tail_take"));
     g_switches_reset = reinterpret_cast<spacemit_switches_reset_fn>(table->get_proc_address("spacemit_switches_reset"));
+    g_attn_paths_take =
+        reinterpret_cast<spacemit_attn_paths_take_fn>(table->get_proc_address("spacemit_attn_paths_take"));
     REQUIRE(g_steps_take != nullptr && g_executors_take != nullptr && g_mm_paths_take != nullptr &&
-            g_mm_tail_take != nullptr && g_switches_reset != nullptr);
+            g_mm_tail_take != nullptr && g_switches_reset != nullptr && g_attn_paths_take != nullptr);
     return 0;
 }
 
@@ -236,7 +240,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     // checked where it is used
     const char * names[] = { "spacemit_steps_take", "spacemit_executors_take", "spacemit_mm_paths_take",
                              "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
-                             "spacemit_switches_reset", "spacemit_switches_generation" };
+                             "spacemit_switches_reset", "spacemit_switches_generation",
+                             "spacemit_attn_paths_take" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -1797,6 +1802,40 @@ static void attn_report(const attn_error & e, const char * what, const attn_shap
     }
 }
 
+// the GGML log lines while it lives, kept and still printed by ggml's default callback
+class log_capture {
+  public:
+    log_capture() { ggml_log_set(sink, this); }
+
+    ~log_capture() { ggml_log_set(nullptr, nullptr); }
+
+    log_capture(const log_capture &)             = delete;
+    log_capture & operator=(const log_capture &) = delete;
+
+    // the lines since the last call
+    std::string take() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string                 out;
+        out.swap(text);
+        return out;
+    }
+
+  private:
+    static void sink(enum ggml_log_level level, const char * line, void * user) {
+        auto * self = static_cast<log_capture *>(user);
+        {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            self->text += line;
+        }
+        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
+            std::fputs(line, stderr);  // a warning the checks do not expect stays visible
+        }
+    }
+
+    std::mutex  mutex;
+    std::string text;
+};
+
 // FLASH_ATTN_EXT against the CPU backend, which runs the same algorithm (q rounded to F16, F32 scores, online softmax;
 // V accumulated in F16 by one row, in F32 by its 64 x 64 tiles from 64 tokens), so the NMSE measures rounding. On the
 // K3, with TCM, the cases select each of the provider's kernels: the 4-row (Qwen3-4B) and 2-row (0.6B) one-chunk
@@ -1809,7 +1848,7 @@ static void attn_report(const attn_error & e, const char * what, const attn_shap
 // (the one-chunk kernels accumulate V in F16, where a weight exp(s - 0) is 0 below about -17; below about -104 it is 0
 // in F32 too, which -120 shows in the F32 reference); (b) no mask, which crashed; (c) ALiBi with GQA, where the grouped
 // rows took the first row's slope
-static int check_flash_attn(ggml_backend_dev_t dev) {
+static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     // claimed exactly: llama.cpp's graph (here before allocation) at head sizes up to 128, without a mask too; not head
     // size 256, F32 or quantized K and V, or K and V of different types
     ggml_init_params params = { ggml_tensor_overhead() * 128, nullptr, true };
@@ -1865,6 +1904,9 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
     // (checked below, where each run sets FLAGOS_SPACEMIT_ATTN_KVH itself)
     env_override one_chunk_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
     env_override kvh_off_switch("FLAGOS_SPACEMIT_ATTN_KVH", "off");
+    // and the tiled kernel from 64 tokens, so that the cases keep their kernels and the row bounds by token count
+    // (k_attn_tiled_tokens) stay right under any default of FLAGOS_SPACEMIT_ATTN_TILED (plan.md "T1 spec")
+    env_override tiled_switch("FLAGOS_SPACEMIT_ATTN_TILED", "64");
     double       worst = 0.0;
     uint32_t     seed  = 40;
     for (const attn_case & c : cases) {
@@ -2092,6 +2134,166 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
         n_kvh_direct_same += same;
     }
 
+    // T1 (plan.md "T1 spec"): the tiled kernel below 64 tokens, under FLAGOS_SPACEMIT_ATTN_TILED=1 and the pins above
+    // (KVH off, so 1 to 8 tokens reach the one-step kernel too). Against two references: the CPU on the same call,
+    // within the general bounds (below 64 tokens the CPU runs its one-chunk kernel, which sums V in F16), and the CPU's
+    // tiled kernel on the same call made 64 tokens long, whose first rows are this call's (attn_run draws K and V cell
+    // by cell and q token by token from the seed; the mask hides the added cells from these rows), within the tiled
+    // bound, which catches a missed visible position. The kernel by the counter: the tiled one on the K3, the reference
+    // on the host or under GGML_FLAGOS_KERNEL_VARIANTS=0. A second run must repeat bit for bit; that the output differs
+    // from the one under 64 is counted only. The cases take its edges: 108 rows over 8 tiles (tiles start inside a
+    // head), rows 0-13 of 26 after 50 seeing none of the second KV tile (one mixed group of 4), 1 to 7 tokens (no group
+    // of 4, or one and 1 to 3 rows alone)
+    const bool         expect_reference = host || reference_label()[0] != '\0';
+    const char * const kernel_names[3]  = { "tiled", "one-chunk", "reference" };
+    const int          expected_kernel  = expect_reference ? 2 : 0;
+    struct tiled_case {
+        const char * what;
+        attn_shape   s;
+        attn_mask    mode     = attn_mask::causal;
+        float        max_bias = 0.0f;
+        float        q_scale  = 4.0f;
+        float        softcap  = 0.0f;
+        bool         sinks    = false;
+        float        visible  = 0.0f;
+    };
+    std::vector<tiled_case> tiled_cases;
+    for (int64_t n_tokens : { 9, 12, 26, 38, 63 }) {
+        for (int64_t n_kv : { 256, 1000, 4096 }) {
+            tiled_cases.push_back({ "Qwen3-4B", { 32, 8, 128, n_kv, n_tokens, n_kv - n_tokens } });
+        }
+    }
+    tiled_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 9, 503 } });
+    tiled_cases.push_back({ "Qwen3-0.6B", { 16, 8, 128, 512, 63, 449 } });
+    tiled_cases.push_back({ "GQA 8", { 32, 4, 128, 1024, 26, 998 } });
+    tiled_cases.push_back({ "GQA 1", { 8, 8, 128, 1024, 26, 998 } });
+    tiled_cases.push_back({ "108 rows over 8 tiles, tiles starting inside a head", { 12, 4, 128, 512, 9, 503 } });
+    tiled_cases.push_back({ "26 after 50, one group of 4 mixed over the second KV tile", { 32, 8, 128, 256, 26, 50 } });
+    tiled_cases.push_back({ "head size 64", { 32, 8, 64, 1024, 26, 998 } });
+    tiled_cases.push_back({ "no mask", { 32, 8, 128, 1024, 26, 998 }, attn_mask::none });
+    tiled_cases.push_back({ "sinks", { 32, 8, 128, 1024, 26, 998 }, attn_mask::causal, 0.0f, 4.0f, 0.0f, true });
+    tiled_cases.push_back({ "softcap 2", { 32, 8, 128, 1024, 26, 998 }, attn_mask::causal, 0.0f, 4.0f, 2.0f });
+    tiled_cases.push_back({ "ALiBi (max_bias 8) with GQA 4", { 32, 8, 128, 1024, 26, 998 }, attn_mask::alibi, 8.0f });
+    tiled_cases.push_back({ "every cell hidden, sinks", { 32, 8, 128, 1024, 26, 998 }, attn_mask::causal, 0.0f, 4.0f,
+                            0.0f, true, -INFINITY });
+    tiled_cases.push_back({ "flat scores at depth", { 32, 8, 128, 4096, 26, 4070 }, attn_mask::causal, 0.0f, 1.0f });
+    for (int64_t n_tokens : { 1, 2, 3, 5, 7 }) {
+        tiled_cases.push_back({ "Qwen3-4B", { 32, 8, 128, 256, n_tokens, 256 - n_tokens } });
+    }
+    int    n_tiled_ran = 0, n_tiled_repeat = 0, n_tiled_differ = 0;
+    double e_tiled = 0.0, e_tiled_row = 0.0, e_tiled_row64 = 0.0;
+    for (const tiled_case & c : tiled_cases) {
+        const uint32_t case_seed = seed++;
+        attn_run       run;
+        REQUIRE(run.init(dev, c.s, c.mode, c.visible, c.max_bias, case_seed, c.q_scale, c.softcap, c.sinks));
+        REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
+        // the second reference: 64 tokens from the same n_past, the cells raised so that the mask has room
+        attn_shape s64 = c.s;
+        s64.n_tokens   = 64;
+        s64.n_kv       = c.mode == attn_mask::none ? c.s.n_kv : std::max(c.s.n_kv, c.s.n_past + 64);
+        attn_run run64;
+        REQUIRE(run64.init(dev, s64, c.mode, c.visible, c.max_bias, case_seed, c.q_scale, c.softcap, c.sinks));
+        REQUIRE(ggml_backend_graph_compute(cpu, run64.g_cpu) == GGML_STATUS_SUCCESS);
+        const int64_t      n = ggml_nelements(run.out);
+        std::vector<float> tiled[2], at64;
+        uint64_t           count[3];
+        {
+            env_override tiled_one("FLAGOS_SPACEMIT_ATTN_TILED", "1");
+            g_attn_paths_take(&count[0], &count[1], &count[2]);
+            REQUIRE(run.dev_output(backend, tiled[0]));
+            g_attn_paths_take(&count[0], &count[1], &count[2]);
+            REQUIRE(run.dev_output(backend, tiled[1]));
+        }
+        {
+            env_override tiled_default("FLAGOS_SPACEMIT_ATTN_TILED", "64");
+            REQUIRE(run.dev_output(backend, at64));
+        }
+        const std::string what = std::string("tiled below 64 tokens, ") + c.what;
+        const attn_error  e    = attn_errors(tiled[0].data(), static_cast<const float *>(run.out_ref->data), n,
+                                             run.out->ne[0]);
+        attn_report(e, (what + ", against the CPU").c_str(), c.s);
+        const attn_error e64 = attn_errors(tiled[0].data(), static_cast<const float *>(run64.out_ref->data), n,
+                                           run.out->ne[0]);
+        attn_report(e64, (what + ", against the CPU's tiled kernel on 64 tokens").c_str(), c.s,
+                    k_attn_max_row_nmse_tiled);
+        e_tiled       = std::max(e_tiled, e.all);
+        e_tiled_row   = std::max(e_tiled_row, e.row);
+        e_tiled_row64 = std::max(e_tiled_row64, e64.row);
+        bool ran = true;
+        for (int k = 0; k < 3; k++) {
+            ran = ran && count[k] == (k == expected_kernel ? 1u : 0u);
+        }
+        if (!ran) {
+            std::fprintf(stderr,
+                         "FAIL: attention tiled below 64 tokens, %s, %lld tokens at n_kv %lld: counted tiled %llu, "
+                         "one-chunk %llu, reference %llu (expected one %s)\n",
+                         c.what, (long long) c.s.n_tokens, (long long) c.s.n_kv, (unsigned long long) count[0],
+                         (unsigned long long) count[1], (unsigned long long) count[2], kernel_names[expected_kernel]);
+            g_failures++;
+        }
+        n_tiled_ran += ran;
+        const bool repeat = std::memcmp(tiled[0].data(), tiled[1].data(), n * sizeof(float)) == 0;
+        if (!repeat) {
+            std::fprintf(stderr,
+                         "FAIL: attention tiled below 64 tokens, %s, %lld tokens at n_kv %lld: two runs differ\n",
+                         c.what, (long long) c.s.n_tokens, (long long) c.s.n_kv);
+            g_failures++;
+        }
+        n_tiled_repeat += repeat;
+        n_tiled_differ += std::memcmp(tiled[0].data(), at64.data(), n * sizeof(float)) != 0;
+    }
+
+    // the switch's values on one 26-token call (KVH off by the pin): a bad value is warned once and keeps the default;
+    // the kernel by the counter (on the host and under GGML_FLAGOS_KERNEL_VARIANTS=0 the reference for all)
+    const struct {
+        const char * value;
+        bool         tiled, warned;
+    } tiled_values[] = {
+        { nullptr, false, false }, { "", false, false },  { "64", false, false }, { "26", true, false },
+        { "1", true, false },      { "27", false, false }, { "0", false, true },   { "65", false, true },
+        { "9x", false, true },     { "x", false, true },
+    };
+    const auto lines_with = [](const std::string & text, const char * what) {
+        int n = 0;
+        for (size_t at = 0; at < text.size();) {
+            const size_t end = std::min(text.find('\n', at), text.size());
+            n += text.substr(at, end - at).find(what) != std::string::npos;
+            at = end + 1;
+        }
+        return n;
+    };
+    int n_values_ok = 0;
+    {
+        const attn_shape s = { 32, 8, 128, 1024, 26, 998 };
+        attn_run         run;
+        REQUIRE(run.init(dev, s, attn_mask::causal, 0.0f, 0.0f, seed++));
+        for (const auto & v : tiled_values) {
+            env_override       tiled_value("FLAGOS_SPACEMIT_ATTN_TILED", v.value);
+            log_capture        log;
+            std::vector<float> o;
+            uint64_t           count[3];
+            g_attn_paths_take(&count[0], &count[1], &count[2]);
+            REQUIRE(run.dev_output(backend, o));
+            g_attn_paths_take(&count[0], &count[1], &count[2]);
+            const int warnings = lines_with(log.take(), "FLAGOS_SPACEMIT_ATTN_TILED=");
+            const int kernel   = expect_reference ? 2 : v.tiled ? 0 : 1;
+            bool      ok       = warnings == (v.warned ? 1 : 0);
+            for (int k = 0; k < 3; k++) {
+                ok = ok && count[k] == (k == kernel ? 1u : 0u);
+            }
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: attention FLAGOS_SPACEMIT_ATTN_TILED=%s: %d warning lines (expected %d), counted "
+                             "tiled %llu, one-chunk %llu, reference %llu (expected one %s)\n",
+                             v.value != nullptr ? v.value : "(unset)", warnings, v.warned ? 1 : 0,
+                             (unsigned long long) count[0], (unsigned long long) count[1],
+                             (unsigned long long) count[2], kernel_names[kernel]);
+                g_failures++;
+            }
+            n_values_ok += ok;
+        }
+    }
+
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf(
@@ -2118,6 +2320,22 @@ static int check_flash_attn(ggml_backend_dev_t dev) {
                 kvh_cases.size(), e_kvh, k_attn_max_nmse, e_kvh_row, k_attn_max_row_nmse, n_kvh_taken,
                 kvh_cases.size(), n_kvh_differ, kvh_cases.size(), n_kvh_repeat, kvh_cases.size(), n_kvh_direct_same,
                 n_kvh_direct, reference_label());
+    std::printf("attn     tiled kernel below 64 tokens (FLAGOS_SPACEMIT_ATTN_TILED=1, KVH off) on %zu cases (Qwen3-4B "
+                "9-63 tokens at n_kv 256-4096, Qwen3-0.6B, GQA 8 and 1, tiles starting inside a head, a mixed group "
+                "of 4, head size 64, no mask, sinks, softcap, ALiBi with GQA 4, every cell hidden, flat scores at "
+                "depth, 1-7 tokens): vs CPU max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); vs the CPU's "
+                "tiled kernel on 64 tokens worst row %.2e (bound %.0e); the %s ran in %d/%zu; two runs identical in "
+                "%d/%zu; %d/%zu outputs differ from those under 64%s\n",
+                tiled_cases.size(), e_tiled, k_attn_max_nmse, e_tiled_row, k_attn_max_row_nmse, e_tiled_row64,
+                k_attn_max_row_nmse_tiled, expect_reference ? "reference" : "tiled kernel", n_tiled_ran,
+                tiled_cases.size(), n_tiled_repeat, tiled_cases.size(), n_tiled_differ, tiled_cases.size(),
+                reference_label());
+    std::printf("attn     FLAGOS_SPACEMIT_ATTN_TILED values (unset, empty, 64, 26, 1, 27, 0, 65, 9x, x) on a 26-token "
+                "call at n_kv 1024: one warning for each of 0, 65, 9x and x and none for the others, the kernel by "
+                "the counter %s, as expected in %d/%zu%s\n",
+                expect_reference ? "the reference for all" :
+                                   "tiled for 26 and 1, one-chunk for the others (the default kept for a bad value)",
+                n_values_ok, sizeof(tiled_values) / sizeof(tiled_values[0]), reference_label());
     return 0;
 }
 
@@ -3815,40 +4033,6 @@ static int check_plan(ggml_backend_dev_t dev) {
 // FLAGOS_SPACEMIT_* name is reported once with the new one and otherwise ignored
 //
 
-// the GGML log lines while it lives, kept and still printed by ggml's default callback
-class log_capture {
-  public:
-    log_capture() { ggml_log_set(sink, this); }
-
-    ~log_capture() { ggml_log_set(nullptr, nullptr); }
-
-    log_capture(const log_capture &)             = delete;
-    log_capture & operator=(const log_capture &) = delete;
-
-    // the lines since the last call
-    std::string take() {
-        std::lock_guard<std::mutex> lock(mutex);
-        std::string                 out;
-        out.swap(text);
-        return out;
-    }
-
-  private:
-    static void sink(enum ggml_log_level level, const char * line, void * user) {
-        auto * self = static_cast<log_capture *>(user);
-        {
-            std::lock_guard<std::mutex> lock(self->mutex);
-            self->text += line;
-        }
-        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
-            std::fputs(line, stderr);  // a warning the checks do not expect stays visible
-        }
-    }
-
-    std::mutex  mutex;
-    std::string text;
-};
-
 // lines of text that start with prefix
 static int count_lines(const std::string & text, const char * prefix) {
     const size_t len = std::strlen(prefix);
@@ -4584,7 +4768,7 @@ static int bench_mm(ggml_backend_dev_t dev) {
 // bench_mm). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own
 // launch here. At one token the default (from n_kv 512 the split over the tiles with the turns; plan.md M2e.3, round 2)
 // also against FLAGOS_SPACEMIT_ATTN=split (the split without the turns) and one-chunk (the kernels before round 2); a
-// few tokens FLAGOS_SPACEMIT_ATTN_KVH=off against the default (below)
+// few tokens FLAGOS_SPACEMIT_ATTN_KVH=off against the default (below). --bench-attn also runs bench_attn_tiled after it
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -4685,6 +4869,77 @@ static int bench_attn(ggml_backend_dev_t dev) {
     }
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
+    return 0;
+}
+
+// T1 (plan.md "T1 spec"), --bench-attn only: the tiled kernel below 64 tokens at Qwen3-4B's heads, 9-64 tokens at n_kv
+// 256-8192, every cell valid, causal; FLAGOS_SPACEMIT_ATTN_TILED=64 (the default) against 9, taking turns twice (64, 9,
+// then 9, 64), the faster turn of each kept, ATTN and ATTN_KVH unset; the copies and GB/s as bench_attn's KV-head
+// comparison. Each setting's kernel by the counter (spacemit_attn_paths_take): "mixed" if more than one ran. 64 tokens
+// is the control, tiled under both
+static int bench_attn_tiled(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    REQUIRE(backend != nullptr);
+    for (const int64_t n_kv : { 256, 512, 1024, 2048, 4096, 8192 }) {
+        const int iterations = n_kv <= 256 ? 30 : n_kv <= 512 ? 25 : n_kv <= 1024 ? 20 : n_kv <= 4096 ? 10 : 5;
+        for (const int64_t n_tokens : { 9, 12, 16, 26, 32, 38, 48, 63, 64 }) {
+            const attn_shape s        = { 32, 8, 128, n_kv, n_tokens, n_kv - n_tokens };
+            const double     kv_bytes = 2.0 * (double) (s.n_kv * s.n_head_kv * s.d) * sizeof(ggml_fp16_t);
+            const size_t     copies   = (size_t) std::min(32.0, std::ceil(32e6 / kv_bytes));
+            std::vector<std::unique_ptr<attn_run>> runs;
+            for (size_t c = 0; c < copies; c++) {
+                runs.push_back(std::make_unique<attn_run>());
+                REQUIRE(runs.back()->init(dev, s, attn_mask::causal, 0.0f, 0.0f, (uint32_t) c));
+                CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
+            }
+            uint64_t count[2][3] = {};  // per setting: tiled, one-chunk, reference
+            {
+                uint64_t ignored[3];
+                g_attn_paths_take(&ignored[0], &ignored[1], &ignored[2]);
+            }
+            bool       ok     = true;
+            size_t     next   = 0;
+            const auto dev_us = [&](int k) {
+                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
+                env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", nullptr);
+                env_override tiled_switch("FLAGOS_SPACEMIT_ATTN_TILED", k == 0 ? "64" : "9");
+                const double t = time_us(
+                    [&] {
+                        ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS;
+                    },
+                    iterations);
+                uint64_t taken[3];
+                g_attn_paths_take(&taken[0], &taken[1], &taken[2]);
+                for (int i = 0; i < 3; i++) {
+                    count[k][i] += taken[i];
+                }
+                return t;
+            };
+            double t[2] = { HUGE_VAL, HUGE_VAL };
+            t[0]        = std::min(t[0], dev_us(0));
+            t[1]        = std::min(t[1], dev_us(1));
+            t[1]        = std::min(t[1], dev_us(1));
+            t[0]        = std::min(t[0], dev_us(0));
+            CHECK(ok);
+            const auto kernel = [&](int k) {
+                int n_ran = 0, last = 0;
+                for (int i = 0; i < 3; i++) {
+                    if (count[k][i] != 0) {
+                        n_ran++;
+                        last = i;
+                    }
+                }
+                static const char * const names[3] = { "tiled", "one-chunk", "reference" };
+                return n_ran == 1 ? names[last] : n_ran == 0 ? "none" : "mixed";
+            };
+            std::printf("bench    attn %lld tokens n_kv %4lld, FLAGOS_SPACEMIT_ATTN_TILED: 64 %8.0f us (%5.1f GB/s, "
+                        "%s); 9 %8.0f us (%+.1f%%, %5.1f GB/s, %s)\n",
+                        (long long) n_tokens, (long long) n_kv, t[0], kv_bytes / t[0] / 1e3, kernel(0), t[1],
+                        100.0 * (t[1] / t[0] - 1.0), kv_bytes / t[1] / 1e3, kernel(1));
+            std::fflush(stdout);
+        }
+    }
+    ggml_backend_free(backend);
     return 0;
 }
 
@@ -4820,7 +5075,9 @@ int main(int argc, char ** argv) {
             run_mm = true;
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm]\n",
+                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm]\n"
+                         "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
+                         "tokens\n",
                          argv[0]);
             return 2;
         }
@@ -4865,11 +5122,14 @@ int main(int argc, char ** argv) {
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
-        check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev) != 0 || check_layer(dev) != 0 ||
-        check_plan(dev) != 0 || check_diagnostics(dev) != 0 || check_shared_stream(dev, host) != 0) {
+        check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
+        check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
+        check_shared_stream(dev, host) != 0) {
         return 1;
     }
-    if (run_bench ? bench(dev) != 0 : (run_attn && bench_attn(dev) != 0) || (run_mm && bench_mm(dev) != 0)) {
+    if (run_bench ? bench(dev) != 0 :
+                    (run_attn && (bench_attn(dev) != 0 || bench_attn_tiled(dev) != 0)) ||
+                        (run_mm && bench_mm(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

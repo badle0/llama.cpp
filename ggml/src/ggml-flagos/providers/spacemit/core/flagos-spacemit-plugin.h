@@ -104,6 +104,8 @@ typedef uint64_t (*spacemit_steps_take_fn)(void);
 // test-only: the executors created since the last call; a device's streams share one
 typedef uint64_t (*spacemit_executors_take_fn)(void);
 typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c);
+// test-only: the one-step attention calls since the last call by the kernel that ran (tiled, one-chunk, reference)
+typedef void (*spacemit_attn_paths_take_fn)(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout

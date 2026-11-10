@@ -428,6 +428,9 @@ void * plugin_get_proc_address(const char * name) {
     if (std::strcmp(name, "spacemit_mm_tail_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_mm_tail_take_fn>(spacemit_mm_tail_take));
     }
+    if (std::strcmp(name, "spacemit_attn_paths_take") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_attn_paths_take_fn>(spacemit_attn_paths_take));
+    }
     if (std::strcmp(name, "spacemit_run_stats_attach") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_run_stats_attach_fn>(spacemit_run_stats_attach));
     }
