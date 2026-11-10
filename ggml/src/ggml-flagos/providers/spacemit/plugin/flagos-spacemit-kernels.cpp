@@ -15,10 +15,6 @@
 bool spacemit_use_reference() {
     static const bool reference = [] {
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-        // spacemit_renamed's line: that function is the core's, and no symbol crosses to the plugin. Parsed once, so once
-        if (std::getenv("FLAGOS_SPACEMIT_TEST_REFERENCE") != nullptr) {
-            GGML_LOG_WARN("FlagOS SpacemiT: FLAGOS_SPACEMIT_TEST_REFERENCE is now GGML_FLAGOS_KERNEL_VARIANTS\n");
-        }
         const char * value = std::getenv("GGML_FLAGOS_KERNEL_VARIANTS");
         return value != nullptr && std::strcmp(value, "0") == 0;
 #else

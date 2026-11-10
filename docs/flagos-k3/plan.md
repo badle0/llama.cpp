@@ -2443,7 +2443,117 @@ That completes the baseline. `batch-one.md` §5's order then goes on: the embedd
     - T1 and T2 together would take it to 1.2 to 2.8 s, and a turn at depth 4096 to 0.7 to 1.4 s, against the 1 s target.
   - Not tried: a ubatch of 1024 would make such a turn one ubatch, about 27 s at turn 19 by the same rates, with no code. Its memory cost, and whether the provider's kernels take 1024 rows, are not checked.
 
-That completes the baseline. Next, by the to-do order the user agreed 2026-11-08: the token embedding lookup on the AI cores, then T1 and T6. Nothing starts without the user's word.
+That completes the baseline. Next, by the to-do order the user agreed 2026-11-08: the token embedding lookup on the AI cores, then T1 and T6. Changed by the user 2026-11-09: T1 first, then the embedding lookup ("T1 spec" below).
+
+### Cleanup before T1: five finished test switches removed (2026-11-10)
+
+**Status:** done 2026-11-10 on the user's decision ("help me remove the unwanted files"), after the audit of 2026-11-09 for the mentor's status report listed five candidates with their reasons and the switches kept on purpose. The coder implemented it from the main session's spec; the main session checked it again on the Mac. The K3 run is the user's (below). Every default path is the code it was: what went ran only under a test switch or a value other than the default. Recorded as of `61707ee57` in git; the docs keep the runs made with it.
+
+**Removed, by the decision that closed it:**
+
+| What | Where (lines before -> after) | Closed by |
+|---|---|---|
+| `FLAGOS_SPACEMIT_STREAM=per-call`: `spacemit_stream_policy`, its reader, the executor's per-call branch; the check program's per-call cases and `--bench`'s per-call row | `plugin/flagos-spacemit-exec.h` 45 -> 38, `-exec.cpp` 423 -> 414, `-plugin.cpp` 499 -> 490 (with the huge-page row) | one executor per device since S2's step 2 (2026-11-06), measured equal to per-call |
+| `FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel\|gpu`: the type is IGPU with no switch; the runner's ACCEL check; the scripts' `unset` lists | `core/flagos-spacemit.cpp` 802 -> 783 (with the next rows' comments), `tools/spacemit_check.py` 877 -> 870 | D3, IGPU agreed by the mentor. Since C5's revert `accel` no longer reproduced the ACCEL numbers, and the type changes nothing inside the check program, so the ACCEL check tested only the switch |
+| `FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES` | the plugin's buffer allocation; the check program's info line | huge pages adopted 2026-10-11 (+1%) |
+| The `<lo>-<hi>` form of `FLAGOS_SPACEMIT_ATTN_KVH`: the setting is on (unset, empty or `2-8`) or off, any other value warned once and taken as off; the check program's `2-4`, `1-4` and `1-8` settings (`1-8` stays, as a value taken as off), its one-token KV-head case and `--bench-attn`'s one-token row | `plugin/flagos-spacemit-attn.cpp` 803 -> 788, `-attn.h` 46 -> 46 | 2 to 8 tokens adopted 2026-11-05; one token rejected (tg32 -4.6% and -18.1% at depths 1024 and 4096) |
+| The old-name report: `spacemit_renamed`, its five calls, the check program's renamed-switch check | `core/flagos-spacemit-diagnostics.cpp` 496 -> 480, `.h` 158 -> 153, `-loader.cpp` 214 -> 211, `plugin/flagos-spacemit-kernels.cpp` 529 -> 525 | the deck's names since S1 step 5 (2026-11-02); an old name is now ignored without a report |
+
+Also `tests/check_spacemit.cpp` 4948 -> 4881, a comment in `core/flagos-spacemit-ops.cpp`, and the `unset` lists of `scripts/fusion-experiments.sh` and `scripts/structural-experiments.sh`.
+
+**Kept**, though they look like leftovers:
+- `FLAGOS_SPACEMIT_ATTN=split` and `FLAGOS_SPACEMIT_MM=split`: the check program's byte-exact references for the default's pair turns and matmul path choice. The CPU comparison only bounds the error.
+- `ATTN=one-chunk` and `ATTN_KVH=off`: the checks reach the one-chunk kernels through them, and T1's checks need `KVH=off`.
+- `PLAN=none`: the plan cache's comparison.
+- `QUANTIZE=shared`: not finished. It was built 2026-10-21 and never timed on a model, and fusion is deferred.
+
+**Checked on the Mac (2026-11-10):**
+- The host build has no warnings. The plain build (`build-nohost`) gives "device checks skipped".
+- `flagos-check-spacemit --expect-device`: all checks passed. Every line is as before except those the removal changes:
+  - the contracts line: settings `unset, empty, off, 2-8, 1-8`, 200 selections where there were 240;
+  - the KV-head line: 30 cases where there were 31, with the same max NMSE 9.15e-05 and worst row 1.74e-04, every case taking its contract;
+  - the diag line: no renamed part;
+  - the stream line: 2180/2180 where there were 2194/2194, the per-call block's 7 runs in two tile modes;
+  - the plan line: its lookup and key times moved by a few tenths of a microsecond (wall clock), its counts the same.
+- Under each of the six kept switches (`ATTN=split`, `MM=split`, `QUANTIZE=shared`, `PLAN=none`, `GGML_FLAGOS_SYNC_LAUNCH=1`, `GGML_FLAGOS_KERNEL_VARIANTS=0`): all checks passed.
+- The 14 `test-backend-ops` sets have the counts from before: ADD 54, MUL 46, RMS_NORM 52, ROPE 273, SET_ROWS 180, GET_ROWS 9, SWIGLU 12, MUL_MAT 3, FLASH_ATTN_EXT 1324, CPY 15, and the four graphs 30/25/144/24.
+- The riscv64 syntax check: 0 errors on the four changed plugin files.
+- The executor's spine-runtime branch and the plugin, compiled with `-DGGML_FLAGOS_SPACEMIT_SPERT` against a stub of `spert.hpp`: 0 errors, before and after.
+- Three mutations caught: the KV-head parser taking `1-8` as on (10 FAIL lines), its upper bound at 9 (6), the device type ACCEL (2).
+- The runner and the TTFT harness compile, both scripts pass `bash -n`, and no code or script names a removed switch.
+
+**On the K3 (the user's):** the runner with `--build` and `--server-baseline` on Qwen3-0.6B, and with `--server-baseline` on Qwen3-4B. Predicted:
+- 49/49 and 47/47, one fewer than S2's 50 and 48: the ACCEL check;
+- every reply equal to S2's baselines;
+- perplexity and KLD to the last digit;
+- speed within spread.
+
+### T1 spec: the tiled kernel below 64 tokens, for review (2026-11-09)
+
+**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Nothing implemented. Step 1 adds a test-only switch and leaves every default path bit for bit today's; step 2, the new default, follows only if the rule below passes. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above).
+
+**Why.** From 9 to 63 tokens per call, attention takes the one-chunk kernels, which read a KV head's whole cache once per token and query head. From 64 tokens the tiled kernel reads it once per query head for a tile of up to 64 tokens. The switch-over is one comparison against `tiled_min_rows = 64` (`plugin/flagos-spacemit-attn.cpp:31`, used at `:590`), ggml-cpu's tile size, never measured on the K3. The full runs' grid (above; Qwen3-4B, client p50, ms):
+
+| Cached tokens | 26 new | 38 | 63 | 64 |
+|---|---|---|---|---|
+| 256 | 693 | 960 | 1,566 | 624 |
+| 1024 | 1,982 | 2,843 | 4,687 | 826 |
+| 4096 | 7,255 | 10,562 | 17,585 | 1,673 |
+| 8192 | 15,332 | 22,290 | 37,191 | 2,789 |
+
+- 63 tokens take longer than 64 at every depth: 676 against 556 ms at depth 0, 13 times at 8192. Qwen3-0.6B at depth 4096: 26 tokens 2,797 ms, 63 6,878, 64 535.
+- In chat, the 21 to 25 tokens after a 512-token ubatch take 32 to 40% of turns 7 to 19 (the result above; inference).
+- The tiled kernel already handles a tile of fewer than 64 rows. A tile's rows stop at the call's or the head's end (`plugin/flagos-spacemit-rvv-attn.cpp:1759`), its loops run over those rows only (4 at a time, then 1 to 3 alone), and such a tile passes the tight row bound today (99 tokens after 37 hold a 35-row tile, `tests/check_spacemit.cpp:1846`).
+
+**The approach, and the alternatives.** Put the threshold behind a switch, measure where the tiled kernel wins, and set the default by a rule fixed now. No new kernel: one comparison reads the switch, the rest is checks and measurement. The alternatives lose:
+- Fused passes of the KV-head split for 9 to 63 tokens (its result above: a fused pass of 4 tokens at n_kv 4096 takes 3.43 ms). New kernel code, and 26 tokens in 7 passes would take about 24 ms a call, against the tiled kernel's estimated 13 to 17 ms (below). It may still win at 5 to 8 tokens, which stay the KV-head split's here.
+- A tiled kernel that packs a KV head's query heads into one tile, reading each KV head once instead of 4 times on Qwen3-4B. A rewrite, worth it only if the runs show the reads dominate small tiles.
+- Server settings. A ubatch of 1024 moves only the chat tail; a 26-token request at depth 4096 still takes 7 s.
+
+**The change, step 1** (all inside `providers/spacemit/`, so no `upstream-changes.md` entry; comments ASCII):
+1. The switch, `FLAGOS_SPACEMIT_ATTN_TILED=<n>`, 1 ≤ n ≤ 64: the tiled kernel takes calls of n tokens and more, at every n_kv. Unset or empty: the default, 64 in step 1. Any other value is warned once and the default kept. Parsed with `spacemit_cached_switch` as `FLAGOS_SPACEMIT_ATTN_KVH` is (`flagos-spacemit-attn.cpp:407-426`), read at registration in `spacemit_flash_attn_read_switch` (`:608-611`), and compiled in every build, so the Mac parses it too.
+2. The choice (`spacemit_kernel_flash_attn`, `:590`): `q->ne[1]` against the switch's value instead of the constant, the TCM condition unchanged. It reaches only the calls no earlier contract takes: by default 9 to 63 tokens (2 to 8 go to the KV-head split, one token from n_kv 512 to the paired split), so values from 2 to 9 differ only with `FLAGOS_SPACEMIT_ATTN_KVH` narrowed or off.
+3. A test-only counter, as the matmuls' `spacemit_mm_paths_take` (`plugin/flagos-spacemit-ime.cpp:270-274`): `spacemit_attn_paths_take(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference)`, the calls of `spacemit_kernel_flash_attn` by the kernel that ran, counted by tile 0. By name through `plugin_get_proc_address` (`plugin/flagos-spacemit-plugin.cpp:415-431`), its typedef beside `spacemit_mm_paths_take_fn` (`core/flagos-spacemit-plugin.h:106`), and in the check program's list of names (`tests/check_spacemit.cpp:237-239`).
+4. The check program:
+   - The attention block pins `FLAGOS_SPACEMIT_ATTN_TILED=64` beside its two pins (`:1866-1867`), so its cases keep their kernels under any default and its row bounds by token count (`:1855-1858`) stay right.
+   - A new block after the KV-head split's, under `FLAGOS_SPACEMIT_ATTN_TILED=1` and `FLAGOS_SPACEMIT_ATTN_KVH=off`, so that every case takes the tiled kernel. The cases: Qwen3-4B's heads {32, 8, 128} at 9, 12, 26, 38 and 63 tokens and n_kv 256, 1000 and 4096, every cell valid; Qwen3-0.6B's {16, 8, 128} at 9 and 63 tokens, n_kv 512; GQA 8 {32, 4, 128} and GQA 1 {8, 8, 128} at 26 tokens, n_kv 1024; 12 query and 4 KV heads at 9 tokens, n_kv 512 (108 rows over 8 tiles, so tiles start inside a head and hold 1 to 9 rows); 26 tokens after 50 at n_kv 256 (rows 0 to 13 see none of the second KV tile, which rows 14 to 25 see, so one group of 4 is mixed); head size 64; no mask; sinks; softcap 2; ALiBi (max_bias 8) with GQA 4; every cell hidden, with sinks; 26 tokens after 4070 with flat scores (q scaled by 1); and 1, 2, 3, 5 and 7 tokens at n_kv 256 (no group of 4, or one and 1 to 3 rows alone).
+   - Each case against two references. The CPU on the same call, within the attention bounds (NMSE 5e-4, worst row 5e-3): below 64 tokens the CPU runs its one-chunk kernel, which sums V in F16, so the tight bound cannot apply. And the CPU's tiled kernel on the same call made 64 tokens long, its first rows within the tiled kernel's row bound, 1e-5 (`:1755`), which catches a missed visible position. That works because `attn_run` draws q, K and V from separate seeds and q token by token (`:1673-1677`): with the same seed, n_past and mask mode (n_kv raised to n_past + 64 where a mask needs the room) its first rows are this call's, and ggml-cpu takes its tiled kernel from 64 rows (`ggml/src/ggml-cpu/ops.cpp:9171-9176`).
+   - Per case also: the counter shows the tiled kernel on the K3, the reference on the Mac or under `GGML_FLAGOS_KERNEL_VARIANTS=0`; a second run is identical bit for bit; a different output from the one under `FLAGOS_SPACEMIT_ATTN_TILED=64` is counted only.
+   - The switch's values, on one 26-token call at n_kv 1024 with `FLAGOS_SPACEMIT_ATTN_KVH=off`: unset, empty and `64` give the one-chunk kernel, `26` and `1` the tiled one, `27` the one-chunk one; `0`, `65`, `9x` and `x` the default, with one warning (`log_capture`, `:3819`). The kernel by the counter on the K3; on the Mac the warning only.
+   - The benchmark (`--bench-attn`, after the KV-head block, `:4648-4685`): Qwen3-4B's heads at 9, 12, 16, 26, 32, 38, 48, 63 and 64 tokens and n_kv 256, 512, 1024, 2048, 4096 and 8192, every cell valid. `FLAGOS_SPACEMIT_ATTN_TILED=64` against `9`, taking turns twice, the faster turn of each: µs per call, GB/s, the change, and the kernel each ran by the counter. 64 tokens is the control, tiled under both.
+5. Docs: the switch's row in `build.md` §7's switch table, the results here, `batch-one.md`'s T1 row.
+
+**Tests on the Mac** (the coder runs them, I rerun them; the Mac runs the reference kernels, so the RVV path below 64 tokens first runs on the K3):
+1. `build-host` builds, no warnings in the changed files; the riscv64 syntax check of the changed plugin file, as for the KV-head split.
+2. The check program (`--expect-device`, simulated device): all checks pass, with the switch unset every line the figures of the build before the change. The new block passes against both references (the reference kernels sum V in F32, so the tight bound holds there too), its counter showing the reference; a bad value of the switch gives one warning.
+3. test-backend-ops `FLASH_ATTN_EXT`: every claimed case passes unset and under `FLAGOS_SPACEMIT_ATTN_KVH=off FLAGOS_SPACEMIT_ATTN_TILED=1`.
+4. Two mutations caught: the parser taking 65 (no warning), and the 64-token reference drawing q from another seed (the tight comparison fails).
+
+**On the K3** (the user's runs, one block in tmux after the `/dev/tcm` check; about 1.5 hours, estimate):
+1. The build. The check program `--expect-device`: all checks pass, the new block's cases on the tiled kernel by the counter. test-backend-ops `FLASH_ATTN_EXT` unset and under `FLAGOS_SPACEMIT_ATTN_KVH=off FLAGOS_SPACEMIT_ATTN_TILED=1`. A failure stops the block.
+2. Speed, `64` and `9` taking turns twice, the better of each:
+   - `--bench-attn`, the new block;
+   - llama-bench on Qwen3-4B and Qwen3-0.6B, `-t 8 -fa 1 -mmp 0 -r 3 -p 9,12,16,26,32,38,48,63,64,512 -n 32 -d 0,1024,4096`; pp64, pp512 and tg32 are the controls.
+3. Accuracy: Qwen3-4B, `llama-perplexity -c 4096 -b 4096 --chunks 1 -fa on -t 8` at `-ub 9` and `-ub 26`, under `64` and `9`, the KLD against the CPU base of 2026-11-04, `~/kvh/base1.kld` (`PROJECT.md` §6's rule: one thread, made twice, the files identical; `-c 4096 -b 4096 --chunks 1 -fa on` on `~/kvh-wiki.test.raw`). 9 rows are 2 groups of 4 and 1 alone, 26 are 6 and 2. Under `9` every ubatch of either size takes the tiled kernel, so the two cover any threshold the rule picks (inference: a row's arithmetic in the tiled kernel does not depend on how many rows share its tile).
+
+**Decision rule, set before the runs:**
+- K3 step 1's checks pass, or nothing below is read.
+- The threshold R is the smallest measured count (9, 12, 16, 26, 32, 38, 48 or 63) such that at R and at every larger measured count: the benchmark is at least 20% faster under `9` at every n_kv from 512; llama-bench pp at depths 1024 and 4096 is at least 20% faster on both models; and no benchmark shape at n_kv 256 and no llama-bench pp at depth 0 is more than 2% slower. Counts between two measured ones take their result. If only the n_kv 256 or depth-0 condition fails, the tiled kernel takes calls below 64 tokens from n_kv 512, as the KV-head split's rule would have it. The controls within 2%, or the speed runs are repeated.
+- Accuracy: the mean KLD under `9` is not above the one under `64` by more than one standard error of the latter, at both ubatches. A lower KLD passes (the user's reading for the KV-head split, 2026-11-05).
+- If no count passes, the default stays 64, the switch stays for tests, and the result goes to `batch-one.md`.
+
+**Predictions** (estimates; the one-chunk kernels from the KV-head split's benchmark above, about 7.7 ms per token at n_kv 4096; the tiled kernel from its 128-token call at n_kv 4096, 63.6 ms (`build.md` §7, L4), with each 64-token tile's pass over K and V taken as anything from free to 6.9 ms, 64 MiB at the cache layout's 9.7 GB/s):
+- Per call at n_kv 4096: 9 tokens from about 69 ms to 4.5-10.4; 26 from about 200 to 13-17; 63 from about 485 to about 31 (64: about 32). At n_kv 256 still faster, about 3 to 9 times at 9 tokens (from the 128-token call at n_kv 128), the smallest margin in the table.
+- llama-bench, Qwen3-4B (today's figures from the grid's times): at depth 4096, pp9 from about 3.4 to 17-28 t/s, pp26 from 3.58 to 30-35, pp38 from 3.60 to 32-36, pp63 from 3.58 to about 37 (pp64 38.4); at depth 1024, pp26 from about 13 to 56-63; at depth 0 within 3% up to pp32, and pp63 near pp64. Qwen3-0.6B: similar ratios.
+- So R = 9 at every n_kv. A 26-token request at depth 4096 would take 0.7 to 0.9 s against 7.26 s, and 38 tokens 1.1 to 1.2 s: the 1 s target would hold for 26 tokens, not for 38 or 110.
+- The KLD lower or equal under `9`: V summed in F32 against F16 (the reading of the KV-head split's base, above).
+- The checks pass; the tiled rows within about 1e-6 of the CPU's tiled kernel, as today's tiled cases (8.4e-7).
+
+**Step 2, if the rule passes.** The default becomes R (from n_kv 512 if the rule says so); the switch stays for comparisons, `64` giving today's kernels. On the Mac: the check program and test-backend-ops as above. On the K3: the check program; the runner on both models as for S2's acceptance (Qwen3-0.6B with `--build`, Qwen3-4B with `--depth`, both with `--server-baseline`); the TTFT harness's `grid` and `chat` on Qwen3-4B, against the baseline above and the targets. Predictions for the runner: perplexity and both KLDs to the last digit (their ubatches are 512 rows). A request whose prompt ends in a 9 to 63-token ubatch now takes the tiled kernel, so a server reply may change at a near-tie (inference); one that does is reported with its first differing token, and the user decides whether the baselines are recorded again. Docs: here, `batch-one.md` (T1, C3, C5, C6, the targets), `build.md` §7, `progress.md`, `PROJECT.md` §8.
+
+**Time:** step 1 is one coder session and my check on the Mac, then on the K3 one build and about 1.5 hours of runs (estimate: the benchmark about 5 minutes, llama-bench about 20 on Qwen3-4B and 7 on Qwen3-0.6B, the four KLD passes about 26). Step 2: a small change and about 2 hours of runs (estimate).
+
+**Not covered:** 2 to 8 tokens (the KV-head split stays; the tiled kernel against it at 5 to 8 tokens, where the split takes one pass per token on Qwen3-4B, is a later comparison); a faster tiled kernel (T7, or one KV head per tile); 64 tokens and up (unchanged); Qwen3-0.6B's KLD at 4096 (no base on the board; its runner's KLDs use 512-row ubatches).
 
 ### Not planned
 

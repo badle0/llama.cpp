@@ -4,15 +4,14 @@
 // deck's names (page 7), and the two counter files. Moved here from flagos-spacemit.cpp 2026-11-02 (S1 step 5), where
 // graph_compute had them inline; the core's own code, built without libspert and without Common.
 //
-// The names (S1 step 5 §2; the old FLAGOS_SPACEMIT_* name of each, when still set, is reported once and otherwise
-// ignored, spacemit_renamed):
+// The names (S1 step 5 §2):
 //   GGML_FLAGOS_STATS=<file>|-|1          the per-graph counters (E3c's per-token budget); - or 1: stderr
 //   GGML_FLAGOS_OP_STATS=<file>|-|1       the op counters (fusion-and-splitting.md §7)
 //   GGML_FLAGOS_DISABLE_OPS=<op>[,<op>]   named ggml ops back to the CPU (spacemit_find_op refuses them)
 //   GGML_FLAGOS_TRACE_LAUNCH=1            the steps logged by name before each replay, the failing one named
 //   GGML_FLAGOS_SYNC_LAUNCH=1             one launch per step, the host waiting for each (E3a)
 // GGML_FLAGOS_KERNEL_VARIANTS=0 is the plugin's (flagos-spacemit-kernels.cpp) and GGML_FLAGOS_PROVIDER_PATH the
-// loader's. The core's other switches keep their names (FLAGOS_SPACEMIT_DISABLE, PLAN, QUANTIZE, TEST_DEVICE_TYPE):
+// loader's. The core's other switches keep their names (FLAGOS_SPACEMIT_DISABLE, PLAN, QUANTIZE):
 // the deck names none of them.
 
 #include "flagos-spacemit-plan.h"    // spacemit_plan_result
@@ -29,13 +28,9 @@
 #include <tuple>
 #include <vector>
 
-// an old switch name that was replaced: when it is still set, reported once with the new name and otherwise ignored.
-// Called where the new name is read. Read by tests too (the check program's check_diagnostics)
-void spacemit_renamed(const char * old_name, const char * new_name);
-
-// the switches parsed once (GGML_FLAGOS_DISABLE_OPS, GGML_FLAGOS_TRACE_LAUNCH) and the warnings of
-// spacemit_renamed parse and warn again after this call; the counter files' switches are read once per process and
-// are not affected. For tests that change a switch inside one process (the check program's set_env)
+// the switches parsed once (GGML_FLAGOS_DISABLE_OPS, GGML_FLAGOS_TRACE_LAUNCH) parse and warn again after this call;
+// the counter files' switches are read once per process and are not affected. For tests that change a switch inside
+// one process (the check program's set_env)
 void spacemit_diagnostics_reset();
 
 enum class spacemit_launch_kind {

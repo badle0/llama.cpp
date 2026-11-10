@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # Acceptance run for the SpacemiT provider (plan.md §5). Run on the K3; standard library only. It checks:
 #   (--build) configure and build build-flagos/; FlagOS Common's checks; flagos-check-spacemit with the device present
-#   (with --full: Qwen3-4B's shapes), with the reference kernels on the AI cores, with FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=
-#   accel (which must report ACCEL) and with FLAGOS_SPACEMIT_DISABLE=1 (no device); the plugin loaded through the
-#   loader; llama.cpp lists the device; the provider claims exactly ADD, MUL, RMS_NORM, ROPE, SET_ROWS, GET_ROWS,
-#   SWIGLU, MUL_MAT (Q4_0, Q4_1, Q8_0 and Q6_K weights in their IME layouts), FLASH_ATTN_EXT (F16 K and V, head sizes
-#   up to 128) and CPY (F32 into the quantized and BF16 cache types), and test-backend-ops passes for each and for the
-#   multi-op graphs built from them, with the RVV and with the reference kernels; the benchmark of the check program;
+#   (with --full: Qwen3-4B's shapes), with the reference kernels on the AI cores and with FLAGOS_SPACEMIT_DISABLE=1 (no
+#   device); the plugin loaded through the loader; llama.cpp lists the device; the provider claims exactly ADD, MUL,
+#   RMS_NORM, ROPE, SET_ROWS, GET_ROWS, SWIGLU, MUL_MAT (Q4_0, Q4_1, Q8_0 and Q6_K weights in their IME layouts),
+#   FLASH_ATTN_EXT (F16 K and V, head sizes up to 128) and CPY (F32 into the quantized and BF16 cache types), and
+#   test-backend-ops passes for each and for the multi-op graphs built from them, with the RVV and with the reference
+#   kernels; the benchmark of the check program;
 #   a model run with the provider and with FLAGOS_SPACEMIT_DISABLE=1 (the IME kernels quantize activations differently
 #   from the CPU, so the text is reported, not compared): the weights, every layer and the KV cache on the provider
 #   (IGPU, D3), -fa auto keeping flash attention there (FAIL with llama.cpp's warning if it turns it off, or if the
@@ -154,13 +154,6 @@ def check_tools(bdir, logs):
     loader = next((ln for ln in read_log(logs / "check-spacemit") if ln.startswith("loader ")), "")
     path = loader[len("loader "):].split(": api ", 1)[0].strip()
     report("plugin loaded through the loader", bool(path) and Path(path).is_file(), loader or "no loader line")
-    # the test-only switch back to ACCEL, the type until 2026-10-26: the checks pass and the device says so
-    rc, out, err = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-device"], logs / "check-spacemit-accel",
-                       env_extra={"FLAGOS_SPACEMIT_TEST_DEVICE_TYPE": "accel", **preload}, timeout=900)
-    device = next((ln for ln in out.splitlines() if ln.startswith("device")), "") or "no device line"
-    fails = "; ".join(ln for ln in err.splitlines() if ln.startswith("FAIL") or "timeout" in ln)
-    report("flagos-check-spacemit (FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel)", rc == 0 and "type ACCEL" in device,
-           device + ("" if rc == 0 else f"; rc={rc}: {fails[:300] or last_line(err)}"))
     rc, out, _ = run([str(bdir / "bin" / "flagos-check-spacemit"), "--expect-none"], logs / "check-spacemit-disabled",
                      env_extra={"FLAGOS_SPACEMIT_DISABLE": "1", **preload})
     report("flagos-check-spacemit (FLAGOS_SPACEMIT_DISABLE=1)", rc == 0, "device absent" if rc == 0 else f"rc={rc}")

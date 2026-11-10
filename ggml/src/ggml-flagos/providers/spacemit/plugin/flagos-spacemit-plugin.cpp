@@ -231,8 +231,7 @@ enum spacemit_status plugin_device_memory(spacemit_plugin_device * dev, size_t *
 }
 
 // Buffers of at least one huge page go on huge pages; a smaller one would gain nothing and still take a whole one
-// (about 0.75 ms to fault in on the K3). test-only: FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1 keeps the default pages, for
-// comparison
+// (about 0.75 ms to fault in on the K3)
 enum spacemit_status plugin_buffer_alloc(spacemit_plugin_device * dev, size_t size, spacemit_plugin_buffer ** buf) {
     if (dev == nullptr || buf == nullptr) {
         return SPACEMIT_STATUS_INVALID_ARGUMENT;
@@ -241,8 +240,7 @@ enum spacemit_status plugin_buffer_alloc(spacemit_plugin_device * dev, size_t si
     size_t mapped = 0;
     if (size > 0) {
 #if defined(MADV_HUGEPAGE)
-        const char * no_huge = std::getenv("FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES");
-        if (size >= SPACEMIT_HUGE_PAGE && (no_huge == nullptr || std::strcmp(no_huge, "0") == 0)) {
+        if (size >= SPACEMIT_HUGE_PAGE) {
             data = spacemit_map_huge(size, mapped);
         }
 #endif
@@ -303,13 +301,6 @@ enum spacemit_status plugin_tensor_fill(struct ggml_tensor * t, uint8_t value, s
     return SPACEMIT_STATUS_SUCCESS;
 }
 
-// experiment switch: FLAGOS_SPACEMIT_STREAM=per-call releases the AI cores after every graph (M2a measures both)
-spacemit_stream_policy spacemit_stream_policy_from_env() {
-    const char * value = std::getenv("FLAGOS_SPACEMIT_STREAM");
-    return value != nullptr && std::strcmp(value, "per-call") == 0 ? spacemit_stream_policy::per_call
-                                                                    : spacemit_stream_policy::persistent;
-}
-
 // test-only: FLAGOS_SPACEMIT_TEST_FAIL_NODE=n makes tile 0 report a failure at step n. Read per stream, so one
 // context's forced failure leaves another's runs alone
 int64_t spacemit_test_fail_step() {
@@ -323,9 +314,9 @@ enum spacemit_status plugin_stream_create(spacemit_plugin_device * dev, uint32_t
         return SPACEMIT_STATUS_INVALID_ARGUMENT;
     }
     std::lock_guard<std::mutex> lock(dev->streams_mutex);
-    // the policy and n_tiles are the first stream's, the core passing the device's count each time
+    // n_tiles is the first stream's, the core passing the device's count each time
     if (dev->executor == nullptr) {
-        dev->executor = spacemit_executor_create(spacemit_stream_policy_from_env(), n_tiles);
+        dev->executor = spacemit_executor_create(n_tiles);
         if (dev->executor == nullptr) {
             return SPACEMIT_STATUS_ALLOC_FAILED;
         }

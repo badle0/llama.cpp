@@ -35,8 +35,8 @@ bool spacemit_flash_attn_split_paired_supported(const ggml_tensor * op);
 bool spacemit_flash_attn_split_any_supported(const ggml_tensor * op);  // the merge step, shared by both split contracts
 
 // the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): the calls of
-// 2 to 8 tokens by default, or of FLAGOS_SPACEMIT_ATTN_KVH=<lo>-<hi> tokens (one stream, 2, 4 or 8 query heads per KV
-// head, no ALiBi, from 128 positions per chunk). Step 1 computes per unit (KV head x chunk of positions, dealt
+// 2 to 8 tokens, turned off by FLAGOS_SPACEMIT_ATTN_KVH=off (one stream, 2, 4 or 8 query heads per KV head, no ALiBi,
+// from 128 positions per chunk). Step 1 computes per unit (KV head x chunk of positions, dealt
 // round-robin over the tiles) the partial results of the KV head's query heads and tokens into the workspace; step 2
 // merges each row's chunks and writes dst. The first attention contract: its supports is false for other calls and
 // under FLAGOS_SPACEMIT_ATTN_KVH=off, so the others decide as before

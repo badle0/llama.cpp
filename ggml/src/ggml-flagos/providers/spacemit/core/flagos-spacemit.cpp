@@ -167,7 +167,7 @@ const char * spacemit_buffer_type_name(ggml_backend_buffer_type_t) {
 }
 
 // ggml_backend_buft_alloc_buffer() handles size 0 itself and never calls this with it. The plugin decides the pages
-// (huge pages from 2 MiB; test-only: FLAGOS_SPACEMIT_TEST_NO_HUGE_PAGES=1 keeps the default pages, for comparison)
+// (huge pages from 2 MiB)
 ggml_backend_buffer_t spacemit_buffer_type_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     auto *                   dev = static_cast<spacemit_device_context *>(buft->context);
     spacemit_plugin_buffer * buf = nullptr;
@@ -489,26 +489,9 @@ void spacemit_device_memory(ggml_backend_dev_t dev, size_t * free, size_t * tota
     spacemit_buffer_status("get_memory", ctx->table->device_memory(ctx->dev, free, total));
 }
 
-// IGPU (D3, 2026-10-26): llama.cpp gives the device whole layers and their KV cache, which lives in our buffer.
-// test-only: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=accel or gpu reports that type instead, for comparisons (ACCEL: the type
-// until 2026-10-26, the KV cache in a CPU buffer; structural-experiments.md E1, E2); igpu names the default. Read once,
-// reported once when it changes the type, anything else reported and ignored
+// IGPU (D3): llama.cpp gives the device whole layers and their KV cache, which lives in our buffer
 enum ggml_backend_dev_type spacemit_device_type(ggml_backend_dev_t) {
-    static const enum ggml_backend_dev_type type = [] {
-        const char * v = std::getenv("FLAGOS_SPACEMIT_TEST_DEVICE_TYPE");
-        if (v == nullptr || *v == '\0' || std::strcmp(v, "igpu") == 0) {
-            return GGML_BACKEND_DEVICE_TYPE_IGPU;
-        }
-        if (std::strcmp(v, "accel") == 0 || std::strcmp(v, "gpu") == 0) {
-            const bool accel = v[0] == 'a';
-            GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: reporting %s instead of IGPU\n", v,
-                          accel ? "ACCEL" : "GPU");
-            return accel ? GGML_BACKEND_DEVICE_TYPE_ACCEL : GGML_BACKEND_DEVICE_TYPE_GPU;
-        }
-        GGML_LOG_WARN("spacemit_device_type: FLAGOS_SPACEMIT_TEST_DEVICE_TYPE=%s: unknown setting ignored\n", v);
-        return GGML_BACKEND_DEVICE_TYPE_IGPU;
-    }();
-    return type;
+    return GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
 
 void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
@@ -527,7 +510,7 @@ void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
 }
 
 // one stream handle per backend context; the plugin shares one executor and core grant among a device's handles until
-// the last is destroyed (FLAGOS_SPACEMIT_STREAM is the plugin's switch)
+// the last is destroyed
 ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
     auto *                   dctx   = spacemit_device_from_dev(dev);
     spacemit_plugin_stream * stream = nullptr;
@@ -565,8 +548,7 @@ bool spacemit_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op)
     return ggml_op_is_empty(op->op) || spacemit_find_op(dctx->ops, op, &dctx->buffer_type) != nullptr;
 }
 
-// operands may also live in CPU buffers: the activations of the CPU's splits, and under ACCEL (test-only) the KV cache;
-// under IGPU, the default, the KV cache lives in our buffer
+// operands may also live in CPU buffers: the activations of the CPU's splits
 bool spacemit_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     return buft == &spacemit_device_from_dev(dev)->buffer_type || ggml_backend_buft_is_host(buft);
 }
@@ -679,9 +661,8 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
     g_device.buffer_type.device   = &g_device.device;
     g_device.buffer_type.context  = &g_device;
 
-    // llama.cpp would first read these switches inside common_fit_params's trial load, which passes lines below ERROR
-    // on as DEBUG (common/fit.cpp:49-53), so they are read here, at registration, and their once-only warnings show
-    (void) spacemit_device_type(&g_device.device);
+    // llama.cpp would first read this switch inside common_fit_params's trial load, which passes lines below ERROR
+    // on as DEBUG (common/fit.cpp:49-53), so it is read here, at registration, and its once-only warnings show
     (void) spacemit_op_disabled(GGML_OP_NONE);
     g_present = true;
     return true;

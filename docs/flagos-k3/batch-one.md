@@ -117,7 +117,7 @@ Gains are estimates unless marked. Each needs a rule set before its run, as the 
 
 | # | Technique | Gain | Basis | Effort, risk |
 |---|---|---|---|---|
-| T1 | Tiled kernel below 64 rows (threshold by rows, perhaps n_kv) | 26-token tail at 4096: about 7 s to 0.7-1.4 s | pp64 is 10.5 times pp63; the kernel already takes fewer rows. A long chat turn ends in such a tail, 21 to 25 tokens after its 512-token ubatch: 32 to 40% of the turn on Qwen3-4B in turns 7 to 19 (2026-11-09, `plan.md`; inference) | One constant behind a test switch. May lose at n_kv 256, where a head stays in the core's cache. Its F32 sums might also improve accuracy (inference) |
+| T1 | Tiled kernel below 64 rows (threshold by rows, perhaps n_kv) | 26-token tail at 4096: about 7 s to 0.7-1.4 s | pp64 is 10.5 times pp63; the kernel already takes fewer rows. A long chat turn ends in such a tail, 21 to 25 tokens after its 512-token ubatch: 32 to 40% of the turn on Qwen3-4B in turns 7 to 19 (2026-11-09, `plan.md`; inference) | One constant behind a test switch. May lose at n_kv 256, where a head stays in the core's cache. Its F32 sums might also improve accuracy (inference). Spec for review 2026-11-09 (`plan.md` "T1 spec") |
 | T2 | Keep the prefix across chat turns: `--cache-reuse 16`, or a template keeping the empty think block | Measured on the Mac: decoded 109 to 26 and 138 to 22 | §7 | Settings only. **Replies change** (measured), so first-token KL against scratch must pass. Needs T1 first at depth, where fewer tokens are slower today |
 | T3 | System prompt decoded once, saved, restored at start or per conversation (`--slot-save-path`) | Measured on the Mac: 21.6 s to 1.73 s. K3: about 3.7 s to 0.3-0.7 s | §7; restore 4.7 ms, 39.9 MB | No provider code. The file is tied to model and build. Replies equal over 24 tokens only |
 | T4 | Prefill while the user types or between turns (`n_predict` 0 worked on the Mac) | Leaves the last few template tokens, the shapes T5 serves | §7 | Client work; wasted when the text changes |
@@ -165,7 +165,7 @@ T10, T7, and these smaller ones: elementwise and quantize steps at 512 rows hold
 **After S2:**
 
 1. A TTFT harness: C3, C5, C6, C10 and C14, with C11 and C15 added (the user, 2026-11-06; tg512 has never been run), client-side and server-side, as the baseline. Built 2026-11-08 as a script beside the runner, `tools/spacemit_ttft.py` (`plan.md` "TTFT harness spec" and its result; usage in `build.md` §6). First K3 run the same day, `--quick`, 11/11. The full runs followed that night: 13/13 on Qwen3-0.6B and 12/13 on Qwen3-4B, its one failure the harness's chat context (fixed 2026-11-09). That case and Qwen3-4B's `alongside` without TCM ran again the same day, 3/3, which completes the baseline.
-2. T1, with T5's result beside it.
+2. T1, with T5's result beside it. Next (the user, 2026-11-09, ahead of the embedding lookup); its spec in `plan.md` "T1 spec".
 3. T2, T3 and T10, each against the baseline with its accuracy check.
 4. Block 6's per-op figures, then T7.
 5. G1 (could run any time, it needs no provider change), G3 and G2's KLD.

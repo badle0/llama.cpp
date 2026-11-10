@@ -12,12 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <set>
 
 namespace {
 
-std::mutex            g_diag_mutex;      // the parsed-once switches and the rename warnings
-std::set<std::string> g_renamed_warned;  // old names already reported
+std::mutex g_diag_mutex;  // the parsed-once switches
 
 std::atomic<bool> g_ops_parsed{ false };  // GGML_FLAGOS_DISABLE_OPS, parsed once (and again after a reset)
 std::atomic<bool> g_ops_any{ false };     // whether any op is disabled, the fast path of spacemit_op_disabled
@@ -201,25 +199,13 @@ uint64_t structure_of(const std::vector<spacemit_plugin_step> & steps) {
 
 }  // namespace
 
-void spacemit_renamed(const char * old_name, const char * new_name) {
-    if (std::getenv(old_name) == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_diag_mutex);
-    if (g_renamed_warned.insert(old_name).second) {
-        GGML_LOG_WARN("FlagOS SpacemiT: %s is now %s\n", old_name, new_name);
-    }
-}
-
 void spacemit_diagnostics_reset() {
     std::lock_guard<std::mutex> lock(g_diag_mutex);
     g_ops_parsed.store(false, std::memory_order_release);
     g_trace_parsed.store(false, std::memory_order_release);
-    g_renamed_warned.clear();
 }
 
 spacemit_launch_kind spacemit_launch_mode() {
-    spacemit_renamed("FLAGOS_SPACEMIT_TEST_LAUNCH", "GGML_FLAGOS_SYNC_LAUNCH");
     const char * v = std::getenv("GGML_FLAGOS_SYNC_LAUNCH");
     const bool   on = v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
     return on ? spacemit_launch_kind::per_step : spacemit_launch_kind::per_split;
@@ -300,7 +286,6 @@ spacemit_stats_file::spacemit_stats_file(const char * value) {
 }
 
 spacemit_stats_file * spacemit_stats_file::get() {
-    spacemit_renamed("FLAGOS_SPACEMIT_TEST_STATS", "GGML_FLAGOS_STATS");
     static spacemit_stats_file file(std::getenv("GGML_FLAGOS_STATS"));
     return file.writing() ? &file : nullptr;
 }
@@ -381,7 +366,6 @@ spacemit_op_stats_file::spacemit_op_stats_file(const char * value) {
 }
 
 spacemit_op_stats_file * spacemit_op_stats_file::get() {
-    spacemit_renamed("FLAGOS_SPACEMIT_TEST_OP_STATS", "GGML_FLAGOS_OP_STATS");
     static spacemit_op_stats_file file(std::getenv("GGML_FLAGOS_OP_STATS"));
     return file.writing() ? &file : nullptr;
 }

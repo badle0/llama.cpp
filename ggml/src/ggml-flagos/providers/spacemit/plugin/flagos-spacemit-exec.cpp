@@ -189,12 +189,11 @@ void spacemit_tile_main(spert::Context * ctx, spacemit_launch * launch) noexcept
 
 class spert_executor final : public spacemit_executor {
   public:
-    spert_executor(spacemit_stream_policy policy, uint32_t n_cores) : policy(policy), n_cores(n_cores) {}
+    explicit spert_executor(uint32_t n_cores) : n_cores(n_cores) {}
 
     bool run(const spacemit_plugin_step * steps, size_t n_steps, void * workspace, size_t workspace_size,
              const spacemit_run_options & options) override {
-        std::unique_ptr<spert::Stream> per_call_stream;
-        spert::Stream *                stream = stream_for_run(per_call_stream);
+        spert::Stream * stream = stream_for_run();
         if (stream == nullptr) {
             return false;
         }
@@ -220,22 +219,16 @@ class spert_executor final : public spacemit_executor {
     }
 
     const char * name() const override {
-        return policy == spacemit_stream_policy::per_call ? "spine-runtime, stream per call" : "spine-runtime, persistent stream";
+        return "spine-runtime";
     }
 
   private:
-    // the stream for one run: the device's, or one of its own (FLAGOS_SPACEMIT_STREAM=per-call) kept in per_call
-    spert::Stream * stream_for_run(std::unique_ptr<spert::Stream> & per_call) {
-        spert::Stream * stream = nullptr;
-        if (policy == spacemit_stream_policy::per_call) {
-            per_call = make_stream();
-            stream   = per_call.get();
-        } else {
-            if (persistent_stream == nullptr) {
-                persistent_stream = make_stream();
-            }
-            stream = persistent_stream.get();
+    // the device's one stream (core grant), created at the first run and kept until the executor is freed
+    spert::Stream * stream_for_run() {
+        if (persistent_stream == nullptr) {
+            persistent_stream = make_stream();
         }
+        spert::Stream * stream = persistent_stream.get();
         if (stream != nullptr && static_cast<uint32_t>(stream->core_count()) > SPACEMIT_MAX_TILES) {
             GGML_LOG_ERROR("FlagOS SpacemiT: %u AI cores, at most %u supported\n",
                            static_cast<uint32_t>(stream->core_count()), SPACEMIT_MAX_TILES);
@@ -253,7 +246,6 @@ class spert_executor final : public spacemit_executor {
         return stream;
     }
 
-    spacemit_stream_policy         policy;
     uint32_t                       n_cores;
     std::unique_ptr<spert::Stream> persistent_stream;
 };
@@ -412,12 +404,11 @@ uint64_t spacemit_executors_take() {
     return g_executors_created.exchange(0);
 }
 
-std::unique_ptr<spacemit_executor> spacemit_executor_create(spacemit_stream_policy policy, uint32_t n_cores) {
+std::unique_ptr<spacemit_executor> spacemit_executor_create(uint32_t n_cores) {
     g_executors_created++;
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
-    return std::make_unique<spert_executor>(policy, n_cores);
+    return std::make_unique<spert_executor>(n_cores);
 #else
-    GGML_UNUSED(policy);
     return std::make_unique<host_executor>(n_cores);
 #endif
 }

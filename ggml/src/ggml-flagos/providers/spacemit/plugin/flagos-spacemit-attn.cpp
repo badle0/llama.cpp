@@ -1,6 +1,6 @@
 // FLASH_ATTN_EXT on the AI cores (plan.md, M2e design): the claim, the split of the rows over the tiles, and the
 // portable reference; for one token per call from n_kv 512, the split of the KV positions over the tiles and the merge
-// of their partial results (plan.md, M2e.3 round 2); for 2 to 8 tokens by default (FLAGOS_SPACEMIT_ATTN_KVH),
+// of their partial results (plan.md, M2e.3 round 2); for 2 to 8 tokens (FLAGOS_SPACEMIT_ATTN_KVH=off: none),
 // ggml-spacemit's split by KV head and its merge (plan.md, "The KV-head split for a few tokens, from SpacemiT's fork").
 
 #include "flagos-spacemit-attn.h"
@@ -398,38 +398,23 @@ bool split_partial(const spacemit_tile & tile, ggml_tensor * dst, bool paired) {
     return true;
 }
 
-// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"), by default
-// for 2 to 8 tokens per call. FLAGOS_SPACEMIT_ATTN_KVH stays, to compare and to turn the path off: <lo>-<hi>, the token
-// counts per call it takes, 1 <= lo <= hi <= 63; off: none; unset or empty: the default. Kept as lo * 64 + hi, 0 for
-// none; parsed once (spacemit_cached_switch); anything else is reported once and taken as off
-constexpr int kvh_default_setting = 2 * 64 + 8;
+// the KV-head split for a few tokens (plan.md "The KV-head split for a few tokens, from SpacemiT's fork"): 2 to 8
+// tokens per call. FLAGOS_SPACEMIT_ATTN_KVH=off turns it off, for comparisons (2-8 names the default). 1 on, 0 off;
+// parsed once (spacemit_cached_switch); anything else is reported once and taken as off
+constexpr int64_t kvh_min_tokens = 2;
+constexpr int64_t kvh_max_tokens = 8;
 
 int parse_kvh_setting() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN_KVH");
-    if (v == nullptr || *v == '\0') {
-        return kvh_default_setting;
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "2-8") == 0) {
+        return 1;
     }
     if (std::strcmp(v, "off") == 0) {
         return 0;
     }
-    const char * p      = v;
-    const auto   number = [&p](int & out) {
-        if (*p < '0' || *p > '9') {
-            return false;
-        }
-        for (out = 0; *p >= '0' && *p <= '9'; ++p) {
-            out = std::min(out * 10 + (*p - '0'), 1000);
-        }
-        return true;
-    };
-    int lo = 0, hi = 0;
-    if (number(lo) && *p++ == '-' && number(hi) && *p == '\0' && 1 <= lo && lo <= hi && hi <= 63) {
-        return lo * 64 + hi;
-    }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN_KVH=%s: not <lo>-<hi> with 1 <= lo <= hi <= 63, taken as off\n",
-                      __func__, v);
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN_KVH=%s: not off or 2-8, taken as off\n", __func__, v);
     }
     return 0;
 }
@@ -448,12 +433,11 @@ int64_t kvh_n_chunks(const ggml_tensor * op) {
     return std::max<int64_t>(1, kvh_units / op->src[1]->ne[2]);
 }
 
-// the shapes the KV-head split takes (ggml-spacemit 855a53b, rvv_kernels.cpp:1380-1402, with the switch's token counts
-// for its 1 to 4): one stream, as many K as V heads, 2, 4 or 8 query heads per KV head, no ALiBi, the mask (if any) one
-// row per token for every head, from 128 positions per chunk. Softcap and sinks allowed
+// the shapes the KV-head split takes (ggml-spacemit 855a53b, rvv_kernels.cpp:1380-1402, with 2 to 8 tokens for its
+// 1 to 4): one stream, as many K as V heads, 2, 4 or 8 query heads per KV head, no ALiBi, the mask (if any) one row per
+// token for every head, from 128 positions per chunk. Softcap and sinks allowed
 bool kvh_shape(const ggml_tensor * op) {
-    const int setting = kvh_setting_from_env();
-    if (setting == 0) {
+    if (kvh_setting_from_env() == 0) {
         return false;
     }
     const ggml_tensor * q    = op->src[0];
@@ -461,9 +445,10 @@ bool kvh_shape(const ggml_tensor * op) {
     const ggml_tensor * v    = op->src[2];
     const ggml_tensor * mask = op->src[3];
     const int64_t       rk2  = q->ne[2] / k->ne[2];
-    return q->ne[1] >= setting / 64 && q->ne[1] <= setting % 64 && q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
-           k->ne[2] == v->ne[2] && (rk2 == 2 || rk2 == 4 || rk2 == 8) && ggml_get_op_params_f32(op, 1) == 0.0f &&
-           (mask == nullptr || (mask->ne[2] == 1 && mask->ne[3] == 1)) && k->ne[1] >= 128 * kvh_n_chunks(op);
+    return q->ne[1] >= kvh_min_tokens && q->ne[1] <= kvh_max_tokens && q->ne[3] == 1 && k->ne[3] == 1 &&
+           v->ne[3] == 1 && k->ne[2] == v->ne[2] && (rk2 == 2 || rk2 == 4 || rk2 == 8) &&
+           ggml_get_op_params_f32(op, 1) == 0.0f && (mask == nullptr || (mask->ne[2] == 1 && mask->ne[3] == 1)) &&
+           k->ne[1] >= 128 * kvh_n_chunks(op);
 }
 
 // the reference of the KV-head split's step 1, also its path without the RVV kernels or without TCM: the units, their
