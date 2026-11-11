@@ -378,7 +378,7 @@ start only after the structural work on the backend (the IGPU switch, the plugin
 | `RMS_NORM` | `flagos_rms_norm_f32` (`BLOCK` 4096 covers Qwen3's rows), and `flagos_rms_norm_mul_f32` fused | yes |
 | `ROPE` | `flagos_rope_neox_f32` | NEOX only; our claim includes NORMAL mode (Qwen3 uses NEOX) |
 | `SET_ROWS` | `flagos_set_rows_f32_f16` | F32 into F16 only; ours claims the four F32/F16 pairs and I32 or I64 indices |
-| `GET_ROWS` | `flagos_get_rows_f32`, `_q4_k_f32`, `_q6_k_f32` | F32 as ours; the Q6_K one is the token-embedding lookup, the last op on the X100 cores (`plan.md` M3's later list), a candidate for taking the token to 1 split |
+| `GET_ROWS` | `flagos_get_rows_f32`, `_q4_k_f32`, `_q6_k_f32` | F32 as ours; the Q6_K one is the token-embedding lookup, the last op on the X100 cores until 2026-11-11, when our own `get_rows.quant` took the token to 1 split with ggml's dequantizer (`plan.md` "Embedding lookup spec") |
 | `GLU` SwiGLU | `flagos_swiglu_split_f32` | the split form; ours also claims the single-tensor form |
 | `FLASH_ATTN_EXT` | `flagos_flash_attn_decode_f32_f16` | one-token calls only; prompt processing has no shared kernel (the AMD overlay was not checked), so the tiled kernel stays RVV |
 | `MUL_MAT` | `flagos_mul_mat_q4_0/q4_k/q6_k_f32` (+ batched), on GGUF's block layout | **not usable on our weights**: the IME layouts (`flagos-spacemit-ime-kernels.h:1-20`) are not GGUF's, and the matmuls are 95% of a token (E3c). By the rule's second half they stay IME; this is the one op where both halves of the rule apply, so it should be confirmed (§7, Q13) |

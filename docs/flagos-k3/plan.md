@@ -2657,7 +2657,7 @@ What changes on the K3 with it, by reading (the coder's list, which I checked ag
 
 ### Embedding lookup spec: the token embedding on the AI cores, for review (2026-11-11)
 
-**Status:** written for review 2026-11-11, on the user's word ("can you plan for token embedding lookup on ai cores?"), item 3 of the to-do order agreed 2026-11-08. Approved the same day (the user: "i would like to try with ggml's own dequantizer per row on ai cores first, and then try with our own customized kernel later to compare the performance"); the two review points were left unanswered, so I took both as recommended (the eight block types; adopt on "not slower") and said so. Built and checked on the Mac 2026-11-11 ("As built" below); its K3 run is the user's. A kernel of our own (RVV at VLEN 1024) is a second step after this one's K3 run, compared through the same checks; it is not bit-identical by construction, so its rule will need a bound or a proof.
+**Status:** written for review 2026-11-11, on the user's word ("can you plan for token embedding lookup on ai cores?"), item 3 of the to-do order agreed 2026-11-08. Approved the same day (the user: "i would like to try with ggml's own dequantizer per row on ai cores first, and then try with our own customized kernel later to compare the performance"); the two review points were left unanswered, so I took both as recommended (the eight block types; adopt on "not slower") and said so. Built and checked on the Mac 2026-11-11 ("As built" below). Run on the K3 the same day ("Result on the K3" below): every check passes, 1 split per graph, the speed flat with one figure at -1.04%; whether that keeps it is the user's decision. A kernel of our own (RVV at VLEN 1024) is a second step after this one's K3 run, compared through the same checks; it is not bit-identical by construction, so its rule will need a bound or a proof.
 
 **Why.** A token is 2 graph splits today, and the first holds one node. On the Mac's simulated device with `GGML_SCHED_DEBUG=2` (Qwen3-0.6B, 2026-11-11), every graph reads:
 - split 0, CPU: `GET_ROWS` of `token_embd.weight` by `inp_tokens`, giving `embd`;
@@ -2734,6 +2734,32 @@ The changes: `core/flagos-spacemit-ops.cpp` (the contract `get_rows.quant`, the 
 - Mutations caught: the kernel dequantizing the next row (16 comparisons fail); the claim taking any layout (6 claims fail); the claim ignoring the switch.
 - The script: `bash -n`, a dry run, and a run against a stand-in for llama-bench, whose summary filled every row.
 - Not testable on the Mac: the RVV build and the tiles on threads, the page faults of the mapped embedding on an A100 core, llama-server, perplexity, Qwen3-4B, any speed.
+
+**Result on the K3 (2026-11-11; the user's run on `361258f3a`; the logs on the Mac: `~/k3-logs/embd-06.txt`, `embd-4b.txt`, `embd.txt`, `embd/`).** The rule's first two conditions hold; the speed condition misses on one figure of eight by 0.04 of a point, which is the user's to decide.
+- **The runner 49/49 on Qwen3-0.6B and 47/47 on Qwen3-4B.** 16/16 replies equal to T1's baselines on both, the first run against them. Perplexity and both KLDs to the last digit (Qwen3-4B 9.7736, 0.002489, 0.001229; Qwen3-0.6B 14.4471, 0.004722, 0.002533). So the embedding is the CPU's on the board too.
+- **1 graph split:** the model run's token, llama-server with 4 slots, and both perplexity runs, on both models (57 and 73 splits with the ops disabled by name, as before plus none).
+- **The check program on the K3:** 16/16 lookups identical to the CPU by `memcmp`, the claims exact on 56 nodes, through the scheduler 1 split against 2 under either switch with the outputs identical; the same under the reference kernels.
+- **The server with its default `mmap`** ran every check: the first touch of the mapped embedding on an A100 core is no problem.
+- **Speed** (`scripts/embd-experiments.sh`, three turns, every run rc 0; t/s, the better turn; the provider's lookup against `FLAGOS_SPACEMIT_EMBD=cpu`):
+
+  | | Qwen3-4B | Qwen3-0.6B |
+  |---|---|---|
+  | pp128 | 106.84 against 106.13, +0.7% | 702.77 against 710.13, -1.0% |
+  | pp512 | 96.32 against 96.94, -0.6% | 529.71 against 529.49, +0.0% |
+  | tg128 | 11.10 against 11.11, -0.0% | 56.56 against 56.64, -0.1% |
+  | pp512 at depth 4096 | 36.05 against 35.98, +0.2% | - |
+  | tg32 at depth 4096 | 7.76 against 7.74, +0.3% | - |
+
+  Qwen3-0.6B's pp128 is -1.04%, the old placement ahead in each of the three turns (710.13, 708.16 and 704.39 against 702.18, 702.77 and 698.30): 1.9 ms of a 182 ms prompt. Qwen3-4B's pp128 goes the other way in each turn, and its pp512 the first way. Generation is flat on both. No figure gains more than the board's spread.
+- **Against the predictions:** 1 split, the replies and digits, and "within the spread, at most +0.5%" held but for the two pp128 figures (+0.7% and -1.0%). Not read: the step count of a token's launch (1,087 predicted).
+- **Reading (inference):** the lookup costs about the same on either side. What the split's removal saves per graph is too small to see, and at 128 rows the eight A100 tiles dequantize no faster than the X100 pool did. This is the figure a kernel of our own would have to move, and the room is about 1% of pp128 on Qwen3-0.6B and nothing visible in generation.
+
+**Step 2: a kernel of our own, behind the switch (2026-11-11; the user: "attempt to create the custom lookup kernels; does make the lookup nonquantized potentially makes it faster?").** I take the lookup as kept on the provider, since the user went on to this step without answering the 1.04%, and said so.
+- **The kernel:** Q6_K rows dequantized with RVV at VLEN 1024, 32 values per vector, in `plugin/` beside the other RVV kernels. It can be the CPU's bit for bit, and the rule requires it: ggml computes `(d * scale) * q` in F32 with no addition (`ggml/src/ggml-quants.c:1939-1967`), so one scalar product per 16 values and one vector multiply by the exactly converted integer round as ggml's two multiplies do (inference until the K3's `memcmp`). A single row is split over the tiles by blocks (10 blocks on Qwen3-4B), which ggml's per-row call cannot do. Other types and other VLENs keep ggml's dequantizer.
+- **The switch:** `FLAGOS_SPACEMIT_EMBD` gains `ggml` (today's kernel, the default in this step) and `rvv`; `cpu` as before.
+- **The user's question, measured instead of argued:** a benchmark, `--bench-embd`, times one lookup call at 1, 8, 128 and 512 rows of 1,024 and 2,560 columns three ways: ggml's dequantizer, the RVV kernel, and the same rows as F32 copied by `get_rows.f32`. The third is the ceiling of a table kept dequantized: nothing done to a Q6_K row can beat copying it. What such a table would cost is known without a run: 151,936 rows of 2,560 F32 are 1.45 GiB on Qwen3-4B (0.58 GiB on Qwen3-0.6B) beside the 304 MiB file copy, and dequantizing 389 million values at every start, on the path T6 wants shorter. F16 would halve it and no longer be the CPU's bits.
+- **Rule, set before the run:** `rvv` becomes the default if every lookup in the check program is identical to the CPU's by `memcmp` on the K3, the runner's replies, perplexity and KLDs do not move, the benchmark's call is at least 20% faster than ggml's at 1, 128 and 512 rows, and no llama-bench figure is more than 1% slower than under `ggml`. An F32 table is proposed only if the benchmark's copy is faster than the RVV kernel by more than 1% of a 128-row prompt's time on Qwen3-0.6B (1.8 ms); otherwise its memory and start-up cost buy nothing.
+- **Predictions (estimates):** the RVV call several times faster than ggml's scalar loop on an A100 core; llama-bench unchanged within spread but perhaps Qwen3-0.6B's pp128, by at most 1%; generation unchanged. The lookup's own time has not been measured yet; the benchmark is the first reading.
 
 **For the user to decide at review:**
 1. The type list: every listed block type (recommended: the same code, each checked byte for byte against the CPU), or Q6_K alone.

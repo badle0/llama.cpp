@@ -66,7 +66,7 @@ descriptor declares no patterns. `plan.md` M4's rule stands: K3-specific fusions
 - Rules from the structural experiments: keep one launch in flight per stream; never order launches with `join`
   (F16: tiles then move and share TCM); a tile takes its TCM once per launch, safe because tiles do not move within a
   single launch (0 of 160 tiles moved, E3d). Any fused kernel that uses TCM or pair waits inherits these assumptions.
-- Placement today: 2 splits per token, the token-embedding lookup (`GET_ROWS` Q6_K) on the X100 cores and everything
+- Placement until 2026-11-11 (since then 1 split, the lookup on the provider too; `plan.md` "Embedding lookup spec"): 2 splits per token, the token-embedding lookup (`GET_ROWS` Q6_K) on the X100 cores and everything
   else on the AI cores, as ACCEL with C5a and C5b and as IGPU or GPU without them (E2). The KV cache is read in place from
   a CPU buffer (ACCEL) or lives in our buffer (IGPU, GPU).
 
@@ -184,7 +184,7 @@ whole graph at every call; at 0.1-0.3 ms per token (not measured) it would cance
 
 ## 6. Graph splitting on the K3
 
-- Today: 2 splits per token; the X100 cores run only the embedding lookup, so they are nearly idle during generation
+- Until 2026-11-11 (since then 1 split and no graph node on the X100 cores): 2 splits per token; the X100 cores run only the embedding lookup, so they are nearly idle during generation
   (inferred from the split structure; their use was not measured).
 - Using the X100 cores at the same time, e.g. for the output head (16.6 ms on the AI cores): within one sequence every
   layer needs the previous one and the head needs the last layer, so nothing runs in parallel; parallel work exists
