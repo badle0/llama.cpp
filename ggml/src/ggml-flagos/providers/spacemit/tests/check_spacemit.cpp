@@ -11,8 +11,8 @@
 //                    matmul setting (fit,staged) against split at the row counts of --bench-mm
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default; at 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=off
-//                    against the default), then at 9-64 tokens FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 (not run by
-//                    --bench)
+//                    against the default), then at 9-64 tokens FLAGOS_SPACEMIT_ATTN_TILED=64 (the kernels before
+//                    T1) against 9, the default (not run by --bench)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
@@ -2205,7 +2205,7 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
             REQUIRE(run.dev_output(backend, tiled[1]));
         }
         {
-            env_override tiled_default("FLAGOS_SPACEMIT_ATTN_TILED", "64");
+            env_override tiled_64("FLAGOS_SPACEMIT_ATTN_TILED", "64");
             REQUIRE(run.dev_output(backend, at64));
         }
         const std::string what = std::string("tiled below 64 tokens, ") + c.what;
@@ -2249,9 +2249,9 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
         const char * value;
         bool         tiled, warned;
     } tiled_values[] = {
-        { nullptr, false, false }, { "", false, false },  { "64", false, false }, { "26", true, false },
-        { "1", true, false },      { "27", false, false }, { "0", false, true },   { "65", false, true },
-        { "9x", false, true },     { "x", false, true },
+        { nullptr, true, false }, { "", true, false },  { "9", true, false },   { "64", false, false },
+        { "26", true, false },    { "1", true, false }, { "27", false, false }, { "0", true, true },
+        { "65", true, true },     { "9x", true, true }, { "x", true, true },
     };
     const auto lines_with = [](const std::string & text, const char * what) {
         int n = 0;
@@ -2330,11 +2330,12 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
                 k_attn_max_row_nmse_tiled, expect_reference ? "reference" : "tiled kernel", n_tiled_ran,
                 tiled_cases.size(), n_tiled_repeat, tiled_cases.size(), n_tiled_differ, tiled_cases.size(),
                 reference_label());
-    std::printf("attn     FLAGOS_SPACEMIT_ATTN_TILED values (unset, empty, 64, 26, 1, 27, 0, 65, 9x, x) on a 26-token "
-                "call at n_kv 1024: one warning for each of 0, 65, 9x and x and none for the others, the kernel by "
-                "the counter %s, as expected in %d/%zu%s\n",
+    std::printf("attn     FLAGOS_SPACEMIT_ATTN_TILED values (unset, empty, 9, 64, 26, 1, 27, 0, 65, 9x, x) on a "
+                "26-token call at n_kv 1024: one warning for each of 0, 65, 9x and x and none for the others, the "
+                "kernel by the counter %s, as expected in %d/%zu%s\n",
                 expect_reference ? "the reference for all" :
-                                   "tiled for 26 and 1, one-chunk for the others (the default kept for a bad value)",
+                                   "tiled for unset, empty, 9, 26, 1 and the bad values (the default 9 kept), "
+                                   "one-chunk for 64 and 27",
                 n_values_ok, sizeof(tiled_values) / sizeof(tiled_values[0]), reference_label());
     return 0;
 }
@@ -4873,10 +4874,10 @@ static int bench_attn(ggml_backend_dev_t dev) {
 }
 
 // T1 (plan.md "T1 spec"), --bench-attn only: the tiled kernel below 64 tokens at Qwen3-4B's heads, 9-64 tokens at n_kv
-// 256-8192, every cell valid, causal; FLAGOS_SPACEMIT_ATTN_TILED=64 (the default) against 9, taking turns twice (64, 9,
-// then 9, 64), the faster turn of each kept, ATTN and ATTN_KVH unset; the copies and GB/s as bench_attn's KV-head
-// comparison. Each setting's kernel by the counter (spacemit_attn_paths_take): "mixed" if more than one ran. 64 tokens
-// is the control, tiled under both
+// 256-8192, every cell valid, causal; FLAGOS_SPACEMIT_ATTN_TILED=64 (the kernels before T1) against 9, taking turns
+// twice (64, 9, then 9, 64), the faster turn of each kept, ATTN and ATTN_KVH unset; the copies and GB/s as bench_attn's
+// KV-head comparison. Each setting's kernel by the counter (spacemit_attn_paths_take): "mixed" if more than one ran. 64
+// tokens is the control, tiled under both
 static int bench_attn_tiled(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     REQUIRE(backend != nullptr);

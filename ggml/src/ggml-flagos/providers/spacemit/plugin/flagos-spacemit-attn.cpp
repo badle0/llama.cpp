@@ -26,18 +26,22 @@ namespace {
 // largest DK and DV: one register group of the RVV kernels at VLEN 1024, and the reference's local arrays
 constexpr int64_t max_head_size = 128;
 
-// from this many tokens per head the tiled kernel runs (ggml-cpu's ggml_fa_tile_config::Q, as in ime.cpp);
-// FLAGOS_SPACEMIT_ATTN_TILED overrides it for tests
+// ggml-cpu's tile size (ggml_fa_tile_config::Q, as in ime.cpp): its tiled kernel from this many tokens per head, and
+// the largest value of FLAGOS_SPACEMIT_ATTN_TILED
 constexpr int64_t tiled_min_rows = 64;
 
-// test-only (plan.md "T1 spec"): FLAGOS_SPACEMIT_ATTN_TILED=<n>, the tiled kernel from n tokens per call, n decimal
-// digits only, 1 to 64; unset or empty: tiled_min_rows. Parsed once (spacemit_cached_switch); anything else keeps the
-// default with a warning, once per parse generation rather than per process, so that the check program sees each bad
-// value's, and once only when two tiles parse in the same generation
+// the tiled kernel from this many tokens per call, the default since T1 step 2 (measured on the K3 2026-11-11, plan.md
+// "T1 spec"); 2-8 tokens go to the KV-head split before this kernel is reached
+constexpr int64_t tiled_default_rows = 9;
+
+// FLAGOS_SPACEMIT_ATTN_TILED=<n> (plan.md "T1 spec"), for comparisons: the tiled kernel from n tokens per call, n
+// decimal digits only, 1 to 64 (64: the kernels before T1); unset or empty: tiled_default_rows. Parsed once
+// (spacemit_cached_switch); anything else keeps the default with a warning, once per parse generation rather than per
+// process, so that the check program sees each bad value's, and once only when two tiles parse in the same generation
 int parse_tiled_setting() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN_TILED");
     if (v == nullptr || *v == '\0') {
-        return (int) tiled_min_rows;
+        return (int) tiled_default_rows;
     }
     int64_t      n = 0;
     const char * c = v;
@@ -51,9 +55,9 @@ int parse_tiled_setting() {
     const uint32_t               generation = spacemit_switches_generation();
     if (warned_in.exchange(generation) != generation) {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN_TILED=%s: not a token count from 1 to 64, the default %lld kept\n",
-                      __func__, v, (long long) tiled_min_rows);
+                      __func__, v, (long long) tiled_default_rows);
     }
-    return (int) tiled_min_rows;
+    return (int) tiled_default_rows;
 }
 
 int tiled_setting_from_env() {

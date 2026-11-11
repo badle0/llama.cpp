@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # T1 step 1 on the K3 (plan.md "T1 spec: the tiled kernel below 64 tokens"): the build, the checks, then
-# FLAGOS_SPACEMIT_ATTN_TILED=64 (today's kernels) against 9 (the tiled kernel from 9 tokens per call) in the check
+# FLAGOS_SPACEMIT_ATTN_TILED=64 (the kernels before T1) against 9 (the tiled kernel from 9 tokens per call) in the check
 # program's benchmark, llama-bench and the KLD against the CPU base. The decision rule is applied by hand to the
 # summary. Run in tmux after the /dev/tcm check (PROJECT.md section 6); this script does not check /dev/tcm.
 #

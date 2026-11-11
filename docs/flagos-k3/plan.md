@@ -2492,7 +2492,7 @@ Also `tests/check_spacemit.cpp` 4948 -> 4881, a comment in `core/flagos-spacemit
 
 ### T1 spec: the tiled kernel below 64 tokens, for review (2026-11-09)
 
-**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Step 1 implemented 2026-11-10 (the user: "start working on t1") and checked on the Mac ("Step 1 as built" below); its K3 run is the user's. Step 1 adds a test-only switch and leaves every default path bit for bit today's; step 2, the new default, follows only if the rule below passes. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above), before step 1's changes.
+**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Step 1 implemented 2026-11-10 (the user: "start working on t1") and checked on the Mac ("Step 1 as built" below); its K3 run, 2026-11-11, passed the rule with R = 9 at every n_kv ("Result on the K3" below). Step 2, the default 9, built and checked on the Mac the same day ("Step 2 as built" below); its K3 run is the user's. Step 1 added a test-only switch and left every default path bit for bit as before; step 2, the new default, was to follow only if the rule below passed. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above), before step 1's changes.
 
 **Why.** From 9 to 63 tokens per call, attention takes the one-chunk kernels, which read a KV head's whole cache once per token and query head. From 64 tokens the tiled kernel reads it once per query head for a tile of up to 64 tokens. The switch-over is one comparison against `tiled_min_rows = 64` (`plugin/flagos-spacemit-attn.cpp:31`, used at `:590`), ggml-cpu's tile size, never measured on the K3. The full runs' grid (above; Qwen3-4B, client p50, ms):
 
@@ -2577,6 +2577,64 @@ The block has the 33 cases listed above. The changes: `plugin/flagos-spacemit-at
 - The checks pass: the block's counter shows the tiled kernel in 33/33, its rows within 1e-5 of the CPU's tiled kernel; the values give one-chunk for unset, empty, `64`, `27` and the bad values, the tiled kernel for `26` and `1`.
 - The benchmark's kernels: one-chunk under `64` and tiled under `9` below 64 tokens; 64 tokens tiled under both, within spread.
 - The check program takes longer on the K3 than before (inference from the Mac's 18.8 to 41.6 s). The runner's two check passes have 900 s limits; the script's timestamps give the K3 time before step 2's runner.
+
+**Result on the K3 (2026-11-11; the user's run of the script on `699633040`, every step rc 0; the logs on the Mac in `~/k3-logs/t1/`, the summary by `t1-experiments.sh summary`):** the rule passes with R = 9 at every n_kv.
+
+- **The checks pass.** The check program: all checks passed. The block: the tiled kernel by the counter in 33/33; against the CPU max NMSE 8.80e-05 (bound 5e-4), worst row 2.53e-04 (bound 5e-3); against the CPU's tiled kernel on 64 tokens worst row 5.85e-07 (bound 1e-5); two runs identical in 33/33; 32/33 outputs differ from those under `64`. The values 10/10: tiled for `26` and `1`, one-chunk for the others, one warning per bad value. test-backend-ops `FLASH_ATTN_EXT` 1324/1324 unset and under `KVH=off TILED=1`. Every older line of the check program as in the cleanup's run.
+- **The benchmark** (one call, Qwen3-4B's heads, the better of two turns; the kernels by the counter one-chunk under `64` and tiled under `9` at every shape below 64 tokens):
+
+  | Tokens | n_kv 256 | 512 | 1024 | 4096 | 8192 |
+  |---|---|---|---|---|---|
+  | 9 | 3.13 to 0.55 ms | 7.55 to 1.12 | 15.9 to 2.25 | 75.5 to 8.72 | 160.9 to 17.6 |
+  | 26 | 8.26 to 1.06 | 21.0 to 2.05 | 45.9 to 4.07 | 220.1 to 16.2 | 474.0 to 33.0 |
+  | 63 | 17.5 to 2.08 | 49.0 to 4.07 | 107.8 to 7.97 | 531.2 to 32.5 | 1,168 to 65.9 |
+  | 64 (control) | 2.02, 2.01 | 3.98, 3.97 | 7.77, 7.78 | 31.75, 31.66 | 64.31, 64.30 |
+
+  All 48 shapes below 64 tokens are faster under `9`, by 82.4% (9 tokens at n_kv 256, the smallest) to 94.4% (63 at 8192). The control within 0.5%.
+- **llama-bench** (t/s, the better of two turns, `64` to `9`):
+
+  | | Qwen3-4B depth 0 | 1024 | 4096 | Qwen3-0.6B depth 0 | 1024 | 4096 |
+  |---|---|---|---|---|---|---|
+  | pp9 | 59.52 to 59.94 | 12.99 to 39.74 | 3.68 to 22.26 | 325.2 to 326.2 | 37.69 to 157.3 | 9.67 to 70.86 |
+  | pp26 | 77.59 to 79.83 | 13.64 to 55.36 | 3.71 to 30.13 | 496.3 to 534.8 | 39.20 to 247.7 | 9.62 to 99.55 |
+  | pp38 | 87.57 to 91.72 | 13.88 to 63.50 | 3.71 to 33.35 | 521.7 to 588.0 | 39.33 to 275.0 | 9.63 to 108.4 |
+  | pp63 | 93.97 to 102.2 | 13.99 to 70.52 | 3.71 to 35.82 | 532.3 to 655.0 | 39.18 to 306.4 | 9.55 to 116.0 |
+  | pp64 (control) | 116.5, 116.3 | 78.17, 78.11 | 38.51, 38.52 | 689.7, 683.8 | 321.3, 321.2 | 121.1, 121.0 |
+
+  At depths 1024 and 4096 every pp from 9 to 63 is at least 3.06 times as fast (Qwen3-4B pp9 at 1024, the smallest) and up to 12.3 times (Qwen3-0.6B pp48 at 4096). At depth 0 none is slower: +0.3% to +23.0%. The controls (pp64, pp512, tg32, 18 cells) within -0.9% to +1.6%. Between the two turns the same cell moved by up to 4.6% (Qwen3-4B under `64` at depth 4096, the first turn the slower).
+- **The KLD** against the CPU base, Qwen3-4B, one chunk of 4096 (the base's sha256 the same before and after):
+
+  | | `64` | `9` |
+  |---|---|---|
+  | `-ub 9` | 0.002544 +/- 0.000108, 573 s | 0.002155 +/- 0.000065, 128 s |
+  | `-ub 26` | 0.003632 +/- 0.000140, 558 s | 0.002278 +/- 0.000080, 95 s |
+
+  Lower under `9` at both, so the rule's condition holds. The same top token 97.56% and 97.61% against 97.26% and 96.87%. The perplexity ratio to the base is higher under `9`, 1.0121 +/- 0.0046 and 1.0101 +/- 0.0046 against 1.0032 +/- 0.0045 and 1.0008 +/- 0.0048: about two of either's standard errors, on one chunk; not in the rule, noted.
+- **The rule:** at 9 and every larger measured count the benchmark is at least 82% faster at every n_kv from 512, llama-bench at least 3 times as fast at depths 1024 and 4096 on both models, nothing slower at n_kv 256 or depth 0, the controls within 2%, the KLD lower. So R = 9 at every n_kv, with no n_kv condition.
+- **Against the predictions.** Held: R = 9; per call at n_kv 4096, 9 tokens 8.72 ms (4.5-10.4), 26 tokens 16.2 (13-17), 63 tokens 32.5 (about 31); 5.7 times at 9 tokens and n_kv 256 (3 to 9); Qwen3-4B at depth 4096 pp9 22.26 (17-28), pp26 30.13 (30-35), pp38 33.35 (32-36); the KLD lower; the tiled rows within 1e-6. Missed: pp26 at depth 1024 55.36, just under 56-63; pp63 at depth 4096 35.82 against about 37; at depth 0 the gain is larger than "within 3% up to pp32" (Qwen3-4B pp32 +5.1%, Qwen3-0.6B pp16 +4.3% and pp32 +12.3%), and pp63 stays 12% under pp64 on Qwen3-4B (4% on Qwen3-0.6B).
+- **As time to the first token** (inference from llama-bench's rates, not a server run): 26 tokens at depth 4096 on Qwen3-4B in about 0.86 s against 7.0 s, 38 in 1.14 s, 63 in 1.76 s. The harness's `grid` in step 2's K3 run measures it.
+- Not read: the check program's time on the K3. The script's timestamps are in `~/t1.txt` on the board, which was not copied.
+
+**Step 2 as built (2026-11-11), on the rule's result.** The coder from my brief; two files:
+- `plugin/flagos-spacemit-attn.cpp`: `tiled_default_rows = 9`, which the parser returns for an unset, empty or bad value; `tiled_min_rows = 64` stays as ggml-cpu's tile size and the switch's largest value. The warning names the default 9. The kernel's choice is as in step 1. `FLAGOS_SPACEMIT_ATTN_TILED=64` gives the kernels before T1.
+- `tests/check_spacemit.cpp`: the values check expects the tiled kernel for unset, empty, `9` (added, so 11 values), `26`, `1` and the four bad values, and the one-chunk kernels for `64` and `27`. The attention block's pin at `64` keeps its older cases on their kernels, and step 1's block sets `1` and `64` itself, so both are as before.
+
+What changes on the K3 with it, by reading (the coder's list, which I checked against the code): every attention call of 9 to 63 tokens. In the check program none outside the values check (the layer, plan, diagnostics and stream checks use 1 and 7 tokens). In the runner: test-backend-ops' 332 claimed `FLASH_ATTN_EXT` cases of 32 tokens, and the server requests whose uncached part is 9 to 63 tokens. In the TTFT harness: the grid's 9, 12, 16, 26, 32, 38 and 63-token cells, the chat turns' tails and the 32-token prompt of `restart` and `second`. Perplexity, the KLDs and llama-bench's pp128 and tg128 keep their kernels (512-row or one-token ubatches).
+
+**Step 2 on the Mac (2026-11-11; the coder, then I again):**
+- `build-host` (the check program and test-backend-ops by `--target`; the check program is not in the default target) and `build-nohost` without warnings; the riscv64 syntax check of `flagos-spacemit-attn.cpp`: 0 errors.
+- The check program: all checks pass, also under `GGML_FLAGOS_KERNEL_VARIANTS=0`. Against its output at `699633040` only the values line (11/11, was 10/10) and the plan line's wall clock differ; the four warnings read "the default 9 kept".
+- test-backend-ops `FLASH_ATTN_EXT`: 1324/1324 unset and under `FLAGOS_SPACEMIT_ATTN_TILED=64`.
+- A mutation caught: the parser taking 65 (the values check 10/11).
+- Not testable on the Mac, where every call takes the reference: that the RVV choice now starts at 9 tokens. On the K3 the values check shows it by the counter.
+
+**Step 2 on the K3 (the user's run, about 2 hours, estimate):** the runner on Qwen3-0.6B with `--build` and on Qwen3-4B, both with `--server-baseline`; then the TTFT harness's `grid` and `chat` on Qwen3-4B. Without `--depth`, which the spec named: it times tg32 and pp512 at depth, one-token and 512-row calls that keep their kernels, and step 1's llama-bench already covers 9 to 63 tokens at depth. Predicted:
+- The runner 49/49 on Qwen3-0.6B and 47/47 on Qwen3-4B, as the cleanup's run, unless a server reply changes: a reply whose prompt ends in a 9 to 63-token ubatch may differ at a near-tie (inference), which would fail the baseline check and is the user's to decide.
+- The check program's values line: tiled for unset, empty, `9`, `26`, `1` and the bad values, one-chunk for `64` and `27`, 11/11.
+- Perplexity and both KLDs to the last digit; pp128 and tg128 within the board's spread.
+- The grid on Qwen3-4B (client p50; estimates from this run's llama-bench rates plus the baseline's fixed part of about 0.1 s): at depth 4096, 26 tokens in 0.9 to 1.0 s (was 7.26), 38 in 1.2 to 1.3 s (10.56), 63 in 1.8 to 1.9 s (17.58); 64 tokens and one token as in the baseline.
+- Chat with thinking off: turn 19's first event from 42.0 s to about 28 s, the tail after the 512-token ubatches being the part that changes (the estimate of 2026-11-09).
+- Open: the check program's time against the runner's 900 s limit per pass (its K3 time since step 1 was not read).
 
 ### Not planned
 
