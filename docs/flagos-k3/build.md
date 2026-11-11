@@ -983,7 +983,14 @@ Manual checks:
 - One call, Qwen3-4B's heads, ms: 9 tokens at n_kv 256 from 3.13 to 0.55 and at 4096 from 75.5 to 8.72; 26 tokens from 8.26 to 1.06 and from 220.1 to 16.2; 63 tokens from 17.5 to 2.08 and from 531.2 to 32.5. All 48 shapes faster, by 82.4% to 94.4%; 64 tokens (tiled under both) within 0.5%.
 - `llama-bench` t/s, Qwen3-4B: at depth 4096 pp9 from 3.68 to 22.26, pp26 from 3.71 to 30.13, pp63 from 3.71 to 35.82 (pp64 38.5); at depth 1024 pp26 from 13.64 to 55.36; at depth 0 pp26 from 77.59 to 79.83 and pp63 from 93.97 to 102.2. Qwen3-0.6B: at depth 4096 pp26 from 9.62 to 99.55 and pp63 from 9.55 to 116.0; at depth 0 pp26 from 496.3 to 534.8. Every pp from 9 to 63 at depth is 3.1 to 12.3 times as fast, none slower at depth 0; pp64, pp512 and tg32 within -0.9% to +1.6%.
 - The KLD against the CPU base, Qwen3-4B, one chunk of 4096: at `-ub 9` 0.002544 +/- 0.000108 under `64` and 0.002155 +/- 0.000065 under `9`; at `-ub 26` 0.003632 +/- 0.000140 and 0.002278 +/- 0.000080. The perplexity ratio to the base is about 0.009 higher under `9` at both, about two standard errors.
-- The spec's rule passes with the threshold 9 at every n_kv. Step 2 makes 9 the default (checked on the Mac the same day; its K3 run pending).
+- The spec's rule passes with the threshold 9 at every n_kv. Step 2 makes 9 the default.
+
+**T1 step 2 on the K3, 2026-11-11** (`plan.md` "T1 spec", "Step 2 on the K3: the result"; `progress.md` item 58). On `313d769f8`, the tiled kernel the default from 9 tokens; the logs on the Mac: `~/k3-logs/t1s2-*`.
+- The runner **48/49** on Qwen3-0.6B with `--build` and **46/47** on Qwen3-4B, both with `--server-baseline`: the one failure the replies against S2's baselines, 4/16 equal. The check compares the top probabilities exactly, and the 12 are the requests that went through a 9 to 63-token ubatch. Every first token the same; Qwen3-4B's 16 texts equal; on Qwen3-0.6B 4 texts differ later on (C-x1, C-x2, C-x2-scratch, F2-scratch).
+- **New baselines** by the user's decision: `~/kvh/t1-base-06.json` and `~/kvh/t1-base-4b.json` on the board, these runs' `server.json`. Pass them to `--server-baseline` from here on; S2's (`s2-base-*.json`) describe the kernels before T1.
+- Perplexity and both KLDs to the last digit on both models; pp128 and tg128 106.19 and 11.08 t/s on Qwen3-4B, 700.48 and 56.57 on Qwen3-0.6B.
+- The TTFT harness on Qwen3-4B, `grid` and `chat`, **5/5**. Client ms p50 at depth 4096, the baseline in brackets: 12 tokens 443 (3,342), 26 870 (7,255), 38 1,145 (10,562), 63 1,764 (17,585), 64 1,669 (1,673); at 8192, 26 tokens 1,421 (15,332) and 63 2,911 (37,191). One to 8 tokens, 64, 110 and the long prompts as before. Chat with thinking off: the first event at turn 19 26.4 s (42.0).
+- At depth, 8 tokens (the KV-head split) now take longer than 12 (the tiled kernel): 688 against 443 ms at 4096.
 
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 

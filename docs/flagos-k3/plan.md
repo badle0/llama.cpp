@@ -2492,7 +2492,7 @@ Also `tests/check_spacemit.cpp` 4948 -> 4881, a comment in `core/flagos-spacemit
 
 ### T1 spec: the tiled kernel below 64 tokens, for review (2026-11-09)
 
-**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Step 1 implemented 2026-11-10 (the user: "start working on t1") and checked on the Mac ("Step 1 as built" below); its K3 run, 2026-11-11, passed the rule with R = 9 at every n_kv ("Result on the K3" below). Step 2, the default 9, built and checked on the Mac the same day ("Step 2 as built" below); its K3 run is the user's. Step 1 added a test-only switch and left every default path bit for bit as before; step 2, the new default, was to follow only if the rule below passed. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above), before step 1's changes.
+**Status:** written for review 2026-11-09, on the user's word ("agreed to start t1", after I recommended T1 before the embedding lookup). Step 1 implemented 2026-11-10 (the user: "start working on t1") and checked on the Mac ("Step 1 as built" below); its K3 run, 2026-11-11, passed the rule with R = 9 at every n_kv ("Result on the K3" below). Step 2, the default 9, built and checked on the Mac the same day ("Step 2 as built" below) and run on the K3 the same day ("Step 2 on the K3: the result"): T1 is done, with new server baselines by the user's decision. Step 1 added a test-only switch and left every default path bit for bit as before; step 2, the new default, was to follow only if the rule below passed. Line numbers updated 2026-11-10 to the code after "Cleanup before T1" (above), before step 1's changes.
 
 **Why.** From 9 to 63 tokens per call, attention takes the one-chunk kernels, which read a KV head's whole cache once per token and query head. From 64 tokens the tiled kernel reads it once per query head for a tile of up to 64 tokens. The switch-over is one comparison against `tiled_min_rows = 64` (`plugin/flagos-spacemit-attn.cpp:31`, used at `:590`), ggml-cpu's tile size, never measured on the K3. The full runs' grid (above; Qwen3-4B, client p50, ms):
 
@@ -2635,6 +2635,25 @@ What changes on the K3 with it, by reading (the coder's list, which I checked ag
 - The grid on Qwen3-4B (client p50; estimates from this run's llama-bench rates plus the baseline's fixed part of about 0.1 s): at depth 4096, 26 tokens in 0.9 to 1.0 s (was 7.26), 38 in 1.2 to 1.3 s (10.56), 63 in 1.8 to 1.9 s (17.58); 64 tokens and one token as in the baseline.
 - Chat with thinking off: turn 19's first event from 42.0 s to about 28 s, the tail after the 512-token ubatches being the part that changes (the estimate of 2026-11-09).
 - Open: the check program's time against the runner's 900 s limit per pass (its K3 time since step 1 was not read).
+
+**Step 2 on the K3: the result (2026-11-11; the user's run on `313d769f8`; the logs on the Mac: `~/k3-logs/t1s2-06.txt`, `t1s2-4b.txt`, `t1s2-ttft.txt`, `t1s2-ttft-4b/`, the replies in `t1s2-server/`).** T1 is done: the tiled kernel is the default from 9 tokens.
+- **The runner 48/49 and 46/47,** the one failure on each the replies against S2's baselines, 4/16 equal. I had predicted a possible change at a near-tie and missed that the check compares the top probabilities exactly, so it fails wherever the kernel changes. The 12 that differ are the requests whose prompt, or whose cached prefix, went through a 9 to 63-token ubatch (B, C and F; A, D1, D2 and E equal, at 5, 97, 1 and 500 tokens). Every first token is the same on both models. Qwen3-4B: all 16 texts equal, only probabilities moved (B1's first token from 0.616 to 0.588, the largest; the other first tokens by 0.005 or less). Qwen3-0.6B: 4 texts differ later on, C-x1 ("colour" to "color"), C-x2, C-x2-scratch and F2-scratch.
+- **New baselines, the user's decision the same day:** these runs' `server.json`, kept on the board as `~/kvh/t1-base-06.json` and `~/kvh/t1-base-4b.json`; S2's stay beside them. The next runner run takes the new ones.
+- **Everything else as predicted.** The values line 11/11 with the tiled kernel by the counter for unset, empty, `9`, `26`, `1` and the bad values. The four cache-reuse checks pass (KLD 0.000001 to 0.001288, limit 0.1). Perplexity and both KLDs to the last digit on both models (Qwen3-4B 9.7736, 0.002489, 0.001229; Qwen3-0.6B 14.4471, 0.004722, 0.002533). pp128 and tg128: 106.19 and 11.08 t/s, 700.48 and 56.57. The check program's two passes inside the 900 s limit (step 1's script: the check program and both test-backend-ops runs in 2 minutes 38 s together).
+- **The harness on Qwen3-4B, `grid` and `chat`: 5/5,** 395 of 395 grid rows as asked; the IME control 79.34 and 79.15 t/s. Client p50, ms, the baseline in brackets:
+
+  | Cached tokens | 12 new | 26 | 38 | 63 | 64 |
+  |---|---|---|---|---|---|
+  | 0 | - | - | - | 621 (676) | 553 (556) |
+  | 256 | 186 (324) | 367 (693) | 463 (960) | 690 (1,566) | 620 (624) |
+  | 1024 | 247 (921) | 471 (1,982) | 600 (2,843) | 895 (4,687) | 819 (826) |
+  | 4096 | 443 (3,342) | 870 (7,255) | 1,145 (10,562) | 1,764 (17,585) | 1,669 (1,673) |
+  | 8192 | 728 (6,970) | 1,421 (15,332) | 1,885 (22,290) | 2,911 (37,191) | 2,786 (2,789) |
+
+  One to 8 tokens, 64, 110 and the long prompts as in the baseline (within 2.3%, 4 tokens at depth 0 4.2%); 575 tokens at depth 0, whose last ubatch is 63, from 7,946 to 6,083. Against the predictions at depth 4096: 26 tokens 0.87 s (0.9 to 1.0), 38 1.14 s (1.2 to 1.3), 63 1.76 s (1.8 to 1.9), each a little faster.
+- **Chat, thinking off:** 20 of 20 turns. The first event at turn 10 15.6 s (was 22.7) and at turn 19 26.4 s (was 42.0; predicted about 28), each after about 535 new tokens.
+- **The targets:** a chat turn at depth 4096 within 1 s holds for a 26-token tail (870 ms) and not for 38 (1,145 ms) or 110 (2,994 ms).
+- **Seen in the grid, not acted on:** the KV-head split's 5 to 8 tokens are now the slow cells at depth. At depth 4096, 8 tokens take 688 ms against 443 ms for 12, and at 8192 1,198 against 728; 3 tokens take more than 4 at every depth (329 against 237 ms at 4096). The spec left the tiled kernel against the split at 5 to 8 tokens as a later comparison; `FLAGOS_SPACEMIT_ATTN_KVH=2-4` with `FLAGOS_SPACEMIT_ATTN_TILED=5` would measure it with no code (the two switches' values as `build.md` §7 gives them; untried).
 
 ### Not planned
 
