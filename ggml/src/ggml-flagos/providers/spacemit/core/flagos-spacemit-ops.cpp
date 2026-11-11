@@ -118,6 +118,42 @@ static bool spacemit_get_rows_f32_supported(const ggml_tensor * op, const spacem
            op->ne[0] == op->src[0]->ne[0];
 }
 
+// the block types the token embedding's GET_ROWS takes (ggml-cpu's get_rows_q, ggml's to_float per row)
+static bool spacemit_get_rows_block_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// GET_ROWS of quantized rows by I32 indices into F32 rows (the token embedding, src/llama-graph.cpp build_inp_embd):
+// contiguous rows of whole blocks, shaped as ggml-cpu's get_rows_q asserts, stored as ggml's blocks. A host buffer
+// holds them so; the layout rule answers for our buffer (and for a weight not allocated yet), where an IME layout is
+// refused. FLAGOS_SPACEMIT_EMBD=cpu refuses every such lookup (spacemit_embd_on_cpu)
+static bool spacemit_get_rows_quant_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                              ggml_backend_buffer_type_t) {
+    if (spacemit_embd_on_cpu()) {
+        return false;
+    }
+    const ggml_tensor *         src    = op->src[0];
+    const ggml_tensor *         idx    = op->src[1];
+    const ggml_backend_buffer_t buffer = src->view_src != nullptr ? src->view_src->buffer : src->buffer;
+    const bool plain = (buffer != nullptr && ggml_backend_buffer_is_host(buffer)) || table->tensor_layout(src) == 0;
+    return spacemit_f32_rows(op) && idx->type == GGML_TYPE_I32 && spacemit_get_rows_block_type(src->type) &&
+           ggml_is_contiguous(src) && src->nb[0] == ggml_type_size(src->type) &&
+           src->ne[0] % ggml_blck_size(src->type) == 0 && op->ne[0] == src->ne[0] && src->ne[2] == idx->ne[1] &&
+           ggml_nrows(op) == ggml_nelements(idx) && plain;
+}
+
 // GLU: SwiGLU only, split (two tensors) and single-tensor forms; rows addressed as in ggml-cpu (ggml_is_contiguous_1),
 // dst shaped as ggml-cpu asserts (the kernels write nrows x nc elements of it)
 static bool spacemit_swiglu_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
@@ -180,6 +216,7 @@ static const spacemit_contract k_contracts[] = {
     { GGML_OP_SET_ROWS,        spacemit_set_rows_supported,     { "set_rows" },                                      1 },
     { GGML_OP_CPY,             spacemit_cpy_quant_supported,    { "cpy.quant" },                                     1 },
     { GGML_OP_GET_ROWS,        spacemit_get_rows_f32_supported, { "get_rows.f32" },                                  1 },
+    { GGML_OP_GET_ROWS,        spacemit_get_rows_quant_supported, { "get_rows.quant" },                              1 },
     { GGML_OP_GLU,             spacemit_swiglu_f32_supported,   { "swiglu.f32" },                                    1 },
     { GGML_OP_MUL_MAT,         spacemit_mul_mat_ime_supported,  { "mul_mat.quantize", "mul_mat.gemm" },              2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn.kvh.partial", "flash_attn.kvh.merge" },                2 },
@@ -194,13 +231,13 @@ static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts
 static_assert(k_n_contracts <= sizeof(spacemit_ops::ops) / sizeof(spacemit_ops::ops[0]),
               "spacemit_ops::ops must hold every contract");
 
-// the contract names of the 16 kernels the plugin offers, in the order of its kernel table (plan.md "S1 step 1 spec" §3)
+// the contract names of the 17 kernels the plugin offers, in the order of its kernel table (plan.md "S1 step 1 spec" §3)
 const char * const spacemit_required_kernels[] = {
     "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
-    "set_rows",         "cpy.quant",        "get_rows.f32",             "swiglu.f32",
-    "mul_mat.quantize", "mul_mat.gemm",     "flash_attn",               "flash_attn.split.partial",
-    "flash_attn.split.partial_paired",      "flash_attn.split.merge",   "flash_attn.kvh.partial",
-    "flash_attn.kvh.merge",
+    "set_rows",         "cpy.quant",        "get_rows.f32",             "get_rows.quant",
+    "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",             "flash_attn",
+    "flash_attn.split.partial",             "flash_attn.split.partial_paired",
+    "flash_attn.split.merge",               "flash_attn.kvh.partial",   "flash_attn.kvh.merge",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 

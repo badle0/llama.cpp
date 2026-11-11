@@ -1,4 +1,4 @@
-// Fake plugin for the loader's negative matrix (plan.md "S1 step 1 spec" §7): a complete table offering 15 of the 16
+// Fake plugin for the loader's negative matrix (plan.md "S1 step 1 spec" §7): a complete table offering 16 of the 17
 // kernels (mul_mat.gemm left out), so the loader must answer missing_kernel. C11, built by tests.cmake.
 
 #include "flagos-spacemit-plugin.h"
@@ -112,6 +112,7 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "set_rows", fake_step, NULL, NULL },
         { "cpy.quant", fake_step, NULL, NULL },
         { "get_rows.f32", fake_step, NULL, NULL },
+        { "get_rows.quant", fake_step, NULL, NULL },
         { "swiglu.f32", fake_step, NULL, NULL },
         { "mul_mat.quantize", fake_step, NULL, NULL },
         // the fault: no "mul_mat.gemm" entry, a kernel the core's contracts name

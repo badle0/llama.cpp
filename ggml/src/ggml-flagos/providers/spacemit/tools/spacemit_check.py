@@ -10,7 +10,7 @@
 #   a model run with the provider and with FLAGOS_SPACEMIT_DISABLE=1 (the IME kernels quantize activations differently
 #   from the CPU, so the text is reported, not compared): the weights, every layer and the KV cache on the provider
 #   (IGPU, D3), -fa auto keeping flash attention there (FAIL with llama.cpp's warning if it turns it off, or if the
-#   graphs take as many splits as the model has layers, as when the CPU runs attention), and a token in 2 graph splits;
+#   graphs take as many splits as the model has layers, as when the CPU runs attention), and a token in 1 graph split;
 #   a Q8_0 KV cache and a context shift with the provider as with the CPU (structural-experiments.md E2-neg, F8);
 #   llama-server (--skip-server leaves it out): every layer and the KV cache on the provider with 4 slots in one unified
 #   KV cache, a greedy reply equal to llama-completion's, a follow-up turn and two interleaved conversations (reloaded
@@ -292,9 +292,9 @@ def model_run(bdir, logs, model):
     # the run leaves -fa at its default, auto; llama.cpp keeps flash attention on the provider, whose device is the
     # layer's under IGPU
     report("-fa auto keeps flash attention on the provider", *attention_on_provider(log_on, rc_on))
-    # only the token embedding stays on the CPU
+    # the token embedding's lookup too runs on the provider (get_rows.quant)
     n_split = splits_per_token(log_on)
-    report("a token takes 2 graph splits", n_split == 2,
+    report("a token takes 1 graph split", n_split == 1,
            f"per token with the provider {n_split}; enabled {splits[0]}, disabled {splits[1]}")
     info("generation speed", f"enabled {speed[0]} t/s, disabled {speed[1]} t/s")
 
@@ -562,7 +562,7 @@ def server_checks(bdir, logs, model, baseline):
     last_ctx = text[text.rfind("llama_context: n_seq_max"):] if seq else ""
     kv = [(m.group(1), float(m.group(2))) for m in re.finditer(r"(\S+) KV buffer size\s*=\s*([0-9.]+) MiB", last_ctx)]
     ok = (bool(off) and off[-1][0] == off[-1][1] and any(n.startswith("FlagOS:SpacemiT") and v > 0 for n, v in kv) and
-          seq[-1:] == ["4"] and unified[-1:] == ["true"] and bool(splits) and all(n == 2 for n in splits))
+          seq[-1:] == ["4"] and unified[-1:] == ["true"] and bool(splits) and all(n == 1 for n in splits))
     report(names[0], ok,
            f"up after {up_s:.1f} s; " + (f"offloaded {off[-1][0]}/{off[-1][1]} layers" if off else "no offload line") +
            f"; KV buffers {', '.join(f'{n} {v:.2f} MiB' for n, v in kv) or 'none'}; n_seq_max "

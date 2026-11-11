@@ -373,7 +373,7 @@ static int check_contracts(ggml_backend_dev_t dev) {
     std::string  detail;
     REQUIRE(spacemit_ops_bind(table, &ops, &detail));
     CHECK(ops.table == table);
-    CHECK(ops.n_ops == 13);
+    CHECK(ops.n_ops == 14);
     for (uint32_t i = 0; i < ops.n_ops; i++) {
         REQUIRE(ops.ops[i].n_steps >= 1 && ops.ops[i].n_steps <= SPACEMIT_MAX_OP_STEPS);
         for (uint32_t s = 0; s < ops.ops[i].n_steps; s++) {
@@ -2806,6 +2806,455 @@ static int check_rows(ggml_backend_dev_t dev) {
 }
 
 //
+// the token embedding on the provider (plan.md "Embedding lookup spec"): GET_ROWS of quantized rows in a CPU buffer, as
+// llama.cpp keeps token_embd, by ggml's own dequantizer per row, so the output is the CPU's byte for byte
+//
+
+// rows of the test vocabularies: a multiple of 32, so by the layout rule alone Q6_K and Q4_0 would have an IME layout
+// (as token_embd has, 151936 rows); in a CPU buffer they keep ggml's
+constexpr int64_t k_vocab = 4096;
+
+// a vocabulary of k_vocab rows of nc random values quantized to type, in a CPU buffer marked as weights, as llama.cpp
+// keeps token_embd (the scheduler places a node by its weights' buffer)
+struct embd_table {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         w   = nullptr;
+
+    bool init(ggml_type type, int64_t nc, uint32_t seed) {
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ctx                     = ggml_init(params);
+        w                       = ggml_new_tensor_2d(ctx, type, nc, k_vocab);
+        ggml_set_name(w, "token_embd.weight");
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        const std::vector<uint8_t> q = quantize_weights(type, nc, k_vocab, seed);
+        ggml_backend_tensor_set(w, q.data(), 0, q.size());
+        return true;
+    }
+
+    ~embd_table() {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+};
+
+// n token ids, unordered, every fifth a repeat of an earlier one; from 7 on also the first and the last row
+static std::vector<int32_t> token_ids(int64_t n, uint32_t seed) {
+    std::vector<int32_t> ids(n);
+    for (int64_t i = 0; i < n; i++) {
+        ids[i] = i % 5 == 4 ? ids[i / 2] : (int32_t) (((uint64_t) i * 2654435761u + seed * 40503u) % k_vocab);
+    }
+    if (n >= 7) {
+        ids[1] = 0;
+        ids[2] = (int32_t) k_vocab - 1;
+    }
+    return ids;
+}
+
+// the rows of n ids on the provider (output in our buffer, first filled with NaNs) and on the CPU backend: 1 if the
+// bytes are the same, 0 if not, -1 if refused or failed
+static int lookup_identical(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu, const embd_table & t,
+                            int64_t n, uint32_t seed) {
+    ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);
+    ggml_context *   ctx_d  = ggml_init(params);
+    ggml_tensor *    idx    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n);
+    ggml_tensor *    y_ref  = ggml_get_rows(ctx_h, t.w, idx);
+    ggml_tensor *    y      = ggml_get_rows(ctx_d, t.w, idx);
+    ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+    int                   same = -1;
+    if (bh != nullptr && bd != nullptr) {
+        ggml_backend_buffer_clear(bd, 0xff);
+        const std::vector<int32_t> ids = token_ids(n, seed);
+        ggml_backend_tensor_set(idx, ids.data(), 0, ggml_nbytes(idx));
+        ggml_cgraph * gd = ggml_new_graph(ctx_d);
+        ggml_cgraph * gc = ggml_new_graph(ctx_h);
+        ggml_build_forward_expand(gd, y);
+        ggml_build_forward_expand(gc, y_ref);
+        if (ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(backend, gd) == GGML_STATUS_SUCCESS &&
+            ggml_backend_graph_compute(cpu, gc) == GGML_STATUS_SUCCESS) {
+            std::vector<uint8_t> out(ggml_nbytes(y));
+            ggml_backend_tensor_get(y, out.data(), 0, out.size());
+            same = std::memcmp(out.data(), y_ref->data, out.size()) == 0 ? 1 : 0;
+        }
+    }
+    ggml_backend_buffer_free(bh);
+    ggml_backend_buffer_free(bd);
+    ggml_free(ctx_h);
+    ggml_free(ctx_d);
+    return same;
+}
+
+// which GET_ROWS the provider claims, and by which contract: F32 rows by get_rows.f32 as before; Q4_0, Q4_1, Q5_0,
+// Q5_1, Q8_0, Q4_K, Q5_K and Q6_K rows by get_rows.quant from a CPU buffer whatever the layout rule says, from our buffer
+// (or not allocated, as test-backend-ops asks) only where the rule gives ggml's layout; no other type, no I64 indices,
+// no strided rows, no partial block; FLAGOS_SPACEMIT_EMBD=cpu refuses the lookup. Returns the number of nodes checked, and
+// in embd_warnings how often FLAGOS_SPACEMIT_EMBD=x was reported (once)
+static int lookup_claims(ggml_backend_dev_t dev, int & embd_warnings) {
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    spacemit_ops               ops;
+    std::string                detail;
+    if (table == nullptr || !spacemit_ops_bind(table, &ops, &detail)) {
+        std::fprintf(stderr, "FAIL: GET_ROWS claims: no contracts (%s)\n", detail.c_str());
+        g_failures++;
+        return 0;
+    }
+    const ggml_backend_buffer_type_t buft      = ggml_backend_dev_buffer_type(dev);
+    int                              n_checked = 0;
+    // want: the contract's step name, or "" for refused; find_op and supports_op must agree
+    const auto expect = [&](const std::string & what, const ggml_tensor * node, const char * want) {
+        const spacemit_op * op      = spacemit_find_op(ops, node, buft);
+        const std::string   got     = op != nullptr ? op->steps[0]->name : "";
+        const bool          claimed = ggml_backend_dev_supports_op(dev, node);
+        if (got != want || claimed != (*want != '\0')) {
+            std::fprintf(stderr, "FAIL: GET_ROWS claims, %s: %s (supports_op %d), expected %s\n", what.c_str(),
+                         got.empty() ? "refused" : got.c_str(), claimed ? 1 : 0, *want != '\0' ? want : "refused");
+            g_failures++;
+        }
+        n_checked++;
+    };
+
+    ggml_init_params params  = { ggml_tensor_overhead() * 256, nullptr, true };
+    ggml_context *   ctx     = ggml_init(params);  // not allocated, or in a zero-size buffer of ours
+    ggml_context *   ctx_cpu = ggml_init(params);
+    ggml_tensor *    idx     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 7);
+    ggml_tensor *    idx64   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 7);
+    ggml_tensor *    q6_cpu  = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_Q6_K, 1024, 64);
+    ggml_tensor *    q4_cpu  = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_Q4_0, 1024, 64);
+    ggml_tensor *    f32_cpu = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_F32, 1024, 64);
+    ggml_tensor *    f16_cpu = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_F16, 1024, 64);
+    ggml_tensor *    q6_ime  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, 1024, 64);  // the layout rule: q6_k_q8_0_32x32
+    ggml_tensor *    q4_ime  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 1024, 64);  // q4_0_32x256
+    ggml_tensor *    q6_few  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, 1024, 5);   // 5 rows: ggml's layout
+    ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu, ggml_backend_cpu_buffer_type());
+    if (buf_cpu == nullptr) {
+        std::fprintf(stderr, "FAIL: GET_ROWS claims: no CPU buffer\n");
+        g_failures++;
+        ggml_free(ctx);
+        ggml_free(ctx_cpu);
+        return 0;
+    }
+
+    expect("Q6_K in a CPU buffer", ggml_get_rows(ctx, q6_cpu, idx), "get_rows.quant");
+    expect("Q4_0 in a CPU buffer", ggml_get_rows(ctx, q4_cpu, idx), "get_rows.quant");
+    expect("F32 in a CPU buffer", ggml_get_rows(ctx, f32_cpu, idx), "get_rows.f32");
+    expect("F16 in a CPU buffer", ggml_get_rows(ctx, f16_cpu, idx), "");
+    expect("the first 32 rows of Q6_K in a CPU buffer",
+           ggml_get_rows(ctx, ggml_view_2d(ctx, q6_cpu, 1024, 32, q6_cpu->nb[1], 0), idx), "get_rows.quant");
+    expect("every other row of Q6_K in a CPU buffer",
+           ggml_get_rows(ctx, ggml_view_2d(ctx, q6_cpu, 1024, 32, 2 * q6_cpu->nb[1], 0), idx), "");
+    // ggml_get_rows asserts I32 indices: the node is built with them, then given I64 ones
+    ggml_tensor * by_i64 = ggml_get_rows(ctx, q6_cpu, idx);
+    by_i64->src[1]       = idx64;
+    expect("I64 indices", by_i64, "");
+    // ggml_new_tensor makes no partial block: a Q4_0 row of 2 blocks is cut to 48 values, with the strides of one block
+    ggml_tensor * cut    = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 64, 5);
+    ggml_tensor * by_cut = ggml_get_rows(ctx, cut, idx);
+    cut->ne[0] = by_cut->ne[0] = 48;
+    cut->nb[1]                 = ggml_type_size(GGML_TYPE_Q4_0);
+    cut->nb[2] = cut->nb[3] = cut->nb[1] * 5;
+    expect("Q4_0 rows of 48 values", by_cut, "");
+
+    // our buffer: an IME layout refused, ggml's taken; not allocated, the same answers
+    for (const bool allocated : { false, true }) {
+        const std::string where = allocated ? " in our buffer" : " not allocated";
+        for (ggml_tensor * w : { q6_ime, q4_ime, q6_few }) {
+            w->buffer = allocated ? ggml_backend_buft_alloc_buffer(buft, 0) : nullptr;
+        }
+        expect("Q6_K of 64 rows (IME layout)" + where, ggml_get_rows(ctx, q6_ime, idx), "");
+        expect("Q4_0 of 64 rows (IME layout)" + where, ggml_get_rows(ctx, q4_ime, idx), "");
+        expect("a view of Q6_K of 64 rows (IME layout)" + where,
+               ggml_get_rows(ctx, ggml_view_2d(ctx, q6_ime, 1024, 32, q6_ime->nb[1], 0), idx), "");
+        expect("Q6_K of 5 rows (ggml's layout)" + where, ggml_get_rows(ctx, q6_few, idx), "get_rows.quant");
+        for (ggml_tensor * w : { q6_ime, q4_ime, q6_few }) {
+            if (w->buffer != nullptr) {
+                ggml_backend_buffer_free(w->buffer);
+                w->buffer = nullptr;
+            }
+        }
+    }
+
+    // FLAGOS_SPACEMIT_EMBD=cpu: the lookup refused, the F32 rows still taken; an unknown value reported once, the
+    // provider kept
+    {
+        env_override embd("FLAGOS_SPACEMIT_EMBD", "cpu");
+        expect("Q6_K in a CPU buffer, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, q6_cpu, idx), "");
+        expect("Q6_K of 5 rows not allocated, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, q6_few, idx), "");
+        expect("F32 in a CPU buffer, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, f32_cpu, idx), "get_rows.f32");
+    }
+    {
+        env_override embd("FLAGOS_SPACEMIT_EMBD", "x");
+        log_capture  log;
+        expect("Q6_K in a CPU buffer, FLAGOS_SPACEMIT_EMBD=x", ggml_get_rows(ctx, q6_cpu, idx), "get_rows.quant");
+        expect("Q4_0 in a CPU buffer, FLAGOS_SPACEMIT_EMBD=x", ggml_get_rows(ctx, q4_cpu, idx), "get_rows.quant");
+        const std::string text = log.take();
+        embd_warnings          = 0;
+        for (size_t at = text.find("FLAGOS_SPACEMIT_EMBD=x"); at != std::string::npos;
+             at        = text.find("FLAGOS_SPACEMIT_EMBD=x", at + 1)) {
+            embd_warnings++;
+        }
+        if (embd_warnings != 1) {
+            std::fprintf(stderr, "FAIL: GET_ROWS claims, FLAGOS_SPACEMIT_EMBD=x reported %d times, not once\n",
+                         embd_warnings);
+            g_failures++;
+        }
+    }
+
+    // every type, 5 rows not allocated (ggml's layout): exactly the listed block types and F32
+    for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+        const ggml_type type = (ggml_type) t;
+        if (ggml_blck_size(type) == 0 || ggml_type_size(type) == 0 || 1024 % ggml_blck_size(type) != 0) {
+            continue;
+        }
+        const bool   listed = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
+                            type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K ||
+                            type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+        const char * want   = listed ? "get_rows.quant" : type == GGML_TYPE_F32 ? "get_rows.f32" : "";
+        expect(std::string(ggml_type_name(type)) + " of 5 rows", ggml_get_rows(ctx, ggml_new_tensor_2d(ctx, type, 1024, 5), idx),
+               want);
+    }
+
+    ggml_backend_buffer_free(buf_cpu);
+    ggml_free(ctx);
+    ggml_free(ctx_cpu);
+    return n_checked;
+}
+
+// an index out of range fails the launch (the CPU asserts), past the end and below 0, among 7 rows and as the one row
+// (tile 0 alone), and the node after the lookup is not run: its output keeps what it held. Returns the launches that
+// behaved, of 4
+static int lookup_bad_index_runs(ggml_backend_dev_t dev, ggml_backend_t backend, const embd_table & t) {
+    ggml_init_params params = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);
+    ggml_context *   ctx_d  = ggml_init(params);
+    ggml_tensor *    idx7   = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 7);
+    ggml_tensor *    idx1   = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, 1);
+    ggml_tensor *    n7     = ggml_rms_norm(ctx_d, ggml_get_rows(ctx_d, t.w, idx7), 1e-6f);
+    ggml_tensor *    n1     = ggml_rms_norm(ctx_d, ggml_get_rows(ctx_d, t.w, idx1), 1e-6f);
+    ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+    int                   ok = 0;
+    if (bh != nullptr && bd != nullptr) {
+        ggml_cgraph * g7 = ggml_new_graph(ctx_d);
+        ggml_cgraph * g1 = ggml_new_graph(ctx_d);
+        ggml_build_forward_expand(g7, n7);
+        ggml_build_forward_expand(g1, n1);
+        const std::vector<int32_t> good = token_ids(7, 3);
+        ggml_backend_tensor_set(idx7, good.data(), 0, ggml_nbytes(idx7));
+        ggml_backend_tensor_set(idx1, good.data(), 0, ggml_nbytes(idx1));
+        // with valid indices both graphs run, so the failures below come from the kernel, not a refusal
+        if (ggml_backend_graph_compute(backend, g7) != GGML_STATUS_SUCCESS ||
+            ggml_backend_graph_compute(backend, g1) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "FAIL: GET_ROWS of Q6_K with valid indices did not run\n");
+            g_failures++;
+            ok = -1;
+        }
+        const struct {
+            ggml_tensor * idx, * out;
+            ggml_cgraph * g;
+            int64_t       at;
+            int32_t       id;
+        } cases[] = {
+            { idx7, n7, g7, 3, (int32_t) k_vocab }, { idx7, n7, g7, 6, -1 },
+            { idx1, n1, g1, 0, (int32_t) k_vocab }, { idx1, n1, g1, 0, -5 },
+        };
+        for (const auto & c : cases) {
+            if (ok < 0) {
+                break;
+            }
+            std::vector<int32_t> ids = good;
+            ids[c.at]                = c.id;
+            ggml_backend_tensor_set(c.idx, ids.data(), 0, ggml_nbytes(c.idx));
+            ggml_backend_tensor_memset(c.out, 0x5a, 0, ggml_nbytes(c.out));
+            const bool           failed = ggml_backend_graph_compute(backend, c.g) == GGML_STATUS_FAILED;
+            std::vector<uint8_t> after(ggml_nbytes(c.out));
+            ggml_backend_tensor_get(c.out, after.data(), 0, after.size());
+            ok += failed && std::all_of(after.begin(), after.end(), [](uint8_t b) { return b == 0x5a; });
+        }
+    }
+    ggml_backend_buffer_free(bh);
+    ggml_backend_buffer_free(bd);
+    ggml_free(ctx_h);
+    ggml_free(ctx_d);
+    return ok;
+}
+
+// the lookup and the first op of a layer (build_inp_embd, then attn_norm) through a scheduler of the provider and the
+// CPU, the ids in a CPU buffer, the norm weight in ours: inputs and weights allocated beforehand, the graph left to the
+// scheduler, as diag_layer
+struct lookup_graph {
+    ggml_context *        ctx_h = nullptr, * ctx_w = nullptr, * ctx_g = nullptr;
+    ggml_backend_buffer_t bh = nullptr, bw = nullptr;
+    ggml_tensor *         ids = nullptr, * x = nullptr, * norm = nullptr, * y = nullptr;
+    ggml_cgraph *         g = nullptr;
+
+    bool init(ggml_backend_dev_t dev, const embd_table & t, int64_t n) {
+        ggml_init_params params = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+        ctx_h                   = ggml_init(params);
+        ctx_w                   = ggml_init(params);
+        ctx_g                   = ggml_init(params);
+        ids                     = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n);
+        ggml_tensor * nw        = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, t.w->ne[0]);
+        ggml_set_name(nw, "blk.0.attn_norm.weight");
+        bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+        bw = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, ggml_backend_dev_buffer_type(dev));
+        if (bh == nullptr || bw == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        const std::vector<int32_t> iv = token_ids(n, 11);
+        const std::vector<float>   wv = random_values(nw->ne[0], 12, 1.0f);
+        ggml_backend_tensor_set(ids, iv.data(), 0, ggml_nbytes(ids));
+        ggml_backend_tensor_set(nw, wv.data(), 0, ggml_nbytes(nw));
+        x    = ggml_get_rows(ctx_g, t.w, ids);
+        norm = ggml_rms_norm(ctx_g, x, 1e-6f);
+        y    = ggml_mul(ctx_g, norm, nw);
+        ggml_set_output(x);
+        ggml_set_output(y);
+        g = ggml_new_graph(ctx_g);
+        ggml_build_forward_expand(g, y);
+        return true;
+    }
+
+    ~lookup_graph() {
+        for (ggml_backend_buffer_t b : { bh, bw }) {
+            ggml_backend_buffer_free(b);
+        }
+        for (ggml_context * c : { ctx_h, ctx_w, ctx_g }) {
+            ggml_free(c);
+        }
+    }
+};
+
+static int check_embedding(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+
+    // Q6_K as Qwen3's token_embd (1024 and 2560 columns), one type each of the legacy and the K family
+    const struct {
+        ggml_type type;
+        int64_t   nc;
+    } tables[] = {
+        { GGML_TYPE_Q6_K, 1024 }, { GGML_TYPE_Q6_K, 2560 }, { GGML_TYPE_Q4_0, 1024 }, { GGML_TYPE_Q4_K, 1024 },
+    };
+    int n_cases = 0, n_same = 0, bad_ok = 0;
+    for (const auto & tb : tables) {
+        embd_table t;
+        REQUIRE(t.init(tb.type, tb.nc, 21));
+        for (int64_t n : { 1, 7, 64, 512 }) {
+            const int same = lookup_identical(dev, backend, cpu, t, n, (uint32_t) (n + tb.nc));
+            if (same != 1) {
+                std::fprintf(stderr, "FAIL: GET_ROWS of %lld %s rows of %lld from a CPU buffer: %s\n", (long long) n,
+                             ggml_type_name(tb.type), (long long) tb.nc,
+                             same < 0 ? "refused or failed" : "bytes differ from the CPU's");
+                g_failures++;
+            }
+            n_cases++;
+            n_same += same == 1;
+        }
+        if (tb.type == GGML_TYPE_Q6_K && tb.nc == 1024) {
+            bad_ok = lookup_bad_index_runs(dev, backend, t);
+            if (bad_ok != 4) {
+                std::fprintf(stderr, "FAIL: GET_ROWS of Q6_K, index out of range: %d of 4 launches as expected\n",
+                             bad_ok);
+                g_failures++;
+            }
+        }
+    }
+    int       embd_warnings = -1;
+    const int n_claims      = lookup_claims(dev, embd_warnings);
+
+    // through the scheduler: 1 split with the lookup on the provider, 2 with it on the CPU (GGML_FLAGOS_DISABLE_OPS,
+    // FLAGOS_SPACEMIT_EMBD=cpu), the same bytes. Then, under uid-trust, new ids on the kept graph (a decode reusing its
+    // graph): one hit by uid, and the rows of the new ids as the CPU's
+    embd_table t;
+    REQUIRE(t.init(GGML_TYPE_Q6_K, 1024, 22));
+    int                  splits[3] = { 0, 0, 0 };
+    bool                 placed[3] = { false, false, false };
+    std::vector<uint8_t> out[3];
+    bool                 ran = true, reused = false;
+    uint64_t             hits = 0;
+    for (int i = 0; i < 3; i++) {
+        env_override         switch_off("GGML_FLAGOS_DISABLE_OPS", i == 1 ? "GET_ROWS" : nullptr);
+        env_override         embd_switch("FLAGOS_SPACEMIT_EMBD", i == 2 ? "cpu" : nullptr);
+        env_override         plan_switch("FLAGOS_SPACEMIT_PLAN", "uid-trust");
+        env_override         quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
+        lookup_graph         l;
+        REQUIRE(l.init(dev, t, 7));
+        ggml_backend_t       both[2] = { backend, cpu };
+        ggml_backend_sched_t sched   = ggml_backend_sched_new(both, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        const bool ok = sched != nullptr && ggml_backend_sched_graph_compute(sched, l.g) == GGML_STATUS_SUCCESS;
+        ran           = ran && ok;
+        if (ok) {
+            splits[i] = ggml_backend_sched_get_n_splits(sched);
+            placed[i] = ggml_backend_sched_get_tensor_backend(sched, l.x) == (i == 0 ? backend : cpu) &&
+                        ggml_backend_sched_get_tensor_backend(sched, l.norm) == backend;
+            out[i].resize(ggml_nbytes(l.x) + ggml_nbytes(l.y));
+            ggml_backend_tensor_get(l.x, out[i].data(), 0, ggml_nbytes(l.x));
+            ggml_backend_tensor_get(l.y, out[i].data() + ggml_nbytes(l.x), 0, ggml_nbytes(l.y));
+        }
+        if (ok && i == 0) {
+            ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
+            ggml_context *   ctx_r  = ggml_init(params);
+            ggml_tensor *    ids_r  = ggml_new_tensor_1d(ctx_r, GGML_TYPE_I32, 7);
+            ggml_tensor *    x_r    = ggml_get_rows(ctx_r, t.w, ids_r);
+            ggml_backend_buffer_t br = ggml_backend_alloc_ctx_tensors_from_buft(ctx_r, ggml_backend_cpu_buffer_type());
+            const std::vector<int32_t> next = token_ids(7, 99);
+            ggml_backend_tensor_set(l.ids, next.data(), 0, ggml_nbytes(l.ids));
+            ggml_backend_tensor_set(ids_r, next.data(), 0, ggml_nbytes(ids_r));
+            ggml_cgraph * gr = ggml_new_graph(ctx_r);
+            ggml_build_forward_expand(gr, x_r);
+            spacemit_plan_counters_take();
+            const bool again = ggml_backend_sched_graph_compute(sched, l.g) == GGML_STATUS_SUCCESS;
+            hits             = spacemit_plan_counters_take().hits_uid;
+            if (br != nullptr && again && ggml_backend_graph_compute(cpu, gr) == GGML_STATUS_SUCCESS) {
+                std::vector<uint8_t> x_new(ggml_nbytes(l.x));
+                ggml_backend_tensor_get(l.x, x_new.data(), 0, x_new.size());
+                reused = std::memcmp(x_new.data(), x_r->data, x_new.size()) == 0;
+            }
+            ggml_backend_buffer_free(br);
+            ggml_free(ctx_r);
+        }
+        ggml_backend_sched_free(sched);
+    }
+    const bool same     = out[0] == out[1] && out[0] == out[2];
+    const bool sched_ok = ran && splits[0] == 1 && splits[1] == 2 && splits[2] == 2 && placed[0] && placed[1] &&
+                          placed[2] && same && reused && hits == 1;
+    if (!sched_ok) {
+        std::fprintf(stderr,
+                     "FAIL: GET_ROWS of Q6_K through the scheduler: %s; splits %d (GGML_FLAGOS_DISABLE_OPS=GET_ROWS "
+                     "%d, FLAGOS_SPACEMIT_EMBD=cpu %d), placement as expected %d/%d/%d, outputs %s, new ids on the "
+                     "kept graph %s, %llu hits by uid\n",
+                     ran ? "ran" : "a graph failed", splits[0], splits[1], splits[2], placed[0] ? 1 : 0,
+                     placed[1] ? 1 : 0, placed[2] ? 1 : 0, same ? "identical" : "differ",
+                     reused ? "as the CPU's" : "wrong", (unsigned long long) hits);
+        g_failures++;
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    std::printf("rows     GET_ROWS of a quantized token embedding in a CPU buffer vs CPU (Q6_K of 1024 and 2560 columns, "
+                "Q4_0 and Q4_K of 1024, %lld rows; 1-512 ids, repeated and unordered): %d/%d identical (bound 0, "
+                "memcmp); claims exact (%d nodes: the eight block types, not other types, I64 indices, strided "
+                "rows, a partial block or an IME layout; F32 rows still get_rows.f32; FLAGOS_SPACEMIT_EMBD=cpu "
+                "refuses the lookup and keeps the F32 rows, x reported %d time and ignored); index out of range fails "
+                "the launch and the next node is not run: %d/4\n",
+                (long long) k_vocab, n_same, n_cases, n_claims, embd_warnings, bad_ok);
+    std::printf("rows     the lookup and RMS_NORM through the scheduler: %d split against %d with "
+                "GGML_FLAGOS_DISABLE_OPS=GET_ROWS and %d with FLAGOS_SPACEMIT_EMBD=cpu, outputs %s; new ids on the "
+                "kept graph %s, %llu hit by uid\n",
+                splits[0], splits[1], splits[2], same ? "identical" : "differ", reused ? "as the CPU's" : "wrong",
+                (unsigned long long) hits);
+    return 0;
+}
+
+//
 // D3 (IGPU): llama.cpp's KV cache in the provider's buffer, written by the provider (the cache writes' SET_ROWS, the
 // context shift's ROPE in place and its CPY back into a quantized cache), against the CPU backend
 //
@@ -5123,7 +5572,7 @@ int main(int argc, char ** argv) {
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
-        check_rows(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
+        check_rows(dev) != 0 || check_embedding(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {
         return 1;

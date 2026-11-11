@@ -360,6 +360,31 @@ bool get_rows_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     return true;
 }
 
+// ops.cpp ggml_compute_forward_get_rows_q: ggml's to_float per row, so the rows are the CPU's bit for bit. The tiles
+// split the rows, so a single row goes whole to tile 0
+bool get_rows_quant_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const ggml_to_float_t dequantize = ggml_get_type_traits(src0->type)->to_float;
+
+    int64_t ir0, ir1;
+    tile_range(ggml_nelements(src1), tile, ir0, ir1);
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i / (ne11 * ne10);
+        const int64_t i11 = (i - i12 * ne11 * ne10) / ne10;
+        const int64_t i10 = i - i12 * ne11 * ne10 - i11 * ne10;
+        const int64_t i01 = *(const int32_t *) ((const char *) src1->data + i10 * nb10 + i11 * nb11 + i12 * nb12);
+        if (i01 < 0 || i01 >= ne01) {
+            return false;
+        }
+        dequantize((const char *) src0->data + i01 * nb01 + i11 * nb02 + i12 * nb03,
+                   (float *) ((char *) dst->data + i10 * nb1 + i11 * nb2 + i12 * nb3), ne00);
+    }
+    return true;
+}
+
 // ops.cpp ggml_compute_forward_swiglu_f32 with vec.h ggml_silu_f32: silu(x) * g, split or single-tensor form; tiles
 // split the elements (rows x columns) evenly
 void swiglu_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
@@ -509,6 +534,11 @@ bool spacemit_kernel_get_rows_f32(const spacemit_tile * tile_p, ggml_tensor * ds
     }
 #endif
     return get_rows_f32_ref(tile, dst);
+}
+
+// quantized rows into F32 (the token embedding): ggml's dequantizers on every build, no RVV version
+bool spacemit_kernel_get_rows_quant(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    return get_rows_quant_ref(*tile_p, dst);
 }
 
 bool spacemit_kernel_swiglu_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {

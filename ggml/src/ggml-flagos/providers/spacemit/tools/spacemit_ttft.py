@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # TTFT baseline for the SpacemiT provider (plan.md, "TTFT harness spec"): the figures T1 and the later levers are held
 # against. Run on the K3; standard library only; it imports the acceptance runner's helpers (spacemit_check.py).
-# Placement first, from a short -lv 4 start: every layer and the KV cache on the provider and 2 graph splits, else the
+# Placement first, from a short -lv 4 start: every layer and the KV cache on the provider and 1 graph split, else the
 # run stops (--allow-cpu: reported only). The IME build's llama-bench before and after the cases as the control. The
 # cases, always in this order:
 #   grid: time to the first token by cached depth and new tail (C3, C5); chat: 20 turns through /v1/chat/completions,
@@ -339,14 +339,14 @@ def placement(ctx):
     splits = [int(n) for n in found[-1] if n] if found else []
     n_ctx = re.findall(r"llama_context: n_ctx\s*=\s*(\d+)", text)
     ok = (bool(off) and off[-1][0] == off[-1][1] and any(n.startswith("FlagOS:SpacemiT") and v > 0 for n, v in kv) and
-          bool(splits) and all(n == 2 for n in splits))
+          bool(splits) and all(n == 1 for n in splits))
     detail = ((f"offloaded {off[-1][0]}/{off[-1][1]} layers" if off else "no offload line") +
               f"; KV buffers {', '.join(f'{n} {v:.2f} MiB' for n, v in kv) or 'none'}; graph splits "
               f"{'/'.join(map(str, splits)) or '?'}; n_ctx {n_ctx[-1] if n_ctx else '?'}")
     row("placement", up_s=secs, offloaded=list(off[-1]) if off else None, kv_buffers=kv, graph_splits=splits,
         n_ctx=int(n_ctx[-1]) if n_ctx else None, ok=ok, tokenize_error=tok_err,
         base_tokens=len(ctx.base) if ctx.base else None)
-    name = "placement: every layer and the KV cache on the provider, 2 graph splits"
+    name = "placement: every layer and the KV cache on the provider, 1 graph split"
     if secs is None:
         sc.report(name, False, f"the placement server did not come up: {why}")
         return False

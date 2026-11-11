@@ -2657,7 +2657,7 @@ What changes on the K3 with it, by reading (the coder's list, which I checked ag
 
 ### Embedding lookup spec: the token embedding on the AI cores, for review (2026-11-11)
 
-**Status:** written for review 2026-11-11, on the user's word ("can you plan for token embedding lookup on ai cores?"), item 3 of the to-do order agreed 2026-11-08. Nothing implemented.
+**Status:** written for review 2026-11-11, on the user's word ("can you plan for token embedding lookup on ai cores?"), item 3 of the to-do order agreed 2026-11-08. Approved the same day (the user: "i would like to try with ggml's own dequantizer per row on ai cores first, and then try with our own customized kernel later to compare the performance"); the two review points were left unanswered, so I took both as recommended (the eight block types; adopt on "not slower") and said so. Built and checked on the Mac 2026-11-11 ("As built" below); its K3 run is the user's. A kernel of our own (RVV at VLEN 1024) is a second step after this one's K3 run, compared through the same checks; it is not bit-identical by construction, so its rule will need a bound or a proof.
 
 **Why.** A token is 2 graph splits today, and the first holds one node. On the Mac's simulated device with `GGML_SCHED_DEBUG=2` (Qwen3-0.6B, 2026-11-11), every graph reads:
 - split 0, CPU: `GET_ROWS` of `token_embd.weight` by `inp_tokens`, giving `embd`;
@@ -2670,6 +2670,8 @@ So per graph the X100 thread pool wakes for one node and the scheduler copies `e
 - No llama.cpp change is needed. The scheduler gives a node with a weight to the first backend that accepts the weight's buffer type and the op (`ggml/src/ggml-backend.cpp:877-889, 956-968`). The provider comes first and accepts host buffers (`core/flagos-spacemit.cpp:552-553`), so the node goes to the CPU today only because `supports_op` refuses it: the provider's one `GET_ROWS` contract is F32 rows (`core/flagos-spacemit-ops.cpp:114-119, 182`).
 - The CPU's kernel is one call per row of ggml's dequantizer, `ggml_get_type_traits(type)->to_float` (`ggml/src/ggml-cpu/ops.cpp:4850-4892`). For Q6_K that is `dequantize_row_q6_K` (`ggml/src/ggml-quants.c:1939`), plain C with no RISC-V branch, in ggml-base, which the plugin links.
 
+- SpacemiT has no kernel for it (read 2026-11-11, on the user's question). In all 11 branches of `spacemit-com/llama.cpp`, their standalone backend (`ggml/src/ggml-spacemit/`) and the in-tree IME path (`ggml/src/ggml-cpu/spacemit/`) take `GET_ROWS` only when source and output are both F32 or both F16, one row copy (`forward_get_rows<int32_t>` and `<int16_t>`); the files hold no dequantizer and no mention of the token embedding. Their backend refuses a quantized source (`ime.cpp`, the `supports_op` case: F32 or F16 only), so with a Q6_K embedding their lookup runs on the CPU as ours does; the in-tree path falls through to ggml-cpu's `ggml_compute_forward_get_rows`. Checked in the newest branches (`perf/k3-decode-state`, `kernel-agent/gdn-opt`, `pr-base-v1.1`, `mtmd-backend`) and in the local snapshot `855a53b`. So nothing to copy; the F32 copy is the one our `get_rows.f32` already came from.
+
 **The approach, and the alternatives.** A second `GET_ROWS` contract in the provider that calls the same dequantizer per row on the AI cores, reading the weight in place from its CPU buffer as attention reads the KV cache. The output is then the CPU's bit for bit, by construction: the same function of the same library on the same bytes. The alternatives lose:
 - Reading the provider's own copy (the head, Q8_0 in the IME layout). Saves 304 MiB of page cache at most, and the embedding would differ from the CPU's: every reply, perplexity and KLD would move, for no speed.
 - An RVV dequantizer at VLEN 1024. One row per token is 2,560 values; nothing to win, and bit-identity would have to be proved instead of inherited.
@@ -2679,7 +2681,7 @@ So per graph the X100 thread pool wakes for one node and the scheduler copies `e
 1. The contract, `get_rows.quant`, in `core/flagos-spacemit-ops.cpp` beside `get_rows.f32`. It claims a `GET_ROWS` whose output is contiguous F32 rows, whose indices are I32, and whose source is a quantized type from a fixed list with a `to_float` (proposed: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, the block types ggml-cpu's `get_rows_q` takes that our checks can build; Q6_K is the one the models use), `ne[0]` a multiple of the block size, plain rows (`nb[0]` the type's size, contiguous), and storage in the plain layout (`tensor_layout(src) == 0`): a host buffer, or our own only where the weight was not repacked. Anything else is refused and stays on the CPU, as today.
 2. The kernel, in `plugin/flagos-spacemit-kernels.cpp` beside `get_rows_f32_ref`, one version for every build (no RVV file): each tile takes a range of the index list and calls `to_float` per row into `dst`. One row goes to tile 0 whole (10 blocks of 256 on Qwen3-4B; splitting it is not worth a second code path). An index out of range fails the step, as the F32 kernel does, where the CPU asserts.
 3. The plugin table: a 17th kernel and the 14th contract (`plugin/flagos-spacemit-plugin.cpp`), the check program's counts with them (16 kernels, 13 contracts today).
-4. The old placement stays reachable with no new switch: `GGML_FLAGOS_DISABLE_OPS=GET_ROWS` sends the node back to the CPU (`core/flagos-spacemit-ops.cpp:261`), which is the A/B.
+4. The old placement stays reachable with no new switch: `GGML_FLAGOS_DISABLE_OPS=GET_ROWS` sends the node back to the CPU (`core/flagos-spacemit-ops.cpp:261`), which is the A/B. (Wrong, found while building: "As built" below.)
 5. The check program:
    - `rows`: Q6_K at 1,024 and 2,560 columns and one other listed type each of the legacy and K families, 1, 7, 64 and 512 rows, the weight in a CPU buffer as llama.cpp has it, repeated and unordered indices: the output equal to the CPU's byte for byte (bound 0, by `memcmp`), on the RVV build and under `GGML_FLAGOS_KERNEL_VARIANTS=0`.
    - Claims: refused for a weight in the IME layout, a strided or F16 source, I64 indices, `ne[0]` not a multiple of the block; an index out of range fails the launch and writes nothing after it.
@@ -2697,13 +2699,13 @@ So per graph the X100 thread pool wakes for one node and the scheduler copies `e
 
 **On the K3** (the user's run, one block in tmux after the `/dev/tcm` check; about 1.5 hours, estimate):
 1. The runner on Qwen3-0.6B with `--build` and on Qwen3-4B, both with `--server-baseline ~/kvh/t1-base-*.json`.
-2. Speed, the new placement against `GGML_FLAGOS_DISABLE_OPS=GET_ROWS` in one session, taking turns three times: llama-bench `-p 128,512 -n 128 -ub 512 -r 3` on both models, and tg32 at depth 4096 on Qwen3-4B.
+2. Speed, the new placement against the old in one session, taking turns three times (`scripts/embd-experiments.sh`, with `FLAGOS_SPACEMIT_EMBD=cpu` for the old one; "As built" below): llama-bench `-p 128,512 -n 128 -ub 512 -r 3` on both models, and tg32 at depth 4096 on Qwen3-4B.
 3. The server with its default `mmap`: the runner's server checks cover it. With the lookup on the AI cores, the page faults of a first-touched embedding row are taken on an A100 core, which has not happened to a file-backed page in this provider before.
 
 **Decision rule, set before the runs:** the lookup stays on the provider if
 - every check passes: the runner 49/49 and 47/47 with 16/16 replies equal to T1's baselines, perplexity and both KLDs to the last digit (the embedding is the CPU's bit for bit, so nothing downstream may move);
 - every 1-token graph is 1 split;
-- no llama-bench figure is more than 1% slower than under `GGML_FLAGOS_DISABLE_OPS=GET_ROWS`, the better of the turns.
+- no llama-bench figure is more than 1% slower than under `FLAGOS_SPACEMIT_EMBD=cpu`, the better of the turns.
 
 A reply or a digit that moves means the output is not the CPU's, and the change is not adopted until that is explained. If only the speed condition fails, the user decides: the gain here is the placement.
 
@@ -2716,6 +2718,22 @@ A reply or a digit that moves means the output is not the CPU's, and the change 
 **Time:** one coder session and my check on the Mac; one K3 block.
 
 **Not covered:** F16 and F32-in-other-layouts embeddings (F32 rows are claimed already); LoRA on the embedding (its `GET_ROWS` of an F32 matrix is claimed today, its `MUL_MAT` is not the provider's); the vector-embedding input (`inp_embd`, no lookup); freeing the CPU copy of the tied weight; a native graph API in spine-runtime and per-step barriers (the two questions for SpacemiT).
+
+**As built (2026-11-11).** The coder from my brief, then a follow-up; three things differ from the text above:
+- **The claim's storage condition is "a host buffer, or the plain layout", not the plain layout alone.** `tensor_layout` answers from a tensor's type, shape and name, never its buffer (`plugin/flagos-spacemit-weights.cpp:22-40`), and `token_embd` has 151,936 rows, a multiple of 32, so it reads as an IME layout though its bytes in the CPU buffer are the file's. With the condition as I wrote it the lookup was refused (the coder's mutation shows it). A host buffer is never repacked; in our own buffer the layout rule decides, so a Q6_K weight there that was requantized is still refused.
+- **`GGML_FLAGOS_DISABLE_OPS=GET_ROWS` is not the old placement:** it also sends the last layer's F32 row pick (`inp_out_ids`, `get_rows.f32`) to the CPU, 4 splits per graph. So a test switch, `FLAGOS_SPACEMIT_EMBD=cpu`, refuses only the quantized lookup: 2 splits, the placement before. Unset or empty is the provider; another value warns once and is ignored. Read in the core on every claim, as `FLAGOS_SPACEMIT_QUANTIZE` is. The step with a kernel of our own would add its value here.
+- **The K3 comparison is a script,** `scripts/embd-experiments.sh` (`run [out]`, `summary <out>`): llama-bench under the default against `FLAGOS_SPACEMIT_EMBD=cpu`, three turns, the order reversed on even turns; `-p 128,512 -n 128 -ub 512 -r 3` on both models and `-p 512 -n 32 -d 4096 -r 1` on Qwen3-4B.
+
+The changes: `core/flagos-spacemit-ops.cpp` (the contract `get_rows.quant`, the 14th; its eight block types), `core/flagos-spacemit-diagnostics.{h,cpp}` (the switch; the step label `GET_ROWS token_embd q6_K r1`), `plugin/flagos-spacemit-kernels.{h,cpp}` and `-plugin.cpp` (the kernel, the 17th: `to_float` per row over a tile's range of the indices; one row whole to tile 0; an index out of range fails the step), the five test plugins' kernel lists, `tests/check_spacemit.cpp` (`check_embedding`), and the two tools (1 graph split where they expected 2: the runner's "a token takes 1 graph split" and its server placement, the harness's placement). The plugin's `api` 1 and `struct_size` 176 are unchanged.
+
+**On the Mac (2026-11-11; the coder, then I again):**
+- `build-host` and `build-nohost` without warnings; the riscv64 syntax check of the two changed plugin files: 0 errors.
+- The check program: all checks pass, also under `GGML_FLAGOS_KERNEL_VARIANTS=0`, `FLAGOS_SPACEMIT_PLAN=none` and `GGML_FLAGOS_SYNC_LAUNCH=1`. Against its output before, only the loader line (17 kernels), the contracts line (14 bound to 17) and the two new `rows` lines differ. The lookup: 16/16 cases identical to the CPU by `memcmp` (Q6_K at 1,024 and 2,560 columns, Q4_0 and Q4_K at 1,024; 1 to 512 ids); the claims exact on 56 nodes; an index out of range fails the launch 4/4; through the scheduler 1 split against 2 under either switch, the outputs identical; new ids on a kept graph give the CPU's rows with 1 hit by uid.
+- test-backend-ops `GET_ROWS`: 44/44 claimed cases pass, 9/9 before (the 35 new ones are quantized sources in our buffer in the plain layout; Q6_K of 2,560 by 32 rows is refused, as it would be requantized there).
+- `llama-completion` on Qwen3-0.6B, 24 tokens at temperature 0: the text byte for byte the one before the change, with the switch unset and under `cpu`. `graph splits = 1` unset, 2 under `FLAGOS_SPACEMIT_EMBD=cpu`, 4 under `GGML_FLAGOS_DISABLE_OPS=GET_ROWS`; with `GGML_SCHED_DEBUG=2`, 21 of 21 graphs are one split on FlagOS:SpacemiT:0.
+- Mutations caught: the kernel dequantizing the next row (16 comparisons fail); the claim taking any layout (6 claims fail); the claim ignoring the switch.
+- The script: `bash -n`, a dry run, and a run against a stand-in for llama-bench, whose summary filled every row.
+- Not testable on the Mac: the RVV build and the tiles on threads, the page faults of the mapped embedding on an A100 core, llama-server, perplexity, Qwen3-4B, any speed.
 
 **For the user to decide at review:**
 1. The type list: every listed block type (recommended: the same code, each checked byte for byte against the CPU), or Q6_K alone.

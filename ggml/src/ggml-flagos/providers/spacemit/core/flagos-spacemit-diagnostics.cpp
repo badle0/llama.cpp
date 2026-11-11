@@ -162,6 +162,14 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
         case GGML_OP_GLU:
             std::snprintf(buf, sizeof(buf), "GLU %s r%lld", ggml_glu_op_name(ggml_get_glu_op(n)), r);
             break;
+        case GGML_OP_GET_ROWS:  // the lookup of quantized rows (the token embedding) by its weight and type
+            if (std::strcmp(name, "get_rows.quant") == 0) {
+                std::snprintf(buf, sizeof(buf), "GET_ROWS %s %s r%lld", spacemit_role(n->src[0]).c_str(),
+                              ggml_type_name(n->src[0]->type), r);
+            } else {
+                std::snprintf(buf, sizeof(buf), "GET_ROWS r%lld", r);
+            }
+            break;
         case GGML_OP_FLASH_ATTN_EXT:
             std::snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT.%s q%lld kv%lld",
                           std::strcmp(name, "flash_attn") == 0             ? "one-step" :
@@ -222,6 +230,21 @@ bool spacemit_quantize_shared() {
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_QUANTIZE=%s: unknown setting ignored\n", __func__, v);
+    }
+    return false;
+}
+
+bool spacemit_embd_on_cpu() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_EMBD");
+    if (v == nullptr || *v == '\0') {
+        return false;
+    }
+    if (std::strcmp(v, "cpu") == 0) {
+        return true;
+    }
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_EMBD=%s: unknown setting ignored\n", __func__, v);
     }
     return false;
 }

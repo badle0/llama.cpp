@@ -358,6 +358,7 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "set_rows",         spacemit_kernel_set_rows,      nullptr,                     nullptr                              },
         { "cpy.quant",        spacemit_kernel_cpy_quant,     nullptr,                     nullptr                              },
         { "get_rows.f32",     spacemit_kernel_get_rows_f32,  nullptr,                     nullptr                              },
+        { "get_rows.quant",   spacemit_kernel_get_rows_quant, nullptr,                    nullptr                              },
         { "swiglu.f32",       spacemit_kernel_swiglu_f32,    nullptr,                     nullptr                              },
         { "mul_mat.quantize", spacemit_mul_mat_quantize,     nullptr,                     spacemit_mul_mat_workspace           },
         { "mul_mat.gemm",     spacemit_mul_mat_gemm,         nullptr,                     spacemit_mul_mat_workspace           },
