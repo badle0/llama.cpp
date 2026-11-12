@@ -34,6 +34,9 @@ void forward_rms_norm_f32(context & ctx, ggml_tensor * op);
 void forward_rope_f32(context & ctx, ggml_tensor * op);  // needs the workspace of spacemit_rope_workspace()
 bool forward_set_rows(context & ctx, ggml_tensor * op);  // false: an index out of range
 bool forward_get_rows_f32(context & ctx, ggml_tensor * op);  // false: an index out of range
+// ours, not ggml-spacemit's: Q6_K rows of whole blocks into F32 rows, ggml's bits, at VLEN 1024 only (the caller checks
+// vlenb); false: an index out of range
+bool forward_get_rows_q6_K(context & ctx, ggml_tensor * op);
 void forward_glu_swiglu_f32(context & ctx, ggml_tensor * op);
 
 }  // namespace spacemit_rvv

@@ -48,8 +48,9 @@ spacemit_launch_kind spacemit_launch_mode();
 bool spacemit_quantize_shared();
 
 // test-only: FLAGOS_SPACEMIT_EMBD=cpu refuses the quantized GET_ROWS (get_rows.quant), so the token embedding's lookup
-// stays on the CPU as before 2026-11-11 and the F32 row pick stays here; unset or empty: the provider takes it. Read at
-// every call, an unknown value reported once and ignored
+// stays on the CPU as before 2026-11-11 and the F32 row pick stays here; unset, empty, ggml or rvv: the provider takes
+// it (ggml and rvv are the plugin's kernel choice, flagos-spacemit-kernels.cpp). Read at every call, an unknown value
+// reported once and ignored
 bool spacemit_embd_on_cpu();
 
 // GGML_FLAGOS_DISABLE_OPS=<op>[,<op>...]: whether this ggml op is named there, so spacemit_find_op refuses it and the

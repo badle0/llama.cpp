@@ -2,6 +2,8 @@
 
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 #    include "flagos-spacemit-rvv-kernels.h"
+
+#    include <riscv_vector.h>
 #endif
 
 #include "../../../../ggml-impl.h"
@@ -536,9 +538,58 @@ bool spacemit_kernel_get_rows_f32(const spacemit_tile * tile_p, ggml_tensor * ds
     return get_rows_f32_ref(tile, dst);
 }
 
-// quantized rows into F32 (the token embedding): ggml's dequantizers on every build, no RVV version
+namespace {
+
+// FLAGOS_SPACEMIT_EMBD (plan.md "Embedding lookup spec", step 2): rvv takes forward_get_rows_q6_K where it applies;
+// unset, empty, ggml, cpu and anything else ggml's dequantizers (cpu and unknown values are the core's to refuse or
+// report). Parsed once (spacemit_cached_switch)
+bool parse_embd_rvv() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_EMBD");
+    return v != nullptr && std::strcmp(v, "rvv") == 0;
+}
+
+bool embd_rvv_from_env() {
+    static std::atomic<bool>     value{ false };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_embd_rvv);
+}
+
+// test-only (spacemit_embd_paths_take): the calls of spacemit_kernel_get_rows_quant by the kernel its tile 0 ran
+std::atomic<uint64_t> g_embd_rvv{ 0 }, g_embd_ggml{ 0 };
+
+}  // namespace
+
+// quantized rows into F32 (the token embedding): ggml's dequantizers, or under FLAGOS_SPACEMIT_EMBD=rvv for Q6_K rows
+// of whole blocks the RVV kernel, which needs VLEN 1024, read on the core that runs it
 bool spacemit_kernel_get_rows_quant(const spacemit_tile * tile_p, ggml_tensor * dst) {
-    return get_rows_quant_ref(*tile_p, dst);
+    const spacemit_tile & tile = *tile_p;
+    const bool            rvv  = embd_rvv_from_env();
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
+    const ggml_tensor *   src0 = dst->src[0];
+    if (rvv && src0->type == GGML_TYPE_Q6_K && src0->ne[0] % ggml_blck_size(GGML_TYPE_Q6_K) == 0 &&
+        !spacemit_use_reference() && __riscv_vlenb() == 128) {
+        if (tile.ith == 0) {
+            g_embd_rvv.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto ctx = rvv_context(tile);
+        return spacemit_rvv::forward_get_rows_q6_K(ctx, dst);
+    }
+#else
+    (void) rvv;
+#endif
+    if (tile.ith == 0) {
+        g_embd_ggml.fetch_add(1, std::memory_order_relaxed);
+    }
+    return get_rows_quant_ref(tile, dst);
+}
+
+void spacemit_embd_read_switch() {
+    (void) embd_rvv_from_env();
+}
+
+void spacemit_embd_paths_take(uint64_t * rvv, uint64_t * ggml) {
+    *rvv  = g_embd_rvv.exchange(0);
+    *ggml = g_embd_ggml.exchange(0);
 }
 
 bool spacemit_kernel_swiglu_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {

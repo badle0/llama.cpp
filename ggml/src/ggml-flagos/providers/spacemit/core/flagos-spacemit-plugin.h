@@ -106,12 +106,14 @@ typedef uint64_t (*spacemit_executors_take_fn)(void);
 typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c);
 // test-only: the one-step attention calls since the last call by the kernel that ran (tiled, one-chunk, reference)
 typedef void (*spacemit_attn_paths_take_fn)(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference);
+// test-only: the quantized lookups (get_rows.quant) since the last call by the kernel that ran (RVV Q6_K, ggml's)
+typedef void (*spacemit_embd_paths_take_fn)(uint64_t * rvv, uint64_t * ggml);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
 // as MUL_MAT a, so that b can multiply what a's quantize step wrote
 typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
-// test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_MM, ATTN) once; a test that changes
+// test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD) once; a test that changes
 // them inside one process calls this so the next read parses again
 typedef void (*spacemit_switches_reset_fn)(void);
 // test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its

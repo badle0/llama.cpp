@@ -1,5 +1,6 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
-// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm]
+// Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
+//                              [--bench | --bench-attn | --bench-mm | --bench-embd]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -15,6 +16,9 @@
 //                    T1) against 9, the default (not run by --bench)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
+//   --bench-embd     of the benchmarks only the token embedding lookup: one call of 1-512 rows of 1024 and 2560
+//                    columns from 32768, Q6_K by FLAGOS_SPACEMIT_EMBD=ggml against rvv, and the same values as F32
+//                    copied by get_rows.f32 (not run by --bench)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
 // them: requantized to Q8_0.
 
@@ -24,6 +28,8 @@
 #include "ggml-flagos.h"
 #include "ggml.h"
 #include "../ggml-impl.h"  // ggml_cgraph's uid and ggml_graph_view (the plan cache's probes)
+#define GGML_COMMON_DECL_CPP
+#include "../ggml-common.h"  // block_q6_K (the lane model of the RVV lookup and its edge blocks)
 #include "providers/spacemit/core/flagos-spacemit-diagnostics.h"  // the diagnostics under the deck's names (S1 step 5)
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
 #include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
@@ -79,6 +85,7 @@ static spacemit_mm_paths_take_fn   g_mm_paths_take   = nullptr;
 static spacemit_mm_tail_take_fn    g_mm_tail_take    = nullptr;
 static spacemit_switches_reset_fn  g_switches_reset  = nullptr;
 static spacemit_attn_paths_take_fn g_attn_paths_take = nullptr;
+static spacemit_embd_paths_take_fn g_embd_paths_take = nullptr;
 
 static int bind_plugin_names(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -90,8 +97,11 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
     g_switches_reset = reinterpret_cast<spacemit_switches_reset_fn>(table->get_proc_address("spacemit_switches_reset"));
     g_attn_paths_take =
         reinterpret_cast<spacemit_attn_paths_take_fn>(table->get_proc_address("spacemit_attn_paths_take"));
+    g_embd_paths_take =
+        reinterpret_cast<spacemit_embd_paths_take_fn>(table->get_proc_address("spacemit_embd_paths_take"));
     REQUIRE(g_steps_take != nullptr && g_executors_take != nullptr && g_mm_paths_take != nullptr &&
-            g_mm_tail_take != nullptr && g_switches_reset != nullptr && g_attn_paths_take != nullptr);
+            g_mm_tail_take != nullptr && g_switches_reset != nullptr && g_attn_paths_take != nullptr &&
+            g_embd_paths_take != nullptr);
     return 0;
 }
 
@@ -241,7 +251,7 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     const char * names[] = { "spacemit_steps_take", "spacemit_executors_take", "spacemit_mm_paths_take",
                              "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
                              "spacemit_switches_reset", "spacemit_switches_generation",
-                             "spacemit_attn_paths_take" };
+                             "spacemit_attn_paths_take", "spacemit_embd_paths_take" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -2815,32 +2825,149 @@ static int check_rows(ggml_backend_dev_t dev) {
 constexpr int64_t k_vocab = 4096;
 
 // a vocabulary of k_vocab rows of nc random values quantized to type, in a CPU buffer marked as weights, as llama.cpp
-// keeps token_embd (the scheduler places a node by its weights' buffer)
+// keeps token_embd (the scheduler places a node by its weights' buffer); with edges, Q6_K blocks built by hand
+// (q6_K_edge_rows) instead
 struct embd_table {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     ggml_tensor *         w   = nullptr;
 
-    bool init(ggml_type type, int64_t nc, uint32_t seed) {
-        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
-        ctx                     = ggml_init(params);
-        w                       = ggml_new_tensor_2d(ctx, type, nc, k_vocab);
-        ggml_set_name(w, "token_embd.weight");
-        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
-        if (buf == nullptr) {
-            return false;
-        }
-        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        const std::vector<uint8_t> q = quantize_weights(type, nc, k_vocab, seed);
-        ggml_backend_tensor_set(w, q.data(), 0, q.size());
-        return true;
-    }
+    bool init(ggml_type type, int64_t nc, uint32_t seed, bool edges = false);
 
     ~embd_table() {
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
     }
 };
+
+// Q6_K blocks by hand for the edges of ggml's arithmetic, (d * scale) * q in F32: block p takes by the digits of p one
+// of 12 values of d (0, -0, 1, -1, a negative one, the smallest subnormal, the largest negative subnormal, the
+// smallest normal, 65504, -65504, a small one, a random normal), one of 5 sets of scales (all -128, all 127, all 0,
+// cycling -128, 127, 0, -1 and 1, random) and one of 4 sets of 6-bit values (all 0, all 63, alternating 0 and 63,
+// random), so every combination occurs among 240 consecutive blocks
+static std::vector<uint8_t> q6_K_edge_rows(int64_t nc, int64_t n, uint32_t seed) {
+    static_assert(sizeof(block_q6_K) == 210, "block_q6_K");
+    const int64_t           nb = nc / QK_K * n;
+    std::vector<block_q6_K> x(nb);
+    uint64_t                state = seed;
+    const auto              next  = [&state] {  // splitmix64
+        uint64_t z = (state += 0x9e3779b97f4a7c15ull);
+        z          = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z          = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    };
+    static const uint16_t d_bits[] = { 0x0000, 0x8000, 0x3c00, 0xbc00, 0xb555, 0x0001,
+                                       0x83ff, 0x0400, 0x7bff, 0xfbff, 0x1234, 0 };
+    static const int8_t   cycle[]  = { -128, 127, 0, -1, 1 };
+    for (int64_t p = 0; p < nb; p++) {
+        block_q6_K & b       = x[p];
+        const int    d_mode  = (int) (p % 12);
+        const int    sc_mode = (int) (p / 12 % 5);
+        const int    q_mode  = (int) (p / 60 % 4);
+        uint16_t     d       = d_bits[d_mode];
+        if (d_mode == 11) {  // a random normal: exponent 1-30, any sign and mantissa
+            const uint64_t r = next();
+            d                = (uint16_t) ((r & 0x83ff) | ((1 + (r >> 16) % 30) << 10));
+        }
+        std::memcpy(&b.d, &d, sizeof(d));
+        for (int j = 0; j < QK_K / 16; j++) {
+            b.scales[j] = sc_mode == 0 ? (int8_t) -128 : sc_mode == 1 ? (int8_t) 127 : sc_mode == 2 ? (int8_t) 0 :
+                          sc_mode == 3 ? cycle[j % 5] : (int8_t) (next() & 0xff);
+        }
+        uint8_t q[QK_K];  // the 6-bit values in output order
+        for (int k = 0; k < QK_K; k++) {
+            q[k] = q_mode == 0 ? 0 : q_mode == 1 ? 63 : q_mode == 2 ? (k % 2 ? 63 : 0) : (uint8_t) (next() & 63);
+        }
+        std::memset(b.ql, 0, sizeof(b.ql));
+        std::memset(b.qh, 0, sizeof(b.qh));
+        for (int h = 0; h < 2; h++) {  // dequantize_row_q6_K's layout, inverted
+            for (int l = 0; l < 32; l++) {
+                const uint8_t * v = q + 128 * h + l;
+                b.ql[64 * h + l]      = (uint8_t) ((v[0] & 0xf) | ((v[64] & 0xf) << 4));
+                b.ql[64 * h + l + 32] = (uint8_t) ((v[32] & 0xf) | ((v[96] & 0xf) << 4));
+                b.qh[32 * h + l] = (uint8_t) ((v[0] >> 4) | ((v[32] >> 4) << 2) | ((v[64] >> 4) << 4) | ((v[96] >> 4) << 6));
+            }
+        }
+    }
+    std::vector<uint8_t> bytes(nb * sizeof(block_q6_K));
+    std::memcpy(bytes.data(), x.data(), bytes.size());
+    return bytes;
+}
+
+bool embd_table::init(ggml_type type, int64_t nc, uint32_t seed, bool edges) {
+    ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+    ctx                     = ggml_init(params);
+    w                       = ggml_new_tensor_2d(ctx, type, nc, k_vocab);
+    ggml_set_name(w, "token_embd.weight");
+    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    if (buf == nullptr || (edges && type != GGML_TYPE_Q6_K)) {
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const std::vector<uint8_t> q = edges ? q6_K_edge_rows(nc, k_vocab, seed) : quantize_weights(type, nc, k_vocab, seed);
+    ggml_backend_tensor_set(w, q.data(), 0, q.size());
+    return true;
+}
+
+// test-only: the RVV lookup's arithmetic (flagos-spacemit-rvv-kernels.cpp dequantize_q6_K_blocks) lane by lane in
+// scalar C++, the same grouping and operand order: per half of 128 values the 8 products d * scale in F32; per group
+// g of 32 lanes (y[32 g + l]) the scale 2 g + l / 16, the 6-bit value from ql[l], ql[l + 32] and qh[l] by the same
+// and, shift and or in uint8, minus 32 in int8, widened to int32 and converted to F32, and one multiply (scale, q) per
+// lane. Checked against ggml's to_float by memcmp, it proves the plan's arithmetic on any host, not the intrinsics
+static void q6_K_lane_model(const block_q6_K * x, int64_t nb, float * y) {
+    for (int64_t b = 0; b < nb; b++) {
+        const float     d  = GGML_FP16_TO_FP32(x[b].d);
+        const uint8_t * ql = x[b].ql;
+        const uint8_t * qh = x[b].qh;
+        const int8_t *  sc = x[b].scales;
+        float *         yb = y + b * QK_K;
+        for (int n = 0; n < QK_K; n += 128) {
+            float s[8];
+            for (int j = 0; j < 8; j++) {
+                s[j] = d * (float) sc[j];
+            }
+            for (int g = 0; g < 4; g++) {
+                for (int l = 0; l < 32; l++) {
+                    const uint8_t l0 = ql[l], l1 = ql[l + 32], h = qh[l];
+                    const uint8_t hb = g == 0 ? (uint8_t) ((uint8_t) (h << 4) & 0x30) :
+                                       g == 1 ? (uint8_t) ((uint8_t) (h << 2) & 0x30) :
+                                       g == 2 ? (uint8_t) (h & 0x30) : (uint8_t) ((h >> 2) & 0x30);
+                    const uint8_t lb = g == 0 ? (uint8_t) (l0 & 0xf) : g == 1 ? (uint8_t) (l1 & 0xf) :
+                                       g == 2 ? (uint8_t) (l0 >> 4) : (uint8_t) (l1 >> 4);
+                    const int8_t  q  = (int8_t) ((int8_t) (lb | hb) - 32);
+                    const float   qf = (float) (int32_t) q;
+                    const float   sv = l < 16 ? s[2 * g] : s[2 * g + 1];
+                    yb[32 * g + l]   = sv * qf;
+                }
+            }
+            yb += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+// the lane model against ggml's to_float on rows of bytes: the blocks whose values are identical (memcmp)
+static int64_t q6_K_lane_model_same(const std::vector<uint8_t> & bytes) {
+    const int64_t      nb = (int64_t) (bytes.size() / sizeof(block_q6_K));
+    std::vector<float> ref(nb * QK_K), got(nb * QK_K);
+    ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(bytes.data(), ref.data(), nb * QK_K);
+    q6_K_lane_model((const block_q6_K *) bytes.data(), nb, got.data());
+    int64_t same = 0;
+    for (int64_t b = 0; b < nb; b++) {
+        same += std::memcmp(ref.data() + b * QK_K, got.data() + b * QK_K, QK_K * sizeof(float)) == 0;
+    }
+    return same;
+}
+
+// the kernel the quantized lookups since the last call ran, by the counter (spacemit_embd_paths_take): rvv, ggml,
+// none or mixed
+static const char * embd_kernel_taken() {
+    uint64_t rvv = 0, ggml = 0;
+    g_embd_paths_take(&rvv, &ggml);
+    return rvv != 0 && ggml != 0 ? "mixed" : rvv != 0 ? "rvv" : ggml != 0 ? "ggml" : "none";
+}
 
 // n token ids, unordered, every fifth a repeat of an earlier one; from 7 on also the first and the last row
 static std::vector<int32_t> token_ids(int64_t n, uint32_t seed) {
@@ -2893,9 +3020,9 @@ static int lookup_identical(ggml_backend_dev_t dev, ggml_backend_t backend, ggml
 // which GET_ROWS the provider claims, and by which contract: F32 rows by get_rows.f32 as before; Q4_0, Q4_1, Q5_0,
 // Q5_1, Q8_0, Q4_K, Q5_K and Q6_K rows by get_rows.quant from a CPU buffer whatever the layout rule says, from our buffer
 // (or not allocated, as test-backend-ops asks) only where the rule gives ggml's layout; no other type, no I64 indices,
-// no strided rows, no partial block; FLAGOS_SPACEMIT_EMBD=cpu refuses the lookup. Returns the number of nodes checked, and
-// in embd_warnings how often FLAGOS_SPACEMIT_EMBD=x was reported (once)
-static int lookup_claims(ggml_backend_dev_t dev, int & embd_warnings) {
+// no strided rows, no partial block; FLAGOS_SPACEMIT_EMBD=cpu refuses the lookup, ggml, rvv and an unknown value keep it
+// (lookup_switch_values counts the warnings). Returns the number of nodes checked
+static int lookup_claims(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     spacemit_ops               ops;
     std::string                detail;
@@ -2979,30 +3106,19 @@ static int lookup_claims(ggml_backend_dev_t dev, int & embd_warnings) {
         }
     }
 
-    // FLAGOS_SPACEMIT_EMBD=cpu: the lookup refused, the F32 rows still taken; an unknown value reported once, the
-    // provider kept
+    // FLAGOS_SPACEMIT_EMBD=cpu: the lookup refused, the F32 rows still taken; ggml, rvv (the plugin's kernel choice)
+    // and an unknown value: the provider kept
     {
         env_override embd("FLAGOS_SPACEMIT_EMBD", "cpu");
         expect("Q6_K in a CPU buffer, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, q6_cpu, idx), "");
         expect("Q6_K of 5 rows not allocated, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, q6_few, idx), "");
         expect("F32 in a CPU buffer, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, f32_cpu, idx), "get_rows.f32");
     }
-    {
-        env_override embd("FLAGOS_SPACEMIT_EMBD", "x");
-        log_capture  log;
-        expect("Q6_K in a CPU buffer, FLAGOS_SPACEMIT_EMBD=x", ggml_get_rows(ctx, q6_cpu, idx), "get_rows.quant");
-        expect("Q4_0 in a CPU buffer, FLAGOS_SPACEMIT_EMBD=x", ggml_get_rows(ctx, q4_cpu, idx), "get_rows.quant");
-        const std::string text = log.take();
-        embd_warnings          = 0;
-        for (size_t at = text.find("FLAGOS_SPACEMIT_EMBD=x"); at != std::string::npos;
-             at        = text.find("FLAGOS_SPACEMIT_EMBD=x", at + 1)) {
-            embd_warnings++;
-        }
-        if (embd_warnings != 1) {
-            std::fprintf(stderr, "FAIL: GET_ROWS claims, FLAGOS_SPACEMIT_EMBD=x reported %d times, not once\n",
-                         embd_warnings);
-            g_failures++;
-        }
+    for (const char * value : { "ggml", "rvv", "x" }) {
+        env_override      embd("FLAGOS_SPACEMIT_EMBD", value);
+        const std::string what = std::string(", FLAGOS_SPACEMIT_EMBD=") + value;
+        expect("Q6_K in a CPU buffer" + what, ggml_get_rows(ctx, q6_cpu, idx), "get_rows.quant");
+        expect("Q4_0 in a CPU buffer" + what, ggml_get_rows(ctx, q4_cpu, idx), "get_rows.quant");
     }
 
     // every type, 5 rows not allocated (ggml's layout): exactly the listed block types and F32
@@ -3131,44 +3247,160 @@ struct lookup_graph {
     }
 };
 
-static int check_embedding(ggml_backend_dev_t dev) {
+// FLAGOS_SPACEMIT_EMBD's values (plan.md "Embedding lookup spec", step 2) on a lookup of 7 Q6_K rows: the claim (the
+// core's), the bytes, the kernel by the counter (the plugin's: the RVV kernel under rvv where it can run, else ggml's)
+// and the warnings, one from the core for x and none from the plugin. Returns the values that behaved, of 6, and in
+// x_core and x_plugin the warnings of x
+static int lookup_switch_values(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu,
+                                const embd_table & t, bool expect_rvv, int & x_core, int & x_plugin) {
+    const struct {
+        const char * value;  // nullptr: unset
+        bool         claimed;
+        const char * kernel;
+        int          warnings;
+    } values[] = {
+        { nullptr, true, "ggml", 0 }, { "", true, "ggml", 0 },     { "ggml", true, "ggml", 0 },
+        { "rvv", true, expect_rvv ? "rvv" : "ggml", 0 },          { "cpu", false, "none", 0 },
+        { "x", true, "ggml", 1 },
+    };
+    int ok = 0;
+    for (const auto & v : values) {
+        (void) embd_kernel_taken();
+        env_override      embd("FLAGOS_SPACEMIT_EMBD", v.value);
+        log_capture       log;
+        const int         same   = lookup_identical(dev, backend, cpu, t, 7, 31);
+        const char *      kernel = embd_kernel_taken();
+        const std::string text   = log.take();
+        int               all = 0, core = 0;
+        for (size_t at = text.find("FLAGOS_SPACEMIT_EMBD"); at != std::string::npos;
+             at        = text.find("FLAGOS_SPACEMIT_EMBD", at + 1)) {
+            all++;
+        }
+        for (size_t at = text.find("spacemit_embd_on_cpu: FLAGOS_SPACEMIT_EMBD="); at != std::string::npos;
+             at        = text.find("spacemit_embd_on_cpu: FLAGOS_SPACEMIT_EMBD=", at + 1)) {
+            core++;
+        }
+        if (v.value != nullptr && std::strcmp(v.value, "x") == 0) {
+            x_core   = core;
+            x_plugin = all - core;
+        }
+        const bool good = same == (v.claimed ? 1 : -1) && std::strcmp(kernel, v.kernel) == 0 && all == v.warnings &&
+                          core == v.warnings;
+        if (!good) {
+            std::fprintf(stderr,
+                         "FAIL: FLAGOS_SPACEMIT_EMBD=%s: lookup %s, kernel %s (expected %s), %d warnings, %d from the "
+                         "core (expected %d)\n",
+                         v.value != nullptr ? v.value : "(unset)",
+                         same == 1 ? "identical" : same == 0 ? "differs" : "refused or failed", kernel, v.kernel, all,
+                         core, v.warnings);
+            g_failures++;
+        }
+        ok += good;
+    }
+    return ok;
+}
+
+static int check_embedding(ggml_backend_dev_t dev, bool host) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
+    REQUIRE(g_embd_paths_take != nullptr);
 
-    // Q6_K as Qwen3's token_embd (1024 and 2560 columns), one type each of the legacy and the K family
-    const struct {
-        ggml_type type;
-        int64_t   nc;
-    } tables[] = {
-        { GGML_TYPE_Q6_K, 1024 }, { GGML_TYPE_Q6_K, 2560 }, { GGML_TYPE_Q4_0, 1024 }, { GGML_TYPE_Q4_K, 1024 },
-    };
-    int n_cases = 0, n_same = 0, bad_ok = 0;
-    for (const auto & tb : tables) {
-        embd_table t;
-        REQUIRE(t.init(tb.type, tb.nc, 21));
-        for (int64_t n : { 1, 7, 64, 512 }) {
-            const int same = lookup_identical(dev, backend, cpu, t, n, (uint32_t) (n + tb.nc));
-            if (same != 1) {
-                std::fprintf(stderr, "FAIL: GET_ROWS of %lld %s rows of %lld from a CPU buffer: %s\n", (long long) n,
-                             ggml_type_name(tb.type), (long long) tb.nc,
-                             same < 0 ? "refused or failed" : "bytes differ from the CPU's");
+    // the RVV kernel runs under FLAGOS_SPACEMIT_EMBD=rvv on the AI cores only (as the T1 block decides its kernel):
+    // not on the host executor, not under GGML_FLAGOS_KERNEL_VARIANTS=0
+    const bool expect_rvv = !host && reference_label()[0] == '\0';
+
+    // the lane model of the RVV kernel against ggml's to_float, on any host: random Q6_K rows of 256, 1024 and 2560
+    // values and the edge blocks
+    int64_t lane_blocks = 0, lane_same = 0;
+    for (const int64_t nc : { 256, 1024, 2560 }) {
+        for (const bool edges : { false, true }) {
+            const std::vector<uint8_t> q =
+                edges ? q6_K_edge_rows(nc, k_vocab, 23) : quantize_weights(GGML_TYPE_Q6_K, nc, k_vocab, 23);
+            const int64_t same = q6_K_lane_model_same(q);
+            const int64_t nb   = (int64_t) (q.size() / sizeof(block_q6_K));
+            if (same != nb) {
+                std::fprintf(stderr, "FAIL: Q6_K lane model, %s rows of %lld: %lld of %lld blocks identical to ggml's\n",
+                             edges ? "edge" : "random", (long long) nc, (long long) same, (long long) nb);
                 g_failures++;
             }
-            n_cases++;
-            n_same += same == 1;
+            lane_blocks += nb;
+            lane_same += same;
         }
-        if (tb.type == GGML_TYPE_Q6_K && tb.nc == 1024) {
-            bad_ok = lookup_bad_index_runs(dev, backend, t);
-            if (bad_ok != 4) {
-                std::fprintf(stderr, "FAIL: GET_ROWS of Q6_K, index out of range: %d of 4 launches as expected\n",
-                             bad_ok);
+    }
+
+    // Q6_K as Qwen3's token_embd (1024 and 2560 columns), one type each of the legacy and the K family; Q6_K of one
+    // block per row and with the edge blocks (q6_K_edge_rows), at 1-3 ids (a row's blocks over the tiles, or a few rows)
+    // and from 9. Each under FLAGOS_SPACEMIT_EMBD unset (ggml's dequantizers) and rvv, the kernel by the counter
+    const std::vector<int64_t> ids_first = { 1, 7, 64, 512 };
+    const std::vector<int64_t> ids_few   = { 1, 2, 3, 9, 64, 512 };
+    const struct {
+        ggml_type                    type;
+        int64_t                      nc;
+        bool                         edges;
+        const std::vector<int64_t> & ids;
+    } tables[] = {
+        { GGML_TYPE_Q6_K, 1024, false, ids_first }, { GGML_TYPE_Q6_K, 2560, false, ids_first },
+        { GGML_TYPE_Q4_0, 1024, false, ids_first }, { GGML_TYPE_Q4_K, 1024, false, ids_first },
+        { GGML_TYPE_Q6_K, 256, false, ids_few },    { GGML_TYPE_Q6_K, 2560, false, ids_few },
+        { GGML_TYPE_Q6_K, 2560, true, ids_few },
+    };
+    const char * const settings[2] = { nullptr, "rvv" };
+    int                n_cases = 0, n_same = 0, n_kernel = 0, bad_ok = 0, n_bad = 0;
+    for (const auto & tb : tables) {
+        embd_table t;
+        REQUIRE(t.init(tb.type, tb.nc, 21, tb.edges));
+        for (const char * setting : settings) {
+            env_override embd("FLAGOS_SPACEMIT_EMBD", setting);
+            log_capture  log;  // neither setting is reported (the core's one warning is x's, lookup_switch_values)
+            const char * want = setting != nullptr && expect_rvv && tb.type == GGML_TYPE_Q6_K ? "rvv" : "ggml";
+            for (int64_t n : tb.ids) {
+                (void) embd_kernel_taken();
+                const int    same   = lookup_identical(dev, backend, cpu, t, n, (uint32_t) (n + tb.nc));
+                const char * kernel = embd_kernel_taken();
+                if (same != 1 || std::strcmp(kernel, want) != 0) {
+                    std::fprintf(stderr,
+                                 "FAIL: GET_ROWS of %lld %s rows of %lld%s from a CPU buffer, FLAGOS_SPACEMIT_EMBD=%s: "
+                                 "%s, kernel %s (expected %s)\n",
+                                 (long long) n, ggml_type_name(tb.type), (long long) tb.nc,
+                                 tb.edges ? " (edge blocks)" : "", setting != nullptr ? setting : "(unset)",
+                                 same == 1 ? "identical" : same < 0 ? "refused or failed" : "bytes differ from the CPU's",
+                                 kernel, want);
+                    g_failures++;
+                }
+                n_cases++;
+                n_same += same == 1;
+                n_kernel += std::strcmp(kernel, want) == 0;
+            }
+            if (tb.type == GGML_TYPE_Q6_K && tb.nc == 1024) {
+                (void) embd_kernel_taken();
+                const int    bad    = lookup_bad_index_runs(dev, backend, t);
+                const char * kernel = embd_kernel_taken();  // a failed launch's tile 0 may skip the step: not "mixed"
+                if (bad != 4 || std::strcmp(kernel, want) != 0) {
+                    std::fprintf(stderr,
+                                 "FAIL: GET_ROWS of Q6_K, index out of range, FLAGOS_SPACEMIT_EMBD=%s: %d of 4 launches "
+                                 "as expected, kernel %s (expected %s)\n",
+                                 setting != nullptr ? setting : "(unset)", bad, kernel, want);
+                    g_failures++;
+                }
+                bad_ok += std::strcmp(kernel, want) == 0 ? std::max(bad, 0) : 0;
+                n_bad += 4;
+            }
+            if (log.take().find("FLAGOS_SPACEMIT_EMBD") != std::string::npos) {
+                std::fprintf(stderr, "FAIL: FLAGOS_SPACEMIT_EMBD=%s reported\n", setting != nullptr ? setting : "(unset)");
                 g_failures++;
             }
         }
     }
-    int       embd_warnings = -1;
-    const int n_claims      = lookup_claims(dev, embd_warnings);
+
+    // the switch's values before lookup_claims, whose x would take the core's one warning
+    int value_x_core = -1, value_x_plugin = -1, n_values = 0;
+    {
+        embd_table t;
+        REQUIRE(t.init(GGML_TYPE_Q6_K, 1024, 24));
+        n_values = lookup_switch_values(dev, backend, cpu, t, expect_rvv, value_x_core, value_x_plugin);
+    }
+    const int n_claims = lookup_claims(dev);
 
     // through the scheduler: 1 split with the lookup on the provider, 2 with it on the CPU (GGML_FLAGOS_DISABLE_OPS,
     // FLAGOS_SPACEMIT_EMBD=cpu), the same bytes. Then, under uid-trust, new ids on the kept graph (a decode reusing its
@@ -3239,13 +3471,22 @@ static int check_embedding(ggml_backend_dev_t dev) {
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
-    std::printf("rows     GET_ROWS of a quantized token embedding in a CPU buffer vs CPU (Q6_K of 1024 and 2560 columns, "
-                "Q4_0 and Q4_K of 1024, %lld rows; 1-512 ids, repeated and unordered): %d/%d identical (bound 0, "
-                "memcmp); claims exact (%d nodes: the eight block types, not other types, I64 indices, strided "
-                "rows, a partial block or an IME layout; F32 rows still get_rows.f32; FLAGOS_SPACEMIT_EMBD=cpu "
-                "refuses the lookup and keeps the F32 rows, x reported %d time and ignored); index out of range fails "
-                "the launch and the next node is not run: %d/4\n",
-                (long long) k_vocab, n_same, n_cases, n_claims, embd_warnings, bad_ok);
+    std::printf("rows     GET_ROWS of a quantized token embedding in a CPU buffer vs CPU (Q6_K of 256, 1024 and 2560 "
+                "columns and of 2560 with edge blocks, Q4_0 and Q4_K of 1024, %lld rows; 1-512 ids, repeated and "
+                "unordered), FLAGOS_SPACEMIT_EMBD unset and rvv: %d/%d identical (bound 0, memcmp), kernels as "
+                "expected %d/%d (under rvv %s for Q6_K, ggml for Q4_0 and Q4_K; unset ggml); claims exact (%d nodes: "
+                "the eight block types, not other types, I64 indices, strided rows, a partial block or an IME layout; "
+                "F32 rows still get_rows.f32; FLAGOS_SPACEMIT_EMBD=cpu refuses the lookup and keeps the F32 rows, "
+                "ggml, rvv and x keep it); index out of range fails the launch and the next node is not run: %d/%d\n",
+                (long long) k_vocab, n_same, n_cases, n_kernel, n_cases, expect_rvv ? "rvv" : "ggml", n_claims, bad_ok,
+                n_bad);
+    std::printf("rows     FLAGOS_SPACEMIT_EMBD on 7 Q6_K rows: unset, empty and ggml ggml's kernel, rvv %s, cpu refused, x "
+                "ggml's with %d warning from the core and %d from the plugin: %d/6 as expected\n",
+                expect_rvv ? "the RVV kernel" : "ggml's (no RVV kernel here)", value_x_core, value_x_plugin, n_values);
+    std::printf("rows     Q6_K lane model of the RVV lookup vs ggml's to_float (random rows of 256, 1024 and 2560 values "
+                "and edge blocks: d 0, -0, negative, subnormal, +-65504; scales -128, 127, 0; q 0 and 63): %lld/%lld "
+                "blocks identical (memcmp; the arithmetic plan, not the intrinsics)\n",
+                (long long) lane_same, (long long) lane_blocks);
     std::printf("rows     the lookup and RMS_NORM through the scheduler: %d split against %d with "
                 "GGML_FLAGOS_DISABLE_OPS=GET_ROWS and %d with FLAGOS_SPACEMIT_EMBD=cpu, outputs %s; new ids on the "
                 "kept graph %s, %llu hit by uid\n",
@@ -5393,6 +5634,96 @@ static int bench_attn_tiled(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// plan.md "Embedding lookup spec", step 2, --bench-embd only: one lookup call (a graph of the one GET_ROWS node on the
+// provider, the output in our buffer) from a vocabulary of 32768 rows in a CPU buffer, at 1024 and 2560 columns and 1,
+// 8, 128 and 512 random ids (fixed seed): Q6_K rows by ggml's dequantizers (FLAGOS_SPACEMIT_EMBD=ggml) and by the RVV
+// kernel (rvv), and the same values as F32 rows (dequantized once by ggml's to_float) copied by get_rows.f32, the
+// ceiling of a table kept dequantized. The three take turns twice (in order, then reversed), the faster turn of each
+// kept; the two Q6_K settings' kernels by the counter (spacemit_embd_paths_take). The same ids every call: after the
+// warm-up their rows are in the caches
+static int bench_embd(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    REQUIRE(backend != nullptr);
+    constexpr int64_t n_vocab = 32768;
+    for (const int64_t nc : { 1024, 2560 }) {
+        ggml_init_params params_w = { ggml_tensor_overhead() * 2, nullptr, true };
+        ggml_context *   ctx_w    = ggml_init(params_w);
+        ggml_tensor *    wq       = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q6_K, nc, n_vocab);
+        ggml_tensor *    wf       = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, nc, n_vocab);
+        ggml_set_name(wq, "token_embd.weight");
+        ggml_set_name(wf, "token_embd.weight");
+        ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, ggml_backend_cpu_buffer_type());
+        REQUIRE(bw != nullptr);
+        ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        {
+            const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q6_K, nc, n_vocab, 41);
+            ggml_backend_tensor_set(wq, q.data(), 0, q.size());
+        }
+        ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(wq->data, (float *) wf->data, nc * n_vocab);  // host memory
+        for (const int64_t n : { 1, 8, 128, 512 }) {
+            ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead() * 2, nullptr, true };
+            ggml_context *   ctx_h  = ggml_init(params);
+            ggml_context *   ctx_d  = ggml_init(params);
+            ggml_tensor *    idx    = ggml_new_tensor_1d(ctx_h, GGML_TYPE_I32, n);
+            ggml_tensor *    yq     = ggml_get_rows(ctx_d, wq, idx);
+            ggml_tensor *    yf     = ggml_get_rows(ctx_d, wf, idx);
+            ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+            ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+            REQUIRE(bh != nullptr && bd != nullptr);
+            std::vector<int32_t> ids(n);
+            uint32_t             r = 1000003u * (uint32_t) (n + nc);
+            for (int32_t & id : ids) {
+                r  = r * 1664525u + 1013904223u;
+                id = (int32_t) ((r >> 8) % n_vocab);
+            }
+            ggml_backend_tensor_set(idx, ids.data(), 0, ggml_nbytes(idx));
+            ggml_cgraph * gq = ggml_new_graph(ctx_d);
+            ggml_cgraph * gf = ggml_new_graph(ctx_d);
+            ggml_build_forward_expand(gq, yq);
+            ggml_build_forward_expand(gf, yf);
+            CHECK(ggml_backend_dev_supports_op(dev, yq) && ggml_backend_dev_supports_op(dev, yf));
+            const int     iterations = n <= 8 ? 200 : n <= 128 ? 50 : 20;
+            bool          ok         = true;
+            double        t[3]       = { HUGE_VAL, HUGE_VAL, HUGE_VAL };
+            uint64_t      count[2][2] = {};  // per Q6_K setting: rvv, ggml
+            const auto    run = [&](int k) {
+                env_override  embd("FLAGOS_SPACEMIT_EMBD", k == 0 ? "ggml" : k == 1 ? "rvv" : nullptr);
+                ggml_cgraph * g = k == 2 ? gf : gq;
+                uint64_t      taken[2];
+                g_embd_paths_take(&taken[0], &taken[1]);
+                t[k] = std::min(
+                    t[k], time_us([&] { ok &= ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS; }, iterations));
+                g_embd_paths_take(&taken[0], &taken[1]);
+                if (k < 2) {
+                    count[k][0] += taken[0];
+                    count[k][1] += taken[1];
+                }
+            };
+            for (const int k : { 0, 1, 2, 2, 1, 0 }) {
+                run(k);
+            }
+            CHECK(ok);
+            const auto kernel = [&](int k) {
+                return count[k][0] != 0 && count[k][1] != 0 ? "mixed" : count[k][0] != 0 ? "rvv" :
+                       count[k][1] != 0                     ? "ggml" : "none";
+            };
+            std::printf("bench    embd %lld rows of %lld: ggml %.1f us, rvv %.1f us (%+.1f%%), f32 copy %.1f us; kernels %s "
+                        "%s\n",
+                        (long long) n, (long long) nc, t[0], t[1], 100.0 * (t[1] / t[0] - 1.0), t[2], kernel(0),
+                        kernel(1));
+            std::fflush(stdout);
+            ggml_backend_buffer_free(bh);
+            ggml_backend_buffer_free(bd);
+            ggml_free(ctx_h);
+            ggml_free(ctx_d);
+        }
+        ggml_backend_buffer_free(bw);
+        ggml_free(ctx_w);
+    }
+    ggml_backend_free(backend);
+    return 0;
+}
+
 static int bench(ggml_backend_dev_t dev) {
     const int64_t    n_small = 64;
     const int64_t    n_big   = 16 * 1024 * 1024;
@@ -5510,6 +5841,7 @@ int main(int argc, char ** argv) {
     bool run_bench     = false;
     bool run_attn      = false;
     bool run_mm        = false;
+    bool run_embd      = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -5523,11 +5855,16 @@ int main(int argc, char ** argv) {
             run_attn = true;
         } else if (std::strcmp(argv[i], "--bench-mm") == 0) {
             run_mm = true;
+        } else if (std::strcmp(argv[i], "--bench-embd") == 0) {
+            run_embd = true;
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm]\n"
+                         "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
+                         "--bench-embd]\n"
                          "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
-                         "tokens\n",
+                         "tokens\n"
+                         "  --bench-embd: the token embedding lookup only, FLAGOS_SPACEMIT_EMBD=ggml against rvv and an "
+                         "F32 copy\n",
                          argv[0]);
             return 2;
         }
@@ -5572,14 +5909,14 @@ int main(int argc, char ** argv) {
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
-        check_rows(dev) != 0 || check_embedding(dev) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
+        check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 :
                     (run_attn && (bench_attn(dev) != 0 || bench_attn_tiled(dev) != 0)) ||
-                        (run_mm && bench_mm(dev) != 0)) {
+                        (run_mm && bench_mm(dev) != 0) || (run_embd && bench_embd(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

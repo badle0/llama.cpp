@@ -242,6 +242,9 @@ bool spacemit_embd_on_cpu() {
     if (std::strcmp(v, "cpu") == 0) {
         return true;
     }
+    if (std::strcmp(v, "ggml") == 0 || std::strcmp(v, "rvv") == 0) {  // the plugin's kernel choice
+        return false;
+    }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_EMBD=%s: unknown setting ignored\n", __func__, v);

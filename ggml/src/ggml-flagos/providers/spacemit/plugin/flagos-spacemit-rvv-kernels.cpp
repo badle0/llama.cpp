@@ -9,6 +9,7 @@
 // out-of-range index as a failed step instead of aborting, and GET_ROWS copies with M2b's copy of the same memcpy1d
 // and skips an empty column range (it computed a negative size there); RMS_NORM accumulates tail-undisturbed (_tu).
 // The flagos-spacemit-kernels.cpp entry points decide when these apply; otherwise they use the portable references.
+// forward_get_rows_q6_K, at the end, is ours (plan.md "Embedding lookup spec", step 2), not copied.
 
 #include "flagos-spacemit-rvv-kernels.h"
 
@@ -17,6 +18,9 @@
 #    include "flagos-spacemit-ime-kernels.h"
 
 #    include "../../../../ggml-impl.h"
+
+#    define GGML_COMMON_DECL_CPP
+#    include "../../../../ggml-common.h"  // block_q6_K
 
 #    include <riscv_vector.h>
 
@@ -764,6 +768,100 @@ void forward_rope_f32(context & ctx, ggml_tensor * op) {
 
 bool forward_get_rows_f32(context & ctx, ggml_tensor * op) {
     return forward_get_rows<int32_t>(ctx, op);  // copies 4-byte elements
+}
+
+//
+// flagos: the token embedding's Q6_K rows (plan.md "Embedding lookup spec", step 2), ours
+//
+
+namespace {
+
+// [begin, end) of n items for this tile, as flagos-spacemit-kernels.cpp's tile_range
+void tile_split(int64_t n, const context & ctx, int64_t & begin, int64_t & end) {
+    const int64_t per = (n + ctx.nth - 1) / ctx.nth;
+    begin             = std::min(n, per * (int64_t) ctx.ith);
+    end               = std::min(n, begin + per);
+}
+
+// 32 F32 lanes at LMUL 1 with VLEN 1024, the 6-bit values in e8 at LMUL 1/4; the caller checks vlenb
+constexpr size_t q6_K_vl = 32;
+
+// one group of 32 values: lanes 0-15 s_lo * q, lanes 16-31 s_hi * q, with q the 6-bit value minus 32 converted
+// exactly to F32 and one multiply per lane (no FMA), so each value rounds as ggml's (d * scale) * q
+inline void q6_K_group(float * y, vuint8mf4_t q6, float s_lo, float s_hi, vbool32_t hi) {
+    const vint8mf4_t   q  = __riscv_vsub_vx_i8mf4(__riscv_vreinterpret_v_u8mf4_i8mf4(q6), 32, q6_K_vl);
+    const vfloat32m1_t qf = __riscv_vfcvt_f_x_v_f32m1(__riscv_vsext_vf4_i32m1(q, q6_K_vl), q6_K_vl);
+    const vfloat32m1_t s  = __riscv_vfmerge_vfm_f32m1(__riscv_vfmv_v_f_f32m1(s_lo, q6_K_vl), s_hi, hi, q6_K_vl);
+    __riscv_vse32_v_f32m1(y, __riscv_vfmul_vv_f32m1(s, qf, q6_K_vl), q6_K_vl);
+}
+
+// blocks [b0, b1) of a Q6_K row x into the F32 row y, bit for bit as ggml-quants.c dequantize_row_q6_K: per half of
+// 128 values the products d * scale in scalar F32 as ggml computes them, then for y[l], y[l + 32], y[l + 64] and
+// y[l + 96] (l = 0-31) the scales 0/1, 2/3, 4/5 and 6/7 by lane l / 16, and q from ql[l], ql[l + 32] and qh[l]
+void dequantize_q6_K_blocks(const block_q6_K * x, int64_t b0, int64_t b1, float * y) {
+    const vbool32_t hi = __riscv_vmsgeu_vx_u32m1_b32(__riscv_vid_v_u32m1(q6_K_vl), 16, q6_K_vl);  // lanes 16-31
+    for (int64_t b = b0; b < b1; ++b) {
+        const float     d  = GGML_FP16_TO_FP32(x[b].d);
+        const uint8_t * ql = x[b].ql;
+        const uint8_t * qh = x[b].qh;
+        const int8_t *  sc = x[b].scales;
+        float *         yb = y + b * QK_K;
+        for (int n = 0; n < QK_K; n += 128) {
+            float s[8];
+            for (int j = 0; j < 8; ++j) {
+                s[j] = d * (float) sc[j];
+            }
+            const vuint8mf4_t l0 = __riscv_vle8_v_u8mf4(ql, q6_K_vl);
+            const vuint8mf4_t l1 = __riscv_vle8_v_u8mf4(ql + 32, q6_K_vl);
+            const vuint8mf4_t h  = __riscv_vle8_v_u8mf4(qh, q6_K_vl);
+            // the high 2 bits at bits 4-5: qh bits 0-1, 2-3, 4-5 and 6-7 for the four groups
+            const vuint8mf4_t h0 = __riscv_vand_vx_u8mf4(__riscv_vsll_vx_u8mf4(h, 4, q6_K_vl), 0x30, q6_K_vl);
+            const vuint8mf4_t h1 = __riscv_vand_vx_u8mf4(__riscv_vsll_vx_u8mf4(h, 2, q6_K_vl), 0x30, q6_K_vl);
+            const vuint8mf4_t h2 = __riscv_vand_vx_u8mf4(h, 0x30, q6_K_vl);
+            const vuint8mf4_t h3 = __riscv_vand_vx_u8mf4(__riscv_vsrl_vx_u8mf4(h, 2, q6_K_vl), 0x30, q6_K_vl);
+            q6_K_group(yb, __riscv_vor_vv_u8mf4(__riscv_vand_vx_u8mf4(l0, 0xF, q6_K_vl), h0, q6_K_vl), s[0], s[1], hi);
+            q6_K_group(yb + 32, __riscv_vor_vv_u8mf4(__riscv_vand_vx_u8mf4(l1, 0xF, q6_K_vl), h1, q6_K_vl), s[2], s[3],
+                       hi);
+            q6_K_group(yb + 64, __riscv_vor_vv_u8mf4(__riscv_vsrl_vx_u8mf4(l0, 4, q6_K_vl), h2, q6_K_vl), s[4], s[5], hi);
+            q6_K_group(yb + 96, __riscv_vor_vv_u8mf4(__riscv_vsrl_vx_u8mf4(l1, 4, q6_K_vl), h3, q6_K_vl), s[6], s[7], hi);
+            yb += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+}  // namespace
+
+// as kernels.cpp get_rows_quant_ref, but a single row is split over the tiles by blocks; for one row every tile checks
+// the index itself, so all agree on an out-of-range one
+bool forward_get_rows_q6_K(context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    ggml_tensor *       dst  = op;
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nr = ggml_nelements(src1);
+    const int64_t nb = ne00 / QK_K;
+    int64_t       ir0 = 0, ir1 = nr, b0 = 0, b1 = nb;
+    if (nr == 1) {
+        tile_split(nb, ctx, b0, b1);
+    } else {
+        tile_split(nr, ctx, ir0, ir1);
+    }
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i / (ne11 * ne10);
+        const int64_t i11 = (i - i12 * ne11 * ne10) / ne10;
+        const int64_t i10 = i - i12 * ne11 * ne10 - i11 * ne10;
+        const int64_t i01 = *(const int32_t *) ((const char *) src1->data + i10 * nb10 + i11 * nb11 + i12 * nb12);
+        if (i01 < 0 || i01 >= ne01) {
+            return false;
+        }
+        dequantize_q6_K_blocks((const block_q6_K *) ((const char *) src0->data + i01 * nb01 + i11 * nb02 + i12 * nb03),
+                               b0, b1, (float *) ((char *) dst->data + i10 * nb1 + i11 * nb2 + i12 * nb3));
+    }
+    return true;
 }
 
 }  // namespace spacemit_rvv
