@@ -1,6 +1,6 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
-//                              [--bench | --bench-attn | --bench-mm | --bench-embd]
+//                              [--bench | --bench-attn | --bench-mm | --bench-embd | --bench-repack]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -19,6 +19,8 @@
 //   --bench-embd     of the benchmarks only the token embedding lookup: one call of 1-512 rows of 1024 and 2560
 //                    columns from 32768, Q6_K by FLAGOS_SPACEMIT_EMBD=ggml against rvv, and the same values as F32
 //                    copied by get_rows.f32 (not run by --bench)
+//   --bench-repack   of the benchmarks only the weights' repack at load: one tensor of 2560 columns per layout (Q4_0,
+//                    Q4_1 and Q6_K to Q8_0, Q8_0) with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 and 8 (not run by --bench)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
 // them: requantized to Q8_0.
 
@@ -86,6 +88,8 @@ static spacemit_mm_tail_take_fn    g_mm_tail_take    = nullptr;
 static spacemit_switches_reset_fn  g_switches_reset  = nullptr;
 static spacemit_attn_paths_take_fn g_attn_paths_take = nullptr;
 static spacemit_embd_paths_take_fn g_embd_paths_take = nullptr;
+static spacemit_repack_threads_fn  g_repack_threads  = nullptr;
+static spacemit_repack_take_fn     g_repack_take     = nullptr;
 
 static int bind_plugin_names(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -99,9 +103,12 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
         reinterpret_cast<spacemit_attn_paths_take_fn>(table->get_proc_address("spacemit_attn_paths_take"));
     g_embd_paths_take =
         reinterpret_cast<spacemit_embd_paths_take_fn>(table->get_proc_address("spacemit_embd_paths_take"));
+    g_repack_threads =
+        reinterpret_cast<spacemit_repack_threads_fn>(table->get_proc_address("spacemit_repack_threads"));
+    g_repack_take = reinterpret_cast<spacemit_repack_take_fn>(table->get_proc_address("spacemit_repack_take"));
     REQUIRE(g_steps_take != nullptr && g_executors_take != nullptr && g_mm_paths_take != nullptr &&
             g_mm_tail_take != nullptr && g_switches_reset != nullptr && g_attn_paths_take != nullptr &&
-            g_embd_paths_take != nullptr);
+            g_embd_paths_take != nullptr && g_repack_threads != nullptr && g_repack_take != nullptr);
     return 0;
 }
 
@@ -251,7 +258,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     const char * names[] = { "spacemit_steps_take", "spacemit_executors_take", "spacemit_mm_paths_take",
                              "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
                              "spacemit_switches_reset", "spacemit_switches_generation",
-                             "spacemit_attn_paths_take", "spacemit_embd_paths_take" };
+                             "spacemit_attn_paths_take", "spacemit_embd_paths_take",
+                             "spacemit_repack_threads", "spacemit_repack_take" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -2347,6 +2355,189 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
                                    "tiled for unset, empty, 9, 26, 1 and the bad values (the default 9 kept), "
                                    "one-chunk for 64 and 27",
                 n_values_ok, sizeof(tiled_values) / sizeof(tiled_values[0]), reference_label());
+    return 0;
+}
+
+//
+// T6: a weight's repack on several host threads (plan.md "T6 spec"), against the one-thread bytes
+//
+
+static int count_lines_with(const std::string & text, const char * what) {
+    int n = 0;
+    for (size_t at = 0; at < text.size();) {
+        const size_t end = std::min(text.find('\n', at), text.size());
+        n += text.substr(at, end - at).find(what) != std::string::npos;
+        at = end + 1;
+    }
+    return n;
+}
+
+// per layout, weights of 32, 64, 96 and 4096 rows of 2560 columns and one group of 65536 columns (over 1 MiB in one
+// group), written with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 3, 8 and 16: the stored bytes (the whole alloc size, past
+// ggml_nbytes for the layouts requantized to Q8_0) and the read-back are the one-thread ones, and by the counter the
+// threads ran, with min(n, groups) ranges, exactly for the weights of at least 1 MiB and several groups. Then a partial
+// write (Q4_0, Q8_0) on 8 threads, and the switch's values
+static int check_repack_threads(ggml_backend_dev_t dev) {
+    ggml_backend_buffer_type_t buft    = ggml_backend_dev_buffer_type(dev);
+    const ggml_type            types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K };
+    const struct {
+        int64_t rows, cols;
+    } shapes[]             = { { 32, 2560 }, { 64, 2560 }, { 96, 2560 }, { 4096, 2560 }, { 32, 65536 } };
+    const char * values[]  = { "1", "2", "3", "8", "16" };
+    const size_t min_bytes = size_t(1) << 20;
+    int          n_cmp = 0, n_raw_same = 0, n_read_same = 0, n_path = 0, n_path_ok = 0, n_threaded = 0;
+    uint32_t     seed = 71;
+    for (const ggml_type type : types) {
+        for (const auto & s : shapes) {
+            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+            ggml_context *   ctx    = ggml_init(params);
+            REQUIRE(ctx != nullptr);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, s.cols, s.rows);
+            ggml_set_name(w, "blk.0.ffn_up.weight");
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            REQUIRE(buf != nullptr);
+            const std::vector<uint8_t> q      = quantize_weights(type, s.cols, s.rows, seed++);
+            const size_t               alloc  = ggml_backend_buft_get_alloc_size(buft, w);
+            const int64_t              groups = s.rows / 32;
+            const bool                 big    = ggml_nbytes(w) >= min_bytes && groups > 1;
+            std::vector<uint8_t>       raw_ref, read_ref, read(q.size());
+            for (const char * v : values) {
+                env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", v);
+                ggml_backend_buffer_clear(buf, 0xa5);  // a range left out shows
+                uint64_t threaded = 0, ranges = 0;
+                g_repack_take(&threaded, &ranges);
+                ggml_backend_tensor_set(w, q.data(), 0, q.size());
+                g_repack_take(&threaded, &ranges);
+                ggml_backend_tensor_get(w, read.data(), 0, read.size());
+                const uint8_t * raw     = static_cast<const uint8_t *>(w->data);  // host memory underneath
+                const int64_t   n       = std::atoi(v);
+                const bool      path_ok = big && n > 1 ? threaded == 1 && ranges == (uint64_t) std::min(n, groups) :
+                                                         threaded == 0 && ranges == 0;
+                n_path++;
+                n_path_ok += path_ok;
+                n_threaded += threaded != 0;
+                if (!path_ok) {
+                    std::fprintf(stderr,
+                                 "FAIL: repack %s %lldx%lld with %s threads: %llu threaded with %llu ranges (expected "
+                                 "%s)\n",
+                                 ggml_type_name(type), (long long) s.rows, (long long) s.cols, v,
+                                 (unsigned long long) threaded, (unsigned long long) ranges,
+                                 big && n > 1 ? "1 threaded" : "none");
+                    g_failures++;
+                }
+                if (raw_ref.empty()) {
+                    raw_ref.assign(raw, raw + alloc);
+                    read_ref = read;
+                    CHECK(std::memcmp(raw, q.data(), q.size()) != 0);  // stored repacked
+                    continue;
+                }
+                const bool raw_same  = std::memcmp(raw, raw_ref.data(), alloc) == 0;
+                const bool read_same = read == read_ref;
+                n_cmp++;
+                n_raw_same += raw_same;
+                n_read_same += read_same;
+                if (!raw_same || !read_same) {
+                    std::fprintf(stderr, "FAIL: repack %s %lldx%lld with %s threads: stored bytes %s, read-back %s\n",
+                                 ggml_type_name(type), (long long) s.rows, (long long) s.cols, v,
+                                 raw_same ? "same" : "differ", read_same ? "same" : "differs");
+                    g_failures++;
+                }
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+        }
+    }
+
+    // a partial write repacks the whole weight again (unpack, patch, pack), so on the same threads
+    int n_partial = 0, n_partial_same = 0;
+    for (const ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   ctx    = ggml_init(params);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, 2560, 4096);
+        ggml_set_name(w, "blk.0.ffn_up.weight");
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        REQUIRE(buf != nullptr);
+        const std::vector<uint8_t> q = quantize_weights(type, 2560, 4096, seed++);
+        const std::vector<uint8_t> patch(100000, 0x3c);
+        const size_t               alloc = ggml_backend_buft_get_alloc_size(buft, w);
+        std::vector<uint8_t>       raw_ref;
+        for (const char * v : { "1", "8" }) {
+            env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", v);
+            ggml_backend_buffer_clear(buf, 0xa5);
+            ggml_backend_tensor_set(w, q.data(), 0, q.size());
+            uint64_t threaded = 0, ranges = 0;
+            g_repack_take(&threaded, &ranges);
+            ggml_backend_tensor_set(w, patch.data(), 12345, patch.size());
+            g_repack_take(&threaded, &ranges);
+            const uint8_t * raw = static_cast<const uint8_t *>(w->data);
+            if (raw_ref.empty()) {
+                raw_ref.assign(raw, raw + alloc);
+                CHECK(threaded == 0);
+                continue;
+            }
+            const bool same = std::memcmp(raw, raw_ref.data(), alloc) == 0 && threaded == 1 && ranges == 8;
+            n_partial++;
+            n_partial_same += same;
+            CHECK(same);
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // the switch's values on a 4096-row Q8_0 weight: a bad value is warned once and keeps 1 thread
+    const struct {
+        const char * value;
+        uint32_t     n;
+        bool         warned;
+    } switch_values[] = {
+        { nullptr, 1, false }, { "", 1, false }, { "1", 1, false }, { "8", 8, false },
+        { "16", 16, false },   { "0", 1, true }, { "17", 1, true }, { "abc", 1, true },
+    };
+    int n_values_ok = 0;
+    {
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   ctx    = ggml_init(params);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 4096);
+        ggml_set_name(w, "blk.0.ffn_up.weight");
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        REQUIRE(buf != nullptr);
+        const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q8_0, 2560, 4096, seed++);
+        for (const auto & v : switch_values) {
+            env_override   threads("FLAGOS_SPACEMIT_REPACK_THREADS", v.value);
+            log_capture    log;
+            const uint32_t first = g_repack_threads(), second = g_repack_threads();
+            uint64_t       threaded = 0, ranges = 0;
+            g_repack_take(&threaded, &ranges);
+            ggml_backend_tensor_set(w, q.data(), 0, q.size());
+            g_repack_take(&threaded, &ranges);
+            const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_REPACK_THREADS=");
+            const bool ok       = first == v.n && second == v.n && warnings == (v.warned ? 1 : 0) &&
+                            (v.n > 1 ? threaded == 1 && ranges == v.n : threaded == 0 && ranges == 0);
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: FLAGOS_SPACEMIT_REPACK_THREADS=%s: read %u and %u (expected %u), %d warning lines "
+                             "(expected %d), %llu threaded with %llu ranges\n",
+                             v.value != nullptr ? v.value : "(unset)", first, second, v.n, warnings, v.warned ? 1 : 0,
+                             (unsigned long long) threaded, (unsigned long long) ranges);
+                g_failures++;
+            }
+            n_values_ok += ok;
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    std::printf("repack   FLAGOS_SPACEMIT_REPACK_THREADS 2, 3, 8 and 16 against 1 (Q4_0, Q4_1 and Q6_K to Q8_0, Q8_0; "
+                "32, 64, 96 and 4096 rows of 2560, 32 of 65536): stored bytes identical in %d/%d, read-back identical "
+                "in %d/%d; the threads by the counter as expected in %d/%d (%d threaded: at least 1 MiB and several "
+                "groups only); a partial write on 8 threads identical in %d/%d\n",
+                n_raw_same, n_cmp, n_read_same, n_cmp, n_path_ok, n_path, n_threaded, n_partial_same, n_partial);
+    std::printf("repack   FLAGOS_SPACEMIT_REPACK_THREADS values (unset, empty, 1, 8, 16, 0, 17, abc) on a 4096-row "
+                "Q8_0 weight: one warning for each of 0, 17 and abc and none for the others, 1 thread for them, as "
+                "expected in %d/%zu\n",
+                n_values_ok, sizeof(switch_values) / sizeof(switch_values[0]));
     return 0;
 }
 
@@ -5724,6 +5915,57 @@ static int bench_embd(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// plan.md "T6 spec", step 0, --bench-repack only: one whole-weight write (set_tensor, the repack at load) per layout of
+// 2560 columns, Qwen3-4B's width (Q4_0 and Q4_1 98304 rows, Q8_0 65536, Q6_K 32768: 65-150 MiB of GGUF bytes), with
+// FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 and 8 taking turns, best of 3; MiB/s of the GGUF bytes
+static int bench_repack(ggml_backend_dev_t dev) {
+    const int64_t cols = 2560;
+    const struct {
+        ggml_type    type;
+        const char * name;
+        int64_t      rows;
+    } shapes[] = {
+        { GGML_TYPE_Q4_0, "Q4_0", 98304 },
+        { GGML_TYPE_Q4_1, "Q4_1->Q8_0", 98304 },
+        { GGML_TYPE_Q8_0, "Q8_0", 65536 },
+        { GGML_TYPE_Q6_K, "Q6_K->Q8_0", 32768 },
+    };
+    const char * values[] = { "1", "2", "4", "8" };
+    for (const auto & s : shapes) {
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   ctx    = ggml_init(params);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, s.type, cols, s.rows);
+        ggml_set_name(w, "blk.0.ffn_up.weight");
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+        REQUIRE(buf != nullptr);
+        const std::vector<uint8_t> q = quantize_weights(s.type, cols, s.rows, 43);
+        double                     best[4] = { HUGE_VAL, HUGE_VAL, HUGE_VAL, HUGE_VAL };
+        for (int round = 0; round < 3; round++) {
+            for (int k = 0; k < 4; k++) {
+                env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", values[k]);
+                uint64_t     threaded = 0, ranges = 0;
+                g_repack_take(&threaded, &ranges);
+                const auto t0 = std::chrono::steady_clock::now();
+                ggml_backend_tensor_set(w, q.data(), 0, q.size());
+                const auto t1 = std::chrono::steady_clock::now();
+                g_repack_take(&threaded, &ranges);
+                CHECK(k == 0 ? threaded == 0 : threaded == 1 && ranges == (uint64_t) std::atoi(values[k]));
+                best[k] = std::min(best[k], std::chrono::duration<double>(t1 - t0).count());
+            }
+        }
+        const double mib = q.size() / 1048576.0;
+        std::printf("bench    repack %s %lldx%lld %.1f MiB: 1 thr %.0f MiB/s, 2 thr %.0f MiB/s, 4 thr %.0f MiB/s, 8 thr "
+                    "%.0f MiB/s\n",
+                    s.name, (long long) s.rows, (long long) cols, mib, mib / best[0], mib / best[1], mib / best[2],
+                    mib / best[3]);
+        std::fflush(stdout);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    return 0;
+}
+
 static int bench(ggml_backend_dev_t dev) {
     const int64_t    n_small = 64;
     const int64_t    n_big   = 16 * 1024 * 1024;
@@ -5842,6 +6084,7 @@ int main(int argc, char ** argv) {
     bool run_attn      = false;
     bool run_mm        = false;
     bool run_embd      = false;
+    bool run_repack    = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -5857,14 +6100,18 @@ int main(int argc, char ** argv) {
             run_mm = true;
         } else if (std::strcmp(argv[i], "--bench-embd") == 0) {
             run_embd = true;
+        } else if (std::strcmp(argv[i], "--bench-repack") == 0) {
+            run_repack = true;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
-                         "--bench-embd]\n"
+                         "--bench-embd | --bench-repack]\n"
                          "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
                          "tokens\n"
                          "  --bench-embd: the token embedding lookup only, FLAGOS_SPACEMIT_EMBD=ggml against rvv and an "
-                         "F32 copy\n",
+                         "F32 copy\n"
+                         "  --bench-repack: the weights' repack at load only, FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 "
+                         "and 8\n",
                          argv[0]);
             return 2;
         }
@@ -5908,7 +6155,7 @@ int main(int argc, char ** argv) {
                       std::strcmp(info.profile.runtime, "none") == 0;
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
-        check_mul_mat(dev, full) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
+        check_mul_mat(dev, full) != 0 || check_repack_threads(dev) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {
@@ -5916,7 +6163,8 @@ int main(int argc, char ** argv) {
     }
     if (run_bench ? bench(dev) != 0 :
                     (run_attn && (bench_attn(dev) != 0 || bench_attn_tiled(dev) != 0)) ||
-                        (run_mm && bench_mm(dev) != 0) || (run_embd && bench_embd(dev) != 0)) {
+                        (run_mm && bench_mm(dev) != 0) || (run_embd && bench_embd(dev) != 0) ||
+                        (run_repack && bench_repack(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

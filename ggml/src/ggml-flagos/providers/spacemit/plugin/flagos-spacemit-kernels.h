@@ -13,7 +13,7 @@
 // cores, to tell a ported-kernel error from an orchestration error; hosts without the K3 kernels always use them
 bool spacemit_use_reference();
 
-// test-only: the kernels' environment switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD) are parsed once and cached, not
+// test-only: the kernels' environment switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD; the repack's REPACK_THREADS) are parsed once and cached, not
 // read at every call on every tile (S1 step 2b, 2026-10-30). The check program, which flips them inside one process
 // (env_override), calls spacemit_switches_reset, by name through get_proc_address, so the next read parses again
 uint32_t spacemit_switches_generation();

@@ -113,7 +113,11 @@ typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, st
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
 // as MUL_MAT a, so that b can multiply what a's quantize step wrote
 typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
-// test-only: the plugin parses its kernel switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD) once; a test that changes
+// test-only: FLAGOS_SPACEMIT_REPACK_THREADS as parsed (1 to 16), and the weight repacks since the last take that ran on
+// several threads with the most ranges one of them used
+typedef uint32_t (*spacemit_repack_threads_fn)(void);
+typedef void (*spacemit_repack_take_fn)(uint64_t * threaded, uint64_t * max_ranges);
+// test-only: the plugin parses its switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD, REPACK_THREADS) once; a test that changes
 // them inside one process calls this so the next read parses again
 typedef void (*spacemit_switches_reset_fn)(void);
 // test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its

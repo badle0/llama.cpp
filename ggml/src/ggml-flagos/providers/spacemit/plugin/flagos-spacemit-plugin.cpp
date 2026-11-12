@@ -166,6 +166,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     // the plugin's own switch, read at registration: first read in llama.cpp's trial load, its warning would be hidden
     spacemit_flash_attn_read_switch();
     spacemit_embd_read_switch();
+    (void) spacemit_repack_threads();
     return SPACEMIT_STATUS_SUCCESS;
 }
 
@@ -435,6 +436,12 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_embd_paths_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_embd_paths_take_fn>(spacemit_embd_paths_take));
+    }
+    if (std::strcmp(name, "spacemit_repack_threads") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_repack_threads_fn>(spacemit_repack_threads));
+    }
+    if (std::strcmp(name, "spacemit_repack_take") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_repack_take_fn>(spacemit_repack_take));
     }
     if (std::strcmp(name, "spacemit_run_stats_attach") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_run_stats_attach_fn>(spacemit_run_stats_attach));

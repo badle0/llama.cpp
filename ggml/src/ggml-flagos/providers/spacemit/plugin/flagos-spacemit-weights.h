@@ -41,3 +41,10 @@ void spacemit_tensor_fill(ggml_tensor * t, uint8_t value, size_t offset, size_t 
 
 // true when t, or the tensor it views, is stored repacked
 bool spacemit_tensor_is_repacked(const ggml_tensor * t);
+
+// FLAGOS_SPACEMIT_REPACK_THREADS as parsed (1 to 16): the threads a whole-weight repack may use. Read at registration
+// too, as spacemit_embd_read_switch, so a bad value's warning shows
+uint32_t spacemit_repack_threads();
+// test-only: the repacks since the last call that ran on several threads, and the most ranges one of them used.
+// flagos-check-spacemit checks FLAGOS_SPACEMIT_REPACK_THREADS by it
+void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges);

@@ -1,11 +1,16 @@
 #include "flagos-spacemit-weights.h"
 
 #include "flagos-spacemit-ime-kernels.h"
+#include "flagos-spacemit-kernels.h"
 
 #include "../../../../ggml-impl.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 // llama.cpp's KV cache and recurrent state, named before they are allocated (src/llama-kv-cache.cpp:231-235,
@@ -61,26 +66,132 @@ static ggml_tensor * spacemit_storage(const ggml_tensor * t, size_t & offset) {
     return t->view_src;
 }
 
-static void spacemit_pack(ggml_tensor * t, const void * data) {
-    const size_t size = ggml_nbytes(t);
-    int          rc   = -1;
-    switch (spacemit_weight_layout(t)) {
+namespace {
+
+constexpr int    repack_max_threads = 16;
+constexpr size_t repack_min_bytes   = size_t(1) << 20;  // a smaller weight repacks on the calling thread
+
+// FLAGOS_SPACEMIT_REPACK_THREADS=<n> (plan.md "T6 spec"): the host threads that repack one weight, n decimal digits
+// only, 1 to 16; unset or empty: 1. Parsed once (spacemit_cached_switch); anything else keeps the default with a
+// warning, once per parse generation
+int parse_repack_threads() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_REPACK_THREADS");
+    if (v == nullptr || *v == '\0') {
+        return 1;
+    }
+    int          n = 0;
+    const char * c = v;
+    for (; *c >= '0' && *c <= '9' && n <= repack_max_threads; ++c) {  // stops past 16, so no overflow
+        n = n * 10 + (*c - '0');
+    }
+    if (*c == '\0' && n >= 1 && n <= repack_max_threads) {
+        return n;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };  // the generation last warned in; generations start at 1
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_THREADS=%s: not a thread count from 1 to 16, the default 1 kept\n",
+                      __func__, v);
+    }
+    return 1;
+}
+
+int repack_threads_from_env() {
+    static std::atomic<int>      value{ 1 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_repack_threads);
+}
+
+// test-only (spacemit_repack_take): the repacks that ran on several threads, and the most ranges one of them used
+std::atomic<uint64_t> g_repack_threaded{ 0 }, g_repack_max_ranges{ 0 };
+
+int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, size_t size) {
+    switch (layout) {
         case spacemit_layout::q4_0_32x256:
-            rc = spacemit_ime::repack_q4_0(t, data, size);
-            break;
+            return spacemit_ime::repack_q4_0(t, data, size);
         case spacemit_layout::q4_1_q8_0_32x32:
-            rc = spacemit_ime::repack_q4_1_q8_0(t, data, size);
-            break;
+            return spacemit_ime::repack_q4_1_q8_0(t, data, size);
         case spacemit_layout::q8_0_32x32:
-            rc = spacemit_ime::repack_q8_0(t, data, size);
-            break;
+            return spacemit_ime::repack_q8_0(t, data, size);
         case spacemit_layout::q6_k_q8_0_32x32:
-            rc = spacemit_ime::repack_q6_k(t, data, size);
-            break;
+            return spacemit_ime::repack_q6_k(t, data, size);
         case spacemit_layout::plain:
             break;
     }
-    GGML_ASSERT(rc == 0 && "tensor does not fit its IME layout");
+    return -1;
+}
+
+}  // namespace
+
+uint32_t spacemit_repack_threads() {
+    return (uint32_t) repack_threads_from_env();
+}
+
+void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges) {
+    *threaded   = g_repack_threaded.exchange(0);
+    *max_ranges = g_repack_max_ranges.exchange(0);
+}
+
+// A weight of several 32-row groups and at least repack_min_bytes is cut into up to FLAGOS_SPACEMIT_REPACK_THREADS
+// ranges of whole groups, each repacked by the same routine on a stand-in tensor of its rows (plan.md "T6 spec"): every
+// routine works group by group, so the bytes are the one-thread bytes. The first range runs on the calling thread
+static void spacemit_pack(ggml_tensor * t, const void * data) {
+    const spacemit_layout layout = spacemit_weight_layout(t);
+    const size_t          size   = ggml_nbytes(t);
+    const int64_t         groups = t->ne[1] / (int64_t) spacemit_ime::row_tile;
+    const int64_t         n      = layout == spacemit_layout::plain || size < repack_min_bytes || groups <= 1 ?
+                                       1 :
+                                       std::min<int64_t>(repack_threads_from_env(), groups);
+    if (n == 1) {
+        GGML_ASSERT(spacemit_repack(layout, t, data, size) == 0 && "tensor does not fit its IME layout");
+        return;
+    }
+
+    // a weight layout has ne[1] % 32 == 0, ne[2] == ne[3] == 1 and no view; the Q8_0 layouts store 34 bytes per 32
+    // weights, Q4_0's its own row size
+    const size_t src_row = ggml_row_size(t->type, t->ne[0]);
+    const size_t dst_row = layout == spacemit_layout::q4_0_32x256 ? src_row :
+                                                                    spacemit_ime::q8_0_weight_row_bytes((size_t) t->ne[0]);
+    std::vector<ggml_tensor>  parts((size_t) n);
+    std::vector<const char *> srcs((size_t) n);
+    std::vector<size_t>       sizes((size_t) n);
+    std::vector<int>          rcs((size_t) n, -1);
+    int64_t                   row0 = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const int64_t rows = (groups / n + (i < groups % n ? 1 : 0)) * (int64_t) spacemit_ime::row_tile;
+        ggml_tensor & p    = parts[i];
+        p                  = *t;
+        p.ne[1]            = rows;
+        p.nb[2]            = p.nb[1] * (size_t) rows;
+        p.nb[3]            = p.nb[2];
+        p.data             = static_cast<char *>(t->data) + (size_t) row0 * dst_row;
+        srcs[i]            = static_cast<const char *>(data) + (size_t) row0 * src_row;
+        sizes[i]           = (size_t) rows * src_row;
+        row0 += rows;
+    }
+    GGML_ASSERT(row0 == t->ne[1]);
+
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) n - 1);
+    for (int64_t i = 1; i < n; i++) {
+        try {
+            workers.emplace_back([&, i] { rcs[i] = spacemit_repack(layout, &parts[i], srcs[i], sizes[i]); });
+        } catch (const std::system_error &) {
+            rcs[i] = spacemit_repack(layout, &parts[i], srcs[i], sizes[i]);  // no thread: this range here
+        }
+    }
+    rcs[0] = spacemit_repack(layout, &parts[0], srcs[0], sizes[0]);
+    for (std::thread & w : workers) {
+        w.join();
+    }
+
+    g_repack_threaded.fetch_add(1, std::memory_order_relaxed);
+    uint64_t most = g_repack_max_ranges.load(std::memory_order_relaxed);
+    while (most < (uint64_t) n && !g_repack_max_ranges.compare_exchange_weak(most, (uint64_t) n)) {
+    }
+    for (const int rc : rcs) {
+        GGML_ASSERT(rc == 0 && "tensor does not fit its IME layout");
+    }
 }
 
 static void spacemit_unpack(const ggml_tensor * t, void * data) {

@@ -2786,7 +2786,7 @@ The changes: `core/flagos-spacemit-ops.cpp` (the contract `get_rows.quant`, the 
 
 ### Whole-graph dispatch: the test, for review (2026-11-12)
 
-**Status:** proposed on the user's request ("can you explore testing for whole-graph dispatch results?"); the script's two modes are built and dry-run on the Mac, nothing has run on the K3. The requirement is SpacemiT's (the meeting the user reported 2026-11-10): at decode the backend dispatches the whole graph, with Ascend's llama.cpp backend as the reference. Since the embedding lookup (2026-11-11) a generated token is one graph split and one spine-runtime launch.
+**Status:** proposed on the user's request ("can you explore testing for whole-graph dispatch results?"); the script's two modes built and dry-run on the Mac, run on the K3 the same day ("Result on the K3" below). The requirement is SpacemiT's (the meeting the user reported 2026-11-10): at decode the backend dispatches the whole graph, with Ascend's llama.cpp backend as the reference. Since the embedding lookup (2026-11-11) a generated token is one graph split and one spine-runtime launch.
 
 **What the test shows,** three forms of the same build on both models, the modes interleaved (`scripts/structural-experiments.sh`, `EXPS="e3 e3c embd"`):
 
@@ -2803,7 +2803,73 @@ The changes: `core/flagos-spacemit-ops.cpp` (the contract `get_rows.quant`, the 
 
 **Predictions (estimates, written before the run):** `ref` 1 launch per token with one step more than E3r's 1,086 (Qwen3-4B) and 846 (Qwen3-0.6B), the lookup's, if T1 and S2 changed no one-token step count; `embd-cpu` within 1% of `ref` everywhere (step 1's run: -1.0% to +0.7%), its "outside" column higher by the second split's cost; `e3` tg128 -10 to -16% on Qwen3-4B and -30 to -38% on Qwen3-0.6B (E3r: -13.9% and -34.8%), 11 to 16 us per step; KLD 0 with the same top token 100% for both. No rule: the run is descriptive, the table is what SpacemiT is shown.
 
+**Result on the K3 (2026-11-12; the user's run on `936a2a2b5`, about 1.5 hours, not the 6.5 I estimated; the logs on the Mac: `~/k3-logs/wg-prepare.txt`, `wg-4b.txt`, `wg-06.txt`, `wg/`).** Every prediction held. The check program passed 5 of 5 rounds, one launch per step byte for byte one launch.
+
+| Per generated token | Qwen3-4B `ref` | `embd-cpu` | `e3` | Qwen3-0.6B `ref` | `embd-cpu` | `e3` |
+|---|---|---|---|---|---|---|
+| Graph splits | 1 | 2 | 1 | 1 | 2 | 1 |
+| Launches (counter runs) | 1 | 1 | 1,087 | 1 | 1 | 847 |
+| Steps | 1,087 | 1,086 | 1,087 | 847 | 846 | 847 |
+| tg128, t/s | 11.09 | 11.09 (-0.0%) | 9.54 (-14.0%) | 56.38 | 56.51 (+0.2%) | 36.32 (-35.6%) |
+| pp128, t/s | 106.12 | 106.37 (+0.2%) | 104.83 (-1.2%) | 698.55 | 699.27 (+0.1%) | 672.23 (-3.8%) |
+
+- Qwen3-4B at depth, `e3` against `ref`: tg32 at depths 0 / 1024 / 4096 -14.1 / -12.8 / -10.6% (1,123 steps from n_kv 1024), pp512 at depth 4096 +0.1%; `embd-cpu` within -0.4 to +0.2% on every figure of both models.
+- A token's time under the counters, tg128, us (`e3c` / `e3c-a` / `embd-cc`): Qwen3-4B token 90,707 / 106,443 / 90,685; kernels 86,588 / 88,302 / 86,617; imbalance 2,790 / 2,928 / 2,744; barriers 529 / 538 / 516; launch overhead 515 / 13,098 / 500; host 48 / 1,339 / 44; outside 237 / 239 / 265; idle by the deck's measure 1.47 / 14.29 / 1.46%. Qwen3-0.6B token 18,011 / 28,789 / 18,015; kernels 16,274 / 16,928 / 16,288; launch overhead 312 / 9,455 / 307; host 42 / 1,002 / 38; idle 5.31 / 38.43 / 5.31%. One launch per kernel costs 14.48 us per step on Qwen3-4B (12.05 of it the launch's own overhead) and 12.73 on Qwen3-0.6B (11.16).
+- The second split costs 28 us outside `graph_compute` on Qwen3-4B (265 against 237) and 17 on Qwen3-0.6B, nothing llama-bench can see.
+- Same answers: the texts identical in the three forms; KLD of `e3` and of `embd-cpu` against `ref` mean 0.000000, maximum 5.4e-5 (4B) and 5.9e-5 (0.6B), the base file's floor, same top token 100%; perplexity 9.7736 and 14.4471 as before.
+- The counters cost tg128 0.6% on Qwen3-4B and 1.5% on Qwen3-0.6B. At tg32 depth 0 the "outside" column reads negative (-296 us), an accounting artifact of the short run, not traced; tg128's rows are the ones to quote.
+
 **Not covered:** TTFT under the three forms (the TTFT harness takes no mode; llama-bench's pp figures stand in); a comparison with Ascend's backend, which needs their hardware.
+
+### T6 spec: a faster start, the repack on several threads, for review (2026-11-12)
+
+**Status:** written for review on the user's word ("agree with t6 first", after I had suggested the Qwen3.5 probe first); approved and built the same day behind a switch, default 1 ("As built" below); the K3 run is pending.
+
+**The problem** ("The start-up split", 2026-11-05). llama-server on Qwen3-4B answers `/health` 11.04 s after its start, warm; 8.47 s of that is the stage "weights copied and repacked", 8.24 s of it user time on one thread. Qwen3-0.6B: 2.11 of 4.29 s. The stage is the plugin's `tensor_set` (`plugin/flagos-spacemit-weights.cpp`, `spacemit_pack`), called by llama.cpp's loader once per weight, each call repacking one tensor into its IME layout on the calling thread.
+
+**Where the 8.47 s go (an estimate, to be measured in step 0).** From the two models' stage times and their bytes by type, two equations: the Q4 layers repack at about 430 MiB/s, the Q6_K table requantized to Q8_0 at about 80 MiB/s (a scalar float loop with `nearbyintf` per value). So the tied head, 304 MiB, would be about 3.9 s of Qwen3-4B's 8.47 and the Q4 layers about 4.6 s; on Qwen3-0.6B the head about 1.6 of 2.11 s. The Q4_1 layers are counted at the Q4_0 rate, which flatters them.
+
+**Options.**
+| | What | Gain (estimate) | Cost |
+|---|---|---|---|
+| A | The repack of one tensor split over host threads by groups of 32 rows | the stage 8.5 to 1.3-2.5 s | plugin only, no interface change, the same bytes |
+| B | The Q6_K requantization in RVV | the head's 3.9 s to under 1 s on one thread | a kernel whose rounding must equal `nearbyintf`'s bit for bit |
+| C | A file of the repacked weights beside the model, read at later starts | the stage to the file's read, 0.5-1 s warm | 2.6 GB of disk per model, a format, a key on the model file and the layout version, stale-file handling |
+
+Recommended: A alone first. Every repack routine already works in independent groups of 32 rows, each writing its own bytes, so A is a loop over row ranges; B and C are judged against what A leaves.
+
+**Step 0: measure (no default changes).** `flagos-check-spacemit --bench-repack`: per layout (Q4_0, Q4_1 to Q8_0, Q8_0, Q6_K to Q8_0) one tensor of Qwen3-4B's shape (2,560 columns; the Q6_K one 32,768 rows), repacked with 1, 2, 4 and 8 threads, MiB/s each. It replaces the estimate above with figures and shows whether the threads scale.
+
+**Step 1: the threaded repack.**
+- `spacemit_pack` cuts the tensor's rows into ranges of whole 32-row groups and gives each range to a thread, which calls the existing routine on a stand-in tensor (a copy of the header with `ne[1]` the range's rows and `data` at the range's first byte) and the matching source bytes. The copied routines keep their bodies (R11). Ranges are disjoint in source and destination.
+- Threads: `std::thread`, created per call and joined before it returns, so nothing outlives `tensor_set`; a tensor under 1 MiB, or of one group, stays on the calling thread. They are ordinary host threads on the X100 cores; the AI cores and the executor are not involved (the provider's stream may not exist yet at load).
+- `FLAGOS_SPACEMIT_REPACK_THREADS=<n>`, 1 to 16, parsed once; unset: 8 if the rule below passes, 1 until then; a bad value warns once and keeps the default.
+- A range that fails returns its code; `spacemit_pack` asserts on any, as today.
+- Partial writes (unpack, patch, pack) go through the same function and so the same threads.
+
+**Checks on the Mac.** For each layout, shapes of 32, 64, 96 and 4,096 rows and thread counts 1, 2, 3, 8 and 16 (more threads than groups included): the buffer byte for byte the single-thread one; the read-back (`get_tensor`) unchanged; the switch's values; ThreadSanitizer over the check; one mutation (a range one group short) caught. Both builds without warnings, the riscv64 syntax check, test-backend-ops unchanged, Qwen3-0.6B's text unchanged.
+
+**On the K3.** The check program (the byte comparisons there too) and `--bench-repack`; `scripts/startup-split.py` on both models with the threads at 1 and at 8, taking turns; the runner on both models with 8 and T1's baselines.
+
+**Rule, fixed before the run.** 8 becomes the default if the buffers are byte-identical on the K3, the runner's replies, perplexity and KLD do not move, and the weights stage on Qwen3-4B, warm, is at least twice as fast (under 4.2 s). Otherwise 1 stays. After it: B is proposed only if the Q6_K table still takes more than 1 s of the stage with 8 threads; C only if the stage is still above 2 s after A and B.
+
+**Predictions (estimates).** The weights stage with 8 threads 1.3 to 2.5 s on Qwen3-4B (8.47) and 0.4 to 0.7 s on Qwen3-0.6B (2.11); `/health` at about 4 to 5 s and 2.6 to 2.9 s. Scaling below 8 times: the Q4 repack moves 2 GB and may meet the memory rate (28.7 GB/s read, measured; the write side not measured). No output changes: the same routine on the same bytes. The first request after the start is not changed.
+
+**Not in T6.** The 0.97 s parameter fit and 0.81 s of metadata and vocabulary are llama.cpp's; `--fit off` is a no-code option whose effect on the first request is untested. The cold start's 2.5 s of file read is the disk's.
+
+**As built (2026-11-12; the user: "agreed with you recommendation": A alone, 8 once the rule passes).** Steps 0 and 1 by the `coder` subagent, read and rerun by me. The default is 1 thread, so every default path is today's.
+- `plugin/flagos-spacemit-weights.cpp`: `spacemit_pack` cuts a weight of several 32-row groups and at least 1 MiB into up to n ranges of whole groups, as even as they come; range 0 on the calling thread, a `std::thread` per other range, all joined before the return; each range is the layout's own routine on a stand-in tensor (the header copied, `ne[1]` the range's rows, `data` at its first destination byte). Destination bytes per row: Q4_0 the ggml row size, the three Q8_0 layouts `q8_0_weight_row_bytes`. A thread that cannot be created runs its range on the calling thread. The copied routines are untouched.
+- `FLAGOS_SPACEMIT_REPACK_THREADS=<n>`, 1 to 16 in decimal digits, parsed once with the plugin's other switches and read at registration so a bad value's warning shows; unset or empty 1; a bad value warns once and keeps 1. Test names `spacemit_repack_threads` and `spacemit_repack_take` (the repacks that ran threaded, the most ranges).
+- Thread safety, by reading: `ggml_quantize_chunk` for Q8_0 takes ggml's global critical section for an init that does nothing for Q8_0 (tables exist for the IQ types only), then runs per-row code; Q4_1's `to_float` and the FP16 conversions are pure; every routine writes its own range. No lazy init to trigger.
+- `flagos-check-spacemit`: `check_repack_threads` in the default run, and `--bench-repack` (per layout one tensor of 2,560 columns, 66 to 170 MiB of source, with 1, 2, 4 and 8 threads, best of 3 rounds).
+
+**On the Mac (2026-11-12, rerun by me).** Both builds without warnings. The check program passes under the defaults, with the switch at 8, and at 8 with `FLAGOS_SPACEMIT_TEST_THREADS=1` (the coder also under `GGML_FLAGOS_KERNEL_VARIANTS=0`): stored bytes identical to one thread's in 80/80 (4 layouts, 5 shapes, 2, 3, 8 and 16 threads), the read-back in 80/80, the counter as expected in 100/100, a partial write on 8 threads in 2/2, the switch's values in 8/8. The coder's mutation (the last range one group short) fails 16 of 80. test-backend-ops `MUL_MAT` 3/3 unset and at 8; Qwen3-0.6B's 24 tokens byte for byte the same at 8; the riscv64 syntax check 0 errors; no non-ASCII added. `--bench-repack` runs (the Mac's figures mean nothing for the K3; there the Q6_K conversion is the slowest layout too, 460 MiB/s on one thread against Q4_0's 2,538). **Not run: ThreadSanitizer**, which aborts at start on this Mac for any program; no race detector has seen the change, the argument for it is the disjoint ranges and the reading above.
+
+**On the K3 (the user's run, about 1 hour, estimate):** the build, the check program with `--bench-repack`; `scripts/startup-split.py` once with the switch at 1 and once at 8 (one turn each, not interleaved as the spec said: each run already holds 3 warm and 2 cold starts per model); the runner on both models at 8 with T1's baselines.
+
+**For the user to decide at review:**
+1. A alone first (recommended), or A with B in one step.
+2. 8 threads by default once the rule passes (recommended), or the count of X100 cores read at run time.
 
 ### Not planned
 
