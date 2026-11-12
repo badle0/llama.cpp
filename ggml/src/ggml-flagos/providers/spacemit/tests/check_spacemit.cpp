@@ -2485,14 +2485,14 @@ static int check_repack_threads(ggml_backend_dev_t dev) {
         ggml_free(ctx);
     }
 
-    // the switch's values on a 4096-row Q8_0 weight: a bad value is warned once and keeps 1 thread
+    // the switch's values on a 4096-row Q8_0 weight: a bad value is warned once and keeps the default, 8
     const struct {
         const char * value;
         uint32_t     n;
         bool         warned;
     } switch_values[] = {
-        { nullptr, 1, false }, { "", 1, false }, { "1", 1, false }, { "8", 8, false },
-        { "16", 16, false },   { "0", 1, true }, { "17", 1, true }, { "abc", 1, true },
+        { nullptr, 8, false }, { "", 8, false }, { "1", 1, false }, { "8", 8, false },
+        { "16", 16, false },   { "0", 8, true }, { "17", 8, true }, { "abc", 8, true },
     };
     int n_values_ok = 0;
     {
@@ -2535,8 +2535,8 @@ static int check_repack_threads(ggml_backend_dev_t dev) {
                 "groups only); a partial write on 8 threads identical in %d/%d\n",
                 n_raw_same, n_cmp, n_read_same, n_cmp, n_path_ok, n_path, n_threaded, n_partial_same, n_partial);
     std::printf("repack   FLAGOS_SPACEMIT_REPACK_THREADS values (unset, empty, 1, 8, 16, 0, 17, abc) on a 4096-row "
-                "Q8_0 weight: one warning for each of 0, 17 and abc and none for the others, 1 thread for them, as "
-                "expected in %d/%zu\n",
+                "Q8_0 weight: one warning for each of 0, 17 and abc and none for the others, the default 8 for all but 1, 8 "
+                "and 16, as expected in %d/%zu\n",
                 n_values_ok, sizeof(switch_values) / sizeof(switch_values[0]));
     return 0;
 }

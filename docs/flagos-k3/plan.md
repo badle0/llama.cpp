@@ -2867,6 +2867,14 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 **On the K3 (the user's run, about 1 hour, estimate):** the build, the check program with `--bench-repack`; `scripts/startup-split.py` once with the switch at 1 and once at 8 (one turn each, not interleaved as the spec said: each run already holds 3 warm and 2 cold starts per model); the runner on both models at 8 with T1's baselines.
 
+**Result on the K3 (2026-11-12, on `41e84a60b`; logs `~/k3-logs/t6-check.txt`, `t6-s1.txt`, `t6-s8.txt`, `t6-06.txt`, `t6-4b.txt`, `t6/`): the rule passes, 8 threads are the default.**
+- The check program passes: stored bytes identical to one thread's in 80/80, the read-back in 80/80, the switch's values in 8/8.
+- `--bench-repack`, MiB/s of source with 1 / 2 / 4 / 8 threads: Q4_0 553 / 1,094 / 2,074 / 3,869; Q4_1 to Q8_0 86 / 172 / 344 / 682; Q8_0 1,240 / 2,379 / 4,453 / 6,194; Q6_K to Q8_0 75 / 149 / 298 / 592. The three slow layouts scale 7.0 to 7.9 times at 8 threads, Q8_0 5.0 times.
+- `startup-split.py`, warm medians, 1 thread against 8: the weights stage on Qwen3-4B 8.47 to 1.45 s (5.8 times; user time 8.23 to 8.65 s), on Qwen3-0.6B 2.11 to 0.43 s; `/health` at 11.03 to 3.98 s and 4.30 to 2.58 s; cold 13.31 to 6.30 s and 4.75 to 2.99 s. The first request is unchanged (126 and 124 ms, 31 and 31 ms). Every figure is inside its prediction, `/health` on Qwen3-4B at its lower edge.
+- The runner at 8 threads: 47/47 on both models, 16/16 replies equal to T1's baselines; perplexity and KLD against the CPU the figures of T1's run to the last digit (Qwen3-4B 9.7736, 0.002489 and 0.001229; Qwen3-0.6B 14.4471, 0.004722 and 0.002533).
+- By the rule: B is not proposed (the Q6_K table at 592 MiB/s is about 0.5 s of the stage, an estimate from the benchmark, under 1 s), nor C (the stage is under 2 s). What is left of Qwen3-4B's 3.98 s: 0.97 s parameter fit and 0.81 s metadata and vocabulary, both llama.cpp's, then the 1.45 s stage.
+- The default changed the same day (`repack_default_threads` 8; unset, empty and bad values give 8, `1` the one-thread repack); on the Mac both builds, the check program (also with the switch at 1) and Qwen3-0.6B's text at 1 and at the default are unchanged. The default of 8 has not run on the K3 unset, only as `=8`.
+
 **For the user to decide at review:**
 1. A alone first (recommended), or A with B in one step.
 2. 8 threads by default once the rule passes (recommended), or the count of X100 cores read at run time.

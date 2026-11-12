@@ -68,16 +68,17 @@ static ggml_tensor * spacemit_storage(const ggml_tensor * t, size_t & offset) {
 
 namespace {
 
-constexpr int    repack_max_threads = 16;
-constexpr size_t repack_min_bytes   = size_t(1) << 20;  // a smaller weight repacks on the calling thread
+constexpr int    repack_max_threads     = 16;
+constexpr int    repack_default_threads = 8;  // T6's rule passed on the K3, 2026-11-12
+constexpr size_t repack_min_bytes       = size_t(1) << 20;  // a smaller weight repacks on the calling thread
 
 // FLAGOS_SPACEMIT_REPACK_THREADS=<n> (plan.md "T6 spec"): the host threads that repack one weight, n decimal digits
-// only, 1 to 16; unset or empty: 1. Parsed once (spacemit_cached_switch); anything else keeps the default with a
+// only, 1 to 16; unset or empty: 8. Parsed once (spacemit_cached_switch); anything else keeps the default with a
 // warning, once per parse generation
 int parse_repack_threads() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_REPACK_THREADS");
     if (v == nullptr || *v == '\0') {
-        return 1;
+        return repack_default_threads;
     }
     int          n = 0;
     const char * c = v;
@@ -90,14 +91,14 @@ int parse_repack_threads() {
     static std::atomic<uint32_t> warned_in{ 0 };  // the generation last warned in; generations start at 1
     const uint32_t               generation = spacemit_switches_generation();
     if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_THREADS=%s: not a thread count from 1 to 16, the default 1 kept\n",
-                      __func__, v);
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_THREADS=%s: not a thread count from 1 to 16, the default %d kept\n",
+                      __func__, v, repack_default_threads);
     }
-    return 1;
+    return repack_default_threads;
 }
 
 int repack_threads_from_env() {
-    static std::atomic<int>      value{ 1 };
+    static std::atomic<int>      value{ repack_default_threads };
     static std::atomic<uint32_t> seen{ 0 };
     return spacemit_cached_switch(value, seen, parse_repack_threads);
 }
