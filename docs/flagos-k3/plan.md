@@ -2774,9 +2774,36 @@ The changes: `core/flagos-spacemit-ops.cpp` (the contract `get_rows.quant`, the 
 
 **Step 2 on the K3 (the user's run, about 1.5 hours, estimate):** the build; the script's check and benchmark (a failure stops the block); the runner on both models with `FLAGOS_SPACEMIT_EMBD=rvv` in its environment and T1's baselines; the script's llama-bench, `ggml` against `rvv`. Predicted, beside the step's predictions above: the counter shows the RVV kernel for Q6_K under `rvv`; 68/68 identical; the runner 49/49 and 47/47 with nothing moved. One caution on the benchmark: it looks up the same ids on every call, so the rows are in the caches, which flatters all three columns and the F32 copy most; a real token's row comes from memory.
 
+**Step 2 on the K3: the result (2026-11-12; the user's run on `23f12395b`; figures from the pasted summaries, the logs on the board in `~/embd2`, `~/embd2-06.txt`, `~/embd2-4b.txt`, `~/embd2.txt`).** Not adopted: the default stays ggml's dequantizer on the provider (the user: "keep the quantized upstream version of token embedding kernel"). The kernel stays behind `FLAGOS_SPACEMIT_EMBD=rvv`.
+- Correct at its first run: the check program passed (the lookups byte for byte, the benchmark's lines naming `kernels ggml rvv`); the runner under `rvv` 47/47 on both models with T1's reply baselines.
+- The call (`--bench-embd`, us, ggml / rvv / F32 copy): 1,024 columns, 1 row 31.7 / 13.1 / 12.6, 8 rows 34.1 / 14.1 / 13.6, 128 rows 339.1 / 34.2 / 32.8, 512 rows 1333.7 / 136.5 / 253.8; 2,560 columns, 1 row 60.6 / 13.1 / 12.5, 8 rows 63.8 / 16.0 / 15.4, 128 rows 834.9 / 65.1 / 69.0, 512 rows 3360.5 / 433.4 / 487.6. So 58.6 to 92.2% faster than ggml's, and within 1.5 us of a plain copy up to 128 rows: no F32 table is proposed (the rule asked for 1.8 ms).
+- llama-bench, `rvv` against `ggml`, best of three turns: Qwen3-0.6B pp128 699.97 against 709.52 (-1.3%, lower in all three turns: 699.97, 699.42, 699.23 against 709.52, 702.41, 703.90; by medians -0.6%), pp512 +0.3%, tg128 +0.1%; Qwen3-4B pp128 +0.1%, pp512 -0.3%, tg128 -0.1%, pp512 at depth 4096 +0.3%, tg32 at depth 4096 0.0%. The rule's last condition (nothing more than 1% slower) fails on the one line. Its cause is not known: the call saves about 0.3 ms of a 180 ms prompt, so the kernel cannot cost 2.5 ms inside the lookup; a six-turn rerun on Qwen3-0.6B was offered and not run.
+- One row costs about 13 us with no arithmetic at all (the F32 copy), so what is left of a call is its fixed cost; how much of that is the provider's and how much the benchmark's is not measured.
+
 **For the user to decide at review:**
 1. The type list: every listed block type (recommended: the same code, each checked byte for byte against the CPU), or Q6_K alone.
 2. The rule's speed condition: adopt on "not slower" (recommended), since the purpose is one split per token.
+
+### Whole-graph dispatch: the test, for review (2026-11-12)
+
+**Status:** proposed on the user's request ("can you explore testing for whole-graph dispatch results?"); the script's two modes are built and dry-run on the Mac, nothing has run on the K3. The requirement is SpacemiT's (the meeting the user reported 2026-11-10): at decode the backend dispatches the whole graph, with Ascend's llama.cpp backend as the reference. Since the embedding lookup (2026-11-11) a generated token is one graph split and one spine-runtime launch.
+
+**What the test shows,** three forms of the same build on both models, the modes interleaved (`scripts/structural-experiments.sh`, `EXPS="e3 e3c embd"`):
+
+| Mode | Form | Per generated token (expected) |
+|---|---|---|
+| `ref` | the whole token dispatched at once, the default | 1 split, 1 launch |
+| `embd-cpu` (`FLAGOS_SPACEMIT_EMBD=cpu`) | the placement before 2026-11-11 | 2 splits, 1 launch |
+| `e3` (`GGML_FLAGOS_SYNC_LAUNCH=1`) | one dispatch per kernel, the host waiting for each | 1 split, as many launches as steps |
+
+- Structure, from llama.cpp's log and the provider's counters (`e3c`, `e3c-a`, `embd-cc`): graph splits, launches and steps per token.
+- Where a token's time goes, us: outside `graph_compute`, host work in it, launch overhead, barriers, imbalance, kernels.
+- Speed: pp128, tg128; tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 on Qwen3-4B.
+- Same answers: the generated text, and the KLD of `e3` and `embd-cpu` against `ref`.
+
+**Predictions (estimates, written before the run):** `ref` 1 launch per token with one step more than E3r's 1,086 (Qwen3-4B) and 846 (Qwen3-0.6B), the lookup's, if T1 and S2 changed no one-token step count; `embd-cpu` within 1% of `ref` everywhere (step 1's run: -1.0% to +0.7%), its "outside" column higher by the second split's cost; `e3` tg128 -10 to -16% on Qwen3-4B and -30 to -38% on Qwen3-0.6B (E3r: -13.9% and -34.8%), 11 to 16 us per step; KLD 0 with the same top token 100% for both. No rule: the run is descriptive, the table is what SpacemiT is shown.
+
+**Not covered:** TTFT under the three forms (the TTFT harness takes no mode; llama-bench's pp figures stand in); a comparison with Ascend's backend, which needs their hardware.
 
 ### Not planned
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Structural experiments on the K3 (docs/flagos-k3/structural-experiments.md) on today's build: E3a, one launch per
 # step; E3c, test-only counters of where a token's time goes; the plan cache against the full path (plan.md "S1 step 3c
-# spec"). Every mode runs against the reference (today's build, defaults) in the same session, the modes interleaved in
+# spec"); the embedding lookup on the CPU, a token in 2 graph splits, against the whole token in one split and one launch
+# (plan.md "Embedding lookup spec"). Every mode runs against the reference (today's build, defaults) in the same session, the modes interleaved in
 # every repetition. E1, E2, E2-hp, E2-neg, E3b, E4 and R12-hw ran on builds and switches removed 2026-11-02 once their
 # decisions were made; their scripts are in git history (cad674fda).
 #
@@ -11,7 +12,7 @@
 #        structural-experiments.sh run <model.gguf> [out]   the runs of $EXPS, then the summary (logs in out; default
 #                                                           ~/sx/<model name>)
 #        structural-experiments.sh summary <out>            the summary again from the logs
-# Env:   EXPS      experiments (default "e3c"; also e3 and plan); the reference always runs
+# Env:   EXPS      experiments (default "e3c"; also e3, plan and embd); the reference always runs
 #        REPS      llama-bench repetitions per mode (default 3; 0 skips llama-bench)
 #        DEPTH     1: also tg32 at depths 0, 1024 and 4096 and pp512 at depth 4096 (default 1)
 #        PPL_TEXT  perplexity text (default ~/ppl.txt; empty skips perplexity and KLD); CHUNKS (default 8)
@@ -27,6 +28,9 @@
 #                 ref against plan-n is the default's speed gain
 #   plan-nc       as e3c, with FLAGOS_SPACEMIT_PLAN=none: plan-n with the counters (e3c against plan-nc: the host
 #                 columns)
+#   embd-cpu      FLAGOS_SPACEMIT_EMBD=cpu: the token embedding lookup on the CPU, a token in 2 graph splits (the
+#                 placement before 2026-11-11); ref against it is what the whole token in one split gives
+#   embd-cc       as e3c, with FLAGOS_SPACEMIT_EMBD=cpu (e3c against embd-cc: the outside and host columns)
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -49,12 +53,13 @@ TO=""
 if command -v timeout > /dev/null; then TO="timeout --foreground $TIMEOUT"; fi
 # every run sets its own
 unset GGML_FLAGOS_SYNC_LAUNCH GGML_FLAGOS_STATS FLAGOS_SPACEMIT_DISABLE FLAGOS_SPACEMIT_ATTN \
-    FLAGOS_SPACEMIT_PLAN FLAGOS_SPACEMIT_QUANTIZE
+    FLAGOS_SPACEMIT_PLAN FLAGOS_SPACEMIT_QUANTIZE FLAGOS_SPACEMIT_EMBD
 
 mode_env() {
     case $1 in
         e3 | e3c-a) echo "GGML_FLAGOS_SYNC_LAUNCH=1" ;;
         plan-n | plan-nc) echo "FLAGOS_SPACEMIT_PLAN=none" ;;
+        embd-cpu | embd-cc) echo "FLAGOS_SPACEMIT_EMBD=cpu" ;;
         *) echo "" ;;
     esac
 }
@@ -73,7 +78,7 @@ run() {
     bin=$BUILD_A/bin/$tool
     env=$(mode_env "$mode")
     # E3c: every run writes its counters next to its log, when it ends
-    case $mode in e3c | e3c-a | plan-nc) env="${env:+$env }GGML_FLAGOS_STATS=$log.stats" ;; esac
+    case $mode in e3c | e3c-a | plan-nc | embd-cc) env="${env:+$env }GGML_FLAGOS_STATS=$log.stats" ;; esac
     if [ -n "$DRY" ]; then
         echo "   [$mode] ${env:+$env }$bin $*"
         return 0
@@ -289,6 +294,14 @@ run_all() {
         bench_modes+=" plan-n"
         case " $bench_modes " in *" e3c "*) ;; *) bench_modes+=" e3c" ;; esac
         bench_modes+=" plan-nc" depth_modes+=" plan-n" kld_modes+=" plan-n" kld1_modes+=" plan-n"
+    fi
+    # the lookup on the CPU against the default: the same bytes (ggml's dequantizer on both sides), so the KLD reads 0
+    if has embd; then
+        place+=" embd-cpu" bench_modes+=" embd-cpu"
+        case " $bench_modes " in *" e3c "*) ;; *) bench_modes+=" e3c" ;; esac
+        bench_modes+=" embd-cc" depth_modes+=" embd-cpu" kld_modes+=" embd-cpu"
+        case " $depth_modes " in *" e3c "*) ;; *) depth_modes+=" e3c" ;; esac
+        depth_modes+=" embd-cc"
     fi
     if [ -z "$DRY" ]; then
         {

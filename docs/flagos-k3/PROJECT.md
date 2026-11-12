@@ -126,7 +126,7 @@ Priority order for the mentor (2026-10-26, `structural-review.md` §7.1): (4) `c
 
 ## 8. Current state and next step (2026-11-09)
 
-The log of every milestone and experiment, items 1-62 with their numbers, is `progress.md` §D; the acceptance runs are in `build.md` §7; the plan with its exit criteria is `plan.md` §4.
+The log of every milestone and experiment, items 1-63 with their numbers, is `progress.md` §D; the acceptance runs are in `build.md` §7; the plan with its exit criteria is `plan.md` §4.
 
 - Done: M0-M2 (items 1-18), the structural experiments E1-E7b and E3r (items 20, 31; `structural-experiments.md`), the matmul path work (item 21), the IGPU switch (item 22), S1 step 1 (the C interface header, the `dlopen` loader, item 29), step 2 (the contract table bound by name, item 30), step 2b (the default path pruned: the kernel switches parsed once, item 32). The K3-only core / plugin split (D10, `plan.md` S1 and S2) was the work that followed, its exit met on the K3 2026-11-06.
 - S1 step 3 (A4's plan-cache experiment, `FLAGOS_SPACEMIT_PLAN=none|structure|uid`) ran on the K3 2026-10-31 (item 33; `structural-experiments.md` run 11): both candidates hit every generation graph with identical logits, but neither passes the rule, since the per-node contract check (about 0.5 ms of a 4B token) runs on every graph under both and the expansion the cache replaces is about 0.1 ms; S's compare costs 0.8-1.0 ms on the X100.
