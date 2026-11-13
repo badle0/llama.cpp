@@ -2982,6 +2982,13 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 **Open on the failure path, by reading:** after a sync that is not `Ok` the stream is destroyed and the unfinished ranges rerun; the header says the destroy cancels outstanding work but not that it waits for a tile in mid-run.
 
+**Result on the K3 (2026-11-13, the switch's commit, spine-runtime 0.6.3; logs `~/k3-logs/x100-check.txt`, `x100-threads1.txt`, `x100-x1001.txt`, `x100-threads2.txt`, `x100-x1002.txt`, `x100-06.txt`, `x100-4b.txt`, `x100/`): the route works and is slower; by the rule `threads` stays the default.**
+- The build and the check program pass. Under `x100`: stored bytes and read-back identical to one thread's in 20/20, every split weight through the stream on at most 5 ranges, none fallen back, none rerun.
+- `--bench-repack`, MiB/s of source, 8 threads / `x100` (5 ranges) / 4 threads: Q4_0 3865 / 2518 / 2072; Q4_1 to Q8_0 678 / 429 / 345; Q8_0 6069 / 4310 / 4408; Q6_K to Q8_0 591 / 369 / 298. `x100` is 62 to 65% of 8 threads on the three slow layouts (5 of 8 workers is 62.5%) and 71% on Q8_0.
+- `startup-split.py`, warm medians, two turns each taking turns, `threads` against `x100`: the weights stage on Qwen3-4B 1.50 and 1.50 s against 1.98 and 1.98 s (+32%), on Qwen3-0.6B 0.43 and 0.44 s against 0.53 and 0.55 s (+24%); `/health` at 4.07 against 4.53 s and 2.58 against 2.67 s; cold 6.31 against 6.76 to 6.78 s and 3.08 against 3.08 to 3.09 s. First and second request unchanged (124 and 121 ms, 30 and 27 ms).
+- The runner under `x100`: 47/47 on both models, replies 16/16 equal to T1's baselines, perplexity as before (Qwen3-4B 9.7736).
+- So the cost of the route is its 4 cores: about 0.5 s of start-up on Qwen3-4B and 0.1 s on Qwen3-0.6B. To SpacemiT's engineer: these figures, and whether the X100 backend can expose all 8 X100 cores.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
