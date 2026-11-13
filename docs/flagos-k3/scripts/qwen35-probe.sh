@@ -56,7 +56,9 @@ run() { # run <out file> <command...>: stdout to the file, stderr beside it, the
     shift
     echo "$(date +%H:%M:%S) $*"
     [ -n "$DRY" ] && return 0
-    timeout -k 10 "$TIMEOUT" "$@" > "$out" 2> "${out%.*}.err"
+    # --foreground and no terminal on stdin: llama-completion sets the terminal up at start, and under a plain timeout
+    # (its own background process group) that stops the process before its first log line (seen on the K3, 2026-11-13)
+    timeout --foreground -k 10 "$TIMEOUT" "$@" < /dev/null > "$out" 2> "${out%.*}.err"
     echo $? > "${out%.*}.rc"
 }
 
