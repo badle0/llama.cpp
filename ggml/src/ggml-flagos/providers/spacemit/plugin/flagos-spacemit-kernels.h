@@ -38,6 +38,8 @@ bool spacemit_kernel_rms_norm_f32(const spacemit_tile * tile, ggml_tensor * dst)
 bool spacemit_kernel_rope(const spacemit_tile * tile, ggml_tensor * dst);       // F32 or F16
 bool spacemit_kernel_set_rows(const spacemit_tile * tile, ggml_tensor * dst);   // into F32, F16, quantized or BF16 rows
 bool spacemit_kernel_cpy_quant(const spacemit_tile * tile, ggml_tensor * dst);  // F32 into quantized or BF16 rows
+bool spacemit_kernel_cpy_f32(const spacemit_tile * tile, ggml_tensor * dst);    // F32 into F32
+bool spacemit_kernel_scale_f32(const spacemit_tile * tile, ggml_tensor * dst);  // F32 rows, bias 0
 bool spacemit_kernel_get_rows_f32(const spacemit_tile * tile, ggml_tensor * dst);
 bool spacemit_kernel_get_rows_quant(const spacemit_tile * tile, ggml_tensor * dst);  // quantized rows into F32
 // reads FLAGOS_SPACEMIT_EMBD (rvv or ggml's dequantizers) at registration, as spacemit_flash_attn_read_switch

@@ -527,6 +527,52 @@ bool spacemit_kernel_cpy_quant(const spacemit_tile * tile_p, ggml_tensor * dst) 
     return true;
 }
 
+// CPY of F32 into F32 (spacemit_cpy_f32_supported): the source's rows in ggml's order, each to the destination's next
+// ne00 floats when it is contiguous, else to its row of the same index (same shape) by its own strides; the rows split
+// over the tiles. Bytes copied, so the CPU's
+bool spacemit_kernel_cpy_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
+    const ggml_tensor *   src0 = dst->src[0];
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const bool packed = ggml_is_contiguous(dst);
+    int64_t    ir0, ir1;
+    tile_range(ggml_nelements(src0) == 0 ? 0 : ggml_nrows(src0), tile, ir0, ir1);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir / (ne02 * ne01);
+        const int64_t i02 = (ir / ne01) % ne02;
+        const int64_t i01 = ir % ne01;
+        char * d = (char *) dst->data + (packed ? ir * ne00 * sizeof(float) : i01 * nb1 + i02 * nb2 + i03 * nb3);
+        std::memcpy(d, (const char *) src0->data + i01 * nb01 + i02 * nb02 + i03 * nb03, ne00 * sizeof(float));
+    }
+    return true;
+}
+
+// SCALE of F32 rows by s with bias 0 (spacemit_scale_f32_supported): one multiply per element as ggml-cpu's
+// ggml_vec_scale_f32, so the CPU's bits; in place or not, the rows split over the tiles
+bool spacemit_kernel_scale_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile = *tile_p;
+    const ggml_tensor *   src0 = dst->src[0];
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    float s;
+    std::memcpy(&s, dst->op_params, sizeof(float));
+
+    int64_t ir0, ir1;
+    tile_range(ggml_nelements(dst) == 0 ? 0 : ggml_nrows(dst), tile, ir0, ir1);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir / (ne2 * ne1);
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i1 = ir % ne1;
+        const float * x  = (const float *) ((const char *) src0->data + i1 * nb01 + i2 * nb02 + i3 * nb03);
+        float *       y  = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        for (int64_t i = 0; i < ne0; ++i) {
+            y[i] = x[i] * s;
+        }
+    }
+    return true;
+}
+
 bool spacemit_kernel_get_rows_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
     const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)

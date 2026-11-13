@@ -102,13 +102,37 @@ static bool spacemit_set_rows_supported(const ggml_tensor * op, const spacemit_p
 
 // CPY: F32 rows into a contiguous tensor of a block type above, of the same shape, in whole blocks (the context shift's
 // write-back into a quantized KV cache, src/llama-kv-cache.cpp:1863-1877); op is ggml_cpy's view of the destination,
-// with its ne and nb (ggml.c:3526-3535), never in an IME layout. No other CPY: no same-type copies, no other source
-// types, no non-contiguous destinations
+// with its ne and nb (ggml.c:3526-3535), never in an IME layout. No other source types, no non-contiguous
+// destinations; F32 into F32 is cpy.f32 below
 static bool spacemit_cpy_quant_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
                                          ggml_backend_buffer_type_t) {
     const ggml_tensor * src = op->src[0];
     return spacemit_cache_block_type(op->type) && spacemit_f32_rows(src) && ggml_are_same_shape(src, op) &&
            ggml_is_contiguous(op) && op->ne[0] % ggml_blck_size(op->type) == 0 && table->tensor_layout(op) == 0;
+}
+
+// CPY of F32 into F32, the writes into the recurrent state (src/llama-graph.cpp build_rs, src/models/delta-net-base.cpp),
+// never into an IME layout. Source rows contiguous with any row strides, and either a contiguous destination of the same
+// element count (the shapes may differ, as ggml allows) or a destination of the same shape with contiguous rows and any
+// row strides (the rollback snapshots, delta-net-base.cpp:591-603, with n_rs_seq > 0). No other same-type copy
+static bool spacemit_cpy_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                       ggml_backend_buffer_type_t) {
+    const ggml_tensor * src = op->src[0];
+    if (op->type != GGML_TYPE_F32 || !spacemit_f32_rows(src) || table->tensor_layout(op) != 0) {
+        return false;
+    }
+    return (ggml_is_contiguous(op) && ggml_nelements(src) == ggml_nelements(op)) ||
+           (spacemit_f32_rows(op) && ggml_are_same_shape(src, op));
+}
+
+// SCALE of F32 rows into F32 rows of the same shape, in place or not, bias 0 only (the clear of a recurrent state
+// slot, src/llama-graph.cpp build_rs); a scale with a bias stays on the CPU
+static bool spacemit_scale_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                         ggml_backend_buffer_type_t) {
+    float bias;
+    std::memcpy(&bias, (const float *) op->op_params + 1, sizeof(float));
+    return spacemit_f32_rows(op) && spacemit_f32_rows(op->src[0]) && ggml_are_same_shape(op->src[0], op) &&
+           bias == 0.0f;
 }
 
 // GET_ROWS: F32 rows by I32 indices
@@ -215,6 +239,8 @@ static const spacemit_contract k_contracts[] = {
     { GGML_OP_ROPE,            spacemit_rope_supported,         { "rope" },                                          1 },
     { GGML_OP_SET_ROWS,        spacemit_set_rows_supported,     { "set_rows" },                                      1 },
     { GGML_OP_CPY,             spacemit_cpy_quant_supported,    { "cpy.quant" },                                     1 },
+    { GGML_OP_CPY,             spacemit_cpy_f32_supported,      { "cpy.f32" },                                       1 },
+    { GGML_OP_SCALE,           spacemit_scale_f32_supported,    { "scale.f32" },                                     1 },
     { GGML_OP_GET_ROWS,        spacemit_get_rows_f32_supported, { "get_rows.f32" },                                  1 },
     { GGML_OP_GET_ROWS,        spacemit_get_rows_quant_supported, { "get_rows.quant" },                              1 },
     { GGML_OP_GLU,             spacemit_swiglu_f32_supported,   { "swiglu.f32" },                                    1 },
@@ -231,13 +257,14 @@ static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts
 static_assert(k_n_contracts <= sizeof(spacemit_ops::ops) / sizeof(spacemit_ops::ops[0]),
               "spacemit_ops::ops must hold every contract");
 
-// the contract names of the 17 kernels the plugin offers, in the order of its kernel table (plan.md "S1 step 1 spec" §3)
+// the contract names of the 19 kernels the plugin offers, in its kernel table's order (plan.md "S1 step 1 spec" section 3)
 const char * const spacemit_required_kernels[] = {
     "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
     "set_rows",         "cpy.quant",        "get_rows.f32",             "get_rows.quant",
     "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",             "flash_attn",
     "flash_attn.split.partial",             "flash_attn.split.partial_paired",
     "flash_attn.split.merge",               "flash_attn.kvh.partial",   "flash_attn.kvh.merge",
+    "scale.f32",        "cpy.f32",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 

@@ -400,7 +400,7 @@ static int check_contracts(ggml_backend_dev_t dev) {
     std::string  detail;
     REQUIRE(spacemit_ops_bind(table, &ops, &detail));
     CHECK(ops.table == table);
-    CHECK(ops.n_ops == 14);
+    CHECK(ops.n_ops == 16);
     for (uint32_t i = 0; i < ops.n_ops; i++) {
         REQUIRE(ops.ops[i].n_steps >= 1 && ops.ops[i].n_steps <= SPACEMIT_MAX_OP_STEPS);
         for (uint32_t s = 0; s < ops.ops[i].n_steps; s++) {
@@ -4303,6 +4303,304 @@ static int check_cache_ops(ggml_backend_dev_t dev) {
     return 0;
 }
 
+//
+// the recurrent state's writes (plan.md "Step 1 spec: Qwen3.5-4B loads on the default path"): SCALE by scale.f32 (the
+// clear of a slot) and CPY of F32 into F32 by cpy.f32 (the copies into the state), bit for bit against the CPU
+//
+
+// what a state_op_run case gave: claimed by the provider; the state's and the op's bytes equal the reference's after
+// the backend's run (8 tiles) and after the kernel entry called directly on 1 and on 8 tiles
+struct state_op_result {
+    bool claimed = false, same = false, same_1 = false, same_8 = false;
+};
+
+// one op on an F32 state [ne] named cache_r_l0 that holds init: on the provider with the state in its buffer (in a CPU
+// buffer with host), and directly through kernel on a copy in a CPU buffer. build makes the op on a state from inputs
+// the caller keeps in a CPU buffer; an op that is not a view gets its own tensor beside the state. The reference is
+// the CPU backend (one thread) on a third copy, or expect (the state's bytes) where ggml-cpu cannot run the op
+static state_op_result state_op_run(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu,
+                                    const spacemit_plugin_kernel * kernel, bool host, const std::array<int64_t, 4> & ne,
+                                    const std::vector<float> &                                          init,
+                                    const std::function<ggml_tensor *(ggml_context *, ggml_tensor *)> & build,
+                                    const std::vector<float> * expect = nullptr) {
+    ggml_init_params      params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context *        ctx[3];  // the provider's run, the CPU backend's, the direct calls
+    ggml_tensor *         state[3];
+    ggml_tensor *         node[3];
+    ggml_backend_buffer_t buf[3];
+    for (int k = 0; k < 3; k++) {
+        ctx[k]   = ggml_init(params);
+        state[k] = ggml_new_tensor(ctx[k], GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(state[k], "cache_r_l0");
+        node[k] = build(ctx[k], state[k]);
+        buf[k]  = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx[k], k == 0 && !host ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type());
+    }
+    const auto bytes = [](const ggml_tensor * t) {
+        std::vector<uint8_t> b(ggml_nbytes(t));
+        if (!b.empty()) {
+            ggml_backend_tensor_get(t, b.data(), 0, b.size());
+        }
+        return b;
+    };
+    state_op_result r;
+    if (buf[0] != nullptr && buf[1] != nullptr && buf[2] != nullptr &&
+        (int64_t) init.size() == ggml_nelements(state[0])) {
+        for (int k = 0; k < 3; k++) {
+            ggml_backend_tensor_set(state[k], init.data(), 0, ggml_nbytes(state[k]));
+        }
+        r.claimed           = ggml_backend_dev_supports_op(dev, node[0]);
+        ggml_cgraph * g_dev = ggml_new_graph(ctx[0]);
+        ggml_cgraph * g_cpu = ggml_new_graph(ctx[1]);
+        ggml_build_forward_expand(g_dev, node[0]);
+        ggml_build_forward_expand(g_cpu, node[1]);
+        std::vector<uint8_t> want_state, want_node;
+        bool                 ref_ok = true;
+        if (expect != nullptr) {
+            want_state.resize(expect->size() * sizeof(float));
+            std::memcpy(want_state.data(), expect->data(), want_state.size());
+        } else {
+            ref_ok     = ggml_backend_graph_compute(cpu, g_cpu) == GGML_STATUS_SUCCESS;
+            want_state = bytes(state[1]);
+            want_node  = bytes(node[1]);
+        }
+        const bool own_node = node[0]->view_src == nullptr;  // compared besides the state
+        if (r.claimed && ref_ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS) {
+            r.same = bytes(state[0]) == want_state && (!own_node || expect != nullptr || bytes(node[0]) == want_node);
+            for (uint32_t nth : { 1u, 8u }) {
+                ggml_backend_tensor_set(state[2], init.data(), 0, ggml_nbytes(state[2]));
+                if (own_node && ggml_nbytes(node[2]) > 0) {
+                    const std::vector<uint8_t> junk(ggml_nbytes(node[2]), 0xA5);  // rows a tile skips stay wrong
+                    ggml_backend_tensor_set(node[2], junk.data(), 0, junk.size());
+                }
+                bool ok = true;
+                for (uint32_t ith = 0; ith < nth; ith++) {
+                    const spacemit_tile tile = { ith, nth, nullptr, 0, nullptr, 0, nullptr };
+                    ok &= kernel->fn(&tile, node[2]);
+                }
+                const bool same = ok && bytes(state[2]) == want_state &&
+                                  (!own_node || expect != nullptr || bytes(node[2]) == want_node);
+                (nth == 1 ? r.same_1 : r.same_8) = same;
+            }
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        ggml_backend_buffer_free(buf[k]);
+        ggml_free(ctx[k]);
+    }
+    return r;
+}
+
+static int check_state_ops(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);
+
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    const auto                     entry     = [&](const char * name) -> const spacemit_plugin_kernel * {
+        for (uint32_t k = 0; k < n_kernels; k++) {
+            if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
+                return &kernels[k];
+            }
+        }
+        return nullptr;
+    };
+    const spacemit_plugin_kernel * scale = entry("scale.f32");
+    const spacemit_plugin_kernel * copy  = entry("cpy.f32");
+    REQUIRE(scale != nullptr && copy != nullptr);
+    spacemit_ops ops;
+    std::string  detail;
+    REQUIRE(spacemit_ops_bind(table, &ops, &detail));
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    // the sources: a convolution input [7, 100, 2] (its last 3 columns are the state's), states [300, 2], rows
+    // [16, 16, 3, 2] (every other row taken), a new SSM state [65536], an op output [100 + 512 * 2 * 3] holding 3
+    // snapshots of 2 states of 512 after 100 other values (the rollback snapshots, delta-net-base.cpp:591-603)
+    ggml_init_params params = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context *   ctx_h  = ggml_init(params);
+    REQUIRE(ctx_h != nullptr);
+    ggml_tensor *         conv_in = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, 7, 100, 2);
+    ggml_tensor *         rows    = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, 300, 2);
+    ggml_tensor *         rows4   = ggml_new_tensor_4d(ctx_h, GGML_TYPE_F32, 16, 16, 3, 2);
+    ggml_tensor *         ssm     = ggml_new_tensor_1d(ctx_h, GGML_TYPE_F32, 65536);
+    ggml_tensor *         gdn     = ggml_new_tensor_1d(ctx_h, GGML_TYPE_F32, 100 + 512 * 2 * 3);
+    ggml_backend_buffer_t buf_h   = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+    REQUIRE(buf_h != nullptr);
+    uint32_t seed = 500;
+    for (ggml_tensor * t : { conv_in, rows, rows4, ssm, gdn }) {
+        const std::vector<float> v = random_values(ggml_nelements(t), seed++, 1.0f);
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    }
+
+    // a state's values: random, with infinities, NaNs and signed zeros in every row
+    const auto state_init = [&](const std::array<int64_t, 4> & ne) {
+        std::vector<float> v = random_values(ne[0] * ne[1] * ne[2] * ne[3], seed++, 2.0f);
+        for (size_t i = 0; i + 4 < v.size(); i += (size_t) ne[0]) {
+            v[i]     = INFINITY;
+            v[i + 1] = -INFINITY;
+            v[i + 2] = NAN;
+            v[i + 3] = -0.0f;
+        }
+        return v;
+    };
+
+    int        n_cases = 0, n_same = 0;
+    const auto run_case = [&](const char * what, const spacemit_plugin_kernel * kernel,
+                              const std::array<int64_t, 4> & ne,
+                              const std::function<ggml_tensor *(ggml_context *, ggml_tensor *)> & build,
+                              const std::vector<float> * expect = nullptr) {
+        const std::vector<float> init = state_init(ne);
+        std::vector<float>       want;
+        if (expect != nullptr) {  // expect: the multiplier of each element of init, NAN where it stays
+            want = init;
+            for (size_t i = 0; i < want.size(); i++) {
+                want[i] = std::isnan((*expect)[i]) ? init[i] : init[i] * (*expect)[i];
+            }
+        }
+        for (bool host : { false, true }) {
+            const state_op_result r =
+                state_op_run(dev, backend, cpu, kernel, host, ne, init, build, expect != nullptr ? &want : nullptr);
+            n_cases++;
+            const bool ok = r.claimed && r.same && r.same_1 && r.same_8;
+            n_same += ok;
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: %s, the state in %s: %s; bytes as the reference: 8 tiles %s, direct 1 tile %s, "
+                             "8 tiles %s\n",
+                             what, host ? "a CPU buffer" : "our buffer", r.claimed ? "claimed" : "refused",
+                             r.same ? "yes" : "no", r.same_1 ? "yes" : "no", r.same_8 ? "yes" : "no");
+                g_failures++;
+            }
+        }
+    };
+
+    // SCALE: the clear (s 0 in place on one row of 1000, a 1-D view, over infinities and NaNs), the empty view of a step
+    // that clears none, s 0.37 in place on rows 1-3, s -1.5 into a new tensor, s 0 over 33 rows of 7 (tiles of 5 and 3
+    // rows), and s 2 in place on rows of 500 of 1000 (strided; ggml-cpu takes contiguous tensors only, so the host's
+    // product is the reference)
+    const std::array<int64_t, 4> s_ne = { 1000, 4, 1, 1 };
+    run_case("SCALE 0 in place on row 2 of a state [1000, 4]", scale, s_ne, [](ggml_context * ctx, ggml_tensor * st) {
+        return ggml_scale_inplace(ctx, ggml_view_1d(ctx, st, 1000, 2 * st->nb[1]), 0.0f);
+    });
+    run_case("SCALE 0 in place on an empty view", scale, s_ne, [](ggml_context * ctx, ggml_tensor * st) {
+        return ggml_scale_inplace(ctx, ggml_view_1d(ctx, st, 0, 0), 0.0f);
+    });
+    run_case("SCALE 0.37 in place on rows 1-3", scale, s_ne, [](ggml_context * ctx, ggml_tensor * st) {
+        return ggml_scale_inplace(ctx, ggml_view_2d(ctx, st, 1000, 3, st->nb[1], st->nb[1]), 0.37f);
+    });
+    run_case("SCALE -1.5 into a new tensor", scale, s_ne,
+             [](ggml_context * ctx, ggml_tensor * st) { return ggml_scale(ctx, st, -1.5f); });
+    run_case("SCALE 0 in place on [7, 33]", scale, { 7, 33, 1, 1 },
+             [](ggml_context * ctx, ggml_tensor * st) { return ggml_scale_inplace(ctx, st, 0.0f); });
+    {
+        std::vector<float> mult(1000 * 4, NAN);
+        for (int64_t r = 0; r < 4; r++) {
+            for (int64_t c = 0; c < 500; c++) {
+                mult[r * 1000 + c] = 2.0f;
+            }
+        }
+        run_case("SCALE 2 in place on strided rows [500, 4] of [1000, 4]", scale, s_ne,
+                 [](ggml_context * ctx, ggml_tensor * st) {
+                     return ggml_scale_inplace(ctx, ggml_view_2d(ctx, st, 500, 4, st->nb[1], 0), 2.0f);
+                 },
+                 &mult);
+    }
+
+    // CPY: the convolution state's last columns (a 3-D view [3, 100, 2] with rows of 3 of 7) into rows 1-2 of a state
+    // [300, 4]; the extra states [300, 2] into rows 2-3; an empty copy (no extra state); every other row of
+    // [16, 16, 3, 2] into row 1 of a state [768, 2] (a 1-D view); the new SSM state [65536] into row 1 of 3
+    run_case("CPY of conv [3, 100, 2] (rows of 3 of 7) into rows 1-2 of [300, 4]", copy, { 300, 4, 1, 1 },
+             [&](ggml_context * ctx, ggml_tensor * st) {
+                 ggml_tensor * src =
+                     ggml_view_3d(ctx, conv_in, 3, 100, 2, conv_in->nb[1], conv_in->nb[2], 4 * sizeof(float));
+                 return ggml_cpy(ctx, src, ggml_view_2d(ctx, st, 300, 2, st->nb[1], st->nb[1]));
+             });
+    run_case("CPY of [300, 2] into rows 2-3 of [300, 4]", copy, { 300, 4, 1, 1 },
+             [&](ggml_context * ctx, ggml_tensor * st) {
+                 return ggml_cpy(ctx, rows, ggml_view_2d(ctx, st, 300, 2, st->nb[1], 2 * st->nb[1]));
+             });
+    run_case("CPY of [300, 0] into an empty view", copy, { 300, 4, 1, 1 }, [&](ggml_context * ctx, ggml_tensor * st) {
+        return ggml_cpy(ctx, ggml_view_2d(ctx, rows, 300, 0, rows->nb[1], 0),
+                        ggml_view_2d(ctx, st, 300, 0, st->nb[1], 3 * st->nb[1]));
+    });
+    run_case("CPY of every other row of [16, 16, 3, 2] into row 1 of [768, 2]", copy, { 768, 2, 1, 1 },
+             [&](ggml_context * ctx, ggml_tensor * st) {
+                 ggml_tensor * src = ggml_view_4d(ctx, rows4, 16, 8, 3, 2, 2 * rows4->nb[1], rows4->nb[2],
+                                                  rows4->nb[3], 0);
+                 return ggml_cpy(ctx, src, ggml_view_1d(ctx, st, 768, st->nb[1]));
+             });
+    run_case("CPY of [65536] into row 1 of [65536, 3]", copy, { 65536, 3, 1, 1 },
+             [&](ggml_context * ctx, ggml_tensor * st) {
+                 return ggml_cpy(ctx, ssm, ggml_view_1d(ctx, st, 65536, st->nb[1]));
+             });
+    // the same shape into a non-contiguous destination: the rollback snapshots [512, 2, 3] into a state [512, 12] of 3
+    // slots of 4 cells at cell 1 (nb2 4 rows), and every other row of [16, 16, 3, 2] into half rows of a state
+    // [32, 48] at column 4 (nb1 1 row, nb2 8, nb3 24)
+    run_case("CPY of snapshots [512, 2, 3] into slots of 4 cells of [512, 12]", copy, { 512, 12, 1, 1 },
+             [&](ggml_context * ctx, ggml_tensor * st) {
+                 ggml_tensor * src = ggml_view_3d(ctx, gdn, 512, 2, 3, 512 * sizeof(float), 1024 * sizeof(float),
+                                                  100 * sizeof(float));
+                 return ggml_cpy(ctx, src, ggml_view_3d(ctx, st, 512, 2, 3, st->nb[1], 4 * st->nb[1], st->nb[1]));
+             });
+    run_case("CPY of every other row of [16, 16, 3, 2] into half rows of [32, 48]", copy, { 32, 48, 1, 1 },
+             [&](ggml_context * ctx, ggml_tensor * st) {
+                 ggml_tensor * src = ggml_view_4d(ctx, rows4, 16, 8, 3, 2, 2 * rows4->nb[1], rows4->nb[2],
+                                                  rows4->nb[3], 0);
+                 return ggml_cpy(ctx, src, ggml_view_4d(ctx, st, 16, 8, 3, 2, st->nb[1], 8 * st->nb[1],
+                                                        24 * st->nb[1], 4 * sizeof(float)));
+             });
+
+    // the contracts each claim takes, and what stays refused: a scale with a bias, F16 scales; CPY of F16 into F16 or
+    // F32, of F32 into F16, into a non-contiguous F32 view of another shape or with strided elements, from a transposed
+    // source; the same shape into a non-contiguous view is taken
+    {
+        ggml_init_params p   = { ggml_tensor_overhead() * 32, nullptr, true };
+        ggml_context *   ctx = ggml_init(p);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * st   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 300, 4);
+        ggml_tensor * f32  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 300, 2);
+        ggml_tensor * f16  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 300, 2);
+        ggml_tensor * f16d = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 300, 2);
+        ggml_tensor * sq   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_set_name(st, "cache_r_l0");
+        const auto taken = [&](ggml_tensor * node, const spacemit_plugin_kernel * want) {
+            const spacemit_op * got = spacemit_find_op(ops, node, buft);
+            return got != nullptr && got->n_steps == 1 && got->steps[0] == want;
+        };
+        CHECK(taken(ggml_scale_inplace(ctx, ggml_view_1d(ctx, st, 300, st->nb[1]), 0.0f), scale));
+        CHECK(taken(ggml_cpy(ctx, f32, ggml_view_2d(ctx, st, 300, 2, st->nb[1], 0)), copy));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_scale_bias(ctx, f32, 0.5f, 0.25f)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_scale_bias(ctx, f32, 0.0f, 1.0f)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_scale(ctx, f16, 0.0f)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_cpy(ctx, f16, f16d)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_cpy(ctx, f16, f32)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_cpy(ctx, f32, f16d)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_cpy(ctx, f32, ggml_view_2d(ctx, st, 150, 4, st->nb[1], 0))));
+        CHECK(taken(ggml_cpy(ctx, f32, ggml_view_2d(ctx, st, 300, 2, 2 * st->nb[1], 0)), copy));
+        ggml_tensor * sq_dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_cpy(ctx, ggml_transpose(ctx, sq), sq_dst)));
+        CHECK(!ggml_backend_dev_supports_op(dev, ggml_cpy(ctx, sq, ggml_transpose(ctx, sq_dst))));  // nb0 a row
+        ggml_free(ctx);
+    }
+
+    ggml_backend_buffer_free(buf_h);
+    ggml_free(ctx_h);
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    std::printf("state    the recurrent state's writes, F32 in our buffer and in a CPU buffer: SCALE (0 over infinities "
+                "and NaNs, in place on views, empty, into a new tensor, strided rows) and CPY of F32 (3-D strided into "
+                "2-D, contiguous, empty, 4-D every other row, 65536 floats; the same shape into rollback snapshot slots "
+                "and 4-D half rows) %d/%d bit for bit as the CPU on 8 tiles and directly on 1 and 8; a scale with a "
+                "bias, F16 scales and copies, a non-contiguous destination of another shape or with strided "
+                "elements, a transposed source refused: checked\n",
+                n_same, n_cases);
+    return 0;
+}
+
 static int check_layer(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -6283,7 +6581,8 @@ int main(int argc, char ** argv) {
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_repack_threads(dev, !host) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
-        check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
+        check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 ||
+        check_state_ops(dev) != 0 || check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {
         return 1;
