@@ -2942,6 +2942,18 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 **Closed (2026-11-13):** SpacemiT's engineer accepts the tied head's extra copy (reported by the user), so the memory requirement is met and no zero-copy work is planned. What the provider has is the shared-memory kind: the hardware allows it (the AI cores are cores of the same process and read any of its memory) and the provider declares it (`spacemit_device_supports_buft` accepts every host buffer type, `core/flagos-spacemit.cpp:552-553`; the kernels read operands through their pointers). Left unbuilt, none of them needed for the requirement: `buffer_from_host_ptr` (no start-up or memory gain while weights are repacked), host-visible cache and compute buffers (only a quantized KV cache gains), a head kernel on the file's Q6_K layout. To watch when Qwen3.5 resumes: the loader unmaps the file only outside the span of the CPU-mapped tensors, so while many Qwen3.5 tensors stay on the CPU the originals between them stay mapped; `mem-probe.sh` on that file shows it.
 
+### Repack on spert's X100 backend: probe first (2026-11-13)
+
+**Why:** SpacemiT's engineer, on their fork's open PR 55 (a threaded repack like T6, `std::thread` in the backend): parallel load-time work should run on spert's `spacemit-k3-x100` backend, and one process may hold several spert backends. The user wants this settled before the model work.
+
+**Known, from the 0.6.3 SDK the provider is built with (public release, header read on the Mac):** `spert::backend("spacemit-k3-x100")` and `spert::Stream(handle, config)` exist and the library holds that backend; a backend's worker pool starts with its first stream and lives until the process ends; `Future::sync()` waits by polling. The executor uses only the default backend (`spert::Stream(n_cores)`, `plugin/flagos-spacemit-exec.cpp`). SpacemiT's docs on `main` give the X100 backend's default cores as {4, 5, 6, 7}.
+
+**Design, if adopted:** T6's split unchanged (whole 32-row groups, the unchanged routine on a stand-in tensor per range); the ranges become tiles of one launch on a stream of the X100 backend, created in the plugin at the first weight that splits; `std::thread` stays as the fallback (the Mac build has no spert; a stream may not get its cores). No change to the provider interface.
+
+**Open, board only (`scripts/spert-x100-probe.sh`):** how many cores that backend has and grants (4 against T6's 8 threads: `--bench-repack` gave Q4_0 2074 MiB/s on 4 threads and 3869 on 8); whether its idle workers use CPU, with the stream alive and after it is destroyed; whether it maps `/dev/tcm`; a launch against creating and joining 7 threads; whether it stands beside the A100 stream. The probe asks for no more cores than the backend reports; larger requests are a separate step, off by default, since a request that cannot be met may wait in the arbiter's queue.
+
+**Rule (proposed, the user may prefer SpacemiT's convention whatever the speed):** the X100 route becomes the default if its repack-like rate is within 5% of 8 threads' and its idle workers cost no CPU; otherwise threads stay the default, the X100 route goes behind a switch, and the figures go to SpacemiT's engineer.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
