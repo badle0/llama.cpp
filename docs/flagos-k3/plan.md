@@ -2879,6 +2879,32 @@ Recommended: A alone first. Every repack routine already works in independent gr
 1. A alone first (recommended), or A with B in one step.
 2. 8 threads by default once the rule passes (recommended), or the count of X100 cores read at run time.
 
+### Qwen3.5 probe: what the provider lacks (2026-11-13)
+
+**Status:** measured on the Mac (`build-host`, `45cbcfb0f`) by the `coder` subagent, the 4B run and the file's checksum repeated by me; nothing ran on the K3. The user: Qwen3.5-4B first, then the largest under 30B, which is Qwen3.5-27B (the next size is 35B), both quantized. Script: `scripts/qwen35-probe.sh`.
+
+**File.** `bartowski/Qwen_Qwen3.5-4B-GGUF`, `Qwen_Qwen3.5-4B-Q4_0.gguf` (2,776,033,248 bytes, sha256 `3e977de3...0677a49b` as published). By the headers, the share of matmul weight bytes in a type and shape the provider has a layout for: bartowski Q4_0 99.3%, unsloth Q4_0 91.5% (Q5_K `ssm_out`), bartowski Q4_K_M 42.9%, unsloth Q4_K_M 14.7%; for the 27B 99.4 / 92.9 / 41.4 / 21.4%. A Q4_K or Q5_K weight has no layout and its matmul stays on the CPU (0.8B Q4_K_M: 182 CPU matmuls against 17).
+
+**Architecture (headers and `src/models/qwen35.cpp`).** Layer i is attention when (i+1)%4 == 0, else Gated DeltaNet: 4B 8 + 24 of 32, 27B 16 + 48 of 64, 0.8B 6 + 18. Head size 256 at every size, 4 KV heads (0.8B 2), IMROPE, vocabulary 248,320; the 4B's head is tied to the embedding, the 27B's is not. The op set is the same at every size.
+
+**Result on the 4B.**
+- The default path does not load: llama.cpp aborts at context creation (`ggml-backend.cpp:930`, `cache_r_l0` in a FlagOS:SpacemiT buffer that cannot run `SCALE`): the recurrent state is allocated on the layer's device and its slot clear is a `SCALE` the provider does not claim.
+- With `--no-kv-offload` (KV cache and recurrent state in CPU buffers) it runs: 24 tokens identical to the one-thread CPU run, with `-fa auto` and `-fa on`.
+- Graph splits 385 for a token and 817 reserved for 512 (Qwen3: 1). One token: 653 nodes on the provider (MUL 209, MUL_MAT 201, RMS_NORM 105, ADD 88, SWIGLU 32, SET_ROWS 16, GET_ROWS 2), 840 on the CPU (GET_ROWS 96, CPY 96, SCALE 72, REPEAT 72, MUL 72, MUL_MAT 64, SILU 48, L2_NORM 48, SUM_ROWS 48, SIGMOID 32, CONCAT 24, SOFTPLUS 24, EXP 24, SSM_CONV 24, SUB 24, ADD 24, CONT 24, ROPE 16, SOFT_MAX 8).
+- llama.cpp turns off flash attention and both fused Gated DeltaNet forms because the provider does not take them, so the graph measured is the unfused one; most of the CPU ops above exist only in that form. A prompt batch adds CUMSUM, SOLVE_TRI, TRI, DIAG, FILL, SET, PAD, NEG.
+- Buffers: FlagOS:SpacemiT 2,702 MiB (644 MiB of it the tied head, the Q6_K table requantized to Q8_0), CPU_Mapped 2,441 MiB, KV 64 MiB and recurrent state 50 MiB at 2,048 context.
+
+**Why each op is on the CPU.**
+- Not claimed: `GATED_DELTA_NET` (carries state), `SSM_CONV`, `L2_NORM`, `CONCAT`, `SCALE`, `CONT`, `SOFT_MAX`, plain `SILU`, `SIGMOID`, `SOFTPLUS`, and the unfused form's `SUM_ROWS`, `SUB`, `EXP`, `REPEAT` and the prompt-batch ops.
+- Claimed, this form refused: `ROPE` in IMROPE mode (40; the provider takes 0 and 2), `FLASH_ATTN_EXT` at head size 256 (`max_head_size` 128), `CPY` F32 to F32 (the state write-backs).
+- No layout: `MUL_MAT` on the F32 `ssm_alpha` and `ssm_beta` (48 a token; 32 rows at 4B, so a layout type would fit; 48 rows at 27B never fit the 32-row rule) and on views of the F16 cache (only with flash attention off).
+- Claimed but pulled to the CPU by their neighbours: MUL 72, ADD 24, the state's GET_ROWS 96.
+- SpacemiT's fork has RVV kernels for the Gated DeltaNet (per token and chunked), SSM_CONV with CONCAT fused, ROPE with IMROPE, SILU, SIGMOID, SOFTPLUS (wrong at `855a53b`, fixed later), in its standalone backend; L2_NORM is scalar there. Whether its attention covers head size 256 was not checked.
+
+**Memory on the K3 (estimates; the method gives the Mac's four provider buffers within 0.7 MiB).** 4B Q4_0 about 3.9 GiB at 4,096 context; 27B Q4_0 about 16.3 to 16.8 GiB of 29.8 free. The Q4_K_M files may get a second repacked copy of their CPU-side weights from ggml-cpu (up to 26.5 to 28 GiB at 27B; not verified on riscv64).
+
+**Not measured.** Speed anywhere; the fused graph as a run; anything on the K3; the 27B as a run.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
