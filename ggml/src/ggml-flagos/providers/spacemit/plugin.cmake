@@ -16,6 +16,8 @@ add_library(flagos-provider-spacemit SHARED
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-kernels.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-weights.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-weights.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-x100.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-x100.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.h"

@@ -2,6 +2,7 @@
 
 #include "flagos-spacemit-ime-kernels.h"
 #include "flagos-spacemit-kernels.h"
+#include "flagos-spacemit-x100.h"
 
 #include "../../../../ggml-impl.h"
 
@@ -103,8 +104,46 @@ int repack_threads_from_env() {
     return spacemit_cached_switch(value, seen, parse_repack_threads);
 }
 
+enum repack_via : int { repack_via_threads = 0, repack_via_x100 = 1 };
+
+// FLAGOS_SPACEMIT_REPACK_VIA (plan.md "Repack on spert's X100 backend"): unset, empty or threads: std::thread (T6);
+// x100: the tiles of spine-runtime's X100 backend, threads in a build without spine-runtime. Parsed once
+// (spacemit_cached_switch); x100 without spine-runtime and any other value warn once per parse generation
+int parse_repack_via() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_REPACK_VIA");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "threads") == 0) {
+        return repack_via_threads;
+    }
+#if defined(GGML_FLAGOS_SPACEMIT_SPERT)
+    if (std::strcmp(v, "x100") == 0) {
+        return repack_via_x100;
+    }
+#endif
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        if (std::strcmp(v, "x100") == 0) {
+            GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=x100: no spine-runtime in this build, threads kept\n",
+                          __func__);
+        } else {
+            GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=%s: not threads or x100, the default threads kept\n",
+                          __func__, v);
+        }
+    }
+    return repack_via_threads;
+}
+
+int repack_via_from_env() {
+    static std::atomic<int>      value{ repack_via_threads };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_repack_via);
+}
+
 // test-only (spacemit_repack_take): the repacks that ran on several threads, and the most ranges one of them used
 std::atomic<uint64_t> g_repack_threaded{ 0 }, g_repack_max_ranges{ 0 };
+// test-only (spacemit_repack_x100_take): under x100 the weights repacked through an admitted launch, those that fell
+// back to the calling thread, and the ranges run again on the calling thread
+std::atomic<uint64_t> g_repack_x100_through{ 0 }, g_repack_x100_not_through{ 0 }, g_repack_x100_reran{ 0 };
 
 int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, size_t size) {
     switch (layout) {
@@ -122,10 +161,28 @@ int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, 
     return -1;
 }
 
+// the ranges of one split weight, for spacemit_x100_run
+struct pack_ranges {
+    spacemit_layout      layout;
+    ggml_tensor *        parts;
+    const char * const * srcs;
+    const size_t *       sizes;
+    int *                rcs;
+};
+
+void pack_range(void * arg, uint32_t i) {
+    const pack_ranges & r = *static_cast<const pack_ranges *>(arg);
+    r.rcs[i]              = spacemit_repack(r.layout, &r.parts[i], r.srcs[i], r.sizes[i]);
+}
+
 }  // namespace
 
 uint32_t spacemit_repack_threads() {
     return (uint32_t) repack_threads_from_env();
+}
+
+uint32_t spacemit_repack_via() {
+    return (uint32_t) repack_via_from_env();
 }
 
 void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges) {
@@ -133,16 +190,38 @@ void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges) {
     *max_ranges = g_repack_max_ranges.exchange(0);
 }
 
+void spacemit_repack_x100_take(uint64_t * through_stream, uint64_t * not_through, uint64_t * reran) {
+    *through_stream = g_repack_x100_through.exchange(0);
+    *not_through    = g_repack_x100_not_through.exchange(0);
+    *reran          = g_repack_x100_reran.exchange(0);
+}
+
 // A weight of several 32-row groups and at least repack_min_bytes is cut into up to FLAGOS_SPACEMIT_REPACK_THREADS
 // ranges of whole groups, each repacked by the same routine on a stand-in tensor of its rows (plan.md "T6 spec"): every
-// routine works group by group, so the bytes are the one-thread bytes. The first range runs on the calling thread
+// routine works group by group, so the bytes are the one-thread bytes. The first range runs on the calling thread.
+// Under FLAGOS_SPACEMIT_REPACK_VIA=x100 the other ranges are tiles on the X100 backend, at most its cores + 1 ranges,
+// and no thread is started
 static void spacemit_pack(ggml_tensor * t, const void * data) {
     const spacemit_layout layout = spacemit_weight_layout(t);
     const size_t          size   = ggml_nbytes(t);
     const int64_t         groups = t->ne[1] / (int64_t) spacemit_ime::row_tile;
-    const int64_t         n      = layout == spacemit_layout::plain || size < repack_min_bytes || groups <= 1 ?
-                                       1 :
-                                       std::min<int64_t>(repack_threads_from_env(), groups);
+    const bool            split  = !(layout == spacemit_layout::plain || size < repack_min_bytes || groups <= 1);
+    int64_t               n      = split ? std::min<int64_t>(repack_threads_from_env(), groups) : 1;
+    const bool            x100   = n > 1 && repack_via_from_env() == repack_via_x100;
+    if (x100) {  // the backend starts (workers, /dev/tcm) at the first such weight
+        const uint32_t cores = spacemit_x100_cores();
+        if (cores == 0) {
+            static std::atomic<bool> warned{ false };
+            if (!warned.exchange(true)) {
+                GGML_LOG_WARN("FlagOS SpacemiT: FLAGOS_SPACEMIT_REPACK_VIA=x100: the X100 backend has no cores; "
+                              "weights repack on the calling thread\n");
+            }
+            g_repack_x100_not_through.fetch_add(1, std::memory_order_relaxed);
+            n = 1;
+        } else {
+            n = std::min<int64_t>(n, (int64_t) cores + 1);
+        }
+    }
     if (n == 1) {
         GGML_ASSERT(spacemit_repack(layout, t, data, size) == 0 && "tensor does not fit its IME layout");
         return;
@@ -172,18 +251,26 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
     }
     GGML_ASSERT(row0 == t->ne[1]);
 
-    std::vector<std::thread> workers;
-    workers.reserve((size_t) n - 1);
-    for (int64_t i = 1; i < n; i++) {
-        try {
-            workers.emplace_back([&, i] { rcs[i] = spacemit_repack(layout, &parts[i], srcs[i], sizes[i]); });
-        } catch (const std::system_error &) {
-            rcs[i] = spacemit_repack(layout, &parts[i], srcs[i], sizes[i]);  // no thread: this range here
+    if (x100) {
+        pack_ranges ranges = { layout, parts.data(), srcs.data(), sizes.data(), rcs.data() };
+        uint32_t    reran  = 0;
+        const bool  ran    = spacemit_x100_run((uint32_t) n, pack_range, &ranges, &reran);
+        (ran ? g_repack_x100_through : g_repack_x100_not_through).fetch_add(1, std::memory_order_relaxed);
+        g_repack_x100_reran.fetch_add(reran, std::memory_order_relaxed);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve((size_t) n - 1);
+        for (int64_t i = 1; i < n; i++) {
+            try {
+                workers.emplace_back([&, i] { rcs[i] = spacemit_repack(layout, &parts[i], srcs[i], sizes[i]); });
+            } catch (const std::system_error &) {
+                rcs[i] = spacemit_repack(layout, &parts[i], srcs[i], sizes[i]);  // no thread: this range here
+            }
         }
-    }
-    rcs[0] = spacemit_repack(layout, &parts[0], srcs[0], sizes[0]);
-    for (std::thread & w : workers) {
-        w.join();
+        rcs[0] = spacemit_repack(layout, &parts[0], srcs[0], sizes[0]);
+        for (std::thread & w : workers) {
+            w.join();
+        }
     }
 
     g_repack_threaded.fetch_add(1, std::memory_order_relaxed);

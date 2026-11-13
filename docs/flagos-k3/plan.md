@@ -2954,6 +2954,34 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 **Rule (proposed, the user may prefer SpacemiT's convention whatever the speed):** the X100 route becomes the default if its repack-like rate is within 5% of 8 threads' and its idle workers cost no CPU; otherwise threads stay the default, the X100 route goes behind a switch, and the figures go to SpacemiT's engineer.
 
+**Probe on the K3 (2026-11-13, `98c7e5c6c`, spine-runtime 0.6.3, one run; logs `~/k3-logs/spert-x100`):** rc 0, every checksum equal.
+- The backend: valid, 4 cores, its tiles on CPUs 4-7 (4 threads), `vlen` 32 bytes, 384 KiB per core. Requests of 0, 4 and 2 cores granted in 0.01-0.35 ms, released in 0.01-0.02 ms. Not asked: more than 4.
+- It maps `/dev/tcm`, and starts its 4 workers, at `spert::backend()` already (threads 1 to 5, `tcm=no` to `yes` after the `info` step), not at the first stream as the header says.
+- Repack-like pass over 1 GiB (nibble swap and xor, 927 MiB/s on one thread), median of 5, MiB/s: 8 threads 3882 (3501 to 5501), 4 threads 2774, 4 X100 tiles 3585, 4 tiles and the caller 3486. So 4 pinned tiles are 29% above 4 threads and 7.6% under 8 threads on this pass. The pass is lighter than any real repack and gains only 4.2x from 8 threads, so memory bounds it; `--bench-repack` gains 7.0x (Q4_0) to 7.9x (Q6_K) from 8 threads, so for the real routines 4 or 5 workers should fall further behind 8 (a prediction).
+- One empty launch and sync 6.0 us; creating and joining 7 threads 362 us.
+- Idle workers use no CPU: 0.000 s in 2 s with the stream alive, 0.002 s after its destroy; the 4 workers stay for the life of the process.
+- Beside it the default backend gave `Stream(8)` its 8 cores on CPUs 8-15, and the X100 pass ran at 3688 MiB/s meanwhile.
+
+**By the rule:** not within 5% of 8 threads, so threads stay the default and the X100 route goes behind a switch, to be measured on the real repack.
+
+**Spec (for review; not started):** a switch `FLAGOS_SPACEMIT_REPACK_VIA`, `threads` (unset, the default) or `x100`; any other value warns once and keeps the default.
+- `plugin/flagos-spacemit-weights.cpp`, `spacemit_pack`: the split is T6's. With `x100` in a spert build, a weight that splits takes `spert::backend("spacemit-k3-x100")` (once per process) and a stream of all its cores for this call; the ranges are min(`FLAGOS_SPACEMIT_REPACK_THREADS`, groups, granted cores + 1), range 0 on the calling thread and the others the tiles of one launch, then `Future::sync()`; the stream is destroyed before the return, so the grant is held only while a weight repacks (0.03 ms to take, by the probe). An invalid handle or stream, a refused launch or a status other than `Ok` makes this weight's remaining ranges run on the calling thread and warns once; a tile that failed part-way reruns whole, the routines being idempotent on their range.
+- Without spert (the Mac's build) `x100` warns once and is `threads`.
+- Counters: `spacemit_repack_take` also reports the weights repacked through the stream; the check program prints them.
+- Checks: the switch's values; on the device, the bytes of every layout through `x100` equal the one-thread bytes (`flagos-check-spacemit --expect-device`); `--bench-repack` gains the `x100` rate beside 1, 2, 4 and 8 threads.
+- On the K3: the checks, `--bench-repack`, the start-up script on both Qwen3 models under `threads` and `x100` taking turns, the runner once under `x100`.
+- Rule: `x100` becomes the default if the weights stage is within 5% of `threads` on both models; otherwise `threads` stays and the figures go to SpacemiT's engineer, with the question whether the X100 backend can expose all 8 cores.
+- To record with it: under `x100` the process maps `/dev/tcm` from the model load on, so it counts for the `/dev/tcm` check earlier than today; whether that backend writes to TCM is not known.
+
+**As built (2026-11-13; the user: the path SpacemiT's engineer points to, four tiles and the calling thread, and measure).** By the `coder` subagent, read and rerun by me. The default is unchanged (`threads`).
+- `plugin/flagos-spacemit-x100.{h,cpp}` (new): `spacemit_x100_cores` (the backend's `num_cores`, once per process, 0 without it) and `spacemit_x100_run(n, fn, arg, reran)`: a stream of n - 1 cores for the call, one launch of n - 1 tiles for indexes 1 to n - 1 while the calling thread runs index 0, the sync, the stream released, then any index whose tile did not finish run again on the calling thread. No backend, no stream or a refused launch: every index on the calling thread, one warning per process. No `std::thread` in the file.
+- `spacemit_pack`: under `x100` the ranges are min(`FLAGOS_SPACEMIT_REPACK_THREADS`, groups, cores + 1), so 5 on the K3; a backend without cores repacks the weight on the calling thread. With `FLAGOS_SPACEMIT_REPACK_THREADS=1` the backend is never started. The `threads` branch is T6's code.
+- Test names `spacemit_repack_via` and `spacemit_repack_x100_take` (weights through an admitted launch, weights not through, ranges rerun). `flagos-check-spacemit`: the switch's values; with spine-runtime, every layout and shape under `x100` against the one-thread bytes, stored and read back, and the counters; `--bench-repack` gains an `x100` column. `rvv-syntax-check.sh` takes `SPERT_INCLUDE` to check the spine-runtime code.
+
+**On the Mac (rerun by me).** `build-host` without warnings; the check program passes with the switch unset, `threads` and `x100` (which warns and is `threads` here, the `x100` comparisons printed as skipped). The new file alone against the real 0.6.3 header and a thread-backed stand-in for spert, plain and under UBSan: every index once for n = 2 to 9, with fewer cores granted, with no stream, with a refused launch, and with one tile dropped (rerun once); the coder's mutation (no rerun) fails that case. The riscv64 syntax check with the 0.6.3 header on the four plugin files: 0 errors. By the coder, not rerun by me: `build-nohost`, test-backend-ops `MUL_MAT` 3/3, Qwen3-0.6B's 24 tokens unchanged. **Not run anywhere yet:** the provider's real spine-runtime path, which the Mac cannot run; its first compile against `libspert` and its first run are the K3's. Not run: ThreadSanitizer.
+
+**Open on the failure path, by reading:** after a sync that is not `Ok` the stream is destroyed and the unfinished ranges rerun; the header says the destroy cancels outstanding work but not that it waits for a tile in mid-run.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.

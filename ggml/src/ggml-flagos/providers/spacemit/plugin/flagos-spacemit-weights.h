@@ -45,6 +45,12 @@ bool spacemit_tensor_is_repacked(const ggml_tensor * t);
 // FLAGOS_SPACEMIT_REPACK_THREADS as parsed (1 to 16): the threads a whole-weight repack may use. Read at registration
 // too, as spacemit_embd_read_switch, so a bad value's warning shows
 uint32_t spacemit_repack_threads();
-// test-only: the repacks since the last call that ran on several threads, and the most ranges one of them used.
-// flagos-check-spacemit checks FLAGOS_SPACEMIT_REPACK_THREADS by it
+// test-only: the repacks since the last call that ran on several threads (on either route), and the most ranges one of
+// them used. flagos-check-spacemit checks FLAGOS_SPACEMIT_REPACK_THREADS by it
 void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges);
+// FLAGOS_SPACEMIT_REPACK_VIA as parsed: 0 threads, 1 x100 (only in a build with spine-runtime). Read at registration
+// too, so a bad value's warning shows
+uint32_t spacemit_repack_via();
+// test-only: under x100 since the last call, the weights repacked through an admitted launch, those that fell back to
+// the calling thread (no cores, no stream, launch refused), and the ranges run again on the calling thread
+void spacemit_repack_x100_take(uint64_t * through_stream, uint64_t * not_through, uint64_t * reran);

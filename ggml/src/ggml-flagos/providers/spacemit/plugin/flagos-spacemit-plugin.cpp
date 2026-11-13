@@ -167,6 +167,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     spacemit_flash_attn_read_switch();
     spacemit_embd_read_switch();
     (void) spacemit_repack_threads();
+    (void) spacemit_repack_via();
     return SPACEMIT_STATUS_SUCCESS;
 }
 
@@ -442,6 +443,12 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_repack_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_repack_take_fn>(spacemit_repack_take));
+    }
+    if (std::strcmp(name, "spacemit_repack_via") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_repack_via_fn>(spacemit_repack_via));
+    }
+    if (std::strcmp(name, "spacemit_repack_x100_take") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_repack_x100_take_fn>(spacemit_repack_x100_take));
     }
     if (std::strcmp(name, "spacemit_run_stats_attach") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_run_stats_attach_fn>(spacemit_run_stats_attach));
