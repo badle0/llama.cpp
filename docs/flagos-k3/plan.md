@@ -2967,6 +2967,31 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 **Not measured.** Speed as a benchmark; the fused graph as a run; the 27B as a run; anything on Qwen3.6-35B-A3B.
 
+*As built (2026-11-14; three coders in parallel worktrees, merged and verified by me).* 25 contracts on 27 kernels (`spacemit_ops::ops[32]`), the plugin API version still 1.
+- A. `gdn.f32` (`plugin/flagos-spacemit-gdn.cpp`): the reference is ggml-cpu's kernel with its vector calls written out in index order; the RVV variant is SpacemiT's `forward_gated_delta_net_one_chunk` and `rvv_dot_f32` (upstream master's `ggml-cpu/spacemit/rvv_kernels.cpp`, fetched 2026-11-13), the row range and the scratch taken from the tile. The scratch is a per-tile slice of the shared workspace; the state side is bounded at 256. Not ggml-cpu's bits (its dot and multiply-add are SIMD): checked within NMSE 1e-6, our own repeat and 1 against 8 tiles bit for bit.
+- B. `max_head_size` 128 to 256 in the plugin's attention; the RVV attention kernels keep their own limit of 128 (one register group), so head sizes 129 to 256 run the scalar references on the K3 too: a speed item for step 4. `ROPE` takes mode 40 (IMROPE), always on the reference kernel (the RVV kernel's IMROPE branch has never run).
+- C. `silu.f32`, `sigmoid.f32`, `softplus.f32`, `l2_norm.f32`, `ssm_conv.f32`, `concat.f32` (dimension 0, any source strides: the model's second source is a transposed view), `CONT` on `cpy.f32`'s kernel, `mul_mat.f32` (a 2-D contiguous F32 weight that is not a view). References only: no SSM_CONV body to port was found in SpacemiT's published branches beyond ggml-cpu's own loop. With `SSM_CONV` and the F32 `MUL_MAT` claimed, the loader places `ssm_conv1d`, `ssm_alpha` and `ssm_beta` in the provider's buffer in the file's layout (+18 MiB), and `CPU_Mapped` falls from 2,441 to 497 MiB (it is a span of the file, which those weights stretched).
+- The runner's op list: the nine new names (`MUL_MAT_HADAMARD` is a test-backend-ops case the F32 matmul now claims), 20 ops and 4 graphs.
+
+*On the Mac (the merged tree, the host-test device, rerun by me).* The check program passes: `gdn` 30/30, `seq` 82/82, the attention cases at 129, 192 and 256 and IMROPE with it. test-backend-ops on the provider: GATED_DELTA_NET 36/36, SILU 4/4, SIGMOID 4/4, SOFTPLUS 4/4, L2_NORM 20/20, SSM_CONV 45/45, CONCAT 4/4, CONT 8/8, MUL_MAT 32/32 (was 3/3), MUL_MAT_HADAMARD 8/8, ROPE 341/341 (273), FLASH_ATTN_EXT 1794/1794 (1324), CPY 72/72, SCALE 1/1; the whole sweep ends OK. Qwen3.5-4B Q4_0: flash attention and both fused forms enabled, **1 split**, the one-token graph's 1,149 nodes all on the provider, rc 0 with `-fa auto` and `-fa on`, the text the one-thread CPU's. Qwen3-0.6B (24 tokens) and Qwen3-4B (16) as the one-thread CPU, 1 split. The riscv64 syntax check on the five plugin files touched: 0 errors. By the coders, not rerun by me: one mutation per kernel fails a check (piece C's first softplus mutation passed, cases with values to +-40 were added and it fails now); a 1,552-token prompt in 512-token batches as the one-thread CPU. Not run: the RVV Gated DeltaNet kernel anywhere (compiled-only), ThreadSanitizer, the server and speculative decoding, anything on the K3.
+
+#### Qwen3.6-35B-A3B header probe (2026-11-13; headers only, by a subagent, not rerun by me; nothing run)
+
+*Files.* `unsloth/Qwen3.6-35B-A3B-GGUF` `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (20.61 GiB) and `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` `Qwen_Qwen3.6-35B-A3B-Q4_0.gguf` (19.41 GiB, the only plain Q4_0 found; it carries an MTP block `blk.40` of 0.84 GiB that the loader skips unless asked).
+
+*Architecture.* `qwen35moe`, built by `src/models/qwen35moe.cpp`: 40 blocks, 10 attention (every fourth) and 30 Gated DeltaNet, embedding 2,048, 16 heads, 2 KV heads, head size 256, 256 experts of width 512 with 8 used, plus a shared expert. The head is not tied (`output.weight` is in the files).
+
+*Where the bytes are.* The 3-D expert tensors (`ffn_gate_exps`, `ffn_up_exps` [2048, 512, 256], `ffn_down_exps` [512, 2048, 256]) are 88.5% of the Q4_K_M file (Q4_K 80, Q5_K 37, Q6_K 3) and 91.5% of the Q4_0 file (Q4_0 except `ffn_down_exps` of layers 0-4 in Q4_1). In the Q4_K_M file every 2-D weight is Q8_0 or Q6_K: Q4_K and Q5_K occur only in the expert tensors. The Q4_0 file's 2-D weights mix Q4_0, Q8_0, Q6_K and Q5_0 (60 shared-expert weights in 20 layers).
+
+*What the provider lacks beyond Qwen3.5-4B's step 2.*
+- Ops of the MoE feed-forward (`build_moe_ffn`, `src/llama-graph.cpp:1915`): `MUL_MAT_ID` on the expert tensors (3 a layer), `ARGSORT`, `SOFT_MAX`, `SUM_ROWS`, `CLAMP`, `DIV`; `MUL_MAT` on the F32 router `ffn_gate_inp` [2048, 256] and the 1-D `ffn_gate_inp_shexp`.
+- Layouts: none for a 3-D tensor of any type (`spacemit_weight_layout` returns plain when `ne[2] != 1`), none for Q4_K, Q5_K, Q5_0.
+- Every 2-D quantized weight keeps the 32-row rule.
+
+*Memory (estimates, weights only, by the present rule that only 2-D Q4_1 and Q6_K grow).* Q4_K_M 20.72 GiB, Q4_0 19.53 GiB (18.69 without the MTP block), of 29.8 GiB free. Requantizing the Q4_K_M expert tensors to Q8_0 would be 34.4 GiB and does not fit: the Q4_K_M route needs kernels on Q4_K and Q5_K themselves; the Q4_0 file needs only a Q4_0 `MUL_MAT_ID` (and Q4_1 for five tensors, +0.55 GiB if taken as Q8_0).
+
+*Not determined.* Anything at run time; whether the MoE graph falls back to the CPU cleanly today; the recurrent state and compute buffers.
+
 ### Memory probe: does the provider hold weights twice (2026-11-13)
 
 **Why:** SpacemiT's engineer (through the user, 2026-11-13): the point of zero copy is that running on the provider adds no memory; where a repack is needed, the original weights must be dropped.

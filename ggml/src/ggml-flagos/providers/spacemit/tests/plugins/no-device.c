@@ -124,6 +124,14 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "flash_attn.kvh.merge", fake_step, NULL, NULL },
         { "scale.f32", fake_step, NULL, NULL },
         { "cpy.f32", fake_step, NULL, NULL },
+        { "gdn.f32", fake_step, NULL, NULL },
+        { "silu.f32", fake_step, NULL, NULL },
+        { "sigmoid.f32", fake_step, NULL, NULL },
+        { "softplus.f32", fake_step, NULL, NULL },
+        { "l2_norm.f32", fake_step, NULL, NULL },
+        { "ssm_conv.f32", fake_step, NULL, NULL },
+        { "concat.f32", fake_step, NULL, NULL },
+        { "mul_mat.f32", fake_step, NULL, NULL },
     };
     if (count != NULL) {
         *count = sizeof(kernels) / sizeof(kernels[0]);

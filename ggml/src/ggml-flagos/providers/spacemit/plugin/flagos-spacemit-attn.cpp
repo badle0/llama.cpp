@@ -23,8 +23,10 @@
 
 namespace {
 
-// largest DK and DV: one register group of the RVV kernels at VLEN 1024, and the reference's local arrays
-constexpr int64_t max_head_size = 128;
+// largest DK and DV of the claim and of the references' local arrays (2 KiB of stack at most per frame, as the RVV
+// ROPE's table). The RVV kernels take up to 128 (spacemit_rvv_attn::supported_shape); larger heads (Qwen3.5: 256)
+// run the references on every build
+constexpr int64_t max_head_size = 256;
 
 // ggml-cpu's tile size (ggml_fa_tile_config::Q, as in ime.cpp): its tiled kernel from this many tokens per head, and
 // the largest value of FLAGOS_SPACEMIT_ATTN_TILED
@@ -576,7 +578,7 @@ void kvh_partial_ref(const ggml_tensor * dst, int64_t n_chunks, int64_t ith, int
 
 }  // namespace
 
-// FLASH_ATTN_EXT: F32 q and F16 K and V, each with contiguous rows; DK (q's and K's row length) and DV in 1..128;
+// FLASH_ATTN_EXT: F32 q and F16 K and V, each with contiguous rows; DK (q's and K's row length) and DV in 1..256;
 // query heads broadcast over the K and V heads (GQA), streams do not; mask absent or F16 covering n_kv and the rows,
 // broadcast over heads and streams as ggml allows; sinks absent or F32, one per query head; dst as ggml_flash_attn_ext
 // makes it (the kernels write whole rows of it, permuted). ALiBi and softcap included: the kernels and the reference

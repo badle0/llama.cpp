@@ -4,8 +4,10 @@
 #   (with --full: Qwen3-4B's shapes), with the reference kernels on the AI cores and with FLAGOS_SPACEMIT_DISABLE=1 (no
 #   device); the plugin loaded through the loader; llama.cpp lists the device; the provider claims exactly ADD, MUL,
 #   RMS_NORM, ROPE, SET_ROWS, GET_ROWS, SWIGLU, MUL_MAT (Q4_0, Q4_1, Q8_0 and Q6_K weights in their IME layouts),
-#   FLASH_ATTN_EXT (F16 K and V, head sizes up to 128), CPY (F32 into the quantized and BF16 cache types, and F32
-#   into F32) and SCALE (F32, no bias), and
+#   FLASH_ATTN_EXT (F16 K and V, head sizes up to 256), CPY (F32 into the quantized and BF16 cache types, and F32
+#   into F32), SCALE (F32, no bias) and GATED_DELTA_NET (F32, the shapes ggml_gated_delta_net builds, state side up
+#   to 256), SILU, SIGMOID, SOFTPLUS, L2_NORM, SSM_CONV, CONCAT along dimension 0, CONT and MUL_MAT on a plain F32
+#   weight (all F32), and
 #   test-backend-ops passes for each and for the multi-op graphs built from them, with the RVV and with the reference
 #   kernels; the benchmark of the check program;
 #   a model run with the provider and with FLAGOS_SPACEMIT_DISABLE=1 (the IME kernels quantize activations differently
@@ -47,7 +49,9 @@ REPO = Path(__file__).resolve().parents[6]
 DEVICE = "FlagOS:SpacemiT:0"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # the ops the provider claims (GLU cases are named by their GLU op), and the test-backend-ops graphs that chain them
-OPS = ["ADD", "MUL", "RMS_NORM", "ROPE", "SET_ROWS", "GET_ROWS", "SWIGLU", "MUL_MAT", "FLASH_ATTN_EXT", "CPY", "SCALE"]
+OPS = ["ADD", "MUL", "RMS_NORM", "ROPE", "SET_ROWS", "GET_ROWS", "SWIGLU", "MUL_MAT", "FLASH_ATTN_EXT", "CPY", "SCALE",
+       "GATED_DELTA_NET", "SILU", "SIGMOID", "SOFTPLUS", "L2_NORM", "SSM_CONV", "CONCAT", "CONT",
+       "MUL_MAT_HADAMARD"]
 GRAPHS = ["RMS_NORM_MUL_ADD", "ADD_RMS_NORM", "RMS_NORM_MUL_ROPE", "ROPE_SET_ROWS"]
 results = []
 preload = {}  # LD_PRELOAD for the model runs (--segv)

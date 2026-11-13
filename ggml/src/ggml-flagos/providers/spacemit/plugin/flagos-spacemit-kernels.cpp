@@ -158,6 +158,42 @@ void ggml_rope_cache_init(float theta_base, float freq_scale, const float * freq
     }
 }
 
+// ops.cpp ggml_mrope_cache_init, copied for IMROPE only (is_imrope true, indep_sects false)
+void ggml_imrope_cache_init(float theta_base_t, float theta_base_h, float theta_base_w, float theta_base_e,
+                            const int sections[4], float freq_scale, const float * freq_factors, float corr_dims[2],
+                            int64_t ne0, float ext_factor, float mscale, float * cache, float sin_sign,
+                            float theta_scale) {
+    float theta_t   = theta_base_t;
+    float theta_h   = theta_base_h;
+    float theta_w   = theta_base_w;
+    float theta_e   = theta_base_e;
+    int   sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+
+    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+
+        int   sector = (i0 / 2) % sect_dims;
+        float theta  = theta_t;
+        if (sector % 3 == 1 && sector < 3 * sections[1]) {
+            theta = theta_h;
+        } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
+            theta = theta_w;
+        } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+            theta = theta_t;
+        } else {
+            theta = theta_e;
+        }
+
+        rope_yarn(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]);
+        cache[i0 + 1] *= sin_sign;
+
+        theta_t *= theta_scale;
+        theta_w *= theta_scale;
+        theta_h *= theta_scale;
+        theta_e *= theta_scale;
+    }
+}
+
 // the element types ROPE takes, read as float and written back
 template <typename T> struct rope_elem;
 
@@ -199,7 +235,7 @@ int64_t rope_cache_floats(const ggml_tensor * node) {
     return node->ne[0] + 64 / (int64_t) sizeof(float);
 }
 
-// ops.cpp ggml_compute_forward_rope_flt<T> (float or ggml_fp16_t), forward, modes NORMAL and NEOX
+// ops.cpp ggml_compute_forward_rope_flt<T> (float or ggml_fp16_t), forward, modes NORMAL, NEOX and IMROPE
 template <typename T> void rope_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -217,6 +253,9 @@ template <typename T> void rope_ref(const spacemit_tile & tile, ggml_tensor * ds
     std::memcpy(&attn_factor, (int32_t *) dst->op_params + 8, sizeof(float));
     std::memcpy(&beta_fast, (int32_t *) dst->op_params + 9, sizeof(float));
     std::memcpy(&beta_slow, (int32_t *) dst->op_params + 10, sizeof(float));
+    int sections[4];
+    std::memcpy(sections, (int32_t *) dst->op_params + 11, sizeof(int) * 4);
+    const bool imrope = mode == GGML_ROPE_TYPE_IMROPE;
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -240,8 +279,14 @@ template <typename T> void rope_ref(const spacemit_tile & tile, ggml_tensor * ds
         if (i2 != last_i2) {
             // flagos: filled to n_dims, not ne0 as in ggml-cpu, which reads the n_dims/2 frequency factors past their
             // end when n_dims < ne0 (the entries past n_dims are never used)
-            ggml_rope_cache_init(pos[i2], freq_scale, freq_factors, corr_dims, n_dims, ext_factor, attn_factor, cache,
-                                 1.0f, theta_scale);
+            if (imrope) {
+                ggml_imrope_cache_init(pos[i2], pos[i2 + ne2], pos[i2 + ne2 * 2], pos[i2 + ne2 * 3], sections,
+                                       freq_scale, freq_factors, corr_dims, n_dims, ext_factor, attn_factor, cache,
+                                       1.0f, theta_scale);
+            } else {
+                ggml_rope_cache_init(pos[i2], freq_scale, freq_factors, corr_dims, n_dims, ext_factor, attn_factor,
+                                     cache, 1.0f, theta_scale);
+            }
             last_i2 = i2;
         }
 
@@ -473,11 +518,13 @@ bool spacemit_kernel_rms_norm_f32(const spacemit_tile * tile_p, ggml_tensor * ds
     return true;
 }
 
-// forward_rope_f32 takes F32 only (its branch for other types converts with casts, wrong for ggml_fp16_t)
+// forward_rope_f32 takes F32 only (its branch for other types converts with casts, wrong for ggml_fp16_t); IMROPE
+// goes to the reference on every build (forward_rope_impl's IMROPE branch is not checked on the K3)
 bool spacemit_kernel_rope(const spacemit_tile * tile_p, ggml_tensor * dst) {
     const spacemit_tile & tile = *tile_p;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-    if (dst->type == GGML_TYPE_F32 && !spacemit_use_reference()) {
+    if (dst->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 2) != GGML_ROPE_TYPE_IMROPE &&
+        !spacemit_use_reference()) {
         auto ctx = rvv_context(tile);
         spacemit_rvv::forward_rope_f32(ctx, dst);
         return true;

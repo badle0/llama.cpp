@@ -7,8 +7,10 @@
 
 #include "flagos-spacemit-attn.h"
 #include "flagos-spacemit-exec.h"
+#include "flagos-spacemit-gdn.h"
 #include "flagos-spacemit-ime.h"
 #include "flagos-spacemit-kernels.h"
+#include "flagos-spacemit-seq.h"
 #include "../core/flagos-spacemit-ops.h"
 #include "flagos-spacemit-weights.h"
 
@@ -378,6 +380,14 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
           spacemit_flash_attn_kvh_workspace                                                                                    },
         { "scale.f32",        spacemit_kernel_scale_f32,     nullptr,                     nullptr                              },
         { "cpy.f32",          spacemit_kernel_cpy_f32,       nullptr,                     nullptr                              },
+        { "gdn.f32",          spacemit_kernel_gated_delta_net, nullptr,                   spacemit_gdn_workspace               },
+        { "silu.f32",         spacemit_kernel_silu_f32,      nullptr,                     nullptr                              },
+        { "sigmoid.f32",      spacemit_kernel_sigmoid_f32,   nullptr,                     nullptr                              },
+        { "softplus.f32",     spacemit_kernel_softplus_f32,  nullptr,                     nullptr                              },
+        { "l2_norm.f32",      spacemit_kernel_l2_norm_f32,   nullptr,                     nullptr                              },
+        { "ssm_conv.f32",     spacemit_kernel_ssm_conv_f32,  nullptr,                     nullptr                              },
+        { "concat.f32",       spacemit_kernel_concat_f32,    nullptr,                     nullptr                              },
+        { "mul_mat.f32",      spacemit_kernel_mul_mat_f32,   nullptr,                     nullptr                              },
     };
     if (count != nullptr) {
         *count = sizeof(kernels) / sizeof(kernels[0]);

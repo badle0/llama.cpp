@@ -50,18 +50,26 @@ static bool spacemit_rms_norm_f32_supported(const ggml_tensor * op, const spacem
 
 // ROPE (forward): F32 or F16 rows into rows of the same type (F16: the context shift's ROPE in place on the KV cache,
 // src/llama-kv-cache.cpp:1878-1883); modes NORMAL and NEOX; I32 positions, one per token; optional F32 frequency
-// factors; the channels past n_dims are copied in pairs, so ne0 is even
+// factors; the channels past n_dims are copied in pairs, so ne0 is even. IMROPE (Qwen3.5, ggml_rope_multi): four
+// positions per token, sections >= 0 with one of the first three > 0 and their sum at most ne0 (ggml-cpu's asserts)
 static bool spacemit_rope_supported(const ggml_tensor * op, const spacemit_plugin_v1 *, ggml_backend_buffer_type_t) {
     const ggml_tensor * src0   = op->src[0];
     const ggml_tensor * pos    = op->src[1];
     const ggml_tensor * ff     = op->src[2];
     const int           n_dims = ggml_get_op_params_i32(op, 1);
     const int           mode   = ggml_get_op_params_i32(op, 2);
+    const bool          imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    bool                sections_ok = !imrope;
+    if (imrope) {
+        const int32_t * s = (const int32_t *) op->op_params + 11;
+        sections_ok       = s[0] >= 0 && s[1] >= 0 && s[2] >= 0 && s[3] >= 0 && (s[0] > 0 || s[1] > 0 || s[2] > 0) &&
+                      (int64_t) s[0] + s[1] + s[2] + s[3] <= src0->ne[0];
+    }
     return spacemit_f32_f16_rows(op) && spacemit_f32_f16_rows(src0) && op->type == src0->type &&
            ggml_are_same_shape(src0, op) &&
-           (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) && n_dims > 0 && n_dims % 2 == 0 &&
-           n_dims <= src0->ne[0] && src0->ne[0] % 2 == 0 && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) &&
-           pos->ne[0] >= src0->ne[2] &&
+           (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX || imrope) && sections_ok && n_dims > 0 &&
+           n_dims % 2 == 0 && n_dims <= src0->ne[0] && src0->ne[0] % 2 == 0 && pos->type == GGML_TYPE_I32 &&
+           ggml_is_contiguous(pos) && pos->ne[0] >= (imrope ? 4 : 1) * src0->ne[2] &&
            (ff == nullptr || (ff->type == GGML_TYPE_F32 && ggml_is_contiguous(ff) && ff->ne[0] >= n_dims / 2));
 }
 
@@ -133,6 +141,154 @@ static bool spacemit_scale_f32_supported(const ggml_tensor * op, const spacemit_
     std::memcpy(&bias, (const float *) op->op_params + 1, sizeof(float));
     return spacemit_f32_rows(op) && spacemit_f32_rows(op->src[0]) && ggml_are_same_shape(op->src[0], op) &&
            bias == 0.0f;
+}
+
+// the largest state side (S_v) gdn.f32 claims: Qwen3.5 uses 128 (plan.md "Qwen3.5 probe"). The kernel's scratch is
+// S_v * S_v floats per tile when K > 1, taken from the shared workspace, so a far larger state would ask for a far
+// larger workspace; such a node stays on the CPU
+static constexpr int64_t k_gdn_max_state = 256;
+
+// GATED_DELTA_NET (the fused Gated DeltaNet step, src/models/delta-net-base.cpp:402 and :567): every operand and the
+// output F32 and shaped exactly as ggml_gated_delta_net (ggml/src/ggml-cpu/ops.cpp's kernel reads them so):
+//   v [S_v, H, n_tokens, n_seqs] with contiguous rows, the state [S_v, S_v, H, n_seqs] contiguous;
+//   the gate g contiguous, scalar (g->ne[0] == 1) or one value per channel (KDA, g->ne[0] == S_v), and beta
+//   contiguous with beta->ne[0] == 1, both [*, H, n_tokens, n_seqs];
+//   q and k rows of S_v with contiguous rows, one row per (head, token, sequence), repeating over the heads and the
+//   sequences as the kernel reads them (iq1 = iv1 % neq1, iq3 = iv3 / (nev3 / neq3)): their head and sequence counts
+//   divide H and n_seqs, and they carry every token;
+//   K (the snapshot slots, op_params 0) >= 1 and the output contiguous of ggml_gated_delta_net's shape,
+//   [S_v * H, n_tokens * n_seqs + K * S_v * n_seqs].
+// An F32 tensor never has an IME layout (the layout rule is by type, shape and name), so no layout check here.
+// Anything else is refused and runs on the CPU
+static bool spacemit_gdn_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                       ggml_backend_buffer_type_t) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * g = op->src[3];
+    const ggml_tensor * b = op->src[4];
+    const ggml_tensor * s = op->src[5];
+    if (q == nullptr || k == nullptr || v == nullptr || g == nullptr || b == nullptr || s == nullptr) {
+        return false;
+    }
+    if (op->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+        v->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        s->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(q) || !ggml_is_contiguous_rows(k) || !ggml_is_contiguous_rows(v) ||
+        !ggml_is_contiguous(g) || !ggml_is_contiguous(b) || !ggml_is_contiguous(s) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t K        = ggml_get_op_params_i32(op, 0);
+    if (S_v < 1 || S_v > k_gdn_max_state || H < 1 || n_tokens < 1 || n_seqs < 1 || K < 1) {
+        return false;
+    }
+    if ((g->ne[0] != 1 && g->ne[0] != S_v) || g->ne[1] != H || g->ne[2] != n_tokens || g->ne[3] != n_seqs) {
+        return false;
+    }
+    if (b->ne[0] != 1 || b->ne[1] != H || b->ne[2] != n_tokens || b->ne[3] != n_seqs) {
+        return false;
+    }
+    if (s->ne[0] != S_v || s->ne[1] != S_v || s->ne[2] != H || s->ne[3] != n_seqs) {
+        return false;
+    }
+    for (const ggml_tensor * t : { q, k }) {
+        if (t->ne[0] != S_v || t->ne[1] < 1 || t->ne[3] < 1 || t->ne[2] != n_tokens || H % t->ne[1] != 0 ||
+            n_seqs % t->ne[3] != 0) {
+            return false;
+        }
+    }
+    return op->ne[0] == S_v * H && op->ne[1] == n_tokens * n_seqs + K * S_v * n_seqs && op->ne[2] == 1 &&
+           op->ne[3] == 1;
+}
+
+// SILU, SIGMOID and SOFTPLUS of F32 rows into F32 rows of the same shape (Qwen3.5's Gated DeltaNet gates and its
+// convolution's activation, src/models/qwen35.cpp:253, :366, :374, :398): rows contiguous with any row strides, as
+// ggml-cpu's apply_unary_op addresses them. The plain SILU here is not the SWIGLU already claimed (GGML_OP_GLU)
+static bool spacemit_unary_f32_rows(const ggml_tensor * op) {
+    return spacemit_f32_rows(op) && spacemit_f32_rows(op->src[0]) && ggml_are_same_shape(op->src[0], op);
+}
+
+static bool spacemit_silu_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                        ggml_backend_buffer_type_t) {
+    return ggml_get_unary_op(op) == GGML_UNARY_OP_SILU && spacemit_unary_f32_rows(op);
+}
+
+static bool spacemit_sigmoid_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                           ggml_backend_buffer_type_t) {
+    return ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID && spacemit_unary_f32_rows(op);
+}
+
+static bool spacemit_softplus_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                            ggml_backend_buffer_type_t) {
+    return ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS && spacemit_unary_f32_rows(op);
+}
+
+// L2_NORM of F32 rows into F32 rows of the same shape (the convolved queries and keys, src/models/qwen35.cpp:432):
+// rows contiguous with any row strides (the model's sources are views of the convolution's output), the op's eps from
+// op_params, which ggml-cpu asserts to be >= 0
+static bool spacemit_l2_norm_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                           ggml_backend_buffer_type_t) {
+    float eps;
+    std::memcpy(&eps, op->op_params, sizeof(float));
+    return spacemit_unary_f32_rows(op) && eps >= 0.0f;
+}
+
+// SSM_CONV of F32 (src/models/qwen35.cpp:395): the shapes ggml_ssm_conv builds and ggml-cpu asserts - a 3-D input
+// whose first two dimensions are contiguous, a 2-D contiguous kernel with as many rows as the input's, and a
+// contiguous 3-D output [d_inner, n_t, n_s]. The kernel is read in ggml's layout, so it must have no IME layout
+static bool spacemit_ssm_conv_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                            ggml_backend_buffer_type_t) {
+    const ggml_tensor * sx = op->src[0];
+    const ggml_tensor * c  = op->src[1];
+    return op->type == GGML_TYPE_F32 && sx->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(op) && table->tensor_layout(c) == 0 && table->tensor_layout(op) == 0 &&
+           sx->nb[0] == sizeof(float) && sx->nb[1] == (size_t) sx->ne[0] * sizeof(float) && sx->ne[3] == 1 &&
+           ggml_is_contiguous(c) && c->ne[2] == 1 && c->ne[3] == 1 && c->ne[1] == sx->ne[1] &&
+           op->ne[0] == sx->ne[1] && op->ne[1] == sx->ne[0] - c->ne[0] + 1 && op->ne[2] == sx->ne[2] &&
+           op->ne[3] == 1;
+}
+
+// CONCAT along dimension 0 of two F32 sources into a contiguous F32 destination (the convolution's input: the state's
+// columns and the transposed projection, src/models/delta-net-base.cpp:470, so the second source is a transposed
+// view). Every output element is one source element, read with ggml-cpu's strides, so any source strides work
+static bool spacemit_concat_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                          ggml_backend_buffer_type_t) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    return ggml_get_op_params_i32(op, 0) == 0 && op->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 &&
+           b->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && table->tensor_layout(op) == 0 &&
+           op->ne[0] == a->ne[0] + b->ne[0] && op->ne[1] == a->ne[1] && op->ne[2] == a->ne[2] &&
+           op->ne[3] == a->ne[3] && a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3];
+}
+
+// CONT of F32: a contiguous copy of a source whose rows are contiguous with any row strides (the attention layers'
+// gate, src/models/qwen35.cpp:297). GGML_OP_CONT has src[0] only and the op is its own destination, so cpy.f32's
+// kernel does it: the source's rows in ggml's order into the packed destination
+static bool spacemit_cont_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                        ggml_backend_buffer_type_t) {
+    const ggml_tensor * src = op->src[0];
+    return op->type == GGML_TYPE_F32 && spacemit_f32_rows(src) && ggml_is_contiguous(op) &&
+           ggml_nelements(src) == ggml_nelements(op) && table->tensor_layout(op) == 0;
+}
+
+// MUL_MAT of an F32 2-D weight by F32 activations (ssm_alpha and ssm_beta, src/models/qwen35.cpp:362, :369): these
+// weights have no IME layout, so they are stored as the file holds them and read in ggml's layout, in our buffer or in
+// a host buffer. The weight is a tensor of its own, never a view, so a view of an F32 KV cache stays refused; the
+// activations and the output are contiguous, and the weight broadcasts over the activations' higher dimensions
+static bool spacemit_mul_mat_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                           ggml_backend_buffer_type_t) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    return op->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+           w->view_src == nullptr && table->tensor_layout(w) == 0 && ggml_is_contiguous(w) && w->ne[2] == 1 &&
+           w->ne[3] == 1 && ggml_is_contiguous(x) && ggml_is_contiguous(op) && x->ne[0] == w->ne[0] &&
+           op->ne[0] == w->ne[1] && op->ne[1] == x->ne[1] && op->ne[2] == x->ne[2] && op->ne[3] == x->ne[3];
 }
 
 // GET_ROWS: F32 rows by I32 indices
@@ -250,6 +406,16 @@ static const spacemit_contract k_contracts[] = {
       { "flash_attn.split.partial_paired", "flash_attn.split.merge" },                                               2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn.split.partial", "flash_attn.split.merge" },            2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn" },                                                    1 },
+    { GGML_OP_GATED_DELTA_NET, spacemit_gdn_f32_supported,      { "gdn.f32" },                                       1 },
+    // Qwen3.5's Gated DeltaNet layers, the ops beside the state update (plan.md "Step 2 spec", pieces D to G)
+    { GGML_OP_UNARY,           spacemit_silu_f32_supported,     { "silu.f32" },                                      1 },
+    { GGML_OP_UNARY,           spacemit_sigmoid_f32_supported,  { "sigmoid.f32" },                                   1 },
+    { GGML_OP_UNARY,           spacemit_softplus_f32_supported, { "softplus.f32" },                                  1 },
+    { GGML_OP_L2_NORM,         spacemit_l2_norm_f32_supported,  { "l2_norm.f32" },                                   1 },
+    { GGML_OP_SSM_CONV,        spacemit_ssm_conv_f32_supported, { "ssm_conv.f32" },                                  1 },
+    { GGML_OP_CONCAT,          spacemit_concat_f32_supported,   { "concat.f32" },                                    1 },
+    { GGML_OP_CONT,            spacemit_cont_f32_supported,     { "cpy.f32" },                                       1 },
+    { GGML_OP_MUL_MAT,         spacemit_mul_mat_f32_supported,  { "mul_mat.f32" },                                   1 },
 };
 
 static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts[0]);
@@ -257,14 +423,16 @@ static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts
 static_assert(k_n_contracts <= sizeof(spacemit_ops::ops) / sizeof(spacemit_ops::ops[0]),
               "spacemit_ops::ops must hold every contract");
 
-// the contract names of the 19 kernels the plugin offers, in its kernel table's order (plan.md "S1 step 1 spec" section 3)
+// the contract names of the kernels the plugin offers, in its kernel table's order (plan.md "S1 step 1 spec" section 3)
 const char * const spacemit_required_kernels[] = {
     "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
     "set_rows",         "cpy.quant",        "get_rows.f32",             "get_rows.quant",
     "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",             "flash_attn",
     "flash_attn.split.partial",             "flash_attn.split.partial_paired",
     "flash_attn.split.merge",               "flash_attn.kvh.partial",   "flash_attn.kvh.merge",
-    "scale.f32",        "cpy.f32",
+    "scale.f32",        "cpy.f32",          "gdn.f32",
+    "silu.f32",         "sigmoid.f32",      "softplus.f32",             "l2_norm.f32",
+    "ssm_conv.f32",     "concat.f32",       "mul_mat.f32",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 

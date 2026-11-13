@@ -37,7 +37,7 @@ struct spacemit_op {
 // the core's contracts bound to one plugin's kernel table (spacemit_ops_bind); the table is kept for the layout rule
 struct spacemit_ops {
     const spacemit_plugin_v1 * table = nullptr;
-    spacemit_op                ops[16];  // one per contract, in the contract table's order
+    spacemit_op                ops[32];  // one per contract, in the contract table's order
     uint32_t                   n_ops = 0;
 };
 
