@@ -2939,6 +2939,32 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 *On the Mac (the host-test device; the check program, Qwen3-0.6B and the 4B probe rerun by me).* The check program passes, its new `state` line 26/26 bit for bit as the CPU in the provider's buffer and a host buffer, on 8 tiles and directly on 1 and 8; the coder's three mutations fail it. test-backend-ops on the provider: `CPY` 15/15 to 72/72, `SCALE` 0 to 1/1, every other set as before. Qwen3.5-4B Q4_0 on the default path: rc 0 with `-fa auto` and `-fa on`, the text the one-thread CPU's; the state in the provider's buffer (`FlagOS:SpacemiT RS` 50.25 MiB); 433 splits a token (1537 reserved for bs=512), the provider 989 nodes (MUL 257, MUL_MAT 201, ADD 112, RMS_NORM 105, GET_ROWS 98, CPY 96, SCALE 72, SWIGLU 32, SET_ROWS 16), the CPU 504 (REPEAT 72, MUL_MAT 64, SILU 48, L2_NORM 48, SUM_ROWS 48, SIGMOID 32, CONCAT 24, SOFTPLUS 24, EXP 24, SSM_CONV 24, MUL 24, SUB 24, CONT 24, ROPE 16, SOFT_MAX 8). Against the earlier `--no-kv-offload` run: 336 nodes more on the provider and 48 splits more a token, the Gated DeltaNet's core still being the CPU's. Qwen3.5-0.8B the same way (361 splits a token). Qwen3-0.6B's 24 tokens and Qwen3-4B's 16 unchanged, one split each. Not run: ThreadSanitizer; the speculative reply against a CPU reference.
 
+*On the K3 (`65bc212db`, 2026-11-13, one run each; logs `~/k3-logs/q35s1*`).* The check program passes on the AI cores, `state` 26/26. Qwen3.5-4B Q4_0 on the default path: rc 0 with `-fa auto` and `-fa on`, the text the one-thread CPU's, `FlagOS:SpacemiT RS` 50.25 MiB, 433 splits a token, the op histogram the Mac's. Step 1 is done. Speed, not this step's aim: the provider 1.25 tokens a second in generation (802 ms a token) and 2.08 on the prompt, the one-thread CPU 2.27 and 8.22; the 433 splits and the Gated DeltaNet core on the CPU are steps 2 and 3. The Qwen3 runner 46/47 on both models, 16/16 replies equal: its one failure is its own list of claimed ops, which did not name `SCALE` (test-backend-ops `CPY` 72/72). `SCALE` added to the list, which also adds its op test (48 checks expected); not rerun on the K3 yet.
+
+#### Step 2 spec (2026-11-13, for review): the whole fused graph on the provider
+
+*Aim.* Qwen3.5-4B's one-token graph on the provider without a CPU split, as Qwen3's is. Steps 2 and 3 of the earlier outline are merged (user, 2026-11-13: faster than Qwen3, the pattern is known); speed stays step 4.
+
+*What is left, measured.* With llama.cpp's fused forms on (a CPU-only run on the Mac, `FLAGOS_SPACEMIT_DISABLE=1`, 2026-11-13) a token is 1,149 nodes: MUL_MAT 249, MUL 161, RMS_NORM 105, GET_ROWS 98, CPY 96, ADD 88, SCALE 48, SILU 48, L2_NORM 48, SIGMOID 32, SWIGLU 32, CONCAT 24, SSM_CONV 24, SOFTPLUS 24, GATED_DELTA_NET 24, ROPE 16, SET_ROWS 16, FLASH_ATTN_EXT 8, CONT 8. The unfused form's REPEAT, SUM_ROWS, EXP, SUB and SOFT_MAX are gone. What the provider does not take of it today:
+
+| Piece | Nodes a token | Contract |
+|---|---|---|
+| A. `GATED_DELTA_NET` | 24 | F32 everywhere, the shapes `ggml_gated_delta_net` asserts, scalar gate and KDA, K >= 1; rows are (head, sequence), split over the tiles; the scratch (S_v floats, plus S_v x S_v when K > 1) per tile |
+| B. `FLASH_ATTN_EXT` at head size 256 | 8 | `max_head_size` 128 to 256, every stack array and RVV path that assumes 128 checked |
+| C. `ROPE` in IMROPE mode | 16 | mode 40 beside 0 and 2, as ggml-cpu computes it |
+| D. `SILU`, `SIGMOID`, `SOFTPLUS` | 104 | F32, same shape, contiguous rows |
+| E. `L2_NORM` | 48 | F32, rows, the op's eps |
+| F. `SSM_CONV`, `CONCAT`, `CONT` | 56 | the forms the model builds (F32); CONCAT on dim as built; CONT as a strided F32 copy (`cpy.f32`'s kernel) |
+| G. `MUL_MAT` on F32 weights (`ssm_alpha`, `ssm_beta`) | 48 | F32 x F32, 2-D weight contiguous, no layout type; a plain row-dot kernel |
+
+*Kernels.* Every piece gets a reference kernel written from ggml-cpu's own (same arithmetic order where the op is not vectorized there). A (the state update, the hot one) and F's SSM_CONV also get an RVV variant ported from SpacemiT's (`forward_gated_delta_net_f32` and its SSM_CONV, in upstream's `ggml-cpu/spacemit`), selected as the other variants are (`GGML_FLAGOS_KERNEL_VARIANTS=0` keeps the reference). The contract table (`spacemit_ops::ops[16]`, full) grows; the plugin API version stays 1 while kernels are only added.
+
+*Checks.* The check program: each new op against ggml-cpu in the provider's buffer and a host buffer, on 1 and 8 tiles, the exact ops bit for bit (A's reference, C, E, F, G's reference order stated in the test), D within test-backend-ops' bound if ggml-cpu's vector exp differs. test-backend-ops for each new op name and FLASH_ATTN_EXT again. The runner's op list gets the new names. One mutation per piece must fail a check.
+
+*Done when (rules fixed before the run).* On the K3: the check program and test-backend-ops pass with the RVV and the reference kernels; llama.cpp reports flash attention and both fused Gated DeltaNet forms enabled; the one-token graph is 1 split, or every remaining CPU node is named with its reason; the text is reported against the one-thread CPU's (equal expected, a difference is examined, not a failure by itself, as with Qwen3); the Qwen3 runner passes with its replies equal. Tokens a second are recorded, not judged.
+
+*Work split.* Three coders in parallel on disjoint files where possible (A; B and C; D to G), merged and verified by me; one K3 run. The Qwen3.6-35B-A3B header probe runs beside it (read-only, no board).
+
 **Not measured.** Speed as a benchmark; the fused graph as a run; the 27B as a run; anything on Qwen3.6-35B-A3B.
 
 ### Memory probe: does the provider hold weights twice (2026-11-13)
