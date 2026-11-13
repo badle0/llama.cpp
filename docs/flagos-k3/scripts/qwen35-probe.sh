@@ -26,6 +26,10 @@
 #        STEPS (default "gen sched"; cpu is added by CPU=1), DRY=1 (print the commands only)
 set -u
 
+# an abort (the default path's SCALE one) must end the process: without this ggml starts gdb for a backtrace and waits
+# for it, and on the K3 that wait did not end (2026-11-13)
+export GGML_NO_BACKTRACE=1
+
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 BUILD=${BUILD:-$REPO/build-flagos}
 THREADS=${THREADS:-8}
@@ -52,7 +56,7 @@ run() { # run <out file> <command...>: stdout to the file, stderr beside it, the
     shift
     echo "$(date +%H:%M:%S) $*"
     [ -n "$DRY" ] && return 0
-    timeout "$TIMEOUT" "$@" > "$out" 2> "${out%.*}.err"
+    timeout -k 10 "$TIMEOUT" "$@" > "$out" 2> "${out%.*}.err"
     echo $? > "${out%.*}.rc"
 }
 
