@@ -2881,7 +2881,7 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 ### Qwen3.5 probe: what the provider lacks (2026-11-13)
 
-**Status:** measured on the Mac (`build-host`, `45cbcfb0f`) by the `coder` subagent, the 4B run and the file's checksum repeated by me; nothing ran on the K3. The user: Qwen3.5-4B first, then the largest under 30B, which is Qwen3.5-27B (the next size is 35B), both quantized. Script: `scripts/qwen35-probe.sh`.
+**Status:** measured on the Mac (`build-host`, `45cbcfb0f`) by the `coder` subagent, the 4B run and the file's checksum repeated by me; repeated on the K3 the same day ("On the K3" below). The user: Qwen3.5-4B first, then the largest under 30B, which is Qwen3.5-27B (the next size is 35B), both quantized. Script: `scripts/qwen35-probe.sh`.
 
 **File.** `bartowski/Qwen_Qwen3.5-4B-GGUF`, `Qwen_Qwen3.5-4B-Q4_0.gguf` (2,776,033,248 bytes, sha256 `3e977de3...0677a49b` as published). By the headers, the share of matmul weight bytes in a type and shape the provider has a layout for: bartowski Q4_0 99.3%, unsloth Q4_0 91.5% (Q5_K `ssm_out`), bartowski Q4_K_M 42.9%, unsloth Q4_K_M 14.7%; for the 27B 99.4 / 92.9 / 41.4 / 21.4%. A Q4_K or Q5_K weight has no layout and its matmul stays on the CPU (0.8B Q4_K_M: 182 CPU matmuls against 17).
 
@@ -2903,7 +2903,25 @@ Recommended: A alone first. Every repack routine already works in independent gr
 
 **Memory on the K3 (estimates; the method gives the Mac's four provider buffers within 0.7 MiB).** 4B Q4_0 about 3.9 GiB at 4,096 context; 27B Q4_0 about 16.3 to 16.8 GiB of 29.8 free. The Q4_K_M files may get a second repacked copy of their CPU-side weights from ggml-cpu (up to 26.5 to 28 GiB at 27B; not verified on riscv64).
 
-**Not measured.** Speed anywhere; the fused graph as a run; anything on the K3; the 27B as a run.
+**On the K3 (2026-11-13, `a1323c1eb`; logs `~/k3-logs/q35-default.txt`, `q35-nokv.txt`, `q35/`): the Mac's result, to the figure.**
+- The default path aborts with the same `SCALE` line (rc 134), with `-fa auto` and `-fa on`.
+- With `--no-kv-offload`: rc 0, 24 tokens identical to the one-thread CPU run; 385 splits a token and 817 reserved; the same node counts per op on each side; the same buffers (FlagOS:SpacemiT 2,702.31 MiB, CPU_Mapped 2,441.26 MiB).
+- Speed, a first reading only (one short run each at `-lv 4`, 5 prompt tokens and 23 generated; not a benchmark): the provider at 385 splits 2.28 t/s generating (`-fa on` 2.36) and 8.0 t/s on the prompt; the CPU on one thread, on its fused graph, 1.25 and 2.08 t/s. Qwen3-4B generates at 11.09 t/s on the provider. Load 4.0 s.
+- The one-thread CPU run shows a `CPU_REPACK` buffer of 1,876.88 MiB: ggml-cpu does keep a second copy of Q4_0 weights on this board.
+- Two faults of the script cost three runs before this one: under a plain `timeout` with the terminal on stdin, llama-completion was stopped at its terminal set-up before its first log line, and the timeout with it (state `T`, `do_signal_stop`, seen in `/proc`); fixed with `--foreground` and stdin from `/dev/null`, as the other scripts and the runner already did. `GGML_NO_BACKTRACE=1` and `-k 10` were added on a first, wrong reading and stay.
+- Paused here by the user (2026-11-13): zero copy first.
+
+**Not measured.** Speed as a benchmark; the fused graph as a run; the 27B as a run.
+
+### Memory probe: does the provider hold weights twice (2026-11-13)
+
+**Why:** SpacemiT's engineer (through the user, 2026-11-13): the point of zero copy is that running on the provider adds no memory; where a repack is needed, the original weights must be dropped.
+
+**By the code, not yet measured:** the loader hands each offloaded tensor to `set_tensor` from the mapped file (`src/llama-model-loader.cpp:1569`), a whole-tensor write packs straight into the provider's buffer (`plugin/flagos-spacemit-weights.cpp`, `spacemit_tensor_write`), and after the load the file is unmapped outside the range the CPU-mapped tensors span (`:1677-1685`). What stays of the original is the kernel's page cache, as for any reader of the file. Expected excess: the tied output head, held as the file's embedding table (mapped, 304.28 MiB on Qwen3-4B) and again as the provider's Q8_0 head (about 394 MiB by its shape, an estimate); the Q4_1 and Q6_K layers stored as Q8_0 (1-2% of the weight bytes); each buffer rounded up to 2 MiB.
+
+**Measurement:** `scripts/mem-probe.sh`. One llama-bench per run under a sampler that reads `/proc/<pid>/status`, `smaps_rollup` and `smaps` four times a second: the provider with the file mapped, the provider with `-mmp 0`, the one-thread CPU reference, and on request the upstream IME build (`STEPS` with `ime`). Read: steady RssAnon (held by the process), RssFile and the resident part of the `.gguf` mapping (the original still held), the peak RssAnon during the load, and the differences between the runs. Checked on the Mac in ps mode (RSS only) and against a stand-in `/proc`; the real `/proc` is first read on the K3.
+
+**Rule:** no decision hangs on it yet. The figures say what the excess is; whether the head's copy is worth a kernel that reads the file's layout is the user's call after them.
 
 ### Not planned
 
