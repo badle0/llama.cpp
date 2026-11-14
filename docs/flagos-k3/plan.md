@@ -3065,6 +3065,16 @@ The check program passes. Its prefill cases, max NMSE against the CPU (scores / 
 
 Next, the same day, to run on the K3: (1) counters of the form each tile took (`spacemit_gdn_paths_take`, test-only), which the check's prefill cases read and assert, to settle the `tcm` question; (2) our own RVV kernel for `mul_mat.f32` (`ssm_alpha`, `ssm_beta`; the fork has none): four weight rows a strip in m2 lanes, summed across the lanes at the end, so not the reference's bits (the check's bound for these cases was already ggml-cpu's 5e-4 NMSE). The default of `FLAGOS_SPACEMIT_GDN_PREFILL` stays `recurrence` until the user chooses.
 
+**On the K3 (`040d589cf`, logs `f32-*`, one run each):** the check program passes. The counters settle the `tcm` question: in the check's five cases the tiles took the TCM form with `tcm` (5/5), the chunkwise form with `chunk` (5/5) and the two-pass recurrence otherwise, and `tcm`'s bytes are the recurrence's in 5/5, so on the A100 the TCM form rounds exactly as the recurrence does. The F32 matmul: `ssm_alpha` and `ssm_beta` 31 ms each a 501-token graph (278 ms each before, 9 times), NMSE against the CPU at most 5.5e-12 in the check.
+
+| value | `llama-bench` pp501 | graph | prompt in `llama-completion` | generation | text against the one-thread CPU |
+|---|---|---|---|---|---|
+| `recurrence` | 70.18 +- 0.01 | 7,134 ms | not run | not run | not run |
+| `chunk` | 83.67 +- 0.01 | 5,983 ms | 6,054 ms | 7.94 t/s | identical |
+| `tcm` | 84.17 +- 0.04 | 5,948 ms | 5,981 ms | 7.95 t/s | identical |
+
+One generated token is 124.4 ms (131.0 before the F32 kernel). Since the port's first run the same day: the 501-token prompt 7.70 s to 5.98 s, generation 7.54 to 7.95 tokens a second. What is left of the prompt graph with `tcm` (5,948 ms): the quantized matmuls about 4,175 ms (70%), `GATED_DELTA_NET` 525, `CONCAT` 315, the matmuls' quantization 150, `SSM_CONV` 138, `FLASH_ATTN_EXT` 129. Of a generated token: the output layer 22.6 ms, the state's `GET_ROWS` and `CPY` 11.9 ms, `GATED_DELTA_NET` 5.4, `SSM_CONV` 2.8.
+
 ### Memory probe: does the provider hold weights twice (2026-11-13)
 
 **Why:** SpacemiT's engineer (through the user, 2026-11-13): the point of zero copy is that running on the provider adds no memory; where a repack is needed, the original weights must be dropped.
