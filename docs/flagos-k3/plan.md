@@ -3033,6 +3033,26 @@ The prompt graph is not in the profile: `op-stats` does not count a graph seen o
 
 Candidates for the per-kernel steps, in the order of what this table can save (estimates, none measured): the two state copies (11.7 ms), the F32 `ssm_alpha`/`ssm_beta` matmuls (8.6 ms, 48 small nodes), `SSM_CONV` and `CONCAT` back to at least their references (1.1 ms), then the prompt side once it is profiled.
 
+#### The prompt's profile on the K3 (2026-11-14, `3df70a694`, logs `prof-*`)
+
+A 501-token prompt, Qwen3.5-4B, 8 tiles: 7.72 s in `llama-completion` (64.9 tokens a second, the first prompt of the process) and 65.27 +- 0.04 tokens a second in `llama-bench -r 3`. The first graph's table and the warmed one agree (7.706 s and 7.671 s a graph), so first touches of memory are not a cost here. The warmed graph:
+
+| step | ms | share | note |
+|---|---|---|---|
+| `MUL_MAT` on quantized weights (IME) | 4,175 | 54% | FFN 2,548, `attn_qkv` 565, `ssm_out` 373, `attn_gate` 274, `attn_q` 255 |
+| `GATED_DELTA_NET` | 1,732 | 22.6% | every tile busy the whole time; the recurrence, token by token |
+| `MUL_MAT` `ssm_alpha` and `ssm_beta` (F32, scalar) | 557 | 7.3% | |
+| `CONCAT` | 315 | 4.1% | 13 ms a node |
+| `MUL_MAT.quantize`, all | 150 | 2.0% | |
+| `SSM_CONV` | 138 | 1.8% | |
+| `FLASH_ATTN_EXT` | 129 | 1.7% | |
+| `UNARY` (SILU, SIGMOID, SOFTPLUS) | 93 | 1.2% | |
+| `GLU` | 80 | 1.0% | |
+
+The order for the prompt side follows from it: (1) Gated DeltaNet's prefill, where SpacemiT's fork has two forms we did not port, the chunkwise one (16 tokens a chunk; by the fork's own comment about half the recurrence's time on Qwen3.6, and not bit for bit the recurrence) and the recurrence on a transposed state held in TCM, which the fork prefers when TCM is there; (2) the two F32 matmuls; (3) `CONCAT` with `SSM_CONV`, which the fork fuses.
+
+Both prefill forms ported the same day behind `FLAGOS_SPACEMIT_GDN_PREFILL` (`recurrence`, the default and today's path; `chunk`; `tcm`; `build.md`), each under the fork's own conditions (K 1, scalar gate, 16 tokens and up) and else the recurrence. The chunkwise form's buffer (31,552 floats a tile at S_v 128) comes from the workspace, the TCM form keeps the state and the staged k, q, v in the tile's TCM (67 KB) and nothing there outlives the step. The check program runs the three values on the device at 16, 17, 33 and 100 tokens against the CPU (bounds 1e-6 for `chunk`, 1e-10 for `tcm`) and prints the measured NMSE. On the Mac the RVV forms do not exist, so only the switch, the workspace and the cases are tested there; the K3 run measures the three for speed and accuracy and the default is chosen from it.
+
 ### Memory probe: does the provider hold weights twice (2026-11-13)
 
 **Why:** SpacemiT's engineer (through the user, 2026-11-13): the point of zero copy is that running on the provider adds no memory; where a repack is needed, the original weights must be dropped.

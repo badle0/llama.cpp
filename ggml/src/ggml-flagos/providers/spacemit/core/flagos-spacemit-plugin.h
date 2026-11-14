@@ -122,7 +122,7 @@ typedef void (*spacemit_repack_take_fn)(uint64_t * threaded, uint64_t * max_rang
 // calling thread and the ranges rerun there since the last take
 typedef uint32_t (*spacemit_repack_via_fn)(void);
 typedef void (*spacemit_repack_x100_take_fn)(uint64_t * through_stream, uint64_t * not_through, uint64_t * reran);
-// test-only: the plugin parses its switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD, REPACK_THREADS, REPACK_VIA) once; a test
+// test-only: the plugin parses its switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD, REPACK_THREADS, REPACK_VIA, GDN_PREFILL) once; a test
 // that changes them inside one process calls this so the next read parses again
 typedef void (*spacemit_switches_reset_fn)(void);
 // test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its

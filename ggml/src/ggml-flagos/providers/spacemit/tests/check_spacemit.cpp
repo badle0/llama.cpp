@@ -5162,6 +5162,32 @@ struct gdn_run {
             ggml_backend_tensor_set(in[i], v.data(), 0, ggml_nbytes(in[i]));
         }
     }
+
+    // the model's inputs: q and k L2-normalized per head and token (Qwen3.5's graph normalizes both before the op), v
+    // in [-1, 1), the gate (a log decay) in (-2, 0], beta in [0.01, 0.99), the state in [-0.5, 0.5)
+    void fill_model(uint32_t seed) {
+        for (int i = 0; i < 6; i++) {
+            std::vector<float> v = random_values(ggml_nelements(in[i]), seed + (uint32_t) i, 1.0f);
+            if (i <= 1) {
+                const size_t d = (size_t) in[i]->ne[0];
+                for (size_t r = 0; r < v.size(); r += d) {
+                    double sum = 0.0;
+                    for (size_t j = 0; j < d; j++) {
+                        sum += (double) v[r + j] * v[r + j];
+                    }
+                    const float inv = sum > 0.0 ? (float) (1.0 / std::sqrt(sum)) : 1.0f;
+                    for (size_t j = 0; j < d; j++) {
+                        v[r + j] *= inv;
+                    }
+                }
+            } else {
+                for (float & x : v) {
+                    x = i == 3 ? -(x + 1.0f) : i == 4 ? 0.01f + 0.49f * (x + 1.0f) : i == 5 ? 0.5f * x : x;
+                }
+            }
+            ggml_backend_tensor_set(in[i], v.data(), 0, ggml_nbytes(in[i]));
+        }
+    }
 };
 
 // a GATED_DELTA_NET node built by hand, for what ggml_gated_delta_net's asserts forbid the test to build (an F16
@@ -7139,6 +7165,107 @@ static int check_gdn(ggml_backend_dev_t dev) {
         seed += 8;
     }
 
+    // FLAGOS_SPACEMIT_GDN_PREFILL's values at Qwen3.5-4B's side (S_v 128, K 1, scalar gate, the model's inputs) from
+    // the chunk's 16 tokens, through the device only: a direct call runs on the calling thread, on the K3 an X100 core
+    // (VLEN 256, no TCM), where neither prefill form is taken. Against ggml-cpu, the scores and the final state apart:
+    // recurrence within the bound above over the whole output, tcm within a rounding bound, chunk (another order of
+    // operations) within a looser one; each run repeated bit for bit; unset, empty and an unknown value (one warning)
+    // give the recurrence's bytes. A form that ran shows as bytes other than the recurrence's; without the RVV kernels
+    // (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) every value runs the reference
+    const gdn_case prefill_cases[] = {
+  // what,                                                 S_v,   H, tok, seq, H_qk, seq_qk,   kda, K
+        { "16 heads, 16 tokens (one chunk)",                128,  16,  16,   1,   16,      1, false, 1 },
+        { "16 heads, 17 tokens (a 1-token last chunk)",     128,  16,  17,   1,   16,      1, false, 1 },
+        { "16 heads, 33 tokens",                            128,  16,  33,   1,   16,      1, false, 1 },
+        { "16 heads, 100 tokens",                           128,  16, 100,   1,   16,      1, false, 1 },
+        { "4 heads, q and k over 2, 33 tokens (idle tiles)", 128,  4,  33,   1,    2,      1, false, 1 },
+    };
+    const struct {
+        const char * value;
+        int          form;   // 0 recurrence, 1 chunk, 2 tcm
+        double       bound;  // on the scores and on the state; 0: k_gdn_max_nmse on the whole output
+        bool         warned;
+    } prefill_values[] = {
+        { "recurrence", 0, 0.0, false }, { "chunk", 1, 1e-6, false }, { "tcm", 2, 1e-10, false },
+        { nullptr, 0, 0.0, false },      { "", 0, 0.0, false },       { "abc", 0, 0.0, true },
+    };
+    int    n_prefill = 0, n_prefill_ok = 0, n_other[3] = { 0, 0, 0 };
+    double worst_prefill[3][2] = {};  // by form: the scores' NMSE, the state's
+    for (const gdn_case & c : prefill_cases) {
+        gdn_run dv, ref;
+        if (!dv.init(c, buft) || !ref.init(c, ggml_backend_cpu_buffer_type())) {
+            std::fprintf(stderr, "FAIL: GATED_DELTA_NET prefill %s: allocation failed\n", c.what);
+            g_failures++;
+            continue;
+        }
+        dv.fill_model(seed);
+        ref.fill_model(seed);
+        seed += 8;
+
+        const int64_t n       = ggml_nelements(dv.node);
+        const int64_t n_attn  = c.S_v * c.H * c.n_tokens * c.n_seqs;
+        const int64_t n_cmp   = n_attn + c.S_v * c.S_v * c.H * c.n_seqs;
+        const bool    claimed = ggml_backend_dev_supports_op(dev, dv.node);
+
+        ggml_cgraph * g_ref = ggml_new_graph(ref.ctx);
+        ggml_build_forward_expand(g_ref, ref.node);
+        const bool         ref_ok = ggml_backend_graph_compute(cpu, g_ref) == GGML_STATUS_SUCCESS;
+        std::vector<float> want((size_t) n, NAN);
+        if (ref_ok) {
+            ggml_backend_tensor_get(ref.node, want.data(), 0, (size_t) n * sizeof(float));
+        }
+
+        ggml_cgraph * g_dev = ggml_new_graph(dv.ctx);
+        ggml_build_forward_expand(g_dev, dv.node);
+        std::vector<float> recurrence;  // the first value's output
+        for (const auto & pv : prefill_values) {
+            n_prefill++;
+            env_override       mode("FLAGOS_SPACEMIT_GDN_PREFILL", pv.value);
+            log_capture        log;
+            std::vector<float> got[2];
+            bool               dev_ok = claimed && ref_ok;
+            for (int r = 0; r < 2 && dev_ok; r++) {
+                const std::vector<float> junk((size_t) n, (float) (-r - 1));
+                ggml_backend_tensor_set(dv.node, junk.data(), 0, junk.size() * sizeof(float));
+                dev_ok = ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
+                if (dev_ok) {
+                    got[r].assign((size_t) n, NAN);
+                    ggml_backend_tensor_get(dv.node, got[r].data(), 0, (size_t) n * sizeof(float));
+                }
+            }
+            const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_GDN_PREFILL=");
+            const bool repeat   = dev_ok && std::memcmp(got[0].data(), got[1].data(), (size_t) n_cmp * sizeof(float)) == 0;
+            if (recurrence.empty() && dev_ok) {
+                recurrence = got[0];
+            }
+            const bool same = dev_ok && recurrence.size() == got[0].size() &&
+                              std::memcmp(got[0].data(), recurrence.data(), (size_t) n_cmp * sizeof(float)) == 0;
+            const double e_all   = dev_ok ? nmse(got[0].data(), want.data(), n_cmp) : -1.0;
+            const double e_out   = dev_ok ? nmse(got[0].data(), want.data(), n_attn) : -1.0;
+            const double e_state = dev_ok ? nmse(got[0].data() + n_attn, want.data() + n_attn, n_cmp - n_attn) : -1.0;
+            const bool   in_bound =
+                pv.bound > 0.0 ? e_out >= 0.0 && e_out <= pv.bound && e_state >= 0.0 && e_state <= pv.bound :
+                                 e_all >= 0.0 && e_all <= k_gdn_max_nmse;
+            const bool ok = claimed && ref_ok && dev_ok && repeat && in_bound && warnings == (pv.warned ? 1 : 0) &&
+                            (pv.form != 0 || same);
+            n_prefill_ok += ok;
+            n_other[pv.form] += dev_ok && !same;
+            worst_prefill[pv.form][0] = std::max(worst_prefill[pv.form][0], e_out);
+            worst_prefill[pv.form][1] = std::max(worst_prefill[pv.form][1], e_state);
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: GATED_DELTA_NET prefill %s, FLAGOS_SPACEMIT_GDN_PREFILL=%s: %s; the CPU reference "
+                             "%s, the run %s, its repeat %s, the recurrence's bytes %s; NMSE scores %.3e, state %.3e, "
+                             "all %.3e (bound %.0e); %d warning lines (expected %d)\n",
+                             c.what, pv.value != nullptr ? pv.value : "(unset)", claimed ? "claimed" : "refused",
+                             ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", repeat ? "equal" : "differs",
+                             same ? "equal" : "differ", e_out, e_state, e_all,
+                             pv.bound > 0.0 ? pv.bound : k_gdn_max_nmse, warnings, pv.warned ? 1 : 0);
+                g_failures++;
+            }
+        }
+    }
+
     // what the contract takes and what it refuses
     {
         ggml_init_params p   = { ggml_tensor_overhead() * 64, nullptr, true };
@@ -7197,6 +7324,15 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 "do not divide v's, a gate of neither 1 nor S_v, a gate or beta of the wrong head count, a short "
                 "output refused: checked\n",
                 n_ok, n_cases, worst_nmse, k_gdn_max_nmse, worst_abs);
+    std::printf("gdn      FLAGOS_SPACEMIT_GDN_PREFILL (recurrence, chunk, tcm, unset, empty, abc) on the device, S_v "
+                "128, K 1, the model's inputs, 16, 17, 33 and 100 tokens of 16 heads and 33 of 4 (idle tiles)%s: "
+                "%d/%d; max NMSE against the CPU on one thread, scores / state: recurrence %.2e / %.2e, chunk %.2e / "
+                "%.2e (bound %.0e), tcm %.2e / %.2e (bound %.0e); bytes other than the recurrence's (the form ran) "
+                "for chunk in %d/%zu, tcm in %d/%zu; one warning for abc\n",
+                reference_label(), n_prefill_ok, n_prefill, worst_prefill[0][0], worst_prefill[0][1],
+                worst_prefill[1][0], worst_prefill[1][1], prefill_values[1].bound, worst_prefill[2][0],
+                worst_prefill[2][1], prefill_values[2].bound, n_other[1], std::size(prefill_cases), n_other[2],
+                std::size(prefill_cases));
     return 0;
 }
 

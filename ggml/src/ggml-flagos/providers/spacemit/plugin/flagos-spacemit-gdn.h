@@ -11,6 +11,9 @@
 bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile, ggml_tensor * dst);
 
 // the scratch per tile: 3 * S_v floats (the RVV kernel's delta, decay and attention sums; ggml-cpu's kernel and the
-// reference use the first S_v, delta), plus S_v * S_v for the working state when K > 1, padded to a cache line, for
-// SPACEMIT_MAX_TILES tiles
+// reference use the first S_v, delta), plus S_v * S_v for the working state when K > 1; with K 1 and 16 tokens and up
+// at least the chunkwise form's S_v * S_v + 112 * S_v + 832; padded to a cache line, for SPACEMIT_MAX_TILES tiles
 size_t spacemit_gdn_workspace(const ggml_tensor * node);
+
+// reads FLAGOS_SPACEMIT_GDN_PREFILL (recurrence, chunk or tcm) at registration, as spacemit_embd_read_switch
+void spacemit_gdn_read_switch();

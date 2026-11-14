@@ -145,8 +145,8 @@ static bool spacemit_scale_f32_supported(const ggml_tensor * op, const spacemit_
 }
 
 // the largest state side (S_v) gdn.f32 claims: Qwen3.5 uses 128 (plan.md "Qwen3.5 probe"). The kernel's scratch is
-// S_v * S_v floats per tile when K > 1, taken from the shared workspace, so a far larger state would ask for a far
-// larger workspace; such a node stays on the CPU
+// S_v * S_v floats per tile when K > 1, and about as much for K 1 from 16 tokens (the chunkwise form's buffer), taken
+// from the shared workspace, so a far larger state would ask for a far larger workspace; such a node stays on the CPU
 static constexpr int64_t k_gdn_max_state = 256;
 
 // GATED_DELTA_NET (the fused Gated DeltaNet step, src/models/delta-net-base.cpp:402 and :567): every operand and the
