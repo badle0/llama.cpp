@@ -3008,6 +3008,31 @@ Source: `spacemit-com/llama.cpp`, branch `mtmd-backend` at `ddfb41ddc`, `ggml/sr
 
 *On the Mac (the merged tree, the host-test device, rerun by me).* Build without warnings. The check program passes plain, with the reference kernels, with threaded tiles and with `REPACK_VIA=threads`. test-backend-ops on the provider: the whole sweep 3667/3667, OK (MUL_MAT_ID 153/153 by the coder, three runs). The runner's support comparison simulated: claimed names == OPS, 3080 cases. Qwen3.5-4B: 1 split, 1,149 nodes on the provider, the text the one-thread CPU's, the buffers as before. Qwen3-0.6B and Qwen3-4B (16 tokens) as the one-thread CPU. The riscv64 syntax check on the eleven plugin files touched: 0 errors (11 warnings in the RVV attention file and 2 in the IME kernels, all on lines the base has). By the coders, not rerun by me: the mutations per kernel, the exp sweep, the Q6_K read-back study. Never executed anywhere: every new RVV body, the x100-default arm, the IME path of MUL_MAT_ID; no Qwen3.6 file has been run.
 
+#### The port on the K3 (2026-11-14, `33469f2b8`, one run each, logs `port-*`)
+
+Two faults came first, both in the check program. (1) `check_mul_mat_id` called the IME kernels directly, which runs them on the calling X100 core: illegal instruction (word `6694302b`, cpu 1). The direct calls now run only on the host-test device or with the reference kernels. A check must not call an IME kernel directly on the K3; an RVV kernel called directly runs at the X100's vector length. (2) The RVV SSM_CONV is not bit for bit ggml-cpu's on the K3 (6 cases, NMSE at most 2.65e-15, 3.3e-7 relative), so its check has a rounding bound there and stays exact with the reference kernel.
+
+After that: the check program passes with the RVV and the reference kernels; Qwen3.5-4B is 1 split, 1,149 nodes on the provider, text identical to the one-thread CPU's; the Qwen3 runner 64/64 on both models. Speed, not judged: generation 7.58 and 7.70 tokens a second (130 to 132 ms a token) and 25.9 on a 5-token prompt, against step 2's 6.75 and 24.1; a 501-token prompt takes 7.68 s (65.2 tokens a second), generation after it 7.54. With the reference kernels the same run takes 811 s and 0.35 tokens a second, so the reference column below says little about the matmuls.
+
+One generated token at n_kv 512 (`port-ops-rvv.txt`, 10 graphs, 131.0 ms wall, of it 11.5 ms imbalance between tiles):
+
+| step | ms | share | note |
+|---|---|---|---|
+| `MUL_MAT` on Q4_0, Q4_1, Q8_0 weights (IME) | 70.5 | 54% | FFN 44.7, `attn_qkv` 9.5, `attn_gate` 5.0, `ssm_out` 7.2 |
+| `MUL_MAT` `token_embd` Q6_K (the output layer) | 22.3 | 17% | one node |
+| `CPY` r1, 48 nodes | 6.0 | 4.6% | all 8 tiles busy; the state writes, by inference |
+| `GET_ROWS` r1, 49 nodes | 5.7 | 4.4% | all 8 tiles busy; the state reads, by inference |
+| `GATED_DELTA_NET` | 5.0 | 3.8% | reference 16.4 |
+| `MUL_MAT` `ssm_alpha` and `ssm_beta` (F32, scalar) | 8.6 | 6.5% | one tile works, the others wait |
+| `SSM_CONV` | 2.8 | 2.2% | reference 2.0: the RVV kernel is slower |
+| `FLASH_ATTN_EXT` | 1.9 | 1.5% | reference 20.2 |
+| `CONCAT` | 1.3 | 1.0% | reference 1.1: the RVV kernel is slower |
+| `UNARY` r1 (SILU, SIGMOID, SOFTPLUS on one row) | 1.0 | 0.8% | 0.15 kernel, the rest waiting |
+
+The prompt graph is not in the profile: `op-stats` does not count a graph seen once. A prompt profile needs that changed or the same prompt shape run twice.
+
+Candidates for the per-kernel steps, in the order of what this table can save (estimates, none measured): the two state copies (11.7 ms), the F32 `ssm_alpha`/`ssm_beta` matmuls (8.6 ms, 48 small nodes), `SSM_CONV` and `CONCAT` back to at least their references (1.1 ms), then the prompt side once it is profiled.
+
 ### Memory probe: does the provider hold weights twice (2026-11-13)
 
 **Why:** SpacemiT's engineer (through the user, 2026-11-13): the point of zero copy is that running on the provider adds no memory; where a repack is needed, the original weights must be dropped.
