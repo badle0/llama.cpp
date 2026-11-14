@@ -5190,9 +5190,10 @@ static ggml_tensor * gdn_raw(ggml_context * ctx, ggml_type dst_type, ggml_tensor
 // What is compared how, and why:
 // - SSM_CONV, CONCAT and CONT: bit for bit. ggml-cpu computes these scalar in a fixed order (ops.cpp
 //   ggml_compute_forward_ssm_conv_f32 and _concat_f32), and the kernels are those loops with the rows split over the
-//   tiles, or on the K3 their RVV ports: CONCAT's moves the same floats, SSM_CONV's adds the four taps in the same
-//   order with fused multiply-adds, as the compiler contracts ggml-cpu's loop. Each output element comes from one row,
-//   so the split cannot change a result.
+//   tiles, or on the K3 their RVV ports: CONCAT's moves the same floats. SSM_CONV's RVV port adds the four taps with
+//   fused multiply-adds, which is not how GCC built ggml-cpu's loop on the K3, so with the RVV kernels it is held to a
+//   rounding bound instead (k_ssm_conv in check_seq_ops). Each output element comes from one row, so the split cannot
+//   change a result.
 // - SILU, SIGMOID, SOFTPLUS and L2_NORM: within an NMSE and a largest |difference| / max(1, |CPU's value|) (the
 //   absolute error up to 1, the relative one above). The references are bit for bit ggml-cpu's scalar code for
 //   SIGMOID, SOFTPLUS and L2_NORM, but on the K3 the RVV kernels use SpacemiT's vector exp (ARM's optimized routine,
@@ -6110,6 +6111,13 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
+    // SSM_CONV: the reference is ggml-cpu's bytes; the RVV kernel's fused taps are not (K3 2026-11-14: NMSE 2.7e-15,
+    // 3.3e-07 of max(1, |y|) against the ggml-cpu GCC built), so on the K3 it gets a rounding bound
+#if defined(__riscv)
+    const seq_bound k_ssm_conv = *reference_label() != '\0' ? k_seq_exact : seq_bound{ 1e-12, 1e-6 };
+#else
+    const seq_bound k_ssm_conv = k_seq_exact;
+#endif
     ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -6225,7 +6233,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                      });
         }
         // F. SSM_CONV on [3 + n_t, 8192, 1] with a [4, 8192] kernel (qwen35.cpp:395)
-        run_case("SSM_CONV [3 + n_t, 8192, 1] with a [4, 8192] kernel", k_conv, k_seq_exact,
+        run_case("SSM_CONV [3 + n_t, 8192, 1] with a [4, 8192] kernel", k_conv, k_ssm_conv,
                  [n_t](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
                      ggml_tensor * sx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 + n_t, 8192, 1);
                      ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 8192);
@@ -6365,7 +6373,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
         in.push_back(x);
         return ggml_l2_norm(ctx, ggml_view_2d(ctx, x, 128, 0, x->nb[1], 0), 1e-6f);
     });
-    run_case("SSM_CONV [7, 64, 3] with a [4, 64] kernel (3 sequences)", k_conv, k_seq_exact,
+    run_case("SSM_CONV [7, 64, 3] with a [4, 64] kernel (3 sequences)", k_conv, k_ssm_conv,
              [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
                  ggml_tensor * sx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 7, 64, 3);
                  ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 64);
@@ -6373,7 +6381,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                  in.push_back(c);
                  return ggml_ssm_conv(ctx, sx, c);
              });
-    run_case("SSM_CONV [4, 1, 1] with a [4, 1] kernel (one channel)", k_conv, k_seq_exact,
+    run_case("SSM_CONV [4, 1, 1] with a [4, 1] kernel (one channel)", k_conv, k_ssm_conv,
              [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
                  ggml_tensor * sx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 1, 1);
                  ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
@@ -6381,7 +6389,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                  in.push_back(c);
                  return ggml_ssm_conv(ctx, sx, c);
              });
-    run_case("SSM_CONV [3, 64, 1] with a [4, 64] kernel (no token)", k_conv, k_seq_exact,
+    run_case("SSM_CONV [3, 64, 1] with a [4, 64] kernel (no token)", k_conv, k_ssm_conv,
              [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
                  ggml_tensor * sx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 64, 1);
                  ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 64);
