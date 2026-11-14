@@ -9,7 +9,9 @@
 #include "flagos-spacemit-exec.h"
 #include "flagos-spacemit-gdn.h"
 #include "flagos-spacemit-ime.h"
+#include "flagos-spacemit-ime-id.h"
 #include "flagos-spacemit-kernels.h"
+#include "flagos-spacemit-moe.h"
 #include "flagos-spacemit-seq.h"
 #include "../core/flagos-spacemit-ops.h"
 #include "flagos-spacemit-weights.h"
@@ -101,8 +103,9 @@ bool spacemit_ai_gate_available() {
 }
 
 //
-// memory: host memory on huge pages where the system has them, else 64-byte aligned; Q4_0, Q4_1, Q8_0 and Q6_K matmul
-// weights are stored in IME layouts (flagos-spacemit-weights.h), a Q6_K weight in more than ggml_nbytes
+// memory: host memory on huge pages where the system has them, else 64-byte aligned; Q4_0, Q4_1, Q8_0, Q6_K and Q5_0
+// matmul weights (2-D, and 3-D experts but Q4_1) are stored in IME layouts (flagos-spacemit-weights.h), a Q4_1, Q6_K or
+// Q5_0 weight in more than ggml_nbytes
 // (tensor_alloc_size). set, get and fill work in ggml's layout within ggml_nbytes; only the repack and its inverse
 // touch the stored bytes beyond it.
 //
@@ -367,6 +370,8 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "swiglu.f32",       spacemit_kernel_swiglu_f32,    nullptr,                     nullptr                              },
         { "mul_mat.quantize", spacemit_mul_mat_quantize,     nullptr,                     spacemit_mul_mat_workspace           },
         { "mul_mat.gemm",     spacemit_mul_mat_gemm,         nullptr,                     spacemit_mul_mat_workspace           },
+        { "mul_mat_id.quantize", spacemit_mul_mat_id_quantize, nullptr,                   spacemit_mul_mat_id_workspace        },
+        { "mul_mat_id.gemm",  spacemit_mul_mat_id_gemm,      nullptr,                     spacemit_mul_mat_id_workspace        },
         { "flash_attn",       spacemit_kernel_flash_attn,    spacemit_flash_attn_one_step_supported, nullptr                    },
         { "flash_attn.split.partial", spacemit_kernel_flash_attn_split_partial, spacemit_flash_attn_split_supported,
           spacemit_flash_attn_split_workspace                                                                                  },
@@ -388,6 +393,11 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "ssm_conv.f32",     spacemit_kernel_ssm_conv_f32,  nullptr,                     nullptr                              },
         { "concat.f32",       spacemit_kernel_concat_f32,    nullptr,                     nullptr                              },
         { "mul_mat.f32",      spacemit_kernel_mul_mat_f32,   nullptr,                     nullptr                              },
+        { "soft_max.f32",     spacemit_kernel_soft_max_f32,  nullptr,                     nullptr                              },
+        { "argsort.f32",      spacemit_kernel_argsort_f32,   nullptr,                     nullptr                              },
+        { "sum_rows.f32",     spacemit_kernel_sum_rows_f32,  nullptr,                     nullptr                              },
+        { "clamp.f32",        spacemit_kernel_clamp_f32,     nullptr,                     nullptr                              },
+        { "div.f32",          spacemit_kernel_div_f32,       nullptr,                     nullptr                              },
     };
     if (count != nullptr) {
         *count = sizeof(kernels) / sizeof(kernels[0]);

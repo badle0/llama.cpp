@@ -7,9 +7,10 @@
 #   FLASH_ATTN_EXT (F16 K and V, head sizes up to 256), CPY (F32 into the quantized and BF16 cache types, and F32
 #   into F32), SCALE (F32, no bias) and GATED_DELTA_NET (F32, the shapes ggml_gated_delta_net builds, state side up
 #   to 256), SILU, SIGMOID, SOFTPLUS, L2_NORM, SSM_CONV, CONCAT along dimension 0, CONT and MUL_MAT on a plain F32
-#   weight (all F32), and
-#   test-backend-ops passes for each and for the multi-op graphs built from them, with the RVV and with the reference
-#   kernels; the benchmark of the check program;
+#   weight (all F32), and the MoE router's SOFT_MAX (no mask, sinks or ALiBi), ARGSORT, SUM_ROWS, CLAMP and DIV (F32,
+#   ARGSORT into I32), and
+#   test-backend-ops passes for each and for the multi-op graphs built from them (TOPK_MOE: the router's chain), with
+#   the RVV and with the reference kernels; the benchmark of the check program;
 #   a model run with the provider and with FLAGOS_SPACEMIT_DISABLE=1 (the IME kernels quantize activations differently
 #   from the CPU, so the text is reported, not compared): the weights, every layer and the KV cache on the provider
 #   (IGPU, D3), -fa auto keeping flash attention there (FAIL with llama.cpp's warning if it turns it off, or if the
@@ -51,8 +52,8 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # the ops the provider claims (GLU cases are named by their GLU op), and the test-backend-ops graphs that chain them
 OPS = ["ADD", "MUL", "RMS_NORM", "ROPE", "SET_ROWS", "GET_ROWS", "SWIGLU", "MUL_MAT", "FLASH_ATTN_EXT", "CPY", "SCALE",
        "GATED_DELTA_NET", "SILU", "SIGMOID", "SOFTPLUS", "L2_NORM", "SSM_CONV", "CONCAT", "CONT",
-       "MUL_MAT_HADAMARD"]
-GRAPHS = ["RMS_NORM_MUL_ADD", "ADD_RMS_NORM", "RMS_NORM_MUL_ROPE", "ROPE_SET_ROWS"]
+       "MUL_MAT_HADAMARD", "SOFT_MAX", "ARGSORT", "SUM_ROWS", "CLAMP", "DIV", "MUL_MAT_ID"]
+GRAPHS = ["RMS_NORM_MUL_ADD", "ADD_RMS_NORM", "RMS_NORM_MUL_ROPE", "ROPE_SET_ROWS", "TOPK_MOE"]
 results = []
 preload = {}  # LD_PRELOAD for the model runs (--segv)
 summary = None  # <logs>/summary.txt: every line printed by report and info (the terminal's scrollback is short)

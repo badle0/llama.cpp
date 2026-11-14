@@ -15,10 +15,15 @@ enum class spacemit_layout {
     q8_0_32x32,       // IME layout for Q8_0 matmul weights (lossless, same size)
     q6_k_q8_0_32x32,  // Q6_K matmul weights requantized to Q8_0 in the q8_0 32x32 layout (needs more than ggml_nbytes:
                       // 34 bytes per 32 weights, not 26.25; reads are approximate)
+    q5_0_q8_0_32x32,  // Q5_0 matmul weights as Q8_0 in the q8_0 32x32 layout, exactly (d (q - 16) is Q8_0's d qs with
+                      // qs = q - 16); 34 bytes per 32 weights, not 22; reads restore the GGUF bytes
 };
 
 // decided from the tensor's type, shape and name alone, never from how the buffer is used: test-backend-ops places
 // weights in ordinary buffers. supports_op, the buffer functions and the kernels all ask this one function.
+// A 3-D tensor (MUL_MAT_ID's experts) takes the layout of its type under the same rule, its ggml_nrows rows stored as
+// one 2-D weight's are, so each expert's rows start at a 32-row group; but Q4_1, whose requantized read-back is lossy,
+// in 2-D only (a 3-D Q4_1 tensor is plain). A 4-D tensor never has a layout.
 // A view is stored the way its view_src is; it never has a layout of its own. llama.cpp's cache tensors (named
 // cache_k_, cache_v_, cache_r_ and cache_s_ before allocation) always keep ggml's layout, whatever their type and shape,
 // as they are written row by row (SET_ROWS, CPY, the context shift's ROPE).
@@ -28,7 +33,7 @@ spacemit_layout spacemit_weight_layout(const ggml_tensor * t);
 spacemit_layout spacemit_storage_layout(const ggml_tensor * t);
 
 // bytes the tensor takes in the provider's buffer (the buffer type's get_alloc_size): ggml_nbytes, except for the
-// layouts requantized to Q8_0 (Q4_1, Q6_K)
+// layouts stored as Q8_0 (Q4_1, Q6_K requantized; Q5_0 exactly)
 size_t spacemit_weight_alloc_size(const ggml_tensor * t);
 
 // read and write [offset, offset + size) of a tensor in the provider's buffer in ggml's layout, converting repacked
@@ -48,8 +53,8 @@ uint32_t spacemit_repack_threads();
 // test-only: the repacks since the last call that ran on several threads (on either route), and the most ranges one of
 // them used. flagos-check-spacemit checks FLAGOS_SPACEMIT_REPACK_THREADS by it
 void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges);
-// FLAGOS_SPACEMIT_REPACK_VIA as parsed: 0 threads, 1 x100 (only in a build with spine-runtime). Read at registration
-// too, so a bad value's warning shows
+// FLAGOS_SPACEMIT_REPACK_VIA as parsed: 0 threads, 1 x100 (only in a build with spine-runtime, where it is the
+// default). Read at registration too, so a bad value's warning shows
 uint32_t spacemit_repack_via();
 // test-only: under x100 since the last call, the weights repacked through an admitted launch, those that fell back to
 // the calling thread (no cores, no stream, launch refused), and the ranges run again on the calling thread

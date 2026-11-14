@@ -4,6 +4,7 @@
 
 #include "../../../../ggml-impl.h"
 
+#include <cstdint>
 #include <cstring>
 
 // The core's contract table (plan.md "S1 step 2 spec"): per contract the ggml op, the structural check (operand types,
@@ -291,6 +292,63 @@ static bool spacemit_mul_mat_f32_supported(const ggml_tensor * op, const spacemi
            op->ne[0] == w->ne[1] && op->ne[1] == x->ne[1] && op->ne[2] == x->ne[2] && op->ne[3] == x->ne[3];
 }
 
+// rows of elt-byte elements, evenly spaced over every dimension: ggml-cpu's ARGSORT and CLAMP address row i at
+// i * nb[1], which is the row's place only when nb[2] and nb[3] follow from nb[1]
+static bool spacemit_flat_rows(const ggml_tensor * t, size_t elt) {
+    return t->nb[0] == elt && t->nb[2] == t->nb[1] * (size_t) t->ne[1] && t->nb[3] == t->nb[2] * (size_t) t->ne[2];
+}
+
+// The MoE router of Qwen3.6-35B-A3B (build_moe_ffn, src/llama-graph.cpp:1915; plan.md "Qwen3.6-35B-A3B header
+// probe"): softmax over the experts, top-k by ARGSORT, the chosen weights summed, clamped and divided by their sum.
+// SOFT_MAX of F32 without a mask, sinks or ALiBi (src/llama-graph.cpp:1965): a contiguous source (ggml_soft_max_impl
+// asserts it) into a contiguous F32 destination of the same shape, in place or not; any scale
+static bool spacemit_soft_max_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                            ggml_backend_buffer_type_t) {
+    const ggml_tensor * src = op->src[0];
+    float               max_bias;
+    std::memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+    return op->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && op->src[1] == nullptr &&
+           op->src[2] == nullptr && max_bias == 0.0f && ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
+           ggml_are_same_shape(src, op);
+}
+
+// ARGSORT of F32 rows into I32 rows of the same shape, ascending or descending (the expert top-k,
+// ggml_argsort_top_k, src/llama-graph.cpp:2031; its view of the first k columns is not an op). Flat rows on both sides,
+// as ggml-cpu addresses them
+static bool spacemit_argsort_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                           ggml_backend_buffer_type_t) {
+    const ggml_tensor * src   = op->src[0];
+    const int32_t       order = ggml_get_op_params_i32(op, 0);
+    return op->type == GGML_TYPE_I32 && src->type == GGML_TYPE_F32 && ggml_are_same_shape(src, op) &&
+           spacemit_flat_rows(src, sizeof(float)) && spacemit_flat_rows(op, sizeof(int32_t)) &&
+           (order == GGML_SORT_ORDER_ASC || order == GGML_SORT_ORDER_DESC) && src->ne[0] <= INT32_MAX;
+}
+
+// SUM_ROWS of F32 rows into F32 [1, ne1, ne2, ne3] (the chosen weights' sum, src/llama-graph.cpp:2059): rows
+// contiguous with any row strides on both sides, as ggml-cpu reads them
+static bool spacemit_sum_rows_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                            ggml_backend_buffer_type_t) {
+    const ggml_tensor * src = op->src[0];
+    return spacemit_f32_rows(op) && spacemit_f32_rows(src) && op->ne[0] == 1 && op->ne[1] == src->ne[1] &&
+           op->ne[2] == src->ne[2] && op->ne[3] == src->ne[3];
+}
+
+// CLAMP of F32 into F32 of the same shape, in place (ggml_clamp's result is a view of its source,
+// src/llama-graph.cpp:2063) or not; flat rows on both sides, as ggml-cpu addresses them
+static bool spacemit_clamp_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
+                                         ggml_backend_buffer_type_t) {
+    const ggml_tensor * src = op->src[0];
+    return op->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && ggml_are_same_shape(src, op) &&
+           spacemit_flat_rows(src, sizeof(float)) && spacemit_flat_rows(op, sizeof(float));
+}
+
+// DIV: the forms ADD and MUL take (the weights by their clamped sum, [n_used, n_tokens] / [1, n_tokens],
+// src/llama-graph.cpp:2066)
+static bool spacemit_div_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                       ggml_backend_buffer_type_t own_buft) {
+    return spacemit_binary_f32_supported(op, table, own_buft);
+}
+
 // GET_ROWS: F32 rows by I32 indices
 static bool spacemit_get_rows_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
                                             ggml_backend_buffer_type_t) {
@@ -349,23 +407,44 @@ static bool spacemit_swiglu_f32_supported(const ggml_tensor * op, const spacemit
             (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1) && ggml_are_same_shape(src0, src1)));
 }
 
-// a weight in an IME layout (Q4_0 32x256, Q4_1 32x32, Q8_0 and Q6_K in q8_0 32x32), read in that layout: so it must
+// a weight in an IME layout (Q4_0 32x256; Q8_0, Q4_1, Q6_K and Q5_0 in q8_0 32x32), read in that layout: so it must
 // sit in our buffer (or be unallocated at placement time), never in a host buffer. The layout comes from the weight's
 // type, shape and name, the plugin's rule through the table (tensor_layout, which answers for a view's storage, so a
 // view is excluded here): llama.cpp's cache tensors never have one, so a MUL_MAT never reads a quantized KV cache as a
 // weight. The answer must not depend on the row count: llama.cpp asks once per weight, at load, with 512 rows
-// (plan.md M2b design).
+// (plan.md M2b design). A 3-D weight may have a layout (MUL_MAT_ID's experts) but is never a MUL_MAT weight here
 static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
                                            ggml_backend_buffer_type_t own_buft) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
-    if (w->view_src != nullptr || table->tensor_layout(w) == 0) {
+    if (w->view_src != nullptr || w->ne[2] != 1 || w->ne[3] != 1 || table->tensor_layout(w) == 0) {
         return false;
     }
     if (w->buffer != nullptr && ggml_backend_buffer_get_type(w->buffer) != own_buft) {
         return false;
     }
     return x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(op);
+}
+
+// MUL_MAT_ID (the experts' matmuls, src/llama-graph.cpp build_moe_ffn): the experts' weight [K, N, n_expert] in an IME
+// layout, so in our buffer, never a view (the layout rule gives a 3-D weight one when each expert's N rows are whole
+// 32-row groups, and never to a 3-D Q4_1 weight); F32 activations [K, ne11, n_tokens] (ne11 1, broadcast, or
+// n_used) and the F32 output contiguous; I32 ids [n_used, n_tokens] with any strides (build_moe_ffn's are a view of
+// ARGSORT's output, ggml_argsort_top_k). ggml_mul_mat_id asserts the shapes. As for MUL_MAT the answer does not depend
+// on the token count: llama.cpp asks once per weight, at load, with 512 tokens (src/llama-model-loader.cpp:938-946)
+static bool spacemit_mul_mat_id_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
+                                          ggml_backend_buffer_type_t own_buft) {
+    const ggml_tensor * w   = op->src[0];
+    const ggml_tensor * x   = op->src[1];
+    const ggml_tensor * ids = op->src[2];
+    if (ids == nullptr || w->view_src != nullptr || w->ne[3] != 1 || table->tensor_layout(w) == 0) {
+        return false;
+    }
+    if (w->buffer != nullptr && ggml_backend_buffer_get_type(w->buffer) != own_buft) {
+        return false;
+    }
+    return x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+           ggml_is_contiguous(x) && ggml_is_contiguous(op);
 }
 
 // the attention contracts' type and shape facts all sit in the kernels' supports today; moving their type part into
@@ -401,6 +480,7 @@ static const spacemit_contract k_contracts[] = {
     { GGML_OP_GET_ROWS,        spacemit_get_rows_quant_supported, { "get_rows.quant" },                              1 },
     { GGML_OP_GLU,             spacemit_swiglu_f32_supported,   { "swiglu.f32" },                                    1 },
     { GGML_OP_MUL_MAT,         spacemit_mul_mat_ime_supported,  { "mul_mat.quantize", "mul_mat.gemm" },              2 },
+    { GGML_OP_MUL_MAT_ID,      spacemit_mul_mat_id_supported,   { "mul_mat_id.quantize", "mul_mat_id.gemm" },        2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn.kvh.partial", "flash_attn.kvh.merge" },                2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always,
       { "flash_attn.split.partial_paired", "flash_attn.split.merge" },                                               2 },
@@ -416,6 +496,12 @@ static const spacemit_contract k_contracts[] = {
     { GGML_OP_CONCAT,          spacemit_concat_f32_supported,   { "concat.f32" },                                    1 },
     { GGML_OP_CONT,            spacemit_cont_f32_supported,     { "cpy.f32" },                                       1 },
     { GGML_OP_MUL_MAT,         spacemit_mul_mat_f32_supported,  { "mul_mat.f32" },                                   1 },
+    // the MoE router's ops (Qwen3.6-35B-A3B, build_moe_ffn)
+    { GGML_OP_SOFT_MAX,        spacemit_soft_max_f32_supported, { "soft_max.f32" },                                  1 },
+    { GGML_OP_ARGSORT,         spacemit_argsort_f32_supported,  { "argsort.f32" },                                   1 },
+    { GGML_OP_SUM_ROWS,        spacemit_sum_rows_f32_supported, { "sum_rows.f32" },                                  1 },
+    { GGML_OP_CLAMP,           spacemit_clamp_f32_supported,    { "clamp.f32" },                                     1 },
+    { GGML_OP_DIV,             spacemit_div_f32_supported,      { "div.f32" },                                       1 },
 };
 
 static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts[0]);
@@ -427,12 +513,15 @@ static_assert(k_n_contracts <= sizeof(spacemit_ops::ops) / sizeof(spacemit_ops::
 const char * const spacemit_required_kernels[] = {
     "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
     "set_rows",         "cpy.quant",        "get_rows.f32",             "get_rows.quant",
-    "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",             "flash_attn",
+    "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",
+    "mul_mat_id.quantize",                  "mul_mat_id.gemm",          "flash_attn",
     "flash_attn.split.partial",             "flash_attn.split.partial_paired",
     "flash_attn.split.merge",               "flash_attn.kvh.partial",   "flash_attn.kvh.merge",
     "scale.f32",        "cpy.f32",          "gdn.f32",
     "silu.f32",         "sigmoid.f32",      "softplus.f32",             "l2_norm.f32",
     "ssm_conv.f32",     "concat.f32",       "mul_mat.f32",
+    "soft_max.f32",     "argsort.f32",      "sum_rows.f32",             "clamp.f32",
+    "div.f32",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 

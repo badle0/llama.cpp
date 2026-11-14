@@ -20,7 +20,7 @@
 // Bodies are unchanged except, marked "flagos": two zero guards in quantize_a_nrow_i8_hp_ref, one in
 // quantize_a_nrow_i8_ref and one in repack_q6_k_to_q8_0_32_bl_ref; unaligned fp32 scales read and written with memcpy
 // in the references quantize_a_nrow_i8_ref and gemm_kernel_i8i8_mrow_ref. Everything below the copies (dispatch,
-// unpack, the Q4_1 requantization) is new. When upstream changes these functions, take the fix by hand (plan.md R11).
+// unpack, the Q4_1 requantization, the Q5_0 conversion after SpacemiT's fork) is new. When upstream changes these functions, take the fix by hand (plan.md R11).
 // Not taken (2026-10-28, build.md §7): SpacemiT's stable factor for the Q4_0 quantizers (spacemit-com/llama.cpp
 // mtmd-backend 27acf9d, PR #30), which on Qwen3-0.6B raised the one-token KLD at every factor below 1; the overflow it
 // guards against was met by none of our runs (question 8's report). The in-tree Q4_1 layout (q4_1 32x32, an integer
@@ -2138,6 +2138,81 @@ void unpack_q4_1_q8_0(const ggml_tensor * t, void * data) {
             }
         }
         ggml_quantize_chunk(GGML_TYPE_Q4_1, rows.data(), static_cast<char *>(data) + b * row_size, 0, nr, k, nullptr);
+    }
+}
+
+// flagos: Q5_0 stored as Q8_0, as SpacemiT's fork does (ggml-spacemit repack.cpp repack_q5_0_to_q8_0_32): ggml's Q5_0
+// weight j of a block is d * (q - 16), q = (qs nibble) | (bit j of qh) << 4 in [0, 31] (dequantize_row_q5_0), so the
+// Q8_0 block of the same fp16 d and qs = q - 16 in [-16, 15] holds the same values exactly. Then the q8_0 32x32 layout
+// as repack_q8_0_to_q8_0_32_bl_ref stores Q8_0, 32 rows at a time; the only temporary is one group of 32 blocks
+static block_q8_0 q5_0_to_q8_0(const block_q5_0 & in) {
+    block_q8_0 out;
+    uint32_t   qh;
+    std::memcpy(&qh, in.qh, sizeof(qh));
+    out.d = in.d;
+    for (int j = 0; j < QK5_0 / 2; j++) {
+        const uint8_t xh_0          = (uint8_t) (((qh >> j) << 4) & 0x10);
+        const uint8_t xh_1          = (uint8_t) ((qh >> (j + 12)) & 0x10);
+        out.qs[j]                   = (int8_t) (((in.qs[j] & 0x0F) | xh_0) - 16);
+        out.qs[j + QK5_0 / 2]       = (int8_t) (((in.qs[j] >> 4) | xh_1) - 16);
+    }
+    return out;
+}
+
+int repack_q5_0_q8_0(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q5_0);
+    static_assert(QK5_0 == QK8_0, "one Q5_0 block per Q8_0 block");
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t k       = t->ne[0];
+    const int64_t nblocks = k / QK5_0;
+    if (k % QK5_0 != 0 || size != ggml_nbytes(t)) {
+        return -1;
+    }
+    const block_q5_0 * src = static_cast<const block_q5_0 *>(data);
+    block_q8_0x32 *    dst = static_cast<block_q8_0x32 *>(t->data);
+    block_q8_0         group[32];
+
+    for (int64_t b = 0; b < nrow; b += 32, src += 32 * nblocks) {
+        const int64_t nr = std::min<int64_t>(32, nrow - b);
+        for (int64_t x = 0; x < nblocks; x++) {
+            int64_t i = 0;
+            for (; i < nr; i++) {
+                group[i] = q5_0_to_q8_0(src[x + i * nblocks]);
+            }
+            for (; i < 32; i++) {
+                std::memset(&group[i], 0, sizeof(block_q8_0));
+            }
+            *dst++ = make_block_q8_0x32(group, 32);
+        }
+    }
+    return 0;
+}
+
+// flagos: the inverse of repack_q5_0_q8_0, exact: q = qs + 16 gives back the nibbles and the high bits
+void unpack_q5_0_q8_0(const ggml_tensor * t, void * data) {
+    const block_q8_0x32 * src     = static_cast<const block_q8_0x32 *>(t->data);
+    block_q5_0 *          dst     = static_cast<block_q5_0 *>(data);
+    const int64_t         nrow    = ggml_nrows(t);
+    const int64_t         nblocks = t->ne[0] / QK5_0;
+
+    for (int64_t b = 0; b < nrow; b += 32, dst += 32 * nblocks) {
+        const int64_t nr = std::min<int64_t>(32, nrow - b);
+        for (int64_t x = 0; x < nblocks; x++, src++) {
+            for (int64_t i = 0; i < nr; i++) {
+                block_q5_0 &   out = dst[x + i * nblocks];
+                const int8_t * v   = reinterpret_cast<const int8_t *>(src->qs) + i * QK8_0;
+                uint32_t       qh  = 0;
+                out.d              = src->d[i];
+                for (int j = 0; j < QK5_0 / 2; j++) {
+                    const uint8_t lo = (uint8_t) (v[j] + 16);
+                    const uint8_t hi = (uint8_t) (v[j + QK5_0 / 2] + 16);
+                    out.qs[j]        = (uint8_t) ((lo & 0x0F) | ((hi & 0x0F) << 4));
+                    qh |= (uint32_t) ((lo >> 4) & 1) << j;
+                    qh |= (uint32_t) ((hi >> 4) & 1) << (j + QK5_0 / 2);
+                }
+                std::memcpy(out.qh, &qh, sizeof(qh));
+            }
+        }
     }
 }
 

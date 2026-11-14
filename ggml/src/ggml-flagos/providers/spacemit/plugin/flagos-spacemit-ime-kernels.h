@@ -4,10 +4,13 @@
 // layouts, both with 32 rows interleaved:
 // - "q4_0 32x256" (Q4_0): K in blocks of 256; activations quantized to int8 with fp16 scales per 32 values and a
 //   block scale ("hp"). Lossless: a byte permutation of the GGUF blocks.
-// - "q8_0 32x32" (Q8_0, Q4_1, Q6_K): K in blocks of 32, each [fp16 scale x 32][int8 x 32 x 32] (34 bytes per row and
-//   block); activations quantized to int8 with an fp32 scale and the negated sum per 32 values ("i8"). From Q8_0
-//   lossless (a byte permutation); from Q4_1 and Q6_K requantized at load, per 32 values scale = max|w| / 127 (stored
-//   in fp16), so each weight moves by about half a Q8_0 step at most (20 and 26.25 bytes per 32 weights become 34).
+// - "q8_0 32x32" (Q8_0, Q4_1, Q6_K, Q5_0): K in blocks of 32, each [fp16 scale x 32][int8 x 32 x 32] (34 bytes per
+//   row and block); activations quantized to int8 with an fp32 scale and the negated sum per 32 values ("i8"). From
+//   Q8_0 lossless (a byte permutation); from Q4_1 and Q6_K requantized at load, per 32 values scale = max|w| / 127
+//   (stored in fp16), so each weight moves by about half a Q8_0 step at most (20 and 26.25 bytes per 32 weights become
+//   34); from Q5_0 exactly, its scale kept and qs = q - 16 (22 bytes per 32 weights become 34).
+// A 3-D weight (MUL_MAT_ID's experts) is stored as the 2-D weight of its ggml_nrows rows in either layout (Q4_1 has
+// its layout in 2-D only, flagos-spacemit-weights.h).
 // Without GGML_FLAGOS_SPACEMIT_IME2 only the scalar references exist and are used.
 
 #include <cstddef>
@@ -90,5 +93,9 @@ int  repack_q8_0(ggml_tensor * t, const void * data, size_t size);
 void unpack_q8_0(const ggml_tensor * t, void * data);
 int  repack_q6_k(ggml_tensor * t, const void * data, size_t size);
 void unpack_q6_k(const ggml_tensor * t, void * data);
+// Q5_0 as Q8_0, exactly both ways (d (q - 16) is Q8_0's d qs with qs = q - 16): repack writes
+// nrows * q8_0_weight_row_bytes(ne[0]) bytes, more than ggml_nbytes(t); unpack restores the GGUF bytes
+int  repack_q5_0_q8_0(ggml_tensor * t, const void * data, size_t size);
+void unpack_q5_0_q8_0(const ggml_tensor * t, void * data);
 
 }  // namespace spacemit_ime

@@ -10,6 +10,7 @@
 // kernel's slice per tile (spacemit_gdn_workspace)
 bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile, ggml_tensor * dst);
 
-// the scratch of ggml-cpu's kernel, per tile: S_v floats (delta), plus S_v * S_v for the working state when K > 1,
-// padded to a cache line, for SPACEMIT_MAX_TILES tiles
+// the scratch per tile: 3 * S_v floats (the RVV kernel's delta, decay and attention sums; ggml-cpu's kernel and the
+// reference use the first S_v, delta), plus S_v * S_v for the working state when K > 1, padded to a cache line, for
+// SPACEMIT_MAX_TILES tiles
 size_t spacemit_gdn_workspace(const ggml_tensor * node);

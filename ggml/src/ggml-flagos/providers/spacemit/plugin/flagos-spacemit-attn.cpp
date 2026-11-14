@@ -24,8 +24,7 @@
 namespace {
 
 // largest DK and DV of the claim and of the references' local arrays (2 KiB of stack at most per frame, as the RVV
-// ROPE's table). The RVV kernels take up to 128 (spacemit_rvv_attn::supported_shape); larger heads (Qwen3.5: 256)
-// run the references on every build
+// ROPE's table). The RVV kernels take the same (spacemit_rvv_attn::supported_shape; above 128 in segments)
 constexpr int64_t max_head_size = 256;
 
 // ggml-cpu's tile size (ggml_fa_tile_config::Q, as in ime.cpp): its tiled kernel from this many tokens per head, and

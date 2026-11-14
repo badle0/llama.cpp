@@ -25,15 +25,19 @@ static bool spacemit_is_cache_name(const char * name) {
     return false;
 }
 
+// a 3-D tensor (MUL_MAT_ID's experts, [K, N, n_expert]) is stored as its ggml_nrows rows in 32-row groups, each
+// expert's N rows whole groups (N % 32 == 0), so expert e's rows start at row e * N. Q4_1 takes its layout in 2-D only:
+// the requantization's read-back is the nearest Q4_1, on which test-backend-ops' MUL_MAT_ID cases fail under imatrix
+// quantization (NMSE about 6e-4 against 5e-4), so a 3-D Q4_1 weight stays plain and MUL_MAT_ID refuses it
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
-    if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[2] != 1 || t->ne[3] != 1 ||
+    if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[3] != 1 ||
         !ggml_is_contiguous(t) || spacemit_is_cache_name(t->name)) {
         return spacemit_layout::plain;
     }
     if (t->type == GGML_TYPE_Q4_0 && t->ne[0] % spacemit_ime::q4_0_k_block == 0) {
         return spacemit_layout::q4_0_32x256;
     }
-    if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {
+    if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q8_0_k_block == 0 && t->ne[2] == 1) {
         return spacemit_layout::q4_1_q8_0_32x32;
     }
     if (t->type == GGML_TYPE_Q8_0 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {
@@ -41,6 +45,9 @@ spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     }
     if (t->type == GGML_TYPE_Q6_K && t->ne[0] % ggml_blck_size(GGML_TYPE_Q6_K) == 0) {  // always true for Q6_K
         return spacemit_layout::q6_k_q8_0_32x32;
+    }
+    if (t->type == GGML_TYPE_Q5_0 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {  // always true for Q5_0
+        return spacemit_layout::q5_0_q8_0_32x32;
     }
     return spacemit_layout::plain;
 }
@@ -51,7 +58,8 @@ static bool spacemit_requantized(spacemit_layout layout) {
 }
 
 size_t spacemit_weight_alloc_size(const ggml_tensor * t) {
-    if (spacemit_requantized(spacemit_weight_layout(t))) {
+    const spacemit_layout layout = spacemit_weight_layout(t);
+    if (spacemit_requantized(layout) || layout == spacemit_layout::q5_0_q8_0_32x32) {
         return (size_t) ggml_nrows(t) * spacemit_ime::q8_0_weight_row_bytes((size_t) t->ne[0]);
     }
     return ggml_nbytes(t);
@@ -106,12 +114,21 @@ int repack_threads_from_env() {
 
 enum repack_via : int { repack_via_threads = 0, repack_via_x100 = 1 };
 
-// FLAGOS_SPACEMIT_REPACK_VIA (plan.md "Repack on spert's X100 backend"): unset, empty or threads: std::thread (T6);
-// x100: the tiles of spine-runtime's X100 backend, threads in a build without spine-runtime. Parsed once
+#if defined(GGML_FLAGOS_SPACEMIT_SPERT)
+constexpr int repack_via_default = repack_via_x100;  // user, 2026-11-14
+#else
+constexpr int repack_via_default = repack_via_threads;
+#endif
+
+// FLAGOS_SPACEMIT_REPACK_VIA (plan.md "Repack on spert's X100 backend"): threads: std::thread (T6); x100: the tiles of
+// spine-runtime's X100 backend. Unset or empty: x100 with spine-runtime in the build, threads without. Parsed once
 // (spacemit_cached_switch); x100 without spine-runtime and any other value warn once per parse generation
 int parse_repack_via() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_REPACK_VIA");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "threads") == 0) {
+    if (v == nullptr || *v == '\0') {
+        return repack_via_default;
+    }
+    if (std::strcmp(v, "threads") == 0) {
         return repack_via_threads;
     }
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
@@ -126,15 +143,14 @@ int parse_repack_via() {
             GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=x100: no spine-runtime in this build, threads kept\n",
                           __func__);
         } else {
-            GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=%s: not threads or x100, the default threads kept\n",
-                          __func__, v);
+            GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=%s: not threads or x100, the default kept\n", __func__, v);
         }
     }
-    return repack_via_threads;
+    return repack_via_default;
 }
 
 int repack_via_from_env() {
-    static std::atomic<int>      value{ repack_via_threads };
+    static std::atomic<int>      value{ repack_via_default };
     static std::atomic<uint32_t> seen{ 0 };
     return spacemit_cached_switch(value, seen, parse_repack_via);
 }
@@ -155,6 +171,8 @@ int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, 
             return spacemit_ime::repack_q8_0(t, data, size);
         case spacemit_layout::q6_k_q8_0_32x32:
             return spacemit_ime::repack_q6_k(t, data, size);
+        case spacemit_layout::q5_0_q8_0_32x32:
+            return spacemit_ime::repack_q5_0_q8_0(t, data, size);
         case spacemit_layout::plain:
             break;
     }
@@ -198,13 +216,15 @@ void spacemit_repack_x100_take(uint64_t * through_stream, uint64_t * not_through
 
 // A weight of several 32-row groups and at least repack_min_bytes is cut into up to FLAGOS_SPACEMIT_REPACK_THREADS
 // ranges of whole groups, each repacked by the same routine on a stand-in tensor of its rows (plan.md "T6 spec"): every
-// routine works group by group, so the bytes are the one-thread bytes. The first range runs on the calling thread.
-// Under FLAGOS_SPACEMIT_REPACK_VIA=x100 the other ranges are tiles on the X100 backend, at most its cores + 1 ranges,
-// and no thread is started
+// routine works group by group, so the bytes are the one-thread bytes. A 3-D weight is cut the same way, on its
+// ggml_nrows rows: a range may span experts, as its rows are one flat list of groups. The first range runs on the
+// calling thread. Under FLAGOS_SPACEMIT_REPACK_VIA=x100 the other ranges are tiles on the X100 backend, at most its
+// cores + 1 ranges, and no thread is started
 static void spacemit_pack(ggml_tensor * t, const void * data) {
     const spacemit_layout layout = spacemit_weight_layout(t);
     const size_t          size   = ggml_nbytes(t);
-    const int64_t         groups = t->ne[1] / (int64_t) spacemit_ime::row_tile;
+    const int64_t         nrows  = ggml_nrows(t);
+    const int64_t         groups = nrows / (int64_t) spacemit_ime::row_tile;
     const bool            split  = !(layout == spacemit_layout::plain || size < repack_min_bytes || groups <= 1);
     int64_t               n      = split ? std::min<int64_t>(repack_threads_from_env(), groups) : 1;
     const bool            x100   = n > 1 && repack_via_from_env() == repack_via_x100;
@@ -227,8 +247,8 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
         return;
     }
 
-    // a weight layout has ne[1] % 32 == 0, ne[2] == ne[3] == 1 and no view; the Q8_0 layouts store 34 bytes per 32
-    // weights, Q4_0's its own row size
+    // a weight layout has ne[1] % 32 == 0, ne[3] == 1 and no view; each range's stand-in is a 2-D tensor of its rows.
+    // The Q8_0 layouts store 34 bytes per 32 weights, Q4_0's its own row size
     const size_t src_row = ggml_row_size(t->type, t->ne[0]);
     const size_t dst_row = layout == spacemit_layout::q4_0_32x256 ? src_row :
                                                                     spacemit_ime::q8_0_weight_row_bytes((size_t) t->ne[0]);
@@ -242,6 +262,8 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
         ggml_tensor & p    = parts[i];
         p                  = *t;
         p.ne[1]            = rows;
+        p.ne[2]            = 1;
+        p.ne[3]            = 1;
         p.nb[2]            = p.nb[1] * (size_t) rows;
         p.nb[3]            = p.nb[2];
         p.data             = static_cast<char *>(t->data) + (size_t) row0 * dst_row;
@@ -249,7 +271,7 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
         sizes[i]           = (size_t) rows * src_row;
         row0 += rows;
     }
-    GGML_ASSERT(row0 == t->ne[1]);
+    GGML_ASSERT(row0 == nrows);
 
     if (x100) {
         pack_ranges ranges = { layout, parts.data(), srcs.data(), sizes.data(), rcs.data() };
@@ -295,6 +317,9 @@ static void spacemit_unpack(const ggml_tensor * t, void * data) {
             return;
         case spacemit_layout::q6_k_q8_0_32x32:
             spacemit_ime::unpack_q6_k(t, data);
+            return;
+        case spacemit_layout::q5_0_q8_0_32x32:
+            spacemit_ime::unpack_q5_0_q8_0(t, data);
             return;
         case spacemit_layout::plain:
             break;

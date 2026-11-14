@@ -36,8 +36,15 @@
 // is forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16 (1404-1477), kvh_inner_mrow its multi-row kernel
 // flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow (732-1009), a template beside the one-chunk kernels above, with
 // its helpers rvv_fill_f16, rvv_scale_f16, rvv_scale_mad_f16 and rvv_dot_f16_f32 (56-100); the other helpers it calls
-// are the same as this file's. Changes, marked "flagos": only the partial output (no dst or sinks); (g) a row that sees
-// no position of a packed K/V tile is skipped.
+// are the same as this file's. Changes, marked "flagos": (g) a row that sees no position of a packed K/V tile is
+// skipped.
+// Head sizes 129 to 256 (Qwen3.5 and Qwen3.6: 256) from ggml-spacemit's mtmd-backend branch (ddfb41ddc,
+// rvv_kernels.cpp: FA_VLEN1024_MAX_D, 41-47; flash_attn_ext_finalize_row_f16, 105-134; the segmented
+// flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1, 1044-1112, here one_chunk_m1_segmented; its mrow, 765-1042, is
+// kvh_inner_mrow with its dst and sinks output restored). The one-register-group kernels above keep head sizes up to
+// 128 (fa_one_group_d), so those run as before; forward_one_chunk sends larger heads to the segmented ones. The tiled
+// kernel and the split's helpers loop over any length already; split_begin's q conversion is segmented here. flagos:
+// (h) every segment loop advances by the vl it got, not by vlmax(e16m2), as (f).
 // flagos-spacemit-attn.cpp decides when these apply.
 
 #include "flagos-spacemit-rvv-attn.h"
@@ -74,12 +81,22 @@ auto align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+// head dims above vlmax(e16m2) = 128 are processed in 128-wide segments
+static constexpr int64_t FA_VLEN1024_MAX_D = 256;
+
 static inline bool flash_attn_ext_supported_d_vlen1024_vf16(int64_t d) {
-    return d > 0 && d <= 128;
+    return d > 0 && d <= FA_VLEN1024_MAX_D;
 }
 
 static inline bool flash_attn_ext_supported_shape_vlen1024_vf16(int64_t DK, int64_t DV) {
     return flash_attn_ext_supported_d_vlen1024_vf16(DK) && flash_attn_ext_supported_d_vlen1024_vf16(DV);
+}
+
+// flagos: the head sizes of the one-chunk kernels that keep a row in one e16m2 register group (vlmax 128 at VLEN 1024)
+static constexpr int64_t fa_one_group_d = 128;
+
+static inline bool flash_attn_ext_one_group_shape(int64_t DK, int64_t DV) {
+    return DK > 0 && DK <= fa_one_group_d && DV > 0 && DV <= fa_one_group_d;
 }
 
 static inline float reduce_sum_f32m4_vlen1024(vfloat32m4_t v, size_t vl) {
@@ -624,7 +641,7 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                                                                   int64_t             DK,
                                                                   void *              tcm_buffer,
                                                                   size_t              tcm_buffer_size) {
-    GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
+    GGML_ASSERT(flash_attn_ext_one_group_shape(DK, DV));  // flagos: larger heads go to kvh_inner_mrow
     float S[QLEN] = { 0.0f };  // sum
     float M[QLEN];             // maximum KQ value
     // flagos: (a) "= { -INFINITY }" set only M[0] and left the other rows at 0, so a row whose scores all lay far
@@ -887,7 +904,7 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
                                                                 int64_t             nbv1,
                                                                 int64_t             DV,
                                                                 int64_t             DK) {
-    GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
+    GGML_ASSERT(flash_attn_ext_one_group_shape(DK, DV));  // flagos: larger heads go to one_chunk_m1_segmented
 
     float S = 0.0f;       // sum
     float M = -INFINITY;  // maximum KQ value
@@ -1160,13 +1177,121 @@ static inline float rvv_dot_f16_f32(const _Float16 * a, const _Float16 * b, int6
     return s;
 }
 
-// flagos: ggml-spacemit's flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow with its partial output only: the
-// sinks and dst arguments and the finalize branch left out, partial and the mask rows no longer defaulted
+// head sizes 129 to 256: ggml-spacemit ddfb41ddc, rvv_kernels.cpp:105-134 and 1044-1112
+
+// dst = VKQ16 / S, after folding in the attention sink (if any)
+static inline void flash_attn_ext_finalize_row_f16(float *          dst,
+                                                   const _Float16 * vkq16,
+                                                   int64_t          dv,
+                                                   float            S,
+                                                   float            M,
+                                                   const float *    sink) {
+    float ms = 1.0f;
+    if (sink) {
+        const float s  = *sink;
+        float       vs = 1.0f;
+        if (s > M) {
+            ms = expf(M - s);
+        } else {
+            vs = expf(s - M);
+        }
+        S = S * ms + vs;
+    }
+    const float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
+
+    for (int64_t d0 = 0; d0 < dv;) {
+        const size_t vl = __riscv_vsetvl_e16m2(dv - d0);
+        vfloat32m4_t v  = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(vkq16 + d0, vl), vl);
+        if (ms != 1.0f) {
+            v = __riscv_vfmul_vf_f32m4(v, ms, vl);
+        }
+        __riscv_vse32_v_f32m4(dst + d0, __riscv_vfmul_vf_f32m4(v, S_inv, vl), vl);
+        d0 += vl;
+    }
+}
+
+// flagos: ggml-spacemit's segmented flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1, for rows that do not fit one
+// register group; q in F16 and the V sum on the stack, FA_VLEN1024_MAX_D halves each
+static void one_chunk_m1_segmented(const float *       pq,
+                                   const char *        k_data_row,
+                                   const char *        v_data_row,
+                                   const ggml_fp16_t * mp,
+                                   const float *       sinks,
+                                   float *             dst,
+                                   float               scale,
+                                   float               logit_softcap,
+                                   float               slope,
+                                   int64_t             nek1,
+                                   int64_t             nbk1,
+                                   int64_t             nbv1,
+                                   int64_t             DV,
+                                   int64_t             DK) {
+    GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
+
+    float S = 0.0f;       // sum
+    float M = -INFINITY;  // maximum KQ value
+
+    _Float16 VKQ16[FA_VLEN1024_MAX_D];
+    _Float16 Q16[FA_VLEN1024_MAX_D];
+
+    rvv_fill_f16(VKQ16, 0.0f, DV);
+    for (int64_t d0 = 0; d0 < DK;) {  // flagos: (h)
+        const size_t vl = __riscv_vsetvl_e16m2(DK - d0);
+        __riscv_vse16_v_f16m2(Q16 + d0, __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq + d0, vl), vl), vl);
+        d0 += vl;
+    }
+
+    for (int64_t ic = 0; ic < nek1; ++ic) {
+        const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
+        if (mv == -INFINITY) {
+            continue;
+        }
+
+        const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
+
+        float s = rvv_dot_f16_f32(k_data, Q16, DK);
+
+        s = s * scale;  // scale KQ value
+
+        if (logit_softcap != 0.0f) {
+            s = logit_softcap * tanhf(s);
+        }
+
+        s += mv;  // apply mask
+
+        const float Mold = M;
+
+        float ms = 1.0f;  // upon new higher max val, scale VKQ and KQ sum with this value
+        float vs = 1.0f;  // post-softmax KQ value, expf(s - M)
+
+        if (s > M) {
+            // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+            M  = s;
+            ms = expf(Mold - M);
+        } else {
+            // no new maximum, ms == 1.0f, vs != 1.0f
+            vs = expf(s - M);
+        }
+
+        // V = V*expf(Mold - M) + vs*v
+        rvv_scale_mad_f16(VKQ16, ms, vs, (const _Float16 *) (v_data_row + ic * nbv1), DV);
+
+        S = S * ms + vs;  // scale and increment sum with partial sum
+    }
+
+    flash_attn_ext_finalize_row_f16(dst, VKQ16, DV, S, M, sinks);
+}
+
+// flagos: ggml-spacemit's flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow, the KV-head split's kernel and, with
+// partial null, forward_one_chunk's for rows that do not fit one register group; partial and the mask rows no longer
+// defaulted
 template <size_t QLEN>
 static void kvh_inner_mrow(float **            pq,
                            const char *        k_data_row,
                            const char *        v_data_row,
                            const ggml_fp16_t * mp,
+                           float **            sinks,
+                           float **            dst,
                            float               scale,
                            float               logit_softcap,
                            float               slope,
@@ -1183,9 +1308,11 @@ static void kvh_inner_mrow(float **            pq,
     // QLEN rows share K/V; groups of 4 rows are computed from the packed K/V tile in TCM.
     // Rows may come from n_mask_rows query tokens (QLEN / n_mask_rows consecutive rows per token), each with
     // its own mask row at mp + m * mask_row_stride bytes; a KV position is packed if any token can see it.
-    // Row i writes {M, S, unnormalized VKQ[DV]} to partial[i] (for a later split-KV reduction).
+    // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial[i] (for a later split-KV
+    // reduction) instead of the normalized output to dst[i].
     static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 16, "unsupported QLEN");
     GGML_ASSERT(n_mask_rows >= 1 && QLEN % n_mask_rows == 0 && n_mask_rows <= 16);
+    GGML_ASSERT(partial != nullptr || (dst != nullptr && sinks != nullptr));
     const int64_t rows_per_mask = QLEN / n_mask_rows;
     auto          mask_at       = [&](int64_t m, int64_t ic) -> float {
         return mp ? slope * ((const _Float16 *) ((const char *) mp + m * mask_row_stride))[ic] : 0.0f;
@@ -1198,8 +1325,9 @@ static void kvh_inner_mrow(float **            pq,
         M[i] = -INFINITY;
     }
 
-    // rows longer than vlmax(e16m2) = 128 are processed in segments
-    const int64_t seg = (int64_t) __riscv_vsetvlmax_e16m2();
+    // rows longer than vlmax(e16m2) = 128 are processed in segments; flagos: (h) each loop advances by the vl it got.
+    // ggml-spacemit's advanced by 128, but for 128 < n < 256 RVV 1.0 lets the first vl be anything from ceil(n / 2) to
+    // 128, and a shorter one would skip elements
 
     _Float16 *   kq16_buffer          = (_Float16 *) tcm_buffer;
     _Float16 *   qv_buffer            = kq16_buffer + QLEN * DV;
@@ -1208,10 +1336,11 @@ static void kvh_inner_mrow(float **            pq,
 
     for (size_t i = 0; i < QLEN; ++i) {
         rvv_fill_f16(kq16_buffer + i * DV, 0.0f, DV);
-        for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+        for (int64_t d0 = 0; d0 < DK;) {
             const size_t vl = __riscv_vsetvl_e16m2(DK - d0);
             __riscv_vse16_v_f16m2(qv_buffer + i * DK + d0,
                                   __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq[i] + d0, vl), vl), vl);
+            d0 += vl;
         }
     }
 
@@ -1252,16 +1381,18 @@ static void kvh_inner_mrow(float **            pq,
                 const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
 
                 // K tile is stored transposed (d-major), V tile row-major
-                for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+                for (int64_t d0 = 0; d0 < DK;) {
                     const size_t       vl       = __riscv_vsetvl_e16m2(DK - d0);
                     const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data + d0, vl);
                     __riscv_vsse16_v_f16m2(k_tile_pack + d0 * ic_tile_step + ic_step, k_tile_byte_stride, k_data_v,
                                            vl);
+                    d0 += vl;
                 }
-                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                for (int64_t d0 = 0; d0 < DV;) {
                     const size_t       vl       = __riscv_vsetvl_e16m2(DV - d0);
                     const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
                     __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
+                    d0 += vl;
                 }
                 for (int64_t m = 0; m < n_mask_rows; ++m) {
                     mv_tile_pack[m * ic_tile_step + ic_step] = mvs[m];
@@ -1342,7 +1473,7 @@ static void kvh_inner_mrow(float **            pq,
                     S[i] += rvv_softmax_exp_inplace_f32(row_ptr, ic_step, M[i]);
                 }
 
-                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                for (int64_t d0 = 0; d0 < DV;) {
                     const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
                     for (size_t g = 0; g < QLEN; g += 4) {
                         if constexpr (QLEN >= 4) {
@@ -1388,6 +1519,7 @@ static void kvh_inner_mrow(float **            pq,
                             __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV + d0, pv_acc1, vl);
                         }
                     }
+                    d0 += vl;
                 }
 
                 ic_step = 0;
@@ -1429,14 +1561,19 @@ static void kvh_inner_mrow(float **            pq,
     }
 
     for (size_t i = 0; i < QLEN; ++i) {
-        float * pr = partial[i];
-        pr[0]      = M[i];
-        pr[1]      = S[i];
-        for (int64_t d0 = 0; d0 < DV; d0 += seg) {
-            const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
-            __riscv_vse32_v_f32m4(pr + 2 + d0,
-                                  __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kq16_buffer + i * DV + d0, vl), vl),
-                                  vl);
+        if (partial) {
+            float * pr = partial[i];
+            pr[0]      = M[i];
+            pr[1]      = S[i];
+            for (int64_t d0 = 0; d0 < DV;) {
+                const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
+                __riscv_vse32_v_f32m4(
+                    pr + 2 + d0, __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kq16_buffer + i * DV + d0, vl), vl),
+                    vl);
+                d0 += vl;
+            }
+        } else {
+            flash_attn_ext_finalize_row_f16(dst[i], kq16_buffer + i * DV, DV, S[i], M[i], sinks[i]);
         }
     }
 }
@@ -1515,6 +1652,10 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
     // flagos: (c) the 2- and 4-row kernels apply one slope, the first row's, to all their rows, and with ALiBi each
     // query head has its own; rows are grouped only when every slope is 1
     const bool group_rows = !(max_bias > 0.0f);
+
+    // flagos: rows that fit one e16m2 register group take the kernels above, as before; larger ones the segmented
+    // kernels (ggml-spacemit ddfb41ddc), kvh_inner_mrow with dst and sinks and one mask row, and one_chunk_m1_segmented
+    const bool one_group = flash_attn_ext_one_group_shape(DK, DV);
 
     int ir_step = 1;
     for (int ir = ir0; ir < ir1; ir += ir_step) {
@@ -1607,14 +1748,21 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
             dst_buffer[2] = (float *) ((char *) dst->data + (iq3_2 * ne2 * ne1 + iq2_2 + iq1_2 * ne1) * nb1);
             dst_buffer[3] = (float *) ((char *) dst->data + (iq3_3 * ne2 * ne1 + iq2_3 + iq1_3 * ne1) * nb1);
 
-            flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<4>(  //
-                pq_buffer.data(),                                      //
-                (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),    //
-                (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3),    //
-                mp,                                                    //
-                sinks_buffer.data(),                                   //
-                dst_buffer.data(),                                     //
-                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size);
+            if (one_group) {
+                flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<4>(  //
+                    pq_buffer.data(),                                      //
+                    (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),    //
+                    (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3),    //
+                    mp,                                                    //
+                    sinks_buffer.data(),                                   //
+                    dst_buffer.data(),                                     //
+                    scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size);
+            } else {
+                kvh_inner_mrow<4>(pq_buffer.data(), (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),
+                                  (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3), mp, sinks_buffer.data(),
+                                  dst_buffer.data(), scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer,
+                                  tcm_buffer_size, nullptr, 1, 0);
+            }
         } else if (group_rows && tcm_buffer != nullptr && 2 * KV_row_size < tcm_buffer_size && ir < (ir1 - 1) &&
                    mp_equal_2 && ik3_1 == ik3 && ik2_1 == ik2 && iv3_1 == iv3 && iv2_1 == iv2) {
             ir_step = 2;
@@ -1628,24 +1776,39 @@ void forward_one_chunk(const ggml_tensor * dst, int64_t ir0, int64_t ir1, void *
             dst_buffer[0] = (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1);
             dst_buffer[1] = (float *) ((char *) dst->data + (iq3_1 * ne2 * ne1 + iq2_1 + iq1_1 * ne1) * nb1);
 
-            flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<2>(  //
-                pq_buffer.data(),                                      //
-                (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),    //
-                (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3),    //
-                mp,                                                    //
-                sinks_buffer.data(),                                   //
-                dst_buffer.data(),                                     //
-                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size);
+            if (one_group) {
+                flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<2>(  //
+                    pq_buffer.data(),                                      //
+                    (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),    //
+                    (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3),    //
+                    mp,                                                    //
+                    sinks_buffer.data(),                                   //
+                    dst_buffer.data(),                                     //
+                    scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer, tcm_buffer_size);
+            } else {
+                kvh_inner_mrow<2>(pq_buffer.data(), (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),
+                                  (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3), mp, sinks_buffer.data(),
+                                  dst_buffer.data(), scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK, tcm_buffer,
+                                  tcm_buffer_size, nullptr, 1, 0);
+            }
         } else {
             ir_step = 1;
-            flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(                             //
-                pq,                                                                          //
-                (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),                          //
-                (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3),                          //
-                mp,                                                                          //
-                sinks ? ((float *) ((char *) sinks->data)) + h : nullptr,                    //
-                (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1),  //
-                scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK);
+            if (one_group) {
+                flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(                             //
+                    pq,                                                                          //
+                    (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),                          //
+                    (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3),                          //
+                    mp,                                                                          //
+                    sinks ? ((float *) ((char *) sinks->data)) + h : nullptr,                    //
+                    (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1),  //
+                    scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK);
+            } else {
+                one_chunk_m1_segmented(pq, (const char *) k->data + (ik2 * nbk2 + ik3 * nbk3),
+                                       (const char *) v->data + (iv2 * nbv2 + iv3 * nbv3), mp,
+                                       sinks ? ((float *) ((char *) sinks->data)) + h : nullptr,
+                                       (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1),
+                                       scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK);
+            }
         }
     }
 }
@@ -2003,9 +2166,14 @@ void split_begin(const ggml_tensor * dst, void * tcm, size_t tcm_size) {
     // q in F16, unscaled (the scores are scaled in F32), as forward_one_chunk's kernels and ggml-cpu round it
     _Float16 * q16 = (_Float16 *) (base + L.off_q);
     for (int64_t h = 0; h < L.n_head; ++h) {
-        const float *      pq = (const float *) ((const char *) q->data + h * q->nb[2]);
-        const vfloat16m2_t qh = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq, L.DK), L.DK);
-        __riscv_vse16_v_f16m2(q16 + h * L.DK, qh, L.DK);
+        const float * pq = (const float *) ((const char *) q->data + h * q->nb[2]);
+        // flagos: in segments of vlmax(e16m2) = 128, (h); one at head sizes up to 128
+        for (int64_t d0 = 0; d0 < L.DK;) {
+            const size_t       vl = __riscv_vsetvl_e16m2(L.DK - d0);
+            const vfloat16m2_t qh = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq + d0, vl), vl);
+            __riscv_vse16_v_f16m2(q16 + h * L.DK + d0, qh, vl);
+            d0 += (int64_t) vl;
+        }
     }
     rvv_zero_f32((float *) (base + L.off_acc), L.n_head * L.DV);
     float * M = (float *) (base + L.off_max);
@@ -2191,8 +2359,8 @@ void kvh_partial(const ggml_tensor * dst,
             const size_t  mstride     = mask ? mask->nb[1] : 0;
 
 #    define KVH_MROW(QL)                                                                                          \
-        kvh_inner_mrow<QL>(pq.data(), kd, vd, mp, scale, logit_softcap, 1.0f, c1 - c0, k->nb[1], v->nb[1], DV, DK, \
-                           tcm_buffer, tcm_buffer_size, pr.data(), n_mask_rows, mstride)
+        kvh_inner_mrow<QL>(pq.data(), kd, vd, mp, nullptr, nullptr, scale, logit_softcap, 1.0f, c1 - c0, k->nb[1], \
+                           v->nb[1], DV, DK, tcm_buffer, tcm_buffer_size, pr.data(), n_mask_rows, mstride)
             switch (prows) {
                 case 2: KVH_MROW(2); break;
                 case 4: KVH_MROW(4); break;

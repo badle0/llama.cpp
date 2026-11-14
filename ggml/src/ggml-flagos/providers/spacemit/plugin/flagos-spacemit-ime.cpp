@@ -1,5 +1,6 @@
 #include "flagos-spacemit-ime.h"
 
+#include "flagos-spacemit-ime-format.h"
 #include "flagos-spacemit-ime-kernels.h"
 #include "flagos-spacemit-kernels.h"
 #include "flagos-spacemit-weights.h"
@@ -16,26 +17,17 @@ namespace {
 constexpr int64_t nb_cols   = spacemit_ime::row_tile;  // weight rows per IME tile
 constexpr int64_t row_align = 4;                       // rows of the 4-row kernel
 
-// one IME weight layout: its K block, its row sizes and its kernels (flagos-spacemit-ime-kernels.h)
-struct mm_format {
-    int64_t k_block;  // K values per block, in the activations and in the weights
-    size_t (*act_row_bytes)(size_t k);
-    size_t (*weight_row_bytes)(size_t k);
-    void (*quantize_row)(const float * a, size_t count_k, uint8_t * qa, bool reference);
-    void (*quantize_4rows)(const float * a, size_t count_k, uint8_t * qa, bool reference);
-    size_t (*gemm)(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n, size_t k_blocks,
-                   size_t ldc, bool reference);
-};
-
 const mm_format k_q4_0_32x256 = { (int64_t) spacemit_ime::q4_0_k_block, spacemit_ime::q4_0_act_row_bytes,
                                   spacemit_ime::q4_0_weight_row_bytes,  spacemit_ime::q4_0_quantize_row,
                                   spacemit_ime::q4_0_quantize_4rows,    spacemit_ime::q4_0_gemm };
-// Q8_0 weights, and Q4_1 and Q6_K weights requantized to Q8_0 at load: the same layout and kernels
+// Q8_0 weights, Q4_1 and Q6_K weights requantized to Q8_0 at load, and Q5_0 weights stored as Q8_0 exactly: the same
+// layout and kernels
 const mm_format k_q8_0_32x32  = { (int64_t) spacemit_ime::q8_0_k_block, spacemit_ime::i8_act_row_bytes,
                                   spacemit_ime::q8_0_weight_row_bytes,  spacemit_ime::i8_quantize_row,
                                   spacemit_ime::i8_quantize_4rows,      spacemit_ime::q8_0_gemm };
 
-// spacemit_find_op admits only weights with an IME layout
+}  // namespace
+
 const mm_format & mm_format_of(const ggml_tensor * w) {
     switch (spacemit_weight_layout(w)) {
         case spacemit_layout::q4_0_32x256:
@@ -43,12 +35,19 @@ const mm_format & mm_format_of(const ggml_tensor * w) {
         case spacemit_layout::q4_1_q8_0_32x32:
         case spacemit_layout::q8_0_32x32:
         case spacemit_layout::q6_k_q8_0_32x32:
+        case spacemit_layout::q5_0_q8_0_32x32:
             return k_q8_0_32x32;
         case spacemit_layout::plain:
             break;
     }
     GGML_ABORT("MUL_MAT weight without an IME layout");
 }
+
+bool mm_use_reference() {
+    return spacemit_use_reference() || !spacemit_ime::have_ime();
+}
+
+namespace {
 
 struct mm_dims {
     const mm_format * f;  // the weight's layout
@@ -76,12 +75,6 @@ mm_dims mm_dims_of(const ggml_tensor * node) {
 
 int64_t div_up(int64_t a, int64_t b) {
     return (a + b - 1) / b;
-}
-
-// test-only GGML_FLAGOS_KERNEL_VARIANTS=0 (flagos-spacemit-kernels.h); without the IME kernels the scalar references
-// are always used
-bool use_reference() {
-    return spacemit_use_reference() || !spacemit_ime::have_ime();
 }
 
 // FLAGOS_SPACEMIT_MM (fusion-and-splitting.md §7.3): fit,staged, the default since 2026-10-25, takes path B where TCM
@@ -300,7 +293,7 @@ bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor 
 bool spacemit_mul_mat_quantize(const spacemit_tile * tile_p, ggml_tensor * node) {
     const spacemit_tile & tile = *tile_p;
     const mm_dims d         = mm_dims_of(node);
-    const bool    reference = use_reference();
+    const bool    reference = mm_use_reference();
     const float * x         = static_cast<const float *>(node->src[1]->data);
     uint8_t *     qa        = static_cast<uint8_t *>(tile.workspace);
 
@@ -336,7 +329,7 @@ bool spacemit_mul_mat_quantize(const spacemit_tile * tile_p, ggml_tensor * node)
 bool spacemit_mul_mat_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
     const spacemit_tile & tile = *tile_p;
     const mm_dims   d         = mm_dims_of(node);
-    const bool      reference = use_reference();
+    const bool      reference = mm_use_reference();
     const uint8_t * qa        = static_cast<const uint8_t *>(tile.workspace);
     const uint8_t * w         = static_cast<const uint8_t *>(node->src[0]->data);
     float *         out       = static_cast<float *>(node->data);

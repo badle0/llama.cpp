@@ -116,6 +116,8 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "swiglu.f32", fake_step, NULL, NULL },
         { "mul_mat.quantize", fake_step, NULL, NULL },
         { "mul_mat.gemm", fake_step, NULL, NULL },
+        { "mul_mat_id.quantize", fake_step, NULL, NULL },
+        { "mul_mat_id.gemm", fake_step, NULL, NULL },
         { "flash_attn", fake_step, NULL, NULL },
         { "flash_attn.split.partial", fake_step, NULL, NULL },
         { "flash_attn.split.partial_paired", fake_step, NULL, NULL },
@@ -132,6 +134,11 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "ssm_conv.f32", fake_step, NULL, NULL },
         { "concat.f32", fake_step, NULL, NULL },
         { "mul_mat.f32", fake_step, NULL, NULL },
+        { "soft_max.f32", fake_step, NULL, NULL },
+        { "argsort.f32", fake_step, NULL, NULL },
+        { "sum_rows.f32", fake_step, NULL, NULL },
+        { "clamp.f32", fake_step, NULL, NULL },
+        { "div.f32", fake_step, NULL, NULL },
     };
     if (count != NULL) {
         *count = sizeof(kernels) / sizeof(kernels[0]);

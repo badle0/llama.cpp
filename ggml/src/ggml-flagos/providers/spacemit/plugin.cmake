@@ -22,6 +22,9 @@ add_library(flagos-provider-spacemit SHARED
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-x100.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-format.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-id.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-id.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-attn.h"
@@ -29,7 +32,9 @@ add_library(flagos-provider-spacemit SHARED
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-attn.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-attn.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-gdn.h"
-    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-gdn.cpp")
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-gdn.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-moe.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-moe.cpp")
 target_link_libraries(flagos-provider-spacemit PRIVATE ggml-base)
 target_include_directories(flagos-provider-spacemit PRIVATE ..)
 # no version suffix, the name the loader opens; beside libggml-flagos, as ggml_add_backend_library places a module; only
@@ -86,7 +91,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
                                 "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-kernels.cpp"
                                 "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-attn.cpp"
                                 "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-rvv-attn.cpp"
-                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-gdn.cpp" PROPERTIES
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-gdn.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-seq.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-moe.cpp" PROPERTIES
         COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba;-mabi=lp64d")
     set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.cpp" PROPERTIES
         COMPILE_OPTIONS "${FLAGOS_SPACEMIT_IME_MARCH};-mabi=lp64d")
