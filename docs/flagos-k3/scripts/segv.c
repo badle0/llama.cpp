@@ -1,11 +1,12 @@
-// segv.c: crash reporter. On SIGSEGV/SIGBUS prints the fault address, the faulting thread's registers and a
-// backtrace to stderr, then exits with code 139. riscv64 Linux only.
+// segv.c: crash reporter. On SIGSEGV/SIGBUS/SIGILL prints the fault address, the faulting thread's registers and a
+// backtrace to stderr (for SIGILL also the instruction word and the cpu), then exits with code 139. riscv64 Linux only.
 // Build (K3): gcc -O2 -shared -fPIC -o segv.so segv.c -ldl
 // Use: LD_PRELOAD=/path/to/segv.so <program> ...   (child processes inherit it)
 // Self-test: LD_PRELOAD=./segv.so sh -c 'kill -SEGV $$'   (a signal sent by kill shows the sender's pid as address)
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,12 @@ static void on_fault(int sig, siginfo_t * si, void * context) {
              info.dli_fname ? info.dli_fname : "?", info.dli_fbase ? r[0] - (unsigned long) info.dli_fbase : 0UL,
              info.dli_sname ? info.dli_sname : "?", info.dli_saddr ? r[0] - (unsigned long) info.dli_saddr : 0UL);
     put(line);
+    if (sig == SIGILL) {
+        unsigned int insn = 0;
+        memcpy(&insn, (const void *) r[0], sizeof insn);
+        snprintf(line, sizeof line, "=== instruction word %08x, cpu %d\n", insn, sched_getcpu());
+        put(line);
+    }
     for (int i = 0; i < 32; i++) {
         snprintf(line, sizeof line, "%-4s %016lx%s", k_names[i], r[i], i % 4 == 3 ? "\n" : "   ");
         put(line);
@@ -47,4 +54,5 @@ __attribute__((constructor)) static void segv_install(void) {
     sa.sa_flags     = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
 }
