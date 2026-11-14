@@ -6602,7 +6602,10 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
 // twice through the backend (8 tiles) and its two kernel entries directly on 1 and on 8 tiles: the four outputs bit
 // for bit. An id outside the experts fails the graph.
 // --full adds the model's shapes for Q8_0, Q6_K and Q5_0
-static int check_mul_mat_id(ggml_backend_dev_t dev, bool full) {
+static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
+    // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions, so
+    // they run there only with the reference kernels
+    const bool direct = host || *reference_label() != '\0';
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -6866,7 +6869,7 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool full) {
             }
             const size_t         ws = step_q->workspace_size(y);
             std::vector<uint8_t> workspace(ws);
-            for (int r = 2; r < 4 && dev_ok; r++) {
+            for (int r = 2; r < 4 && dev_ok && direct; r++) {
                 const uint32_t nth = r == 2 ? 1u : 8u;
                 ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
                 for (const spacemit_plugin_kernel * step : { step_q, step_g }) {
@@ -6880,8 +6883,8 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool full) {
             }
             const size_t out_bytes = (size_t) n_out * sizeof(float);
             const bool   same      = dev_ok && std::memcmp(out[0].data(), out[1].data(), out_bytes) == 0 &&
-                              std::memcmp(out[0].data(), out[2].data(), out_bytes) == 0 &&
-                              std::memcmp(out[0].data(), out[3].data(), out_bytes) == 0;
+                              (!direct || (std::memcmp(out[0].data(), out[2].data(), out_bytes) == 0 &&
+                                           std::memcmp(out[0].data(), out[3].data(), out_bytes) == 0));
             const double e    = dev_ok ? nmse(out[0].data(), (const float *) y_ref->data, n_out) : -1.0;
             const double e_q8 = dev_ok && y_q8 != nullptr ? nmse(out[0].data(), (const float *) y_q8->data, n_out) : 0.0;
             if (dev_ok && y_rb != nullptr) {
@@ -9173,7 +9176,7 @@ int main(int argc, char ** argv) {
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_repack_threads(dev, !host) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 ||
-        check_state_ops(dev) != 0 || check_mul_mat_id(dev, full) != 0 || check_gdn(dev) != 0 || check_seq_ops(dev) != 0 || check_moe_ops(dev) != 0 ||
+        check_state_ops(dev) != 0 || check_mul_mat_id(dev, host, full) != 0 || check_gdn(dev) != 0 || check_seq_ops(dev) != 0 || check_moe_ops(dev) != 0 ||
         check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {
