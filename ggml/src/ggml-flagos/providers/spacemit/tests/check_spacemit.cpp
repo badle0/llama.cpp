@@ -8048,6 +8048,132 @@ struct diag_layer {
     }
 };
 
+// the number after "key": in a JSON line, NAN when absent
+static double json_number(const std::string & line, const char * key) {
+    const std::string k  = std::string("\"") + key + "\":";
+    const size_t      at = line.find(k);
+    return at == std::string::npos ? NAN : std::strtod(line.c_str() + at + k.size(), nullptr);
+}
+
+// GGML_FLAGOS_OP_STATS keeps a kind's first graph apart: one kind seen once (rows 7) and one seen three times (rows 9),
+// two steps on two tiles, each graph's clock reads made up. The counted lines of rows 9 hold graphs 2 and 3 only, the
+// "first":1 lines graph 1 only; rows 7 has all-zero counted lines (graphs 0) and first lines with its one graph
+static bool check_op_stats_first() {
+    const std::string path = std::string(FLAGOS_SPACEMIT_TEST_PLUGIN_DIR) + "/diag-op-stats.jsonl";
+    if (FILE * f = std::fopen(path.c_str(), "w")) {  // the destructor appends
+        std::fclose(f);
+    }
+    ggml_init_params params = { 4 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context *   ctx    = ggml_init(params);
+    if (ctx == nullptr) {
+        std::fprintf(stderr, "FAIL: diagnostics, OP_STATS: no context\n");
+        g_failures++;
+        return false;
+    }
+    ggml_tensor *                           a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor *                           x     = ggml_scale(ctx, a, 2.0f);
+    ggml_tensor *                           y     = ggml_add(ctx, x, a);
+    const std::vector<spacemit_plugin_step> steps = { { plan_fake_kernel_1, x, 0 }, { plan_fake_kernel_2, y, 0 } };
+    const std::vector<const char *>         names = { "scale", "add" };
+    const size_t                            n     = steps.size();
+    const uint32_t                          tiles = 2;
+    // graph g's (0-based) clock reads
+    const auto kernel = [](int g, size_t s, uint32_t t) -> uint32_t {
+        return static_cast<uint32_t>(1000 * (g + 1) * (s + 1) + 500 * t);
+    };
+    const auto barrier = [](int g) -> uint32_t { return static_cast<uint32_t>(200 * (g + 1)); };
+    const auto launch  = [](int g) { return 10.0 * (g + 1); };
+    {
+        spacemit_op_stats_file counters(path.c_str());
+        spacemit_run_stats     run;
+        const auto             graph = [&](int64_t rows, int g) {
+            run.reset(n);
+            run.n_steps   = n;
+            run.n_tiles   = tiles;
+            run.launch_us = launch(g);
+            for (uint32_t t = 0; t < tiles; t++) {
+                for (size_t s = 0; s < n; s++) {
+                    run.kernel_ns[t * run.stride + s]       = kernel(g, s, t);
+                    run.step_barrier_ns[t * run.stride + s] = barrier(g);
+                }
+            }
+            counters.add("per-split", rows, 512, steps, names, run);
+        };
+        graph(7, 0);
+        for (int g = 0; g < 3; g++) {
+            graph(9, g);
+        }
+    }  // the destructor writes
+    ggml_free(ctx);
+
+    // the (all) line's expected values per graph over graphs [g0, g1)
+    struct want {
+        double wall, kernel, busy, launch;
+    };
+    const auto expect = [&](int g0, int g1) {
+        want w = {};
+        for (int g = g0; g < g1; g++) {
+            for (size_t s = 0; s < n; s++) {
+                uint32_t slowest = 0;
+                for (uint32_t t = 0; t < tiles; t++) {
+                    w.kernel += kernel(g, s, t);
+                    w.wall += kernel(g, s, t) + barrier(g);
+                    slowest = std::max(slowest, kernel(g, s, t));
+                }
+                w.busy += slowest;
+            }
+            w.launch += launch(g);
+        }
+        const double per = 1e3 * std::max(g1 - g0, 1);
+        return want{ w.wall / tiles / per, w.kernel / tiles / per, w.busy / per, 1e3 * w.launch / per };
+    };
+    // rows -> first -> the (all) line; and the lines per (rows, first)
+    std::map<std::pair<int, bool>, std::string> all;
+    std::map<std::pair<int, bool>, int>         lines;
+    bool                                        format = true;
+    std::ifstream                               written(path);
+    std::string                                 line;
+    while (std::getline(written, line)) {
+        if (line.empty() || line[0] != '{') {
+            continue;
+        }
+        const bool first = line.find("\"first\":1") != std::string::npos;
+        const int  rows  = static_cast<int>(json_number(line, "rows"));
+        lines[{ rows, first }]++;
+        const int graphs = static_cast<int>(json_number(line, "graphs"));
+        char      head[64];  // the fields around "first" in their order
+        std::snprintf(head, sizeof(head), "\"graphs\":%d,%s\"label\":", graphs, first ? "\"first\":1," : "");
+        format = format && line.find(head) != std::string::npos;
+        if (line.find("\"label\":\"(all)\"") != std::string::npos) {
+            all[{ rows, first }] = line;
+        }
+    }
+    const auto matches = [&](const std::string & l, int graphs, const want & w) {
+        const auto near = [](double got, double v) { return std::fabs(got - v) <= 1e-3 * std::max(1.0, std::fabs(v)); };
+        return static_cast<int>(json_number(l, "graphs")) == graphs && near(json_number(l, "wall_us"), w.wall) &&
+               near(json_number(l, "kernel_us"), w.kernel) && near(json_number(l, "busy_us"), w.busy) &&
+               near(json_number(l, "launch_us"), w.launch);
+    };
+    const want zero = {};
+    const bool once = all.count({ 7, false }) && all.count({ 7, true }) && matches(all[{ 7, false }], 0, zero) &&
+                      matches(all[{ 7, true }], 1, expect(0, 1)) && json_number(all[{ 7, true }], "wall_us") > 0.0;
+    const bool thrice = all.count({ 9, false }) && all.count({ 9, true }) &&
+                        matches(all[{ 9, false }], 2, expect(1, 3)) && matches(all[{ 9, true }], 1, expect(0, 1));
+    // two names and (all) per set
+    const bool count = lines.size() == 4 && lines[{ 7, false }] == 3 && lines[{ 7, true }] == 3 &&
+                       lines[{ 9, false }] == 3 && lines[{ 9, true }] == 3;
+    const bool ok = once && thrice && count && format;
+    if (!ok) {
+        std::fprintf(stderr,
+                     "FAIL: diagnostics, OP_STATS: the first graph kept apart: a kind seen once %s, seen three times "
+                     "%s, lines %s, fields %s (%s)\n",
+                     once ? "ok" : "wrong", thrice ? "ok" : "wrong", count ? "ok" : "wrong", format ? "ok" : "wrong",
+                     path.c_str());
+        g_failures++;
+    }
+    return ok;
+}
+
 static int check_diagnostics(ggml_backend_dev_t dev) {
     const spacemit_plugin * loaded = spacemit_device_plugin(dev);
     REQUIRE(loaded != nullptr);
@@ -8270,14 +8396,17 @@ static int check_diagnostics(ggml_backend_dev_t dev) {
     stats_stderr = true;
 #endif
 
+    const bool op_stats = check_op_stats_first();
+
     std::printf("diag     DISABLE_OPS (%d/%zu settings: GLU and FLASH_ATTN_EXT refused by find_op and supports_op, an "
                 "unknown name reported once and ignored; a layer's SwiGLU on the CPU side of the scheduler, %d splits "
                 "against %d, NMSE %.2e, bound %.0e), TRACE_LAUNCH (%d/2: %d step lines for %llu steps and the two "
                 "launch lines, with one launch per step %d status lines for %llu; %d/2 forced failures reported, the "
-                "failing step named %d/1), STATS=- one JSON line to stderr (%s): checked\n",
+                "failing step named %d/1), STATS=- one JSON line to stderr (%s), OP_STATS the first graph kept "
+                "apart (%s): checked\n",
                 disable_ok, sizeof(cases) / sizeof(cases[0]), splits[1], splits[0], e_sched, k_layer_max_nmse,
                 trace_ok, step_lines, (unsigned long long) n_steps, status_lines, (unsigned long long) n_steps_sync,
-                fail_ok, named_step, stats_stderr ? "yes" : "no");
+                fail_ok, named_step, stats_stderr ? "yes" : "no", op_stats ? "yes" : "no");
     return 0;
 }
 

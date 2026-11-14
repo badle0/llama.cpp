@@ -3029,7 +3029,7 @@ One generated token at n_kv 512 (`port-ops-rvv.txt`, 10 graphs, 131.0 ms wall, o
 | `CONCAT` | 1.3 | 1.0% | reference 1.1: the RVV kernel is slower |
 | `UNARY` r1 (SILU, SIGMOID, SOFTPLUS on one row) | 1.0 | 0.8% | 0.15 kernel, the rest waiting |
 
-The prompt graph is not in the profile: `op-stats` does not count a graph seen once. A prompt profile needs that changed or the same prompt shape run twice.
+The prompt graph is not in the profile: `op-stats` does not count a graph seen once. Changed the same day: the counters keep a kind's first graph apart and `op-stats.py` shows a kind seen once from it, marked "first graph only" (`fusion-and-splitting.md` §7); tested on the Mac, the K3's prompt table still to take, once from `llama-completion` (the first prompt, not warmed) and once from `llama-bench -r 3` (warmed).
 
 Candidates for the per-kernel steps, in the order of what this table can save (estimates, none measured): the two state copies (11.7 ms), the F32 `ssm_alpha`/`ssm_beta` matmuls (8.6 ms, 48 small nodes), `SSM_CONV` and `CONCAT` back to at least their references (1.1 ms), then the prompt side once it is profiled.
 

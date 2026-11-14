@@ -396,6 +396,33 @@ spacemit_op_stats_file * spacemit_op_stats_file::get() {
     return file.writing() ? &file : nullptr;
 }
 
+void spacemit_op_stats_file::sums::assign(size_t n, uint32_t tiles) {
+    kernel_ns.assign(n, 0.0);
+    busy_ns.assign(n, 0.0);
+    wall_ns.assign(n, 0.0);
+    tile_ns.assign(n * tiles, 0.0);
+    slowest.assign(n * tiles, 0);
+}
+
+void spacemit_op_stats_file::sums::add(const spacemit_run_stats & run, size_t n, uint32_t tiles) {
+    launch_us += run.launch_us;
+    for (size_t s = 0; s < n; s++) {
+        uint32_t slowest_ns = 0, at = 0;
+        for (uint32_t t = 0; t < tiles; t++) {
+            const uint32_t kernel = run.kernel_ns[t * run.stride + s];
+            kernel_ns[s] += kernel;
+            wall_ns[s] += static_cast<double>(kernel) + run.step_barrier_ns[t * run.stride + s];
+            tile_ns[s * tiles + t] += kernel;
+            if (kernel > slowest_ns) {
+                slowest_ns = kernel;
+                at         = t;
+            }
+        }
+        busy_ns[s] += slowest_ns;
+        slowest[s * tiles + at]++;
+    }
+}
+
 void spacemit_op_stats_file::add(const char * launch, int64_t rows, int64_t n_kv,
                                  const std::vector<spacemit_plugin_step> & steps,
                                  const std::vector<const char *> & names, const spacemit_run_stats & run) {
@@ -408,37 +435,71 @@ void spacemit_op_stats_file::add(const char * launch, int64_t rows, int64_t n_kv
     const uint64_t              shape = structure_of(steps);
     std::lock_guard<std::mutex> lock(mutex);
     totals &                    k = kinds[std::make_tuple(std::string(launch), rows, n_kv, shape)];
-    if (k.labels.empty()) {  // the kind's first graph: its names only
+    if (!k.seen) {  // the kind's first graph: its names, and its times apart
+        k.seen  = true;
         k.tiles = tiles;
         for (size_t s = 0; s < n; s++) {
             k.labels.push_back(spacemit_step_label(steps, names, s));
         }
-        k.kernel_ns.assign(n, 0.0);
-        k.busy_ns.assign(n, 0.0);
-        k.wall_ns.assign(n, 0.0);
-        k.tile_ns.assign(n * tiles, 0.0);
-        k.slowest.assign(n * tiles, 0);
+        k.first.assign(n, tiles);
+        k.later.assign(n, tiles);
+        k.first.add(run, n, tiles);
         return;
     }
     if (k.tiles != tiles) {
         return;
     }
     k.graphs++;
-    k.launch_us += run.launch_us;
-    for (size_t s = 0; s < n; s++) {
-        uint32_t slowest = 0, at = 0;
-        for (uint32_t t = 0; t < tiles; t++) {
-            const uint32_t kernel = run.kernel_ns[t * run.stride + s];
-            k.kernel_ns[s] += kernel;
-            k.wall_ns[s] += static_cast<double>(kernel) + run.step_barrier_ns[t * run.stride + s];
-            k.tile_ns[s * tiles + t] += kernel;
-            if (kernel > slowest) {
-                slowest = kernel;
-                at      = t;
+    k.later.add(run, n, tiles);
+}
+
+void spacemit_op_stats_file::write_kind(FILE * f, const std::tuple<std::string, int64_t, int64_t, uint64_t> & key,
+                                        const totals & k, const sums & sum, uint64_t graphs, bool first) {
+    // each name's steps, the names in the order of their first step; then all steps
+    std::vector<std::string>                   names;
+    std::map<std::string, std::vector<size_t>> steps_of;
+    std::vector<size_t>                        all(k.labels.size());
+    for (size_t s = 0; s < k.labels.size(); s++) {
+        std::vector<size_t> & of = steps_of[k.labels[s]];
+        if (of.empty()) {
+            names.push_back(k.labels[s]);
+        }
+        of.push_back(s);
+        all[s] = s;
+    }
+    names.push_back("(all)");
+    steps_of["(all)"] = all;
+    const double per = 1e3 * static_cast<double>(std::max<uint64_t>(graphs, 1));  // ns summed -> us per graph
+    for (const std::string & name : names) {
+        double                kernel = 0.0, busy = 0.0, wall = 0.0;
+        std::vector<double>   tile(k.tiles, 0.0);
+        std::vector<uint64_t> slowest(k.tiles, 0);
+        for (size_t s : steps_of[name]) {
+            kernel += sum.kernel_ns[s];
+            busy += sum.busy_ns[s];
+            wall += sum.wall_ns[s];
+            for (uint32_t t = 0; t < k.tiles; t++) {
+                tile[t] += sum.tile_ns[s * k.tiles + t];
+                slowest[t] += sum.slowest[s * k.tiles + t];
             }
         }
-        k.busy_ns[s] += slowest;
-        k.slowest[s * tiles + at]++;
+        std::string tile_us, slowest_n;
+        for (uint32_t t = 0; t < k.tiles; t++) {
+            char v[48];
+            std::snprintf(v, sizeof(v), "%s%.3f", t > 0 ? "," : "", tile[t] / per);
+            tile_us += v;
+            std::snprintf(v, sizeof(v), "%s%llu", t > 0 ? "," : "", static_cast<unsigned long long>(slowest[t]));
+            slowest_n += v;
+        }
+        std::fprintf(f,
+                     "{\"launch\":\"%s\",\"rows\":%lld,\"n_kv\":%lld,\"structure\":\"%016llx\",\"steps\":%zu,"
+                     "\"tiles\":%u,\"graphs\":%llu,%s\"label\":\"%s\",\"n\":%zu,\"wall_us\":%.3f,\"kernel_us\":%.3f,"
+                     "\"busy_us\":%.3f,\"launch_us\":%.3f,\"tile_us\":[%s],\"slowest\":[%s]}\n",
+                     std::get<0>(key).c_str(), static_cast<long long>(std::get<1>(key)),
+                     static_cast<long long>(std::get<2>(key)), static_cast<unsigned long long>(std::get<3>(key)),
+                     k.labels.size(), k.tiles, static_cast<unsigned long long>(graphs), first ? "\"first\":1," : "",
+                     name.c_str(), steps_of[name].size(), wall / k.tiles / per, kernel / k.tiles / per, busy / per,
+                     name == "(all)" ? 1e3 * sum.launch_us / per : 0.0, tile_us.c_str(), slowest_n.c_str());
     }
 }
 
@@ -451,52 +512,8 @@ spacemit_op_stats_file::~spacemit_op_stats_file() {
         return;
     }
     for (const auto & [key, k] : kinds) {
-        // each name's steps, the names in the order of their first step; then all steps
-        std::vector<std::string>                   names;
-        std::map<std::string, std::vector<size_t>> steps_of;
-        std::vector<size_t>                        all(k.labels.size());
-        for (size_t s = 0; s < k.labels.size(); s++) {
-            std::vector<size_t> & of = steps_of[k.labels[s]];
-            if (of.empty()) {
-                names.push_back(k.labels[s]);
-            }
-            of.push_back(s);
-            all[s] = s;
-        }
-        names.push_back("(all)");
-        steps_of["(all)"] = all;
-        const double per = 1e3 * static_cast<double>(std::max<uint64_t>(k.graphs, 1));  // ns summed -> us per graph
-        for (const std::string & name : names) {
-            double                kernel = 0.0, busy = 0.0, wall = 0.0;
-            std::vector<double>   tile(k.tiles, 0.0);
-            std::vector<uint64_t> slowest(k.tiles, 0);
-            for (size_t s : steps_of[name]) {
-                kernel += k.kernel_ns[s];
-                busy += k.busy_ns[s];
-                wall += k.wall_ns[s];
-                for (uint32_t t = 0; t < k.tiles; t++) {
-                    tile[t] += k.tile_ns[s * k.tiles + t];
-                    slowest[t] += k.slowest[s * k.tiles + t];
-                }
-            }
-            std::string tile_us, slowest_n;
-            for (uint32_t t = 0; t < k.tiles; t++) {
-                char v[48];
-                std::snprintf(v, sizeof(v), "%s%.3f", t > 0 ? "," : "", tile[t] / per);
-                tile_us += v;
-                std::snprintf(v, sizeof(v), "%s%llu", t > 0 ? "," : "", static_cast<unsigned long long>(slowest[t]));
-                slowest_n += v;
-            }
-            std::fprintf(f,
-                         "{\"launch\":\"%s\",\"rows\":%lld,\"n_kv\":%lld,\"structure\":\"%016llx\",\"steps\":%zu,"
-                         "\"tiles\":%u,\"graphs\":%llu,\"label\":\"%s\",\"n\":%zu,\"wall_us\":%.3f,\"kernel_us\":%.3f,"
-                         "\"busy_us\":%.3f,\"launch_us\":%.3f,\"tile_us\":[%s],\"slowest\":[%s]}\n",
-                         std::get<0>(key).c_str(), static_cast<long long>(std::get<1>(key)),
-                         static_cast<long long>(std::get<2>(key)), static_cast<unsigned long long>(std::get<3>(key)),
-                         k.labels.size(), k.tiles, static_cast<unsigned long long>(k.graphs), name.c_str(),
-                         steps_of[name].size(), wall / k.tiles / per, kernel / k.tiles / per, busy / per,
-                         name == "(all)" ? 1e3 * k.launch_us / per : 0.0, tile_us.c_str(), slowest_n.c_str());
-        }
+        write_kind(f, key, k, k.later, k.graphs, false);
+        write_kind(f, key, k, k.first, 1, true);
     }
     if (to_stderr) {
         std::fflush(f);

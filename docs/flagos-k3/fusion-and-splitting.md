@@ -214,8 +214,9 @@ times by what each step does. It is M4's first item ("profile a generation step"
 - Recorded per step and tile: the kernel time (E3c's `kernel_ns`) and, new, the wait at the barrier after the step
   (`step_barrier_ns`), from the same clock reads.
 - Per kind of graph (launch mode, rows of the first matmul, n_kv of the first attention, and a hash of the steps' kernels,
-  ops and shapes) every step's times are summed over the graphs; the kind's first graph is left out (it may create the
-  stream and touch new memory). Host work: two passes over the steps per graph (estimate 20-40 µs).
+  ops and shapes) every step's times are summed over the graphs; the kind's first graph is kept apart (it may create the
+  stream and touch new memory), in its own lines marked `"first":1`, which `op-stats.py` shows only for a kind with no
+  other graph, such as a prompt seen once per run (since 2026-11-14; until then it was dropped). Host work: two passes over the steps per graph (estimate 20-40 µs).
 - Names, made once per kind (`spacemit_step_label`): the op (with `quantize`/`gemm` for a matmul, `one-step`/`partial`/
   `merge` for attention), the role from the tensors' names (`blk.N.attn_q.weight` -> `attn_q`; an `RMS_NORM` by the norm
   weight of the `MUL` that takes it, a `ROPE` by the one before it, a `SET_ROWS` by its cache, an `ADD` by the matmul
@@ -353,8 +354,9 @@ Not fusion, but larger: the matmuls' imbalance 2.0 ms per token (2.3%: the pair 
 between pairs about 1.4 ms); pp128's path C about 205 ms per batch (14.8%); the split attention's imbalance 1.1-1.3 ms
 per token at depth.
 
-Gaps: pp512 at depth 4096 has no table: with `-r 1` each process runs that graph once, and the counters leave each kind's
-first graph out (to fix: keep it apart instead of dropping it). The board's timebase is not read yet. "Structures" in the
+Gaps: pp512 at depth 4096 has no table: with `-r 1` each process runs that graph once, and the counters left each kind's
+first graph out (since 2026-11-14 they keep it apart, and `op-stats.py` shows a kind seen once from it, marked "first
+graph only"; not rerun on the board yet). The board's timebase is not read yet. "Structures" in the
 tables counts processes, because the hash holds kernel addresses, which differ from one process to the next.
 
 ### 7.2 Rank 1, candidate #6: one quantization for Q/K/V and for gate/up (prepared 2026-10-21; user request)

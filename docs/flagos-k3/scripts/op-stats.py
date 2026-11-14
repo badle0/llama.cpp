@@ -6,41 +6,56 @@
 #        op-stats.py diff <file>... -- <file>...     per kind of graph in both sets, the second set against the first,
 #                                                    name by name, largest change first
 # The files of one set (one mode's runs) are merged: per kind (launch, rows, n_kv), every name's values weighted by the
-# graphs counted. Times in us per graph: wall = the mean tile's kernel and barrier time, kernel = the mean tile's kernel
-# time, imbal. = each step's slowest tile less the mean, summed (busy - kernel), barrier = wall - busy (the barriers' own
-# cost and the tiles' skew leaving them).
+# graphs counted. A kind's first graph is not counted; a kind with no counted graph (a prompt, seen once per run) is
+# shown from its first graphs (the "first":1 lines), one per run, marked "first graph only". Times in us per graph:
+# wall = the mean tile's kernel and barrier time, kernel = the mean tile's kernel time, imbal. = each step's slowest
+# tile less the mean, summed (busy - kernel), barrier = wall - busy (the barriers' own cost and the tiles' skew leaving
+# them).
 import json
 import sys
 from collections import OrderedDict
 
 
+def merge(kinds, path, r, g):
+    # one line into kinds, its values weighted by g graphs
+    k = kinds.setdefault((r["launch"], r["rows"], r["n_kv"]),
+                         {"graphs": 0, "structures": set(), "tiles": r["tiles"], "names": OrderedDict()})
+    if r["label"] == "(all)":
+        k["graphs"] += g
+        k["structures"].add((path, r["structure"]))
+    v = k["names"].setdefault(r["label"], {"g": 0, "n": 0.0, "wall": 0.0, "kernel": 0.0, "busy": 0.0,
+                                            "launch": 0.0, "tile": [0.0] * r["tiles"],
+                                            "slowest": [0] * r["tiles"]})
+    v["g"] += g
+    for f, src in (("n", "n"), ("wall", "wall_us"), ("kernel", "kernel_us"), ("busy", "busy_us"),
+                   ("launch", "launch_us")):
+        v[f] += r[src] * g
+    for t, x in enumerate(r["tile_us"][: len(v["tile"])]):
+        v["tile"][t] += x * g
+    for t, x in enumerate(r["slowest"][: len(v["slowest"])]):
+        v["slowest"][t] += x
+
+
 def load(paths):
-    # (launch, rows, n_kv) -> {"graphs", "structures", "names": OrderedDict(label -> sums weighted by graphs)}
-    kinds = {}
+    # (launch, rows, n_kv) -> {"graphs", "structures", "names": OrderedDict(label -> sums weighted by graphs)}; a kind
+    # with no counted graph takes its first graphs instead, marked "first_only"
+    kinds, firsts = {}, {}
     for path in paths:
         for line in open(path):
             if not line.startswith("{"):
                 continue
             r = json.loads(line)
+            if r.get("first"):
+                merge(firsts, path, r, r["graphs"])  # one per file: the kind's first graph
+                continue
             g = r["graphs"]
             if g == 0:
-                continue  # a kind seen once: only its first graph, which is not counted
-            k = kinds.setdefault((r["launch"], r["rows"], r["n_kv"]),
-                                 {"graphs": 0, "structures": set(), "tiles": r["tiles"], "names": OrderedDict()})
-            if r["label"] == "(all)":
-                k["graphs"] += g
-                k["structures"].add((path, r["structure"]))
-            v = k["names"].setdefault(r["label"], {"g": 0, "n": 0.0, "wall": 0.0, "kernel": 0.0, "busy": 0.0,
-                                                    "launch": 0.0, "tile": [0.0] * r["tiles"],
-                                                    "slowest": [0] * r["tiles"]})
-            v["g"] += g
-            for f, src in (("n", "n"), ("wall", "wall_us"), ("kernel", "kernel_us"), ("busy", "busy_us"),
-                           ("launch", "launch_us")):
-                v[f] += r[src] * g
-            for t, x in enumerate(r["tile_us"][: len(v["tile"])]):
-                v["tile"][t] += x * g
-            for t, x in enumerate(r["slowest"][: len(v["slowest"])]):
-                v["slowest"][t] += x
+                continue  # a kind seen once: its counted lines are all zero
+            merge(kinds, path, r, g)
+    for key, k in firsts.items():
+        if key not in kinds:
+            k["first_only"] = True
+            kinds[key] = k
     return kinds
 
 
@@ -59,8 +74,18 @@ def per_graph(v, graphs):
 
 def title(key, k):
     launch, rows, n_kv = key
+    if k.get("first_only"):
+        return (f"== {launch}, {rows} row(s), n_kv {n_kv}: first graph only, {k['graphs']} run(s) (not warmed: may"
+                f" include first touches of memory), {k['tiles']} tiles")
     return (f"== {launch}, {rows} row(s), n_kv {n_kv}: {k['graphs']} graphs counted"
             f" ({len({s for _, s in k['structures']})} structure(s)), {k['tiles']} tiles")
+
+
+def counted(k):
+    # a set's graphs in diff's title
+    if k.get("first_only"):
+        return f"first graph only, {k['graphs']} run(s) (not warmed)"
+    return f"{k['graphs']} graphs counted"
 
 
 def show(paths):
@@ -88,8 +113,12 @@ def diff(paths_a, paths_b):
         a, b = ka[key], kb[key]
         va = {n: per_graph(v, a["graphs"]) for n, v in a["names"].items()}
         vb = {n: per_graph(v, b["graphs"]) for n, v in b["names"].items()}
-        print(f"== {key[0]}, {key[1]} row(s), n_kv {key[2]}: graphs counted {a['graphs']} (first set), "
-              f"{b['graphs']} (second set); the second set against the first")
+        if a.get("first_only") or b.get("first_only"):
+            print(f"== {key[0]}, {key[1]} row(s), n_kv {key[2]}: {counted(a)} (first set), {counted(b)} (second set);"
+                  f" the second set against the first")
+        else:
+            print(f"== {key[0]}, {key[1]} row(s), n_kv {key[2]}: graphs counted {a['graphs']} (first set), "
+                  f"{b['graphs']} (second set); the second set against the first")
         print(f"   {'name':46}{'n':>5}{'wall':>11}{'n':>6}{'wall':>11}{'change':>10}{'kernel':>10}{'imbal.':>9}"
               f"{'barrier':>9}")
         names = list(OrderedDict.fromkeys(list(va) + list(vb)))

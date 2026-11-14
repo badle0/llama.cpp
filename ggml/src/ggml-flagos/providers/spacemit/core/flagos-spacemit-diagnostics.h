@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <string>
@@ -117,12 +118,13 @@ class spacemit_stats_file {
 
 // test-only (fusion-and-splitting.md §7): GGML_FLAGOS_OP_STATS=<file> times the steps by what they do, from E3c's
 // clock reads (spacemit_run_stats). Per kind of graph (launch mode, rows of its first matmul, KV length of its first
-// attention, and the kernels and shapes of its steps in order) it sums each step's times over the graphs, leaving out
-// the kind's first graph (it may create the stream and touch new memory), and names each step when the kind is first
+// attention, and the kernels and shapes of its steps in order) it sums each step's times over the graphs, keeping the
+// kind's first graph apart (it may create the stream and touch new memory), and names each step when the kind is first
 // seen. When the process ends it appends to <file> (or stderr when the value is - or 1) one JSON line per kind and
 // name, and one for all of the kind's steps, all per graph: the steps, the mean tile's kernel time (kernel_us) and its
 // kernel and barrier time (wall_us), each step's slowest tile summed (busy_us), each tile's kernel time (tile_us) and
-// how often each was a step's slowest (slowest, over all graphs). The switch is read once
+// how often each was a step's slowest (slowest, over all graphs). Then the same lines for the first graph alone, with
+// "graphs":1 and "first":1. The switch is read once
 class spacemit_op_stats_file {
   public:
     // nullptr when the switch is not set
@@ -142,15 +144,29 @@ class spacemit_op_stats_file {
   private:
     bool writing() const { return to_stderr || !path.empty(); }
 
-    struct totals {
-        uint32_t                 tiles     = 0;
-        uint64_t                 graphs    = 0;  // counted ones: all but the first
-        double                   launch_us = 0.0;
-        std::vector<std::string> labels;
-        std::vector<double>      kernel_ns, busy_ns, wall_ns;  // per step, summed over the tiles (busy: the slowest)
-        std::vector<double>      tile_ns;                      // [step * tiles + tile]
-        std::vector<uint64_t>    slowest;                      // [step * tiles + tile]: graphs where it was slowest
+    // per step, summed over graphs
+    struct sums {
+        double                launch_us = 0.0;
+        std::vector<double>   kernel_ns, busy_ns, wall_ns;  // per step, summed over the tiles (busy: the slowest)
+        std::vector<double>   tile_ns;                      // [step * tiles + tile]
+        std::vector<uint64_t> slowest;                      // [step * tiles + tile]: graphs where it was slowest
+
+        void assign(size_t n, uint32_t tiles);
+        void add(const spacemit_run_stats & run, size_t n, uint32_t tiles);
     };
+
+    struct totals {
+        uint32_t                 tiles  = 0;
+        uint64_t                 graphs = 0;  // counted ones: all but the first
+        bool                     seen   = false;
+        std::vector<std::string> labels;
+        sums                     first;  // the kind's first graph alone
+        sums                     later;  // the counted graphs
+    };
+
+    // one line per name and one for all steps, s's values per graph; first: s is the first graph's
+    static void write_kind(FILE * f, const std::tuple<std::string, int64_t, int64_t, uint64_t> & key,
+                           const totals & k, const sums & s, uint64_t graphs, bool first);
 
     std::string                                                           path;  // empty with stderr and when off
     bool                                                                  to_stderr = false;
