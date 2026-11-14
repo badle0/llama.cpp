@@ -18,8 +18,8 @@
 //
 // RVV variants (on the K3, unless GGML_FLAGOS_KERNEL_VARIANTS=0 keeps the references) for SILU, SIGMOID, SOFTPLUS,
 // SSM_CONV and CONCAT are ported from SpacemiT's fork (ggml-spacemit's rvv_kernels.cpp, branch mtmd-backend @
-// ddfb41ddc); the one for L2_NORM is ours. Each takes the same rows of the same tile as its reference. Changes to the
-// ported code are marked "flagos". MUL_MAT has no RVV variant.
+// ddfb41ddc); the ones for L2_NORM and MUL_MAT are ours. Each takes the same rows of the same tile as its reference.
+// Changes to the ported code are marked "flagos".
 
 namespace {
 
@@ -439,6 +439,68 @@ bool concat_dim0_transposed_f32_rvv(const spacemit_tile & tile, ggml_tensor * ds
     return true;
 }
 
+// the sum of an m2 group's vlmax lanes
+float rvv_sum_f32m2(vfloat32m2_t acc, size_t vlmax) {
+    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m2_f32m1(acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlmax));
+}
+
+// ours, not a port: the reference's rows and split, each dot product in m2 lanes over strips of K (a short last strip
+// keeps the lanes past its vl, tail undisturbed) and summed across the lanes at the end, so the sums are not the
+// reference's bits. Four weight rows share each strip of x: 4 accumulators, x and 4 weight strips take 18 of the 32
+// registers. A row's sum does not depend on its block, so the rows past the last 4 take the same order one at a time
+void mul_mat_f32_rvv(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // the weight [K, N]
+    const ggml_tensor * src1 = dst->src[1];  // the activations [K, rows, ...]
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t vlmax = __riscv_vsetvlmax_e32m2();
+    int64_t      ir0, ir1;
+    tile_range(ne1 * ne2 * ne3, tile, ir0, ir1);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir / (ne2 * ne1);
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i1 = ir % ne1;
+
+        const float * x = (const float *) ((const char *) src1->data + i1 * nb11 + i2 * nb12 + i3 * nb13);
+        float *       y = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        int64_t       r = 0;
+        for (; r + 4 <= ne0; r += 4) {
+            const float * w0 = (const float *) ((const char *) src0->data + (r + 0) * nb01);
+            const float * w1 = (const float *) ((const char *) src0->data + (r + 1) * nb01);
+            const float * w2 = (const float *) ((const char *) src0->data + (r + 2) * nb01);
+            const float * w3 = (const float *) ((const char *) src0->data + (r + 3) * nb01);
+            vfloat32m2_t  a0 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+            vfloat32m2_t  a1 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+            vfloat32m2_t  a2 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+            vfloat32m2_t  a3 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+            for (int64_t k = 0; k < ne00;) {
+                const size_t       vl = __riscv_vsetvl_e32m2(ne00 - k);
+                const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + k, vl);
+                a0 = __riscv_vfmacc_vv_f32m2_tu(a0, __riscv_vle32_v_f32m2(w0 + k, vl), xv, vl);
+                a1 = __riscv_vfmacc_vv_f32m2_tu(a1, __riscv_vle32_v_f32m2(w1 + k, vl), xv, vl);
+                a2 = __riscv_vfmacc_vv_f32m2_tu(a2, __riscv_vle32_v_f32m2(w2 + k, vl), xv, vl);
+                a3 = __riscv_vfmacc_vv_f32m2_tu(a3, __riscv_vle32_v_f32m2(w3 + k, vl), xv, vl);
+                k += (int64_t) vl;
+            }
+            y[r + 0] = rvv_sum_f32m2(a0, vlmax);
+            y[r + 1] = rvv_sum_f32m2(a1, vlmax);
+            y[r + 2] = rvv_sum_f32m2(a2, vlmax);
+            y[r + 3] = rvv_sum_f32m2(a3, vlmax);
+        }
+        for (; r < ne0; ++r) {
+            const float * w = (const float *) ((const char *) src0->data + r * nb01);
+            vfloat32m2_t  a = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+            for (int64_t k = 0; k < ne00;) {
+                const size_t       vl = __riscv_vsetvl_e32m2(ne00 - k);
+                const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + k, vl);
+                a                     = __riscv_vfmacc_vv_f32m2_tu(a, __riscv_vle32_v_f32m2(w + k, vl), xv, vl);
+                k += (int64_t) vl;
+            }
+            y[r] = rvv_sum_f32m2(a, vlmax);
+        }
+    }
+}
+
 #endif  // GGML_FLAGOS_SPACEMIT_RVV
 
 }  // namespace
@@ -508,6 +570,12 @@ bool spacemit_kernel_concat_f32(const spacemit_tile * tile_p, ggml_tensor * dst)
 }
 
 bool spacemit_kernel_mul_mat_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
+    if (!spacemit_use_reference()) {
+        mul_mat_f32_rvv(*tile_p, dst);
+        return true;
+    }
+#endif
     mul_mat_f32_ref(*tile_p, dst);
     return true;
 }

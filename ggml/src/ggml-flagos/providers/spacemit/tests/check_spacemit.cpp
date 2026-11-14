@@ -90,6 +90,7 @@ static spacemit_mm_tail_take_fn    g_mm_tail_take    = nullptr;
 static spacemit_switches_reset_fn  g_switches_reset  = nullptr;
 static spacemit_attn_paths_take_fn g_attn_paths_take = nullptr;
 static spacemit_embd_paths_take_fn g_embd_paths_take = nullptr;
+static spacemit_gdn_paths_take_fn  g_gdn_paths_take  = nullptr;
 static spacemit_repack_threads_fn  g_repack_threads  = nullptr;
 static spacemit_repack_take_fn     g_repack_take     = nullptr;
 static spacemit_repack_via_fn      g_repack_via      = nullptr;
@@ -107,6 +108,8 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
         reinterpret_cast<spacemit_attn_paths_take_fn>(table->get_proc_address("spacemit_attn_paths_take"));
     g_embd_paths_take =
         reinterpret_cast<spacemit_embd_paths_take_fn>(table->get_proc_address("spacemit_embd_paths_take"));
+    g_gdn_paths_take =
+        reinterpret_cast<spacemit_gdn_paths_take_fn>(table->get_proc_address("spacemit_gdn_paths_take"));
     g_repack_threads =
         reinterpret_cast<spacemit_repack_threads_fn>(table->get_proc_address("spacemit_repack_threads"));
     g_repack_take = reinterpret_cast<spacemit_repack_take_fn>(table->get_proc_address("spacemit_repack_take"));
@@ -115,7 +118,7 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
         reinterpret_cast<spacemit_repack_x100_take_fn>(table->get_proc_address("spacemit_repack_x100_take"));
     REQUIRE(g_steps_take != nullptr && g_executors_take != nullptr && g_mm_paths_take != nullptr &&
             g_mm_tail_take != nullptr && g_switches_reset != nullptr && g_attn_paths_take != nullptr &&
-            g_embd_paths_take != nullptr && g_repack_threads != nullptr && g_repack_take != nullptr &&
+            g_embd_paths_take != nullptr && g_gdn_paths_take != nullptr && g_repack_threads != nullptr && g_repack_take != nullptr &&
             g_repack_via != nullptr && g_repack_x100_take != nullptr);
     return 0;
 }
@@ -266,7 +269,7 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     const char * names[] = { "spacemit_steps_take", "spacemit_executors_take", "spacemit_mm_paths_take",
                              "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
                              "spacemit_switches_reset", "spacemit_switches_generation",
-                             "spacemit_attn_paths_take", "spacemit_embd_paths_take",
+                             "spacemit_attn_paths_take", "spacemit_embd_paths_take", "spacemit_gdn_paths_take",
                              "spacemit_repack_threads", "spacemit_repack_take",
                              "spacemit_repack_via", "spacemit_repack_x100_take" };
     size_t       n_names = 0;
@@ -5229,7 +5232,8 @@ static ggml_tensor * gdn_raw(ggml_context * ctx, ggml_type dst_type, ggml_tensor
 //   of about 4 for another libm, and two ulps for L2_NORM's scale; NMSE 1e-12 is a few ulps squared. SILU's ggml-cpu uses a vector exp approximation where the host has one
 //   (on the K3 the RVV kernel's own), so its references differ from it too.
 // - MUL_MAT: within test-backend-ops' bound for MUL_MAT (5e-4), not bit for bit: ggml-cpu adds a dot product in
-//   vector lanes (ggml_vec_dot_f32) or runs llamafile's sgemm, which a plain row dot cannot match.
+//   vector lanes (ggml_vec_dot_f32) or runs llamafile's sgemm, which a plain row dot cannot match; nor does the RVV
+//   kernel's lanes on the K3, whose order depends on the vector length too.
 
 // an NMSE and a largest |difference| / max(1, |CPU's value|); { 0, 0 } asks for the CPU's bytes
 struct seq_bound {
@@ -6466,6 +6470,34 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                  in.push_back(x);
                  return ggml_mul_mat(ctx, w, x);
              });
+    // the RVV kernel's blocks of 4 weight rows and its strips of K: N whole blocks, a remainder and both; K under, at
+    // and over a strip of 16, 32 and 64 lanes (VLEN 256, 512 and 1024 at m2) and the model's 2560; 1, 2 and 9 rows
+    {
+        const int64_t mm_rows[] = { 1, 2, 9 };
+        int           i         = 0;
+        for (const int64_t N : { 1, 3, 4, 5, 16 }) {
+            for (const int64_t K : { 1, 7, 31, 32, 33, 65, 128, 2560 }) {
+                const int64_t     M    = mm_rows[i++ % 3];
+                const std::string what = "MUL_MAT of an F32 [" + std::to_string(K) + ", " + std::to_string(N) +
+                                         "] weight by [" + std::to_string(K) + ", " + std::to_string(M) + "]";
+                run_case(what.c_str(), k_mm, k_seq_mul_mat, [N, K, M](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+                    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+                    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+                    in.push_back(w);
+                    in.push_back(x);
+                    return ggml_mul_mat(ctx, w, x);
+                });
+            }
+        }
+    }
+    run_case("MUL_MAT of an F32 [33, 5] weight by [33, 2, 3, 2] (broadcast)", k_mm, k_seq_mul_mat,
+             [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+                 ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 33, 5);
+                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 33, 2, 3, 2);
+                 in.push_back(w);
+                 in.push_back(x);
+                 return ggml_mul_mat(ctx, w, x);
+             });
     run_case("MUL_MAT of an F32 [2560, 32] weight by an empty [2560, 0]", k_mm, k_seq_mul_mat,
              [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
                  ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 32);
@@ -6611,7 +6643,8 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                 "1e-20 and 1e18): %d/%d cases as the CPU on 8 tiles and directly on 1 and 8%s; SSM_CONV, CONCAT and "
                 "CONT bit for bit in %d/%d (max NMSE %.2e); max NMSE and |difference| / max(1, |y|): SILU %.2e "
                 "%.2e, SIGMOID %.2e %.2e, SOFTPLUS %.2e %.2e, L2_NORM %.2e %.2e (bounds 1e-12 and 1e-6, 5e-7, 1e-6, "
-                "5e-7), MUL_MAT NMSE %.2e (bound %.0e, ggml-cpu's vector sums); the lane model of the RVV exp and "
+                "5e-7), MUL_MAT NMSE %.2e (bound %.0e, ggml-cpu's vector sums) and %.2e, N 1, 3, 4, 5 and 16 by K "
+                "1, 7, 31, 32, 33, 65, 128 and 2560; the lane model of the RVV exp and "
                 "activations over %lld floats: exp %.3f ulp, silu %.3f, sigmoid %.3f, softplus %.3f from the exact "
                 "value, from ggml-cpu's formulas silu %.2e, sigmoid %.2e, softplus %.2e; the nine claims (the IME "
                 "matmul still its own) and the refused forms (F16 everywhere, a transposed L2_NORM source, strided "
@@ -6619,7 +6652,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                 "viewed F32 weight, non-contiguous or F16 activations): %d/%d\n",
                 n_ok, n_cases, reference_label(), n_exact, n_exact_cases, worst_exact, w_silu.first, w_silu.second,
                 w_sigmoid.first, w_sigmoid.second, w_softplus.first, w_softplus.second, w_l2.first, w_l2.second,
-                w_mm.first, k_mul_mat_max_nmse, (long long) n_lanes, lane_exp.max_ulp, lane_silu.max_ulp,
+                w_mm.first, k_mul_mat_max_nmse, w_mm.second, (long long) n_lanes, lane_exp.max_ulp, lane_silu.max_ulp,
                 lane_sigmoid.max_ulp, lane_softplus.max_ulp, lane_silu.max_cpu, lane_sigmoid.max_cpu,
                 lane_softplus.max_cpu, n_claims_ok, n_claims);
     return 0;
@@ -7170,8 +7203,9 @@ static int check_gdn(ggml_backend_dev_t dev) {
     // (VLEN 256, no TCM), where neither prefill form is taken. Against ggml-cpu, the scores and the final state apart:
     // recurrence within the bound above over the whole output, tcm within a rounding bound, chunk (another order of
     // operations) within a looser one; each run repeated bit for bit; unset, empty and an unknown value (one warning)
-    // give the recurrence's bytes. A form that ran shows as bytes other than the recurrence's; without the RVV kernels
-    // (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) every value runs the reference
+    // give the recurrence's bytes. The tiles count the form they ran (spacemit_gdn_paths_take): with the RVV kernels
+    // chunk must take the chunkwise form, tcm the TCM form where a tile's TCM holds it, the others a recurrence form;
+    // without them (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) every value runs the reference
     const gdn_case prefill_cases[] = {
   // what,                                                 S_v,   H, tok, seq, H_qk, seq_qk,   kda, K
         { "16 heads, 16 tokens (one chunk)",                128,  16,  16,   1,   16,      1, false, 1 },
@@ -7191,6 +7225,28 @@ static int check_gdn(ggml_backend_dev_t dev) {
     };
     int    n_prefill = 0, n_prefill_ok = 0, n_other[3] = { 0, 0, 0 };
     double worst_prefill[3][2] = {};  // by form: the scores' NMSE, the state's
+    // the counters' forms, in spacemit_gdn_paths_take's order; per value, the cases in which the tiles took each
+    const char * const form_names[5] = { "reference", "fused", "two-pass", "chunk", "tcm" };
+    constexpr size_t   n_values         = sizeof(prefill_values) / sizeof(prefill_values[0]);
+    int                n_took[n_values][5] = {};
+#if defined(__riscv)
+    const bool rvv = std::strlen(reference_label()) == 0;
+#else
+    const bool rvv = false;
+#endif
+    size_t tcm_per_tile = 0;
+    {
+        spacemit_plugin_device * pdev = nullptr;
+        if (table->device_open(0, &pdev) == SPACEMIT_STATUS_SUCCESS && pdev != nullptr) {
+            spacemit_plugin_device_props props = {};
+            props.struct_size                  = sizeof(props);
+            if (table->device_props(pdev, &props) == SPACEMIT_STATUS_SUCCESS) {
+                tcm_per_tile = props.tcm_bytes_per_tile;
+            }
+            table->device_close(pdev);
+        }
+    }
+    size_t tcm_needed = 0;  // the TCM form's state, k, q and v, and up to 128 bytes to align them
     for (const gdn_case & c : prefill_cases) {
         gdn_run dv, ref;
         if (!dv.init(c, buft) || !ref.init(c, ggml_backend_cpu_buffer_type())) {
@@ -7218,12 +7274,17 @@ static int check_gdn(ggml_backend_dev_t dev) {
         ggml_cgraph * g_dev = ggml_new_graph(dv.ctx);
         ggml_build_forward_expand(g_dev, dv.node);
         std::vector<float> recurrence;  // the first value's output
-        for (const auto & pv : prefill_values) {
+        const size_t       tcm_bytes = (size_t) (c.S_v * c.S_v + 3 * c.S_v) * sizeof(float) + 128;
+        tcm_needed                   = std::max(tcm_needed, tcm_bytes);
+        for (size_t vi = 0; vi < n_values; vi++) {
+            const auto & pv = prefill_values[vi];
             n_prefill++;
             env_override       mode("FLAGOS_SPACEMIT_GDN_PREFILL", pv.value);
             log_capture        log;
             std::vector<float> got[2];
             bool               dev_ok = claimed && ref_ok;
+            uint64_t           taken[5];
+            g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);  // drops earlier calls
             for (int r = 0; r < 2 && dev_ok; r++) {
                 const std::vector<float> junk((size_t) n, (float) (-r - 1));
                 ggml_backend_tensor_set(dv.node, junk.data(), 0, junk.size() * sizeof(float));
@@ -7232,6 +7293,14 @@ static int check_gdn(ggml_backend_dev_t dev) {
                     got[r].assign((size_t) n, NAN);
                     ggml_backend_tensor_get(dv.node, got[r].data(), 0, (size_t) n * sizeof(float));
                 }
+            }
+            g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);
+            // the form the tiles must take: chunk 3, tcm 4, -1 a recurrence form (fused or two-pass), 0 the reference
+            const int want_form = !rvv ? 0 : pv.form == 1 ? 3 : pv.form == 2 && tcm_per_tile >= tcm_bytes ? 4 : -1;
+            bool forms_ok = want_form >= 0 ? taken[want_form] > 0 : taken[1] + taken[2] > 0;
+            for (int f = 0; f < 5; f++) {
+                forms_ok = forms_ok && (taken[f] == 0 || f == want_form || (want_form < 0 && (f == 1 || f == 2)));
+                n_took[vi][f] += dev_ok && taken[f] > 0;
             }
             const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_GDN_PREFILL=");
             const bool repeat   = dev_ok && std::memcmp(got[0].data(), got[1].data(), (size_t) n_cmp * sizeof(float)) == 0;
@@ -7247,7 +7316,7 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 pv.bound > 0.0 ? e_out >= 0.0 && e_out <= pv.bound && e_state >= 0.0 && e_state <= pv.bound :
                                  e_all >= 0.0 && e_all <= k_gdn_max_nmse;
             const bool ok = claimed && ref_ok && dev_ok && repeat && in_bound && warnings == (pv.warned ? 1 : 0) &&
-                            (pv.form != 0 || same);
+                            (pv.form != 0 || same) && forms_ok;
             n_prefill_ok += ok;
             n_other[pv.form] += dev_ok && !same;
             worst_prefill[pv.form][0] = std::max(worst_prefill[pv.form][0], e_out);
@@ -7256,11 +7325,17 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 std::fprintf(stderr,
                              "FAIL: GATED_DELTA_NET prefill %s, FLAGOS_SPACEMIT_GDN_PREFILL=%s: %s; the CPU reference "
                              "%s, the run %s, its repeat %s, the recurrence's bytes %s; NMSE scores %.3e, state %.3e, "
-                             "all %.3e (bound %.0e); %d warning lines (expected %d)\n",
+                             "all %.3e (bound %.0e); %d warning lines (expected %d); tile calls by form: reference "
+                             "%llu, fused %llu, two-pass %llu, chunk %llu, tcm %llu (expected %s; TCM %zu bytes per "
+                             "tile, the form needs %zu)\n",
                              c.what, pv.value != nullptr ? pv.value : "(unset)", claimed ? "claimed" : "refused",
                              ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", repeat ? "equal" : "differs",
                              same ? "equal" : "differ", e_out, e_state, e_all,
-                             pv.bound > 0.0 ? pv.bound : k_gdn_max_nmse, warnings, pv.warned ? 1 : 0);
+                             pv.bound > 0.0 ? pv.bound : k_gdn_max_nmse, warnings, pv.warned ? 1 : 0,
+                             (unsigned long long) taken[0], (unsigned long long) taken[1],
+                             (unsigned long long) taken[2], (unsigned long long) taken[3],
+                             (unsigned long long) taken[4], want_form >= 0 ? form_names[want_form] : "fused or two-pass",
+                             tcm_per_tile, tcm_bytes);
                 g_failures++;
             }
         }
@@ -7312,6 +7387,21 @@ static int check_gdn(ggml_backend_dev_t dev) {
         ggml_free(ctx);
     }
 
+    std::string took;  // per value, the forms the tiles took and in how many cases
+    for (size_t vi = 0; vi < n_values; vi++) {
+        const char * v = prefill_values[vi].value;
+        took += std::string(vi > 0 ? "; " : "") + (v == nullptr ? "unset" : *v == '\0' ? "empty" : v) + ":";
+        bool any = false;
+        for (int f = 0; f < 5; f++) {
+            if (n_took[vi][f] > 0) {
+                took += std::string(any ? "," : "") + " " + form_names[f] + " form in " + std::to_string(n_took[vi][f]) +
+                        "/" + std::to_string(std::size(prefill_cases));
+                any = true;
+            }
+        }
+        took += any ? "" : " none";
+    }
+
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf("gdn      GATED_DELTA_NET in our buffer and in a CPU buffer (scalar gate and KDA, K 1, 2 and 4 with "
@@ -7328,11 +7418,12 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 "128, K 1, the model's inputs, 16, 17, 33 and 100 tokens of 16 heads and 33 of 4 (idle tiles)%s: "
                 "%d/%d; max NMSE against the CPU on one thread, scores / state: recurrence %.2e / %.2e, chunk %.2e / "
                 "%.2e (bound %.0e), tcm %.2e / %.2e (bound %.0e); bytes other than the recurrence's (the form ran) "
-                "for chunk in %d/%zu, tcm in %d/%zu; one warning for abc\n",
+                "for chunk in %d/%zu, tcm in %d/%zu; one warning for abc; the tiles' forms by the counters (TCM "
+                "%zu bytes per tile, the tcm form needs %zu): %s\n",
                 reference_label(), n_prefill_ok, n_prefill, worst_prefill[0][0], worst_prefill[0][1],
                 worst_prefill[1][0], worst_prefill[1][1], prefill_values[1].bound, worst_prefill[2][0],
                 worst_prefill[2][1], prefill_values[2].bound, n_other[1], std::size(prefill_cases), n_other[2],
-                std::size(prefill_cases));
+                std::size(prefill_cases), tcm_per_tile, tcm_needed, took.c_str());
     return 0;
 }
 

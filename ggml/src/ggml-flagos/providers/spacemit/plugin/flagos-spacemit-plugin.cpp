@@ -461,6 +461,9 @@ void * plugin_get_proc_address(const char * name) {
     if (std::strcmp(name, "spacemit_embd_paths_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_embd_paths_take_fn>(spacemit_embd_paths_take));
     }
+    if (std::strcmp(name, "spacemit_gdn_paths_take") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_gdn_paths_take_fn>(spacemit_gdn_paths_take));
+    }
     if (std::strcmp(name, "spacemit_repack_threads") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_repack_threads_fn>(spacemit_repack_threads));
     }

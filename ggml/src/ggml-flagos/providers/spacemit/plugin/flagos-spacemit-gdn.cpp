@@ -70,6 +70,9 @@ int gdn_prefill_from_env() {
     return spacemit_cached_switch(value, seen, parse_gdn_prefill);
 }
 
+// test-only (spacemit_gdn_paths_take): the tile calls that had rows, by the form they ran
+std::atomic<uint64_t> g_gdn_reference{ 0 }, g_gdn_fused{ 0 }, g_gdn_two_pass{ 0 }, g_gdn_chunk{ 0 }, g_gdn_tcm{ 0 };
+
 // the fork's chunk of the chunkwise form; also the fewest tokens either prefill form takes
 constexpr int64_t GDN_CHUNK_SIZE = 16;
 
@@ -736,6 +739,7 @@ void gdn_rvv(ggml_tensor * dst,
         src_v->type == GGML_TYPE_F32 && src_g->type == GGML_TYPE_F32 && src_beta->type == GGML_TYPE_F32 &&
         ggml_is_contiguous_rows(src_q) && ggml_is_contiguous_rows(src_k) && ggml_is_contiguous_rows(src_v) &&
         ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta) && src_beta->ne[0] == 1) {
+        g_gdn_chunk.fetch_add(1, std::memory_order_relaxed);
         const int64_t        rq3c = n_seqs / src_q->ne[3];
         const int64_t        rk3c = n_seqs / src_k->ne[3];
         const gdn_chunk_args args = { src_q, src_k, src_v, src_g, src_beta, S_v, H, n_tokens, scale };
@@ -751,6 +755,7 @@ void gdn_rvv(ggml_tensor * dst,
     }
 
     const bool fused     = n_tokens <= 4 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8();
+    (transposed ? g_gdn_tcm : fused ? g_gdn_fused : g_gdn_two_pass).fetch_add(1, std::memory_order_relaxed);
     float *    kda_decay = scratch;
     float *    delta     = scratch;
     float *    decay     = scratch + S_v;
@@ -887,6 +892,15 @@ void spacemit_gdn_read_switch() {
     (void) gdn_prefill_from_env();
 }
 
+void spacemit_gdn_paths_take(uint64_t * reference, uint64_t * fused, uint64_t * two_pass, uint64_t * chunk,
+                             uint64_t * tcm) {
+    *reference = g_gdn_reference.exchange(0);
+    *fused     = g_gdn_fused.exchange(0);
+    *two_pass  = g_gdn_two_pass.exchange(0);
+    *chunk     = g_gdn_chunk.exchange(0);
+    *tcm       = g_gdn_tcm.exchange(0);
+}
+
 bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile_p, ggml_tensor * dst) {
     const spacemit_tile & tile     = *tile_p;
     const gdn_shape       sh       = gdn_shape_of(dst);
@@ -916,6 +930,7 @@ bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile_p, ggml_tensor *
     }
 #endif
     GGML_UNUSED(prefill);
+    g_gdn_reference.fetch_add(1, std::memory_order_relaxed);
     gdn_ref(dst, scratch, state_work, ir0, ir1);
     return true;
 }

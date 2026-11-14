@@ -108,6 +108,10 @@ typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, 
 typedef void (*spacemit_attn_paths_take_fn)(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference);
 // test-only: the quantized lookups (get_rows.quant) since the last call by the kernel that ran (RVV Q6_K, ggml's)
 typedef void (*spacemit_embd_paths_take_fn)(uint64_t * rvv, uint64_t * ggml);
+// test-only: the gdn.f32 tile calls that had rows since the last call by the form they ran (reference, RVV fused
+// recurrence, RVV two-pass recurrence, chunkwise prefill, TCM prefill)
+typedef void (*spacemit_gdn_paths_take_fn)(uint64_t * reference, uint64_t * fused, uint64_t * two_pass, uint64_t * chunk,
+                                           uint64_t * tcm);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout

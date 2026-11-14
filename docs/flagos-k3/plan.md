@@ -3053,6 +3053,18 @@ The order for the prompt side follows from it: (1) Gated DeltaNet's prefill, whe
 
 Both prefill forms ported the same day behind `FLAGOS_SPACEMIT_GDN_PREFILL` (`recurrence`, the default and today's path; `chunk`; `tcm`; `build.md`), each under the fork's own conditions (K 1, scalar gate, 16 tokens and up) and else the recurrence. The chunkwise form's buffer (31,552 floats a tile at S_v 128) comes from the workspace, the TCM form keeps the state and the staged k, q, v in the tile's TCM (67 KB) and nothing there outlives the step. The check program runs the three values on the device at 16, 17, 33 and 100 tokens against the CPU (bounds 1e-6 for `chunk`, 1e-10 for `tcm`) and prints the measured NMSE. On the Mac the RVV forms do not exist, so only the switch, the workspace and the cases are tested there; the K3 run measures the three for speed and accuracy and the default is chosen from it.
 
+**On the K3 (`f90767a54`, logs `gdn-*`, one run each; Qwen3.5-4B, 501 tokens, 8 tiles):**
+
+| value | `GATED_DELTA_NET` a graph | graph | `llama-bench` pp501 | prompt in `llama-completion` | text against the one-thread CPU |
+|---|---|---|---|---|---|
+| `recurrence` | 1,730 ms | 7,649 ms | 65.46 +- 0.01 | 7,695 ms | identical |
+| `chunk` | 571 ms | 6,509 ms | 76.91 +- 0.02 | 6,507 ms | identical |
+| `tcm` | 526 ms | 6,450 ms | 77.62 +- 0.08 | 6,496 ms | identical |
+
+The check program passes. Its prefill cases, max NMSE against the CPU (scores / state): recurrence 3.50e-14 / 3.44e-16, chunk 7.61e-14 / 1.22e-13, tcm 3.50e-14 / 3.44e-16. `chunk` gave bytes other than the recurrence's in 5/5 cases, so it ran; `tcm` gave the recurrence's bytes in 5/5. Open: either the TCM form did not run in those cases (no reason found in the code: the device reports 393,216 TCM bytes a tile and the form needs 67 KB) or it ran and rounds as the recurrence does (the two differ only in the order of one sum, the recurrence's being the hardware's `vfredusum`). The model's times show the form running there. To settle with a count of the forms taken, read by the check. Generation is unchanged in the three (7.5 tokens a second). The one-thread CPU on the same prompt: 204 s.
+
+Next, the same day, to run on the K3: (1) counters of the form each tile took (`spacemit_gdn_paths_take`, test-only), which the check's prefill cases read and assert, to settle the `tcm` question; (2) our own RVV kernel for `mul_mat.f32` (`ssm_alpha`, `ssm_beta`; the fork has none): four weight rows a strip in m2 lanes, summed across the lanes at the end, so not the reference's bits (the check's bound for these cases was already ggml-cpu's 5e-4 NMSE). The default of `FLAGOS_SPACEMIT_GDN_PREFILL` stays `recurrence` until the user chooses.
+
 ### Memory probe: does the provider hold weights twice (2026-11-13)
 
 **Why:** SpacemiT's engineer (through the user, 2026-11-13): the point of zero copy is that running on the provider adds no memory; where a repack is needed, the original weights must be dropped.

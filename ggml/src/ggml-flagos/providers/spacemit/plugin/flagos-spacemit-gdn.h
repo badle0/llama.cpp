@@ -17,3 +17,7 @@ size_t spacemit_gdn_workspace(const ggml_tensor * node);
 
 // reads FLAGOS_SPACEMIT_GDN_PREFILL (recurrence, chunk or tcm) at registration, as spacemit_embd_read_switch
 void spacemit_gdn_read_switch();
+
+// test-only (spacemit_gdn_paths_take_fn): the tile calls with rows since the last call by the form they ran
+void spacemit_gdn_paths_take(uint64_t * reference, uint64_t * fused, uint64_t * two_pass, uint64_t * chunk,
+                             uint64_t * tcm);
