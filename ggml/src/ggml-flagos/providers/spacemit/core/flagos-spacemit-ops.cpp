@@ -4,6 +4,7 @@
 
 #include "../../../../ggml-impl.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
@@ -521,7 +522,7 @@ const char * const spacemit_required_kernels[] = {
     "silu.f32",         "sigmoid.f32",      "softplus.f32",             "l2_norm.f32",
     "ssm_conv.f32",     "concat.f32",       "mul_mat.f32",
     "soft_max.f32",     "argsort.f32",      "sum_rows.f32",             "clamp.f32",
-    "div.f32",
+    "div.f32",          "concat.f32.tail",  "ssm_conv.f32.stashed",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 
@@ -551,26 +552,37 @@ bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std
     }
     out->table = nullptr;
     out->n_ops = 0;
+    // a step name to the plugin's entry, or nullptr with detail set
+    const auto bind = [&](const char * name) -> const spacemit_plugin_kernel * {
+        if (!spacemit_is_required_kernel(name)) {
+            fail(std::string(name) + " is not a required kernel");
+            return nullptr;
+        }
+        for (uint32_t k = 0; k < n_kernels; k++) {
+            if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
+                return &kernels[k];
+            }
+        }
+        fail(std::string("no kernel ") + name);
+        return nullptr;
+    };
     for (size_t i = 0; i < k_n_contracts; i++) {
         const spacemit_contract & contract = k_contracts[i];
         spacemit_op &             op       = out->ops[i];
         op.n_steps                         = contract.n_steps;
         for (uint32_t s = 0; s < contract.n_steps; s++) {
-            const char * name = contract.steps[s];
-            if (!spacemit_is_required_kernel(name)) {
-                return fail(std::string(name) + " is not a required kernel");
+            op.steps[s] = bind(contract.steps[s]);
+            if (op.steps[s] == nullptr) {
+                return false;
             }
-            const spacemit_plugin_kernel * entry = nullptr;
-            for (uint32_t k = 0; k < n_kernels && entry == nullptr; k++) {
-                if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
-                    entry = &kernels[k];
-                }
-            }
-            if (entry == nullptr) {
-                return fail(std::string("no kernel ") + name);
-            }
-            op.steps[s] = entry;
         }
+    }
+    out->conv_pair_concat.n_steps   = 1;
+    out->conv_pair_ssm_conv.n_steps = 1;
+    out->conv_pair_concat.steps[0]   = bind("concat.f32.tail");
+    out->conv_pair_ssm_conv.steps[0] = bind("ssm_conv.f32.stashed");
+    if (out->conv_pair_concat.steps[0] == nullptr || out->conv_pair_ssm_conv.steps[0] == nullptr) {
+        return false;
     }
     out->table = table;
     out->n_ops = (uint32_t) k_n_contracts;
@@ -627,4 +639,88 @@ size_t spacemit_op_workspace(const spacemit_op * op, const ggml_tensor * node) {
         }
     }
     return bytes;
+}
+
+// the few-token pieces of the stream are short; 32 is an estimate, not measured
+static constexpr int64_t k_conv_pair_min_tokens = 32;
+
+// a tensor viewing the pair's CONCAT c: a window of whole columns among c's last 3 (of L), from row 0
+static bool spacemit_conv_pair_window(const ggml_tensor * v, const ggml_tensor * c, int64_t n) {
+    const size_t  row   = c->nb[1];
+    const int64_t first = (int64_t) ((v->view_offs % row) / c->nb[0]);
+    return v->type == c->type && v->nb[0] == c->nb[0] && (v->ne[1] <= 1 || v->nb[1] == row) && v->view_offs < row &&
+           v->view_offs % c->nb[0] == 0 && first >= n && first + v->ne[0] <= c->ne[0] && v->ne[1] <= c->ne[1] &&
+           v->ne[2] == 1 && v->ne[3] == 1;
+}
+
+bool spacemit_conv_pair(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g, int ci,
+                        int * si) {
+    const ggml_tensor * c = g->nodes[ci];
+    if (c->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c, 0) != 0 || c->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(c) || c->ne[2] != 1 || c->ne[3] != 1 || (c->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+    const ggml_tensor * a = c->src[0];
+    const ggml_tensor * b = c->src[1];
+    if (a == nullptr || b == nullptr || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || a->ne[0] != 3 ||
+        a->ne[1] != c->ne[1] || a->ne[2] != c->ne[2] || b->ne[1] != c->ne[1] || b->ne[2] != c->ne[2] ||
+        a->ne[3] != 1 || b->ne[3] != 1 || c->ne[0] != a->ne[0] + b->ne[0]) {
+        return false;
+    }
+    const int64_t n = b->ne[0];
+    if (n < k_conv_pair_min_tokens) {
+        return false;
+    }
+    int conv = -1;
+    for (int t = 0; t < g->n_nodes; t++) {
+        const ggml_tensor * node = g->nodes[t];
+        if (node == c) {
+            continue;
+        }
+        const bool view = node->view_src == c;
+        if (view && !spacemit_conv_pair_window(node, c, n)) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * s = node->src[i];
+            if (s == nullptr) {
+                continue;
+            }
+            if (s == c) {
+                if (view) {
+                    continue;  // a view's source
+                }
+                if (node->op != GGML_OP_SSM_CONV || i != 0 || conv >= 0 || t <= ci) {
+                    return false;  // another consumer, a second SSM_CONV, or one before the CONCAT
+                }
+                conv = t;
+            } else if (s->view_src == c && !spacemit_conv_pair_window(s, c, n)) {
+                return false;
+            }
+        }
+    }
+    if (conv < 0) {
+        return false;
+    }
+    const ggml_tensor * sc = g->nodes[conv];
+    const ggml_tensor * w  = sc->src[1];
+    if (w == nullptr || w->ne[0] != 4 || sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) ||
+        sc->ne[0] != c->ne[1] || sc->ne[1] != n || sc->ne[2] != 1) {
+        return false;
+    }
+    if (spacemit_find_op(ops, c, own_buft) == nullptr || spacemit_find_op(ops, sc, own_buft) == nullptr) {
+        return false;
+    }
+    *si = conv;
+    return true;
+}
+
+static std::atomic<uint64_t> g_conv_pairs{ 0 };
+
+uint64_t spacemit_conv_pairs_take() {
+    return g_conv_pairs.exchange(0);
+}
+
+void spacemit_conv_pairs_add(uint64_t n) {
+    g_conv_pairs += n;
 }

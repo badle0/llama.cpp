@@ -393,6 +393,8 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "l2_norm.f32",      spacemit_kernel_l2_norm_f32,   nullptr,                     nullptr                              },
         { "ssm_conv.f32",     spacemit_kernel_ssm_conv_f32,  nullptr,                     nullptr                              },
         { "concat.f32",       spacemit_kernel_concat_f32,    nullptr,                     nullptr                              },
+        { "concat.f32.tail",  spacemit_kernel_concat_f32_tail, nullptr,                   nullptr                              },
+        { "ssm_conv.f32.stashed", spacemit_kernel_ssm_conv_f32_stashed, nullptr,          spacemit_ssm_conv_stashed_workspace  },
         { "mul_mat.f32",      spacemit_kernel_mul_mat_f32,   nullptr,                     nullptr                              },
         { "soft_max.f32",     spacemit_kernel_soft_max_f32,  nullptr,                     nullptr                              },
         { "argsort.f32",      spacemit_kernel_argsort_f32,   nullptr,                     nullptr                              },

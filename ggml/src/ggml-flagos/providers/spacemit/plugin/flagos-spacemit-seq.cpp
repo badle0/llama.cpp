@@ -154,6 +154,89 @@ void concat_dim0_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     }
 }
 
+// The convolution pair (core/flagos-spacemit-ops.h spacemit_conv_pair): a CONCAT [n + 3, C, 1] of the state's 3
+// columns and n tokens whose only consumers are one SSM_CONV and views of its last 3 columns. The CONCAT step
+// (concat.f32.tail) writes the true last 3 columns, and in each tile's rows of the rest of its buffer the convolution's
+// input token-major: in[j][c] for j = 0..n-1 (outer), c = c0..c1-1 (inner), a stream that fills each row's first n
+// floats and skips its last 3. The SSM_CONV step (ssm_conv.f32.stashed) reads that stream, and the last 3 tokens'
+// inputs past n from the true columns, on the same tile split, so a tile reads only what it wrote
+
+// in[j][c] of the pair: the state's column j for j < 3, else token j - 3 of the second source, read with the sources'
+// strides
+inline float conv_pair_in(const ggml_tensor * a, const ggml_tensor * b, int64_t j, int64_t c) {
+    return j < a->ne[0] ? *(const float *) ((const char *) a->data + j * a->nb[0] + c * a->nb[1]) :
+                          *(const float *) ((const char *) b->data + (j - a->ne[0]) * b->nb[0] + c * b->nb[1]);
+}
+
+void concat_tail_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const int64_t       L = dst->ne[0];
+    const int64_t       n = L - a->ne[0];
+    float *             B = (float *) dst->data;
+
+    int64_t c0, c1;
+    tile_range(dst->ne[1], tile, c0, c1);
+    for (int64_t c = c0; c < c1; ++c) {
+        for (int64_t j = n; j < L; ++j) {
+            B[c * L + j] = conv_pair_in(a, b, j, c);
+        }
+    }
+    float * row = B + c0 * L;
+    int64_t r   = 0;  // the stream's place in its row
+    for (int64_t j = 0; j < n && c1 > c0; ++j) {
+        for (int64_t c = c0; c < c1; ++c) {
+            row[r] = conv_pair_in(a, b, j, c);
+            if (++r == n) {
+                r = 0;
+                row += L;
+            }
+        }
+    }
+}
+
+// ssm_conv_f32_ref's sum, in its order, on the stashed input: one sequence, d_conv 4
+void ssm_conv_stashed_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // the paired CONCAT [n + 3, C, 1]
+    const ggml_tensor * src1 = dst->src[1];  // conv1d.weight {4, C}
+    const int64_t       L    = src0->ne[0];
+    const int64_t       n    = dst->ne[1];
+    const float *       B    = (const float *) src0->data;
+
+    int64_t c0, c1;
+    tile_range(src0->ne[1], tile, c0, c1);
+    const int64_t W = c1 - c0;
+    if (W <= 0) {
+        return;
+    }
+    for (int64_t t = 0; t < n; ++t) {
+        int64_t q[4] = {}, r[4] = {};  // per tap in the stream: the row past c0 and the place in it
+        for (int k = 0; k < 4; ++k) {
+            if (t + k < n) {
+                q[k] = (t + k) * W / n;
+                r[k] = (t + k) * W % n;
+            }
+        }
+        float * y = (float *) ((char *) dst->data + t * dst->nb[1]);
+        for (int64_t c = c0; c < c1; ++c) {
+            const float * cw   = (const float *) ((const char *) src1->data + c * src1->nb[1]);
+            float         sumf = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                const int64_t j = t + k;
+                const float   x = j < n ? B[(c0 + q[k]) * L + r[k]] : B[c * L + j];
+                sumf += x * cw[k];
+            }
+            y[c] = sumf;
+            for (int k = 0; k < 4; ++k) {
+                if (t + k < n && ++r[k] == n) {
+                    r[k] = 0;
+                    q[k]++;
+                }
+            }
+        }
+    }
+}
+
 // MUL_MAT of an F32 2-D weight by F32 activations (spacemit_mul_mat_f32_supported): one dot product per output
 // element, a weight row against an activation row, summed in float; the weight broadcasts over the activations'
 // higher dimensions. The output's rows are split over the tiles. ggml-cpu adds in vector lanes (ggml_vec_dot_f32) or
@@ -439,6 +522,105 @@ bool concat_dim0_transposed_f32_rvv(const spacemit_tile & tile, ggml_tensor * ds
     return true;
 }
 
+// ours: concat_tail_f32_ref with the second source's channels contiguous (false otherwise, and the reference runs).
+// The true columns by strided stores down the rows; the stream in runs of channels, each cut where a row's piece ends,
+// read with one load (the state's columns strided) and stored unit-stride
+bool concat_tail_f32_rvv(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const int64_t       L = dst->ne[0];
+    const int64_t       S = a->ne[0];
+    const int64_t       n = L - S;
+    if (b->nb[1] != sizeof(float) || n < S) {
+        return false;
+    }
+    float * B = (float *) dst->data;
+
+    int64_t c0, c1;
+    tile_range(dst->ne[1], tile, c0, c1);
+    for (int64_t j = n; j < L; ++j) {
+        const float * x = (const float *) ((const char *) b->data + (j - S) * b->nb[0]);
+        for (int64_t c = c0; c < c1;) {
+            const size_t vl = __riscv_vsetvl_e32m4(c1 - c);
+            __riscv_vsse32_v_f32m4(B + c * L + j, (ptrdiff_t) (L * sizeof(float)), __riscv_vle32_v_f32m4(x + c, vl),
+                                   vl);
+            c += (int64_t) vl;
+        }
+    }
+    float * row = B + c0 * L;
+    int64_t r   = 0;  // the stream's place in its row
+    for (int64_t j = 0; j < n && c1 > c0; ++j) {
+        const char * col = j < S ? (const char *) a->data + j * a->nb[0] : (const char *) b->data + (j - S) * b->nb[0];
+        const size_t cs  = j < S ? a->nb[1] : sizeof(float);
+        for (int64_t c = c0; c < c1;) {
+            const size_t       vl = __riscv_vsetvl_e32m4(std::min(c1 - c, n - r));
+            const float *      p  = (const float *) (col + c * cs);
+            const vfloat32m4_t v  = j < S ? __riscv_vlse32_v_f32m4(p, (ptrdiff_t) cs, vl) : __riscv_vle32_v_f32m4(p, vl);
+            __riscv_vse32_v_f32m4(row + r, v, vl);
+            c += (int64_t) vl;
+            r += (int64_t) vl;
+            if (r == n) {
+                r = 0;
+                row += L;
+            }
+        }
+    }
+    return true;
+}
+
+// ours: ssm_conv_f32_rvv's lanes (the same fused multiply-adds in the same order, so its bits) on the stashed input.
+// Per token the tile's channels in runs cut where a tap's stream piece ends: unit-stride loads of the stream and of the
+// weights, de-interleaved once per call into the tile's 4 * W floats of the workspace (offset 4 * c0); the taps past
+// n (the last 3 tokens) by strided loads from the true columns; unit-stride stores. false when the workspace is short
+bool ssm_conv_stashed_f32_rvv(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // the paired CONCAT [n + 3, C, 1]
+    const ggml_tensor * src1 = dst->src[1];  // conv1d.weight {4, C}
+    const int64_t       C    = src0->ne[1];
+    const int64_t       L    = src0->ne[0];
+    const int64_t       n    = dst->ne[1];
+    const float *       B    = (const float *) src0->data;
+
+    int64_t c0, c1;
+    tile_range(C, tile, c0, c1);
+    const int64_t W = c1 - c0;
+    if (W <= 0) {
+        return true;
+    }
+    float * wd = (float *) tile.workspace + 4 * c0;
+    for (int k = 0; k < 4; ++k) {
+        for (int64_t i = 0; i < W;) {
+            const size_t  vl = __riscv_vsetvl_e32m4(W - i);
+            const float * wp = (const float *) ((const char *) src1->data + (c0 + i) * src1->nb[1]) + k;
+            __riscv_vse32_v_f32m4(wd + k * W + i, __riscv_vlse32_v_f32m4(wp, (ptrdiff_t) src1->nb[1], vl), vl);
+            i += (int64_t) vl;
+        }
+    }
+    const ptrdiff_t ls = (ptrdiff_t) (L * sizeof(float));
+    for (int64_t t = 0; t < n; ++t) {
+        float * y = (float *) ((char *) dst->data + t * dst->nb[1]) + c0;
+        for (int64_t i = 0; i < W;) {
+            int64_t len = W - i;
+            for (int k = 0; k < 4; ++k) {
+                if (t + k < n) {
+                    len = std::min(len, n - ((t + k) * W + i) % n);
+                }
+            }
+            const size_t vl  = __riscv_vsetvl_e32m4(len);
+            vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+            for (int k = 0; k < 4; ++k) {
+                const int64_t      j = t + k;
+                const int64_t      p = j * W + i;
+                const vfloat32m4_t x = j < n ? __riscv_vle32_v_f32m4(B + (c0 + p / n) * L + p % n, vl) :
+                                               __riscv_vlse32_v_f32m4(B + (c0 + i) * L + j, ls, vl);
+                acc = __riscv_vfmacc_vv_f32m4(acc, x, __riscv_vle32_v_f32m4(wd + k * W + i, vl), vl);
+            }
+            __riscv_vse32_v_f32m4(y + i, acc, vl);
+            i += (int64_t) vl;
+        }
+    }
+    return true;
+}
+
 // the sum of an m2 group's vlmax lanes
 float rvv_sum_f32m2(vfloat32m2_t acc, size_t vlmax) {
     return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m2_f32m1(acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlmax));
@@ -549,9 +731,11 @@ bool spacemit_kernel_l2_norm_f32(const spacemit_tile * tile_p, ggml_tensor * dst
     return true;
 }
 
+// one token takes the reference: measured on the K3 at one token only (the RVV SSM_CONV 2.8 ms a token against the
+// reference's 2.0, the RVV CONCAT 1.3 against 1.1)
 bool spacemit_kernel_ssm_conv_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-    if (!spacemit_use_reference() && ssm_conv_f32_rvv(*tile_p, dst)) {
+    if (!spacemit_use_reference() && dst->ne[1] != 1 && ssm_conv_f32_rvv(*tile_p, dst)) {
         return true;
     }
 #endif
@@ -561,11 +745,42 @@ bool spacemit_kernel_ssm_conv_f32(const spacemit_tile * tile_p, ggml_tensor * ds
 
 bool spacemit_kernel_concat_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-    if (!spacemit_use_reference() && concat_dim0_transposed_f32_rvv(*tile_p, dst)) {
+    if (!spacemit_use_reference() && dst->src[1]->ne[0] != 1 && concat_dim0_transposed_f32_rvv(*tile_p, dst)) {
         return true;
     }
 #endif
     concat_dim0_f32_ref(*tile_p, dst);
+    return true;
+}
+
+bool spacemit_kernel_concat_f32_tail(const spacemit_tile * tile_p, ggml_tensor * dst) {
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
+    if (!spacemit_use_reference() && concat_tail_f32_rvv(*tile_p, dst)) {
+        return true;
+    }
+#endif
+    concat_tail_f32_ref(*tile_p, dst);
+    return true;
+}
+
+size_t spacemit_ssm_conv_stashed_workspace(const ggml_tensor * node) {
+    return (size_t) (4 * node->src[0]->ne[1]) * sizeof(float);
+}
+
+bool spacemit_kernel_ssm_conv_f32_stashed(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const spacemit_tile & tile   = *tile_p;
+    const size_t          needed = spacemit_ssm_conv_stashed_workspace(dst);
+    if (tile.workspace == nullptr || tile.workspace_size < needed) {
+        GGML_LOG_ERROR("FlagOS SpacemiT: ssm_conv.f32.stashed needs %zu workspace bytes, has %zu\n", needed,
+                       tile.workspace_size);
+        return false;
+    }
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
+    if (!spacemit_use_reference()) {
+        return ssm_conv_stashed_f32_rvv(tile, dst);
+    }
+#endif
+    ssm_conv_stashed_f32_ref(tile, dst);
     return true;
 }
 

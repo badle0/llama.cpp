@@ -6658,6 +6658,366 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
     return 0;
 }
 
+//
+// The convolution pair (core/flagos-spacemit-ops.h spacemit_conv_pair, plugin/flagos-spacemit-seq.cpp): a CONCAT whose
+// only consumers are one SSM_CONV and views of its last 3 columns runs concat.f32.tail and ssm_conv.f32.stashed. The
+// graphs as delta-net-base.cpp build_conv_state and qwen35.cpp build them: concat(state [3, C, n_s], transpose(x)),
+// the view of its last 3 columns copied into a state tensor, ssm_conv(concat, kernel). Through the device against
+// ggml-cpu on one thread: the convolution's output within check_seq_ops' SSM_CONV bound, the copied state (and a
+// case's other output) bit for bit, fused or not by the pair counter (spacemit_conv_pairs_take); a fused case again
+// under FLAGOS_SPACEMIT_SSM_CONV=split, unfused, with the same bytes. A fused case's two kernels also called directly
+// on 1, 3 and 8 tiles on a CPU-buffer copy (on the K3 the calling core, another vector length): the device's bytes,
+// since each element is one sum in one order whatever the split and the vector length. Then one fused graph through
+// the scheduler (its allocator reusing memory) under the plan cache: a miss, a trusted hit counting no pair,
+// FLAGOS_SPACEMIT_SSM_CONV=split a miss by the configuration word, the default a miss again, every output the same
+// bytes. GGML_FLAGOS_KERNEL_VARIANTS=0 is read once per process, so the program's reference pass covers the portable
+// kernels; the device always runs its 8 tiles
+//
+
+struct conv_pair_case {
+    const char * what;
+    int64_t      n, C, n_s, kw;
+    int          variant;  // 0 the model's graph, 1 a second consumer (SCALE of the concat), 2 a view from column
+                           // n - 1 copied out (CONT), 3 the concat flagged as an output
+    bool         fused;
+};
+
+// one case's graph; with ops_unallocated only the inputs are allocated (the scheduler allocates the rest)
+struct conv_pair_graph {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         st = nullptr, *x = nullptr, *w = nullptr, *state = nullptr;  // state: the copy's target
+    ggml_tensor *         cat = nullptr, *out = nullptr, *extra = nullptr;  // extra: variants 1 and 2's output
+    ggml_cgraph *         g = nullptr;
+
+    conv_pair_graph() = default;
+    conv_pair_graph(const conv_pair_graph &) = delete;
+    conv_pair_graph & operator=(const conv_pair_graph &) = delete;
+
+    ~conv_pair_graph() {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    bool init(const conv_pair_case & c, ggml_backend_buffer_type_t buft, uint32_t seed, bool ops_unallocated = false) {
+        ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+        ctx                     = ggml_init(params);
+        if (ctx == nullptr) {
+            return false;
+        }
+        st    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, c.C, c.n_s);
+        x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.C, c.n, c.n_s);
+        w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.kw, c.C);
+        state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, c.C, c.n_s);
+        if (ops_unallocated) {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        }
+        cat = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
+        if (c.variant == 3) {
+            ggml_set_output(cat);
+        }
+        ggml_tensor * last = ggml_view_3d(ctx, cat, 3, c.C, c.n_s, cat->nb[1], cat->nb[2], c.n * sizeof(float));
+        ggml_tensor * cp   = ggml_cpy(ctx, last, state);
+        out                = ggml_ssm_conv(ctx, cat, w);
+        if (c.variant == 1) {
+            extra = ggml_scale(ctx, cat, 2.0f);
+        } else if (c.variant == 2) {
+            extra = ggml_cont(ctx, ggml_view_3d(ctx, cat, 3, c.C, c.n_s, cat->nb[1], cat->nb[2],
+                                                (c.n - 1) * sizeof(float)));
+        }
+        ggml_set_output(out);
+        g = ggml_new_graph(ctx);
+        ggml_build_forward_expand(g, cp);
+        ggml_build_forward_expand(g, out);
+        if (extra != nullptr) {
+            ggml_set_output(extra);
+            ggml_build_forward_expand(g, extra);
+        }
+        if (!ops_unallocated) {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        }
+        if (buf == nullptr) {
+            return false;
+        }
+        uint32_t s = seed;
+        for (ggml_tensor * t : { st, x, w }) {
+            const std::vector<float> v = random_values(ggml_nelements(t), s++, 1.0f);
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        }
+        return true;
+    }
+
+    // the outputs a run writes, set to junk before it so that a missed write shows
+    void junk() const {
+        for (ggml_tensor * t : { cat, out, state, extra }) {
+            if (t != nullptr && t->data != nullptr) {
+                const std::vector<uint8_t> j(ggml_nbytes(t), 0xA5);
+                ggml_backend_tensor_set(t, j.data(), 0, j.size());
+            }
+        }
+    }
+
+    static std::vector<uint8_t> bytes(const ggml_tensor * t) {
+        std::vector<uint8_t> b(t != nullptr ? ggml_nbytes(t) : 0);
+        if (!b.empty()) {
+            ggml_backend_tensor_get(t, b.data(), 0, b.size());
+        }
+        return b;
+    }
+
+    // the concat's last 3 columns, the true ones, of every row
+    std::vector<uint8_t> tail() const {
+        const std::vector<uint8_t> all = bytes(cat);
+        const int64_t              L   = cat->ne[0];
+        std::vector<uint8_t>       t;
+        for (int64_t r = 0; r < ggml_nrows(cat); r++) {
+            const uint8_t * p = all.data() + (r * L + L - 3) * sizeof(float);
+            t.insert(t.end(), p, p + 3 * sizeof(float));
+        }
+        return t;
+    }
+};
+
+static int check_conv_pair(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr && cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
+    // check_seq_ops' SSM_CONV bound: ggml-cpu's bytes, but a rounding bound for the RVV kernels' fused taps
+#if defined(__riscv)
+    const seq_bound bound = *reference_label() != '\0' ? k_seq_exact : seq_bound{ 1e-12, 1e-6 };
+#else
+    const seq_bound bound = k_seq_exact;
+#endif
+
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    const auto                     entry     = [&](const char * name) -> const spacemit_plugin_kernel * {
+        for (uint32_t k = 0; k < n_kernels; k++) {
+            if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
+                return &kernels[k];
+            }
+        }
+        return nullptr;
+    };
+    const spacemit_plugin_kernel * k_tail  = entry("concat.f32.tail");
+    const spacemit_plugin_kernel * k_stash = entry("ssm_conv.f32.stashed");
+    REQUIRE(k_tail != nullptr && k_stash != nullptr && k_stash->workspace_size != nullptr);
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    env_override                     fused_default("FLAGOS_SPACEMIT_SSM_CONV", nullptr);
+    env_override                     plan_default("FLAGOS_SPACEMIT_PLAN", nullptr);
+    env_override                     quantize_default("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
+
+    const conv_pair_case cases[] = {
+  // what,                                          n,    C, n_s, kw, variant, fused
+        { "32 tokens of 8 channels (1 per tile)",       32,    8,   1,  4,       0, true  },
+        { "33 tokens of 96",                            33,   96,   1,  4,       0, true  },
+        { "100 tokens of 1000",                        100, 1000,   1,  4,       0, true  },
+        { "501 tokens of 8192 (Qwen3.5-4B)",           501, 8192,   1,  4,       0, true  },
+        { "64 tokens of 7 (an idle tile)",              64,    7,   1,  4,       0, true  },
+        { "31 tokens (below 32)",                       31,   96,   1,  4,       0, false },
+        { "a second consumer (SCALE of the concat)",    64,   96,   1,  4,       1, false },
+        { "a view from column n - 1 copied out",        64,   96,   1,  4,       2, false },
+        { "2 sequences",                                64,   96,   2,  4,       0, false },
+        { "a kernel of width 3",                        64,   96,   1,  3,       0, false },
+        { "the concat flagged as an output",            64,   96,   1,  4,       3, false },
+    };
+    int      n_cases = 0, n_ok = 0, n_fused = 0, n_direct = 0, n_direct_ok = 0;
+    double   worst_nmse = 0.0, worst_abs = 0.0;
+    uint32_t seed = 1300;
+    for (const conv_pair_case & c : cases) {
+        n_cases++;
+        conv_pair_graph dv, ref;
+        if (!dv.init(c, buft, seed) || !ref.init(c, ggml_backend_cpu_buffer_type(), seed)) {
+            std::fprintf(stderr, "FAIL: conv pair %s: allocation failed\n", c.what);
+            g_failures++;
+            seed += 8;
+            continue;
+        }
+        const bool ref_ok = ggml_backend_graph_compute(cpu, ref.g) == GGML_STATUS_SUCCESS;
+        const std::vector<uint8_t> want_out = conv_pair_graph::bytes(ref.out), want_state = conv_pair_graph::bytes(ref.state),
+                                   want_extra = conv_pair_graph::bytes(ref.extra), want_tail = ref.tail();
+
+        // one device run under the current FLAGOS_SPACEMIT_SSM_CONV: ran, the pairs it fused, its outputs
+        const auto run = [&](uint64_t & pairs, std::vector<uint8_t> & out, std::vector<uint8_t> & state,
+                             std::vector<uint8_t> & extra) {
+            dv.junk();
+            spacemit_conv_pairs_take();  // drops earlier graphs'
+            const bool ok = ggml_backend_graph_compute(backend, dv.g) == GGML_STATUS_SUCCESS;
+            pairs         = spacemit_conv_pairs_take();
+            out           = conv_pair_graph::bytes(dv.out);
+            state         = conv_pair_graph::bytes(dv.state);
+            extra         = conv_pair_graph::bytes(dv.extra);
+            return ok;
+        };
+        uint64_t             pairs = 0, pairs_split = 0;
+        std::vector<uint8_t> out, state, extra, out_split, state_split, extra_split;
+        const bool           dev_ok = ref_ok && run(pairs, out, state, extra);
+        double               e = -1.0, a = -1.0;
+        bool                 exact = false;
+        if (dev_ok && out.size() == want_out.size()) {
+            const float * g = (const float *) out.data();
+            const float * r = (const float *) want_out.data();
+            const int64_t n = (int64_t) (out.size() / sizeof(float));
+            e               = nmse(g, r, n);
+            a               = 0.0;
+            for (int64_t i = 0; i < n; i++) {
+                const double d = g[i] == r[i] ? 0.0 :
+                                 std::isfinite(g[i]) && std::isfinite(r[i]) ?
+                                                 std::fabs((double) g[i] - r[i]) / std::max(1.0, std::fabs((double) r[i])) :
+                                                 HUGE_VAL;
+                a = std::max(a, d);
+            }
+            exact = out == want_out;
+        }
+        const bool in_bound = e >= 0.0 && e <= bound.nmse && a >= 0.0 && a <= bound.abs &&
+                              (bound.nmse > 0.0 || bound.abs > 0.0 || exact);
+        worst_nmse          = std::max(worst_nmse, e);
+        worst_abs           = std::max(worst_abs, a);
+        bool split_ok = true, direct_ok = true;
+        if (c.fused && dev_ok) {
+            env_override split("FLAGOS_SPACEMIT_SSM_CONV", "split");
+            split_ok = run(pairs_split, out_split, state_split, extra_split) && pairs_split == 0 && out_split == out &&
+                       state_split == want_state;
+            // the two kernels directly, on a CPU-buffer copy
+            conv_pair_graph dir;
+            direct_ok = dir.init(c, ggml_backend_cpu_buffer_type(), seed);
+            const size_t       ws = k_stash->workspace_size(dir.out);
+            std::vector<float> workspace(ws / sizeof(float) + 1, NAN);
+            for (uint32_t nth : { 1u, 3u, 8u }) {
+                if (!direct_ok) {
+                    break;
+                }
+                n_direct++;
+                dir.junk();
+                bool ok = true;
+                for (uint32_t ith = 0; ith < nth; ith++) {
+                    const spacemit_tile tile = { ith, nth, nullptr, 0, nullptr, 0, nullptr };
+                    ok &= k_tail->fn(&tile, dir.cat);
+                }
+                for (uint32_t ith = 0; ith < nth; ith++) {
+                    const spacemit_tile tile = { ith, nth, nullptr, 0, workspace.data(), ws, nullptr };
+                    ok &= k_stash->fn(&tile, dir.out);
+                }
+                const bool same = ok && conv_pair_graph::bytes(dir.out) == out && dir.tail() == want_tail;
+                n_direct_ok += same;
+                if (!same) {
+                    std::fprintf(stderr, "FAIL: conv pair %s, the kernels called directly on %u tiles: %s, output %s\n",
+                                 c.what, nth, ok ? "ran" : "failed", same ? "equal" : "differs from the device's");
+                }
+                direct_ok = direct_ok && same;
+            }
+        }
+        const bool ok = ref_ok && dev_ok && pairs == (c.fused ? 1u : 0u) && in_bound && state == want_state &&
+                        extra == want_extra && split_ok && direct_ok;
+        n_ok += ok;
+        n_fused += pairs == 1;
+        if (!ok) {
+            std::fprintf(stderr,
+                         "FAIL: conv pair %s (n %lld, C %lld, %lld sequences, kernel width %lld): the CPU reference %s, "
+                         "the run %s, %llu pairs fused (expected %d); NMSE %.3e, |difference| / max(1, |y|) %.3e "
+                         "(bounds %.0e, %.0e), bytes as the CPU's %s; the copied state %s, the other output %s; split "
+                         "%s; the direct calls %s\n",
+                         c.what, (long long) c.n, (long long) c.C, (long long) c.n_s, (long long) c.kw,
+                         ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", (unsigned long long) pairs,
+                         c.fused ? 1 : 0, e, a, bound.nmse, bound.abs, exact ? "yes" : "no",
+                         state == want_state ? "as the CPU's" : "differs", extra == want_extra ? "as the CPU's" : "differs",
+                         split_ok ? "unfused, the same bytes" : "fused or other bytes",
+                         direct_ok ? "as the device's" : "differ");
+            g_failures++;
+        }
+        seed += 8;
+    }
+
+    // through the scheduler (inputs in our buffer, the rest in its compute buffer) under the plan cache's uid trust
+    bool     sched_ok = false;
+    uint64_t sched_pairs[4] = {}, sched_hits[4] = {}, sched_misses[4] = {};
+    {
+        const conv_pair_case c = { "the scheduler", 100, 1000, 1, 4, 0, true };
+        conv_pair_graph      sg, ref;
+        if (sg.init(c, buft, seed, true) && ref.init(c, ggml_backend_cpu_buffer_type(), seed)) {
+            ggml_backend_t       both[2] = { backend, cpu };
+            ggml_backend_sched_t sched   = ggml_backend_sched_new(both, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+            bool                 ok      = sched != nullptr && ggml_backend_graph_compute(cpu, ref.g) == GGML_STATUS_SUCCESS;
+            const std::vector<uint8_t> want_state = conv_pair_graph::bytes(ref.state);
+            std::vector<uint8_t>       first;
+            // the core reads FLAGOS_SPACEMIT_SSM_CONV at every graph, so it is set here without set_env's reset of the
+            // kernels' switches, which would move the plugin's generation and make every run a miss by that alone
+            const auto set_raw = [](const char * value) {
+#if defined(_WIN32)
+                _putenv_s("FLAGOS_SPACEMIT_SSM_CONV", value != nullptr ? value : "");
+#else
+                if (value != nullptr) {
+                    setenv("FLAGOS_SPACEMIT_SSM_CONV", value, 1);
+                } else {
+                    unsetenv("FLAGOS_SPACEMIT_SSM_CONV");
+                }
+#endif
+            };
+            const char * const settings[4] = { nullptr, nullptr, "split", nullptr };
+            for (int i = 0; i < 4 && ok; i++) {
+                set_raw(settings[i]);
+                spacemit_conv_pairs_take();
+                spacemit_plan_counters_take();
+                ok = ggml_backend_sched_graph_compute(sched, sg.g) == GGML_STATUS_SUCCESS;
+                const spacemit_plan_counters pc = spacemit_plan_counters_take();
+                sched_pairs[i]                  = spacemit_conv_pairs_take();
+                sched_hits[i]                   = pc.hits_uid;
+                sched_misses[i]                 = pc.misses;
+                const std::vector<uint8_t> out  = ok ? conv_pair_graph::bytes(sg.out) : std::vector<uint8_t>();
+                if (i == 0) {
+                    first = out;
+                }
+                ok = ok && out == first && conv_pair_graph::bytes(sg.state) == want_state;
+            }
+            const bool on_device = sched != nullptr && ggml_backend_sched_get_tensor_backend(sched, sg.cat) == backend &&
+                                   ggml_backend_sched_get_tensor_backend(sched, sg.out) == backend;
+            // the output within the bound of ggml-cpu's
+            double e = -1.0;
+            if (ok && first.size() == ggml_nbytes(ref.out)) {
+                e = nmse((const float *) first.data(), (const float *) ref.out->data,
+                         (int64_t) (first.size() / sizeof(float)));
+            }
+            const bool e_ok = e >= 0.0 && e <= bound.nmse &&
+                              (bound.nmse > 0.0 || std::memcmp(first.data(), ref.out->data, first.size()) == 0);
+            sched_ok = ok && on_device && e_ok && sched_pairs[0] == 1 && sched_misses[0] == 1 && sched_hits[1] == 1 &&
+                       sched_pairs[1] == 0 && sched_misses[2] == 1 && sched_pairs[2] == 0 && sched_misses[3] == 1 &&
+                       sched_pairs[3] == 1;
+            if (sched != nullptr) {
+                ggml_backend_sched_free(sched);
+            }
+        }
+        if (!sched_ok) {
+            std::fprintf(stderr,
+                         "FAIL: conv pair through the scheduler: pairs %llu/%llu/%llu/%llu (expected 1/0/0/1), plan "
+                         "hits %llu/%llu/%llu/%llu (expected 0/1/0/0), misses %llu/%llu/%llu/%llu (expected 1/0/1/1), "
+                         "or the outputs, the placement or the bound failed\n",
+                         (unsigned long long) sched_pairs[0], (unsigned long long) sched_pairs[1],
+                         (unsigned long long) sched_pairs[2], (unsigned long long) sched_pairs[3],
+                         (unsigned long long) sched_hits[0], (unsigned long long) sched_hits[1],
+                         (unsigned long long) sched_hits[2], (unsigned long long) sched_hits[3],
+                         (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1],
+                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3]);
+            g_failures++;
+        }
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    std::printf("convpair CONCAT + SSM_CONV as the model builds them (n 32, 33, 100, 501, 64 tokens of 8, 96, 1000, "
+                "8192, 7 channels fused; 31 tokens, a second consumer, a view from column n - 1, 2 sequences, a "
+                "kernel of width 3, an output concat not)%s: %d/%d cases, %d fused by the counter; the output against "
+                "the CPU max NMSE %.2e, |difference| / max(1, |y|) %.2e (bounds %.0e, %.0e), the copied state and "
+                "other outputs bit for bit, FLAGOS_SPACEMIT_SSM_CONV=split unfused with the same bytes; the kernels "
+                "directly on 1, 3 and 8 tiles as the device %d/%d; through the scheduler a miss, a hit by uid (no "
+                "pair), split a miss by the configuration word, the default a miss again, the same bytes: %s\n",
+                reference_label(), n_ok, n_cases, n_fused, worst_nmse, worst_abs, bound.nmse, bound.abs, n_direct_ok,
+                n_direct, sched_ok ? "checked" : "FAILED");
+    return 0;
+}
+
 // MUL_MAT_ID, the experts' matmuls (Qwen3.6-35B-A3B): the claims and the refused forms, then the provider against the
 // CPU backend on one thread, for the IME layouts' types at the model's shapes (gate and up [2048, 512, 256] with one
 // activation row per token, down [512, 2048, 256] with one per id, 8 ids per token) and at small ones, 1 to 512
@@ -7202,10 +7562,12 @@ static int check_gdn(ggml_backend_dev_t dev) {
     // the chunk's 16 tokens, through the device only: a direct call runs on the calling thread, on the K3 an X100 core
     // (VLEN 256, no TCM), where neither prefill form is taken. Against ggml-cpu, the scores and the final state apart:
     // recurrence within the bound above over the whole output, tcm within a rounding bound, chunk (another order of
-    // operations) within a looser one; each run repeated bit for bit; unset, empty and an unknown value (one warning)
-    // give the recurrence's bytes. The tiles count the form they ran (spacemit_gdn_paths_take): with the RVV kernels
-    // chunk must take the chunkwise form, tcm the TCM form where a tile's TCM holds it, the others a recurrence form;
-    // without them (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) every value runs the reference
+    // operations) within a looser one, the default (auto, unset, empty and an unknown value, which warns once) within
+    // chunk's; each run repeated bit for bit. The tiles count the form they ran (spacemit_gdn_paths_take): with the RVV
+    // kernels chunk must take the chunkwise form, tcm the TCM form where a tile's TCM holds it, recurrence a recurrence
+    // form, and the default the TCM form where tcm's run of the same case took it, else the chunkwise form, with the
+    // bytes of the value whose form it took; without them (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) every value
+    // runs the reference, and the default gives the recurrence's bytes
     const gdn_case prefill_cases[] = {
   // what,                                                 S_v,   H, tok, seq, H_qk, seq_qk,   kda, K
         { "16 heads, 16 tokens (one chunk)",                128,  16,  16,   1,   16,      1, false, 1 },
@@ -7216,15 +7578,16 @@ static int check_gdn(ggml_backend_dev_t dev) {
     };
     const struct {
         const char * value;
-        int          form;   // 0 recurrence, 1 chunk, 2 tcm
+        int          form;   // 0 recurrence, 1 chunk, 2 tcm, 3 the default (auto)
         double       bound;  // on the scores and on the state; 0: k_gdn_max_nmse on the whole output
         bool         warned;
     } prefill_values[] = {
         { "recurrence", 0, 0.0, false }, { "chunk", 1, 1e-6, false }, { "tcm", 2, 1e-10, false },
-        { nullptr, 0, 0.0, false },      { "", 0, 0.0, false },       { "abc", 0, 0.0, true },
+        { "auto", 3, 1e-6, false },      { nullptr, 3, 1e-6, false }, { "", 3, 1e-6, false },
+        { "abc", 3, 1e-6, true },
     };
-    int    n_prefill = 0, n_prefill_ok = 0, n_other[3] = { 0, 0, 0 };
-    double worst_prefill[3][2] = {};  // by form: the scores' NMSE, the state's
+    int    n_prefill = 0, n_prefill_ok = 0, n_other[4] = { 0, 0, 0, 0 }, n_default_runs = 0;
+    double worst_prefill[4][2] = {};  // by form: the scores' NMSE, the state's
     // the counters' forms, in spacemit_gdn_paths_take's order; per value, the cases in which the tiles took each
     const char * const form_names[5] = { "reference", "fused", "two-pass", "chunk", "tcm" };
     constexpr size_t   n_values         = sizeof(prefill_values) / sizeof(prefill_values[0]);
@@ -7273,7 +7636,8 @@ static int check_gdn(ggml_backend_dev_t dev) {
 
         ggml_cgraph * g_dev = ggml_new_graph(dv.ctx);
         ggml_build_forward_expand(g_dev, dv.node);
-        std::vector<float> recurrence;  // the first value's output
+        std::vector<float> by_form[3];  // the outputs of recurrence, chunk and tcm (the values before the default)
+        bool               tcm_ran = false;  // tcm's run of this case took the TCM form
         const size_t       tcm_bytes = (size_t) (c.S_v * c.S_v + 3 * c.S_v) * sizeof(float) + 128;
         tcm_needed                   = std::max(tcm_needed, tcm_bytes);
         for (size_t vi = 0; vi < n_values; vi++) {
@@ -7295,8 +7659,13 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 }
             }
             g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);
-            // the form the tiles must take: chunk 3, tcm 4, -1 a recurrence form (fused or two-pass), 0 the reference
-            const int want_form = !rvv ? 0 : pv.form == 1 ? 3 : pv.form == 2 && tcm_per_tile >= tcm_bytes ? 4 : -1;
+            // the form the tiles must take: chunk 3, tcm 4, -1 a recurrence form (fused or two-pass), 0 the reference;
+            // the default the TCM form where tcm's run took it (so a tile had TCM for it), else the chunkwise form
+            const int want_form = !rvv            ? 0 :
+                                  pv.form == 1    ? 3 :
+                                  pv.form == 2    ? (tcm_per_tile >= tcm_bytes ? 4 : -1) :
+                                  pv.form == 3    ? (tcm_ran ? 4 : 3) :
+                                                    -1;
             bool forms_ok = want_form >= 0 ? taken[want_form] > 0 : taken[1] + taken[2] > 0;
             for (int f = 0; f < 5; f++) {
                 forms_ok = forms_ok && (taken[f] == 0 || f == want_form || (want_form < 0 && (f == 1 || f == 2)));
@@ -7304,11 +7673,18 @@ static int check_gdn(ggml_backend_dev_t dev) {
             }
             const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_GDN_PREFILL=");
             const bool repeat   = dev_ok && std::memcmp(got[0].data(), got[1].data(), (size_t) n_cmp * sizeof(float)) == 0;
-            if (recurrence.empty() && dev_ok) {
-                recurrence = got[0];
+            if (pv.form < 3 && dev_ok) {
+                by_form[pv.form] = got[0];
+                tcm_ran          = tcm_ran || (pv.form == 2 && taken[4] > 0);
             }
-            const bool same = dev_ok && recurrence.size() == got[0].size() &&
-                              std::memcmp(got[0].data(), recurrence.data(), (size_t) n_cmp * sizeof(float)) == 0;
+            const auto same_as = [&](const std::vector<float> & other) {
+                return dev_ok && other.size() == got[0].size() &&
+                       std::memcmp(got[0].data(), other.data(), (size_t) n_cmp * sizeof(float)) == 0;
+            };
+            const bool same = same_as(by_form[0]);
+            // the default's bytes are those of the value whose form it took (the recurrence's off the RVV kernels)
+            const bool as_its_form =
+                pv.form != 3 || same_as(by_form[want_form == 4 ? 2 : want_form == 3 ? 1 : 0]);
             const double e_all   = dev_ok ? nmse(got[0].data(), want.data(), n_cmp) : -1.0;
             const double e_out   = dev_ok ? nmse(got[0].data(), want.data(), n_attn) : -1.0;
             const double e_state = dev_ok ? nmse(got[0].data() + n_attn, want.data() + n_attn, n_cmp - n_attn) : -1.0;
@@ -7316,21 +7692,23 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 pv.bound > 0.0 ? e_out >= 0.0 && e_out <= pv.bound && e_state >= 0.0 && e_state <= pv.bound :
                                  e_all >= 0.0 && e_all <= k_gdn_max_nmse;
             const bool ok = claimed && ref_ok && dev_ok && repeat && in_bound && warnings == (pv.warned ? 1 : 0) &&
-                            (pv.form != 0 || same) && forms_ok;
+                            (pv.form != 0 || same) && as_its_form && forms_ok;
             n_prefill_ok += ok;
             n_other[pv.form] += dev_ok && !same;
+            n_default_runs += pv.form == 3;
             worst_prefill[pv.form][0] = std::max(worst_prefill[pv.form][0], e_out);
             worst_prefill[pv.form][1] = std::max(worst_prefill[pv.form][1], e_state);
             if (!ok) {
                 std::fprintf(stderr,
                              "FAIL: GATED_DELTA_NET prefill %s, FLAGOS_SPACEMIT_GDN_PREFILL=%s: %s; the CPU reference "
-                             "%s, the run %s, its repeat %s, the recurrence's bytes %s; NMSE scores %.3e, state %.3e, "
-                             "all %.3e (bound %.0e); %d warning lines (expected %d); tile calls by form: reference "
+                             "%s, the run %s, its repeat %s, the recurrence's bytes %s, its form's %s; NMSE scores "
+                             "%.3e, state %.3e, all %.3e (bound %.0e); %d warning lines (expected %d); tile calls by "
+                             "form: reference "
                              "%llu, fused %llu, two-pass %llu, chunk %llu, tcm %llu (expected %s; TCM %zu bytes per "
                              "tile, the form needs %zu)\n",
                              c.what, pv.value != nullptr ? pv.value : "(unset)", claimed ? "claimed" : "refused",
                              ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", repeat ? "equal" : "differs",
-                             same ? "equal" : "differ", e_out, e_state, e_all,
+                             same ? "equal" : "differ", as_its_form ? "equal" : "differ", e_out, e_state, e_all,
                              pv.bound > 0.0 ? pv.bound : k_gdn_max_nmse, warnings, pv.warned ? 1 : 0,
                              (unsigned long long) taken[0], (unsigned long long) taken[1],
                              (unsigned long long) taken[2], (unsigned long long) taken[3],
@@ -7414,16 +7792,18 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 "do not divide v's, a gate of neither 1 nor S_v, a gate or beta of the wrong head count, a short "
                 "output refused: checked\n",
                 n_ok, n_cases, worst_nmse, k_gdn_max_nmse, worst_abs);
-    std::printf("gdn      FLAGOS_SPACEMIT_GDN_PREFILL (recurrence, chunk, tcm, unset, empty, abc) on the device, S_v "
-                "128, K 1, the model's inputs, 16, 17, 33 and 100 tokens of 16 heads and 33 of 4 (idle tiles)%s: "
-                "%d/%d; max NMSE against the CPU on one thread, scores / state: recurrence %.2e / %.2e, chunk %.2e / "
-                "%.2e (bound %.0e), tcm %.2e / %.2e (bound %.0e); bytes other than the recurrence's (the form ran) "
-                "for chunk in %d/%zu, tcm in %d/%zu; one warning for abc; the tiles' forms by the counters (TCM "
-                "%zu bytes per tile, the tcm form needs %zu): %s\n",
+    std::printf("gdn      FLAGOS_SPACEMIT_GDN_PREFILL (recurrence, chunk, tcm, and the default: auto, unset, empty, "
+                "abc) on the device, S_v 128, K 1, the model's inputs, 16, 17, 33 and 100 tokens of 16 heads and 33 "
+                "of 4 (idle tiles)%s: %d/%d; max NMSE against the CPU on one thread, scores / state: recurrence %.2e / "
+                "%.2e, chunk %.2e / %.2e (bound %.0e), tcm %.2e / %.2e (bound %.0e), the default %.2e / %.2e (bound "
+                "%.0e, its bytes those of the value whose form it took); bytes other than the recurrence's (the form "
+                "ran) for chunk in %d/%zu, tcm in %d/%zu, the default in %d/%d; one warning for abc; the tiles' forms "
+                "by the counters (TCM %zu bytes per tile, the tcm form needs %zu): %s\n",
                 reference_label(), n_prefill_ok, n_prefill, worst_prefill[0][0], worst_prefill[0][1],
                 worst_prefill[1][0], worst_prefill[1][1], prefill_values[1].bound, worst_prefill[2][0],
-                worst_prefill[2][1], prefill_values[2].bound, n_other[1], std::size(prefill_cases), n_other[2],
-                std::size(prefill_cases), tcm_per_tile, tcm_needed, took.c_str());
+                worst_prefill[2][1], prefill_values[2].bound, worst_prefill[3][0], worst_prefill[3][1],
+                prefill_values[3].bound, n_other[1], std::size(prefill_cases), n_other[2], std::size(prefill_cases),
+                n_other[3], n_default_runs, tcm_per_tile, tcm_needed, took.c_str());
     return 0;
 }
 
@@ -9540,7 +9920,7 @@ int main(int argc, char ** argv) {
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_repack_threads(dev, !host) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
         check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 ||
-        check_state_ops(dev) != 0 || check_mul_mat_id(dev, host, full) != 0 || check_gdn(dev) != 0 || check_seq_ops(dev) != 0 || check_moe_ops(dev) != 0 ||
+        check_state_ops(dev) != 0 || check_mul_mat_id(dev, host, full) != 0 || check_gdn(dev) != 0 || check_seq_ops(dev) != 0 || check_conv_pair(dev) != 0 || check_moe_ops(dev) != 0 ||
         check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {

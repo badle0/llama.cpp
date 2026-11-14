@@ -11,7 +11,7 @@
 //   GGML_FLAGOS_TRACE_LAUNCH=1            the steps logged by name before each replay, the failing one named
 //   GGML_FLAGOS_SYNC_LAUNCH=1             one launch per step, the host waiting for each (E3a)
 // GGML_FLAGOS_KERNEL_VARIANTS=0 is the plugin's (flagos-spacemit-kernels.cpp) and GGML_FLAGOS_PROVIDER_PATH the
-// loader's. The core's other switches keep their names (FLAGOS_SPACEMIT_DISABLE, PLAN, QUANTIZE, EMBD):
+// loader's. The core's other switches keep their names (FLAGOS_SPACEMIT_DISABLE, PLAN, QUANTIZE, EMBD, SSM_CONV):
 // the deck names none of them.
 
 #include "flagos-spacemit-plan.h"    // spacemit_plan_result
@@ -47,6 +47,11 @@ spacemit_launch_kind spacemit_launch_mode();
 // test-only until adopted (fusion-and-splitting.md §5, candidate 6): FLAGOS_SPACEMIT_QUANTIZE=shared leaves out a
 // MUL_MAT's quantize step when the matmul that last quantized took the same activations into the same layout
 bool spacemit_quantize_shared();
+
+// FLAGOS_SPACEMIT_SSM_CONV: unset, empty or fused (the default) expands each convolution pair (spacemit_conv_pair)
+// into its two stashed steps; split keeps the ordinary CONCAT and SSM_CONV kernels. Read at every graph, as
+// FLAGOS_SPACEMIT_PLAN and QUANTIZE, so a test can switch; an unknown value is reported once and ignored (fused)
+bool spacemit_ssm_conv_fused();
 
 // test-only: FLAGOS_SPACEMIT_EMBD=cpu refuses the quantized GET_ROWS (get_rows.quant), so the token embedding's lookup
 // stays on the CPU as before 2026-11-11 and the F32 row pick stays here; unset, empty, ggml or rvv: the provider takes

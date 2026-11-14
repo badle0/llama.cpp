@@ -67,6 +67,7 @@ struct spacemit_backend_context {
     spacemit_switches_generation_fn   switches_generation = nullptr;
     std::vector<spacemit_plugin_step> steps;
     std::vector<const char *>         step_names;  // the steps' contract names, parallel to steps
+    std::vector<uint8_t>              conv_role;   // per node of a checked graph: 1 a pair's CONCAT, 2 its SSM_CONV
     spacemit_plan_cache               plan;        // the plan cache (FLAGOS_SPACEMIT_PLAN; plan.md "S1 step 3c spec")
     void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                            workspace_size = 0;
@@ -265,6 +266,9 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         }
         share = false;
     }
+    // FLAGOS_SPACEMIT_SSM_CONV: the convolution pairs (spacemit_conv_pair) expanded into their stashed steps, a
+    // structural decision, so the plan cache keeps it under the uid's trust
+    const bool          fuse_conv = spacemit_ssm_conv_fused();
     // no plan cache under FLAGOS_SPACEMIT_QUANTIZE=shared (test-only): its sharing decisions read data addresses
     // (spacemit_overlaps), which the key does not cover
     const bool          cached = plan_mode == spacemit_plan_mode::uid_trust && !share;
@@ -272,13 +276,13 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     size_t              scratch_size = 0, act_size = 0;
     ctx->steps.clear();
     ctx->step_names.clear();
-    // the configuration word is the activation-sharing fact (bit 0) and, above it, the plugin's switch generation,
-    // which moves whenever a kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading
-    // a plugin switch); a different word is a miss
+    // the configuration word is the activation-sharing fact (bit 0), FLAGOS_SPACEMIT_SSM_CONV=split (bit 1) and,
+    // above them, the plugin's switch generation, which moves whenever a kernel switch is reset (so
+    // FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a plugin switch); a different word is a miss
     uint64_t word = 0;
     if (cached) {
         const uint64_t generation = ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
-        word                      = (generation << 1) | (share ? 1 : 0);
+        word                      = (generation << 2) | (fuse_conv ? 0 : 2) | (share ? 1 : 0);
     }
     // the key alone, before the contract check
     spacemit_plan_result plan = spacemit_plan_result::off;
@@ -331,6 +335,29 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             }
         }
     } else {
+        // the convolution pairs, once per checked graph with an SSM_CONV: each pair's CONCAT and SSM_CONV take their
+        // stashed steps below, after their ordinary contract check
+        const auto computed = [](const ggml_tensor * node) {
+            return !ggml_op_is_empty(node->op) && !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        };
+        uint64_t n_pairs = 0;
+        ctx->conv_role.clear();
+        for (int i = 0; fuse_conv && i < n_nodes; i++) {
+            if (ggml_graph_node(cgraph, i)->op == GGML_OP_SSM_CONV) {
+                ctx->conv_role.assign((size_t) n_nodes, 0);
+                break;
+            }
+        }
+        for (int i = 0; i < (int) ctx->conv_role.size(); i++) {
+            int si = -1;
+            if (ggml_graph_node(cgraph, i)->op == GGML_OP_CONCAT && computed(ggml_graph_node(cgraph, i)) &&
+                spacemit_conv_pair(dev->ops, &dev->buffer_type, cgraph, i, &si) &&
+                computed(ggml_graph_node(cgraph, si)) && ctx->conv_role[si] == 0) {
+                ctx->conv_role[i]  = 1;
+                ctx->conv_role[si] = 2;
+                n_pairs++;
+            }
+        }
         // the contract check, every graph but a trusted hit: a graph either runs completely or fails with nothing
         // written
         for (int i = 0; i < n_nodes; i++) {
@@ -355,8 +382,10 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
                 GGML_LOG_ERROR("FlagOS SpacemiT: %s (%s) has an unallocated operand\n", ggml_op_desc(node), node->name);
                 return GGML_STATUS_FAILED;
             }
-            expand(node, op);
+            const uint8_t role = ctx->conv_role.empty() ? 0 : ctx->conv_role[i];
+            expand(node, role == 1 ? &dev->ops.conv_pair_concat : role == 2 ? &dev->ops.conv_pair_ssm_conv : op);
         }
+        spacemit_conv_pairs_add(n_pairs);
     }
     // after the contract check; start when a trusted hit skipped it
     const std::chrono::steady_clock::time_point checked =

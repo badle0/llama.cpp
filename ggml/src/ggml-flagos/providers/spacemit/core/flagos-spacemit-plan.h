@@ -59,8 +59,8 @@ void spacemit_plan_counters_add(spacemit_plan_result result, double lookup_us, d
 class spacemit_plan_cache {
   public:
     // the key: cgraph's uid not 0 and the entry's, word the entry's, and cgraph's nodes the very objects the entry
-    // recorded, all of them and in order. word: the configuration word (bit 0 the activation-sharing fact, above it
-    // the plugin's switch generation)
+    // recorded, all of them and in order. word: the configuration word (bit 0 the activation-sharing fact, bit 1
+    // FLAGOS_SPACEMIT_SSM_CONV=split, above them the plugin's switch generation)
 
     // the key alone, before the contract check. On a hit fills steps (the entry's, whose nodes are this graph's;
     // workspace offsets 0, graph_compute sets them from the sizes), names when want_names, and the two workspace
