@@ -3149,6 +3149,44 @@ One generated token is 124.4 ms (131.0 before the F32 kernel). Since the port's 
 - The runner under `x100`: 47/47 on both models, replies 16/16 equal to T1's baselines, perplexity as before (Qwen3-4B 9.7736).
 - So the cost of the route is its 4 cores: about 0.5 s of start-up on Qwen3-4B and 0.1 s on Qwen3-0.6B. To SpacemiT's engineer: these figures, and whether the X100 backend can expose all 8 X100 cores.
 
+### Qwen3's op tables at today's code (2026-11-15)
+
+User request: the per-op table of a prompt and of a generated token for Qwen3, as for Qwen3.5. The record had one
+for Qwen3-4B only (`fusion-and-splitting.md` §7.1, 2026-10-21, build `eb7a53962`, 512-token batches and tokens at
+n_kv 256) and none for Qwen3-0.6B. One K3 run at `040d589cf` (the build of the F32 matmul run; no code change), per
+model: `llama-bench -p 501 -n 0 -r 3` and `llama-completion` on the same 501-token prompt with 32 tokens, both with
+`GGML_FLAGOS_OP_STATS`; 8 tiles; logs `~/k3-logs/q3-*`. Not run: the one-thread CPU's text (the runner covers Qwen3),
+deeper contexts. Wall time per graph, grouped by op (the names summed).
+
+| Group | 0.6B prompt, 501 tokens | 0.6B token, n_kv 512 | 4B prompt, 501 tokens | 4B token, n_kv 512 |
+|---|---|---|---|---|
+| matmul multiply steps | 488.5 ms (51.9%) | 14.9 ms (63.3%) | 3,970 ms (76.6%) | 85.1 ms (87.2%) |
+| attention | 241.3 ms (25.6%) | 6.8 ms (28.9%) | 636.4 ms (12.3%) | 9.2 ms (9.4%) |
+| quantize steps | 49.6 ms (5.3%) | 0.5 ms (2.3%) | 165.6 ms (3.2%) | 1.1 ms (1.2%) |
+| `RMS_NORM` | 44.9 ms (4.8%) | 0.3 ms (1.2%) | 109.3 ms (2.1%) | 0.4 ms (0.4%) |
+| `ROPE` | 44.2 ms (4.7%) | 0.4 ms (1.6%) | 85.2 ms (1.6%) | 0.6 ms (0.6%) |
+| `MUL` | 25.4 ms (2.7%) | 0.2 ms (1.0%) | 64.2 ms (1.2%) | 0.4 ms (0.4%) |
+| `GLU` (SwiGLU) | 22.1 ms (2.4%) | 0.1 ms (0.5%) | 90.7 ms (1.7%) | 0.3 ms (0.3%) |
+| `ADD` | 15.6 ms (1.7%) | 0.2 ms (0.7%) | 44.7 ms (0.9%) | 0.3 ms (0.3%) |
+| `SET_ROWS` | 8.6 ms (0.9%) | 0.1 ms (0.4%) | 12.1 ms (0.2%) | 0.2 ms (0.2%) |
+| all (wall) | 941.5 ms | 23.6 ms | 5,181.5 ms | 97.6 ms |
+
+- `llama-bench` pp501: 530.34 t/s (0.6B) and 96.62 t/s (4B). `llama-completion`: the prompt 954 ms and 5,230 ms,
+  generation 24.66 and 99.09 ms a token (40.56 and 10.09 t/s). At n_kv 768 (19 of the 29 counted tokens) a token is
+  23.8 and 98.2 ms, attention 7.2 and 9.7 ms.
+- The output layer (`token_embd`, Q6_K) is the largest single step of a token: 5.3 ms on 0.6B (22.6%), 13.6 ms on 4B
+  (13.9%).
+- Attention in generation: the partial step's slowest tile takes 8.45 ms a token on 4B against the mean's 6.74
+  (imbalance 1.72 ms), 6.46 against 5.16 on 0.6B (1.31 ms).
+- Against the predictions fixed before the run (4B, estimates from the old table): the prompt graph 5.18 s (4.9-5.4,
+  met), its matmuls 76.6% (72-76, just above), its attention 12.3% (11-13, met); a token 97.6-98.2 ms (91-98, at the
+  upper edge), its matmuls 87% (88-93, missed), its attention 9.2-9.7 ms (4-8, missed: at about 500-530 tokens of
+  depth it costs more than the line between the old table's 1.44 ms at n_kv 256 and 14.26 ms at n_kv 1280 gives).
+- Beside Qwen3.5-4B at the same code and prompt (`tcm` prefill): the prompt graph 5,182 against 5,948 ms, a token
+  97.6 against 124.4 ms.
+- What it points to (my reading, nothing built): on 0.6B attention is the first target after the matmuls, a quarter
+  of both the prompt and the token; on 4B the token's attention with its uneven tiles, and the output layer on both.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
