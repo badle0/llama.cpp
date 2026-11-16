@@ -523,6 +523,7 @@ const char * const spacemit_required_kernels[] = {
     "ssm_conv.f32",     "concat.f32",       "mul_mat.f32",
     "soft_max.f32",     "argsort.f32",      "sum_rows.f32",             "clamp.f32",
     "div.f32",          "concat.f32.tail",  "ssm_conv.f32.stashed",
+    "gated_delta_net.f32.direct",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 
@@ -579,9 +580,12 @@ bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std
     }
     out->conv_pair_concat.n_steps   = 1;
     out->conv_pair_ssm_conv.n_steps = 1;
+    out->state_direct.n_steps       = 1;
     out->conv_pair_concat.steps[0]   = bind("concat.f32.tail");
     out->conv_pair_ssm_conv.steps[0] = bind("ssm_conv.f32.stashed");
-    if (out->conv_pair_concat.steps[0] == nullptr || out->conv_pair_ssm_conv.steps[0] == nullptr) {
+    out->state_direct.steps[0]       = bind("gated_delta_net.f32.direct");
+    if (out->conv_pair_concat.steps[0] == nullptr || out->conv_pair_ssm_conv.steps[0] == nullptr ||
+        out->state_direct.steps[0] == nullptr) {
         return false;
     }
     out->table = table;
@@ -723,4 +727,153 @@ uint64_t spacemit_conv_pairs_take() {
 
 void spacemit_conv_pairs_add(uint64_t n) {
     g_conv_pairs += n;
+}
+
+// the storage a tensor stands for: itself, or the tensor a view views (ggml collapses view chains, so a view of a
+// view carries the base and the absolute offset, ggml.c ggml_new_tensor_impl)
+static const ggml_tensor * spacemit_base_of(const ggml_tensor * t) {
+    return t->view_src != nullptr ? t->view_src : t;
+}
+
+// a node that writes nothing: a view, a reshape and the like, or no elements
+static bool spacemit_node_empty(const ggml_tensor * t) {
+    return ggml_op_is_empty(t->op) || ggml_is_empty(t);
+}
+
+// a tensor viewing the GATED_DELTA_NET's output: 1 exactly the new state's region, 0 wholly inside the attention
+// scores before it, -1 neither (the whole output among them)
+static int spacemit_state_region(const ggml_tensor * v, const ggml_tensor * gdn, size_t scores, size_t state) {
+    const size_t offs = v == gdn ? 0 : v->view_offs;
+    const size_t end  = offs + ggml_nbytes(v);
+    if (v->type == gdn->type && offs == scores && end == scores + state && ggml_is_contiguous(v)) {
+        return 1;
+    }
+    return end <= scores ? 0 : -1;
+}
+
+bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g, int gi,
+                         int * ri, int * ci) {
+    const ggml_tensor * gdn = g->nodes[gi];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return false;
+    }
+    const ggml_tensor * v  = gdn->src[2];
+    const ggml_tensor * st = gdn->src[5];
+    if (v == nullptr || st == nullptr || st->ne[3] != 1 || spacemit_find_op(ops, gdn, own_buft) == nullptr) {
+        return false;
+    }
+    // gdn.f32 passed, so the state is [S_v, S_v, H, 1] contiguous and the output [S_v * H, n_tokens + S_v] contiguous
+    const int64_t S_v         = v->ne[0];
+    const int64_t state_elems = S_v * S_v * v->ne[1];
+    const size_t  state_bytes = (size_t) state_elems * sizeof(float);
+    const size_t  score_bytes = (size_t) (S_v * v->ne[1] * v->ne[2]) * sizeof(float);
+
+    // the state read in, through views only: one row of a persistent tensor no node of this graph computes
+    const ggml_tensor * rows = st;
+    if (st->view_src != nullptr) {
+        if (!ggml_op_is_empty(st->op) || st->view_offs != 0) {
+            return false;
+        }
+        rows = st->view_src;
+    }
+    const ggml_tensor * idx = rows->src[1];
+    const ggml_tensor * src = rows->op == GGML_OP_GET_ROWS ? rows->src[0] : nullptr;
+    if (src == nullptr || idx == nullptr || rows->type != GGML_TYPE_F32 || rows->ne[0] != state_elems ||
+        ggml_nrows(rows) != 1 || idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != 1 ||
+        src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || src->ne[0] != state_elems || src->ne[2] != 1 ||
+        src->ne[3] != 1 || src->view_offs % src->nb[1] != 0) {
+        return false;
+    }
+    const ggml_tensor * persistent = spacemit_base_of(src);
+    if (persistent->op != GGML_OP_NONE || persistent->view_src != nullptr) {
+        return false;
+    }
+
+    // the GET_ROWS' index in g, and the one node that reads the op's new state
+    int rows_at = -1, cpy = -1;
+    for (int t = 0; t < g->n_nodes; t++) {
+        const ggml_tensor * n = g->nodes[t];
+        if (n == rows) {
+            rows_at = t;
+            continue;
+        }
+        // a node that is a view of either: it must write neither, and of the output see one region
+        if (n->view_src == rows && !ggml_op_is_empty(n->op)) {
+            return false;
+        }
+        if (n->view_src == gdn &&
+            (!ggml_op_is_empty(n->op) || spacemit_state_region(n, gdn, score_bytes, state_bytes) < 0)) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * s = n->src[i];
+            if (s == nullptr || s == n->view_src) {
+                continue;  // a view node's own source, taken above
+            }
+            const ggml_tensor * base = spacemit_base_of(s);
+            if (base == rows) {
+                if (n != gdn || i != 5) {
+                    return false;  // another consumer of the row read in
+                }
+                continue;
+            }
+            if (base != gdn) {
+                continue;
+            }
+            const int region = spacemit_state_region(s, gdn, score_bytes, state_bytes);
+            if (region < 0 || (region == 1 && (n->op != GGML_OP_CPY || i != 0 || cpy >= 0 || t <= gi))) {
+                return false;  // a view of neither region, or the new state read by more than one CPY after the op
+            }
+            if (region == 1) {
+                cpy = t;
+            }
+        }
+    }
+    if (rows_at < 0 || rows_at >= gi || cpy < 0) {
+        return false;
+    }
+
+    // the CPY writes a whole contiguous row of the tensor the GET_ROWS read
+    const ggml_tensor * cp  = g->nodes[cpy];
+    const ggml_tensor * dst = cp->src[1];
+    if (dst == nullptr || cp->type != GGML_TYPE_F32 || !ggml_is_contiguous(cp) || ggml_nbytes(cp) != state_bytes ||
+        spacemit_base_of(cp) != persistent || spacemit_base_of(dst) != persistent || cp->data != dst->data ||
+        cp->view_offs % src->nb[1] != 0) {
+        return false;
+    }
+
+    // nothing else in g computes that tensor, and nothing between the two copies reads it
+    for (int t = 0; t < g->n_nodes; t++) {
+        const ggml_tensor * n = g->nodes[t];
+        if (n == cp || spacemit_node_empty(n)) {
+            continue;
+        }
+        if (spacemit_base_of(n) == persistent) {
+            return false;
+        }
+        if (t < rows_at || t > cpy || n == rows) {
+            continue;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (n->src[i] != nullptr && spacemit_base_of(n->src[i]) == persistent) {
+                return false;
+            }
+        }
+    }
+    if (spacemit_find_op(ops, rows, own_buft) == nullptr || spacemit_find_op(ops, cp, own_buft) == nullptr) {
+        return false;
+    }
+    *ri = rows_at;
+    *ci = cpy;
+    return true;
+}
+
+static std::atomic<uint64_t> g_state_passes{ 0 };
+
+uint64_t spacemit_state_passes_take() {
+    return g_state_passes.exchange(0);
+}
+
+void spacemit_state_passes_add(uint64_t n) {
+    g_state_passes += n;
 }

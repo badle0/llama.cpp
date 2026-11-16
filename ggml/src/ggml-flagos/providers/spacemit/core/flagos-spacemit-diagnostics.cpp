@@ -104,9 +104,9 @@ std::string spacemit_role(const ggml_tensor * t) {
     return n.empty() ? "-" : n;
 }
 
-// a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention, and a convolution pair's
-// two steps, by the step's contract name), the role its tensors' names give, and its rows (r: the output's; m: a
-// matmul's activations', after its weight type)
+// a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention, a convolution pair's two
+// steps and a state pass's one, by the step's contract name), the role its tensors' names give, and its rows (r: the
+// output's; m: a matmul's activations', after its weight type)
 std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
                                 const std::vector<const char *> & names, size_t i) {
     const spacemit_plugin_step & step = steps[i];
@@ -187,6 +187,14 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
             std::snprintf(buf, sizeof(buf), "SSM_CONV%s r%lld",
                           std::strcmp(name, "ssm_conv.f32.stashed") == 0 ? ".stashed" : "", r);
             break;
+        case GGML_OP_CPY:  // a state pass's step runs on the CPY, for the op it replaces (spacemit_state_pass)
+            if (std::strcmp(name, "gated_delta_net.f32.direct") == 0) {
+                std::snprintf(buf, sizeof(buf), "GATED_DELTA_NET.direct r%lld",
+                              static_cast<long long>(ggml_nrows(n->src[0]->view_src)));
+            } else {
+                std::snprintf(buf, sizeof(buf), "CPY r%lld", r);
+            }
+            break;
         default:
             std::snprintf(buf, sizeof(buf), "%s r%lld", ggml_op_name(n->op), r);
             break;
@@ -253,6 +261,21 @@ bool spacemit_ssm_conv_fused() {
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_SSM_CONV=%s: unknown setting ignored (fused)\n", __func__, v);
+    }
+    return true;
+}
+
+bool spacemit_state_direct() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_STATE");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "direct") == 0) {
+        return true;
+    }
+    if (std::strcmp(v, "copy") == 0) {
+        return false;
+    }
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_STATE=%s: unknown setting ignored (direct)\n", __func__, v);
     }
     return true;
 }

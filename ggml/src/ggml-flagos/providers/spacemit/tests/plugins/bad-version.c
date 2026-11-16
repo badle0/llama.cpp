@@ -135,6 +135,7 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "concat.f32", fake_step, NULL, NULL },
         { "concat.f32.tail", fake_step, NULL, NULL },
         { "ssm_conv.f32.stashed", fake_step, NULL, NULL },
+        { "gated_delta_net.f32.direct", fake_step, NULL, NULL },
         { "mul_mat.f32", fake_step, NULL, NULL },
         { "soft_max.f32", fake_step, NULL, NULL },
         { "argsort.f32", fake_step, NULL, NULL },

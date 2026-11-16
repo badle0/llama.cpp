@@ -128,8 +128,12 @@ int64_t gdn_tile_floats(const gdn_shape & sh) {
     return GGML_PAD(floats, 64 / (int64_t) sizeof(float));
 }
 
-// ops.cpp ggml_compute_forward_gated_delta_net_one_chunk, its ggml_vec_* calls written out element by element
-void gdn_ref(ggml_tensor * dst, float * delta, float * state_work, int64_t ir0, int64_t ir1) {
+// ops.cpp ggml_compute_forward_gated_delta_net_one_chunk, its ggml_vec_* calls written out element by element.
+// flagos: the state comes from state_in_base and the new state goes to state_out_base, which with K 1 may be the same
+// row (the state pass, core/flagos-spacemit-ops.h spacemit_state_pass): the only read of the input state is the copy
+// into s_out, skipped when the two coincide
+void gdn_ref(ggml_tensor * dst, const float * state_in_base, float * state_out_base, float * delta, float * state_work,
+             int64_t ir0, int64_t ir1) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_k     = dst->src[1];
     const ggml_tensor * src_v     = dst->src[2];
@@ -156,13 +160,10 @@ void gdn_ref(ggml_tensor * dst, float * delta, float * state_work, int64_t ir0, 
     const int64_t K                = ggml_get_op_params_i32(dst, 0);
     const int64_t state_seq_stride = (int64_t) (src_state->nb[3] / sizeof(float));
 
-    // the output is the attention scores, then K state snapshots (slot 0 the newest)
-    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
+    // the output starts with the attention scores; the K state snapshots after them (slot 0 the newest) are the
+    // caller's state_out_base
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float *       attn_out_base       = (float *) dst->data;
-    float *       state_out_base      = (float *) dst->data + attn_score_elems;
-
-    const float * state_in_base = (const float *) src_state->data;
 
     const int64_t rq3 = nev3 / neq3;
     const int64_t rk3 = nev3 / nek3;
@@ -183,7 +184,9 @@ void gdn_ref(ggml_tensor * dst, float * delta, float * state_work, int64_t ir0, 
         float * s_out = (K > 1) ? state_work : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        std::memcpy(s_out, s_in, (size_t) (S_v * S_v) * sizeof(float));
+        if (s_out != s_in) {  // the state pass gives the same row for both; the work below is in place
+            std::memcpy(s_out, s_in, (size_t) (S_v * S_v) * sizeof(float));
+        }
 
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
@@ -452,7 +455,8 @@ struct gdn_chunk_args {
 };
 
 // One (head, seq): s_in / s_out are the transposed states (S_v x S_v), attn_data the first token's output.
-// flagos: buf is the tile's workspace slice of gdn_chunk_floats(S_v), not a thread_local std::vector
+// flagos: buf is the tile's workspace slice of gdn_chunk_floats(S_v), not a thread_local std::vector. s_in is read
+// once, into buf, before anything is written to s_out, so the two may be the same row (the state pass)
 void gdn_chunked_head(const gdn_chunk_args & a,
                       int64_t                iq1,
                       int64_t                ik1,
@@ -695,8 +699,11 @@ __attribute__((noinline)) void gdn_recurrent_rows_lookahead(float *       dst,
 // buffer the slice's gdn_chunk_floats(S_v)); the asserts are the contract's; as the fork, auto (the default
 // FLAGOS_SPACEMIT_GDN_PREFILL, prefill) takes the TCM form where it can and else the chunkwise one; chunk and tcm take
 // only their form, recurrence neither, and a call outside a form's conditions, tcm without TCM too, takes the
-// recurrence
+// recurrence. The state is read from state_in_base and written to state_out_base, which with K 1 may be the same row
+// (the state pass, core/flagos-spacemit-ops.h spacemit_state_pass): every form reads a row before it writes it
 void gdn_rvv(ggml_tensor * dst,
+             const float * state_in_base,
+             float *       state_out_base,
              float *       scratch,
              float *       state_work,
              void *        tcm,
@@ -718,11 +725,8 @@ void gdn_rvv(ggml_tensor * dst,
     const int64_t K        = ggml_get_op_params_i32(dst, 0);
 
     const int64_t state_seq_stride    = (int64_t) (src_state->nb[3] / sizeof(float));
-    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float *       attn_out_base       = (float *) dst->data;
-    float *       state_out_base      = attn_out_base + attn_score_elems;
-    const float * state_in_base       = (const float *) src_state->data;
 
     const float scale = 1.0f / sqrtf((float) S_v);
     // the scalar gate uses g[0]; KDA gives one gate per state column (S_v == 1: the two coincide, KDA kept)
@@ -785,8 +789,8 @@ void gdn_rvv(ggml_tensor * dst,
                                            state_out_base + (iv3 * H + iv1) * S_v * S_v;
         const float * s_in  = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         if (transposed) {
-            gdn_transpose(S_v, S_v, s_in, S_v, s_out, S_v);
-        } else if (!fused) {
+            gdn_transpose(S_v, S_v, s_in, S_v, s_out, S_v);  // into TCM, read whole before the state is written back
+        } else if (!fused && s_out != s_in) {  // the state pass gives the same row for both: work in place
             std::memcpy(s_out, s_in, (size_t) (S_v * S_v) * sizeof(float));
         }
         // the fused form reads the input state for its first token and writes the output, then works in place
@@ -890,6 +894,42 @@ void gdn_rvv(ggml_tensor * dst,
 
 #endif  // GGML_FLAGOS_SPACEMIT_RVV
 
+// one tile's rows of node, the state read from state_in_base and the new state written to state_out_base; name is the
+// step's, for the workspace message
+bool gdn_tile_run(const spacemit_tile & tile, ggml_tensor * node, const float * state_in_base, float * state_out_base,
+                  const char * name) {
+    const gdn_shape sh       = gdn_shape_of(node);
+    const int64_t   per_tile = gdn_tile_floats(sh);
+    const size_t    needed   = (size_t) per_tile * tile.nth * sizeof(float);
+    if (tile.nth == 0 || tile.nth > SPACEMIT_MAX_TILES || tile.workspace == nullptr ||
+        tile.workspace_size < needed) {
+        GGML_LOG_ERROR("FlagOS SpacemiT: %s needs %zu scratch bytes for %u tiles, has %zu\n", name, needed, tile.nth,
+                       tile.workspace_size);
+        return false;
+    }
+
+    float * scratch    = (float *) tile.workspace + per_tile * tile.ith;
+    float * state_work = sh.K > 1 ? scratch + 3 * sh.S_v : nullptr;
+    // read on every build, so that an unknown value warns where only the reference runs too
+    const int prefill  = gdn_prefill_from_env();
+
+    int64_t ir0, ir1;
+    tile_range(sh.H * sh.n_seqs, tile, ir0, ir1);
+    if (ir0 >= ir1) {
+        return true;
+    }
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
+    if (!spacemit_use_reference()) {
+        gdn_rvv(node, state_in_base, state_out_base, scratch, state_work, tile.tcm, tile.tcm_size, prefill, ir0, ir1);
+        return true;
+    }
+#endif
+    GGML_UNUSED(prefill);
+    g_gdn_reference.fetch_add(1, std::memory_order_relaxed);
+    gdn_ref(node, state_in_base, state_out_base, scratch, state_work, ir0, ir1);
+    return true;
+}
+
 }  // namespace
 
 size_t spacemit_gdn_workspace(const ggml_tensor * node) {
@@ -910,35 +950,33 @@ void spacemit_gdn_paths_take(uint64_t * reference, uint64_t * fused, uint64_t * 
 }
 
 bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile_p, ggml_tensor * dst) {
-    const spacemit_tile & tile     = *tile_p;
-    const gdn_shape       sh       = gdn_shape_of(dst);
-    const int64_t         per_tile = gdn_tile_floats(sh);
-    const size_t          needed   = (size_t) per_tile * tile.nth * sizeof(float);
-    if (tile.nth == 0 || tile.nth > SPACEMIT_MAX_TILES || tile.workspace == nullptr ||
-        tile.workspace_size < needed) {
-        GGML_LOG_ERROR("FlagOS SpacemiT: gdn.f32 needs %zu scratch bytes for %u tiles, has %zu\n", needed, tile.nth,
-                       tile.workspace_size);
+    const gdn_shape sh = gdn_shape_of(dst);
+    return gdn_tile_run(*tile_p, dst, (const float *) dst->src[5]->data,
+                        (float *) dst->data + sh.S_v * sh.H * sh.n_tokens * sh.n_seqs, "gdn.f32");
+}
+
+bool spacemit_kernel_gated_delta_net_direct(const spacemit_tile * tile_p, ggml_tensor * cpy) {
+    // the state pass's step runs on the CPY (core/flagos-spacemit-ops.h spacemit_state_pass): its source views the
+    // op's new state, the op's own state comes from the GET_ROWS' row of the persistent tensor, and the CPY's
+    // destination is the row to write
+    ggml_tensor * const node = cpy->src[0]->view_src;
+    const ggml_tensor * st   = node->src[5];
+    const ggml_tensor * rows = st->view_src != nullptr ? st->view_src : st;
+    const ggml_tensor * src  = rows->src[0];
+    const int64_t       idx  = ((const int32_t *) rows->src[1]->data)[0];
+    if (idx < 0 || idx >= src->ne[1]) {
+        GGML_LOG_ERROR("FlagOS SpacemiT: gated_delta_net.f32.direct: state row %lld of %lld\n", (long long) idx,
+                       (long long) src->ne[1]);
         return false;
     }
-
-    float * scratch    = (float *) tile.workspace + per_tile * tile.ith;
-    float * state_work = sh.K > 1 ? scratch + 3 * sh.S_v : nullptr;
-    // read on every build, so that an unknown value warns where only the reference runs too
-    const int prefill  = gdn_prefill_from_env();
-
-    int64_t ir0, ir1;
-    tile_range(sh.H * sh.n_seqs, tile, ir0, ir1);
-    if (ir0 >= ir1) {
-        return true;
+    const float * state_in  = (const float *) ((const char *) src->data + (size_t) idx * src->nb[1]);
+    float *       state_out = (float *) cpy->data;
+    const size_t  bytes     = ggml_nbytes(cpy);
+    const char *  in        = (const char *) state_in;
+    const char *  out       = (const char *) state_out;
+    if (in != out && in < out + bytes && out < in + bytes) {  // whole rows: the same row or disjoint ones
+        GGML_LOG_ERROR("FlagOS SpacemiT: gated_delta_net.f32.direct: the state rows overlap in part\n");
+        return false;
     }
-#if defined(GGML_FLAGOS_SPACEMIT_RVV)
-    if (!spacemit_use_reference()) {
-        gdn_rvv(dst, scratch, state_work, tile.tcm, tile.tcm_size, prefill, ir0, ir1);
-        return true;
-    }
-#endif
-    GGML_UNUSED(prefill);
-    g_gdn_reference.fetch_add(1, std::memory_order_relaxed);
-    gdn_ref(dst, scratch, state_work, ir0, ir1);
-    return true;
+    return gdn_tile_run(*tile_p, node, state_in, state_out, "gated_delta_net.f32.direct");
 }
