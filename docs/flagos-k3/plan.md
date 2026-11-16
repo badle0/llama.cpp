@@ -3216,6 +3216,17 @@ User request: the output layer (`token_embd`, Q6_K in the file, a Q8_0 copy in t
 
 To settle the headroom, if wanted: the real 1-row matmul of the output layer (`flagos-check-spacemit --bench`) timed while 8 threads on the X100 cores read another buffer. Unchanged matmul time and about 10 GB/s on the threads would mean the X100 cores could carry about a quarter of every 1-row matmul (88% of a token); that would be a new design (work shared by both core groups), not a kernel.
 
+**The headroom settled (2026-11-16, `592775210`, `flagos-check-spacemit --bench-x100`, test code only, logs `xb-*`, one K3 run, medians of 5, 47/47 checks).** Rules fixed before the run: part 1 passes if the matmul slows by less than 5% while the threads read 8 GB/s or more; part 2 if the best split is at least 15% faster than the AI cores alone on the output layer and on an FFN shape. **Both fail: the memory has no bandwidth beyond what the AI cores take, so the X100 cores cannot add to a 1-row matmul.**
+
+| part 1: the real 1-row matmul beside reader threads on the X100 cores | alone | with 4 readers | with 8 readers |
+|---|---|---|---|
+| output layer (Qwen3-4B's, 394 MiB) | 13.2 ms, 31.3 GB/s | 19.8 ms (1.50x); readers 14.5 to 5.9 GB/s; together 26.8 | 24.0 ms (1.82x); readers 18.4 to 7.8; together 25.1 |
+| `ffn_up` (13.4 MiB) | 0.421 ms, 33.3 GB/s | 0.651 ms (1.55x); together 28.5 | 0.749 ms (1.78x); together 27.2 |
+
+- Together the two groups move fewer bytes than the AI cores alone (25 to 28 against 31 to 33 GB/s): about 31 GB/s is the memory's limit, shared, and contention costs some of it.
+- Part 2, the rows split between the provider and ggml-cpu's threads released together: the output layer 14.4 ms alone; with 85% on the AI cores 14.3 to 14.6 ms (0.99 to 1.01), 75% 15.9, 65% 18.4, 50% 22.0; the CPU alone 30.6 ms. `ffn_up` 0.42 ms alone, no split under 0.61 ms; `ffn_down` 0.50 ms alone, none under 0.58 ms; the CPU alone 3.7 and 3.9 ms.
+- Closed: the output layer, and with it every 1-row matmul, runs at the memory's rate; a token's matmul time is the provider's weight bytes over about 31 GB/s. Only fewer bytes a token would shorten it (a smaller quantization, or a model that reads part of its weights a token, as Qwen3.6-35B-A3B's experts).
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
