@@ -1,6 +1,6 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
-//                              [--bench | --bench-attn | --bench-mm | --bench-embd | --bench-repack]
+//                              [--bench | --bench-attn | --bench-mm | --bench-embd | --bench-repack | --bench-x100]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -23,6 +23,11 @@
 //                    Q4_1 and Q6_K to Q8_0, Q8_0) with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 and 8, and with
 //                    FLAGOS_SPACEMIT_REPACK_VIA=x100 (its ranges printed; "-" without spine-runtime) (not run by
 //                    --bench)
+//   --bench-x100     of the benchmarks only the 1-row matmul beside the X100 cores (head Q6_K 2560x151936, ffn_up
+//                    and ffn_down Q4_0): timed while 4 or 8 threads read another 1 GiB buffer, and split by rows
+//                    between the provider and the CPU backend on 8 or 4 threads; lines "x100bench ...", then
+//                    "x100bench: checks n/n PASS|FAIL". X100BENCH_REPS (5), X100BENCH_SMALL=1 (small shapes) (not run
+//                    by --bench)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
 // them: requantized to Q8_0.
 
@@ -53,12 +58,17 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
-#    include <unistd.h>  // dup, dup2 (the counters' lines read back from stderr)
+#    include <sys/mman.h>  // mmap, madvise (--bench-x100's buffer)
+#    include <unistd.h>    // dup, dup2 (the counters' lines read back from stderr)
+#endif
+#ifdef __linux__
+#    include <sched.h>  // sched_getcpu (--bench-x100's readers)
 #endif
 
 static int g_failures = 0;
@@ -10352,6 +10362,524 @@ static int bench(ggml_backend_dev_t dev) {
     return bench_attn(dev) != 0 ? 1 : bench_mm(dev);
 }
 
+//
+// --bench-x100 (plan.md "Output layer probe"): is there DRAM bandwidth for the X100 cores beside the AI cores' 1-row
+// matmul? Part 1 times the real matmul while ordinary threads read another buffer; part 2 splits one matmul's weight
+// rows between the provider and the CPU backend, both released at the same instant
+//
+
+// X100BENCH_<name> as a positive integer, else def
+static int x100_env(const char * name, int def) {
+    const char * v = std::getenv(name);
+    const int    n = v != nullptr ? std::atoi(v) : 0;
+    return n > 0 ? n : def;
+}
+
+static int x100_cpu() {
+#ifdef __linux__
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+}
+
+struct x100_stat {
+    double med = 0.0, lo = 0.0, hi = 0.0;
+};
+
+static x100_stat x100_stats(std::vector<double> v) {
+    x100_stat s;
+    if (!v.empty()) {
+        std::sort(v.begin(), v.end());
+        s.med = v[v.size() / 2];
+        s.lo  = v.front();
+        s.hi  = v.back();
+    }
+    return s;
+}
+
+// one tensor of rows x k in a buffer of buft, from bytes (GGUF rows for weights, floats for the activation row)
+struct x100_tensor {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         t   = nullptr;
+
+    bool init(ggml_backend_buffer_type_t buft, ggml_type type, int64_t k, int64_t rows, const void * bytes) {
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ctx                     = ggml_init(params);
+        t                       = ggml_new_tensor_2d(ctx, type, k, rows);
+        buf                     = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_backend_tensor_set(t, bytes, 0, ggml_nbytes(t));
+        return true;
+    }
+
+    ~x100_tensor() {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+};
+
+// y = W x for one activation row, y in a buffer of buft
+struct x100_mm {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         y   = nullptr;
+    ggml_cgraph *         g   = nullptr;
+
+    bool init(ggml_backend_buffer_type_t buft, ggml_tensor * w, ggml_tensor * x) {
+        ggml_init_params params = { ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ctx                     = ggml_init(params);
+        y                       = ggml_mul_mat(ctx, w, x);
+        g                       = ggml_new_graph(ctx);
+        ggml_build_forward_expand(g, y);
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        return buf != nullptr;
+    }
+
+    std::vector<float> out() const {
+        std::vector<float> v(ggml_nelements(y));
+        ggml_backend_tensor_get(y, v.data(), 0, ggml_nbytes(y));
+        return v;
+    }
+
+    ~x100_mm() {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+};
+
+// the readers' buffer: 64-byte aligned, huge pages asked for on Linux (as head-probe.cpp), every page touched
+struct x100_buffer {
+    uint64_t * p     = nullptr;
+    size_t     bytes = 0;
+
+    explicit x100_buffer(size_t n) : bytes(n) {
+#if defined(_WIN32)
+        p = static_cast<uint64_t *>(::operator new(n, std::align_val_t(64)));
+#else
+        void * m = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) {
+            return;
+        }
+#    ifdef __linux__
+        madvise(m, n, MADV_HUGEPAGE);
+#    endif
+        p = static_cast<uint64_t *>(m);
+#endif
+        std::memset(p, 1, n);
+    }
+
+    ~x100_buffer() {
+        if (p == nullptr) {
+            return;
+        }
+#if defined(_WIN32)
+        ::operator delete(p, std::align_val_t(64));
+#else
+        munmap(p, bytes);
+#endif
+    }
+
+    x100_buffer(const x100_buffer &)             = delete;
+    x100_buffer & operator=(const x100_buffer &) = delete;
+};
+
+// plain u64 adds in 4 independent sums, a loop the compiler can vectorize
+static uint64_t x100_sum(const uint64_t * p, size_t n) {
+    uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        s0 += p[i];
+        s1 += p[i + 1];
+        s2 += p[i + 2];
+        s3 += p[i + 3];
+    }
+    return s0 + s1 + s2 + s3;
+}
+
+// n ordinary threads, each summing its own contiguous slice of the buffer in 8 MiB steps until stopped. Each counts its
+// bytes every 256 KiB in its own atomic, so a sample is off by at most 256 KiB a thread
+class x100_readers {
+  public:
+    x100_readers(const x100_buffer & b, int n) : slots(n) {
+        const size_t words = b.bytes / sizeof(uint64_t) / n;
+        for (int t = 0; t < n; t++) {
+            threads.emplace_back([this, t, p = b.p + t * words, words] { run(slots[t], p, words); });
+        }
+    }
+
+    ~x100_readers() { stop(); }
+
+    uint64_t bytes() const {
+        uint64_t n = 0;
+        for (const slot & s : slots) {
+            n += s.bytes.load(std::memory_order_relaxed);
+        }
+        return n;
+    }
+
+    // joins the threads; each thread's CPU at its start and end, "start:end,..."
+    std::string stop() {
+        halt.store(true, std::memory_order_relaxed);
+        for (std::thread & t : threads) {
+            t.join();
+        }
+        threads.clear();
+        std::string cpus;
+        for (const slot & s : slots) {
+            cpus += (cpus.empty() ? "" : ",") + std::to_string(s.cpu0) + ":" + std::to_string(s.cpu1);
+        }
+        return cpus;
+    }
+
+  private:
+    struct alignas(64) slot {
+        std::atomic<uint64_t> bytes{ 0 };
+        int                   cpu0 = -1, cpu1 = -1;
+        uint64_t              sum  = 0;
+    };
+
+    void run(slot & s, const uint64_t * p, size_t words) {
+        s.cpu0                = x100_cpu();
+        const size_t step     = (8u << 20) / sizeof(uint64_t);
+        const size_t chunk    = (256u << 10) / sizeof(uint64_t);
+        uint64_t     sum = 0, n = 0;
+        size_t       off = 0;
+        while (!halt.load(std::memory_order_relaxed)) {
+            for (size_t c = 0; c < step; c += chunk) {
+                sum += x100_sum(p + off + c, chunk);
+                n += chunk * sizeof(uint64_t);
+                s.bytes.store(n, std::memory_order_relaxed);
+            }
+            off = off + 2 * step <= words ? off + step : 0;
+        }
+        s.sum  = sum;
+        s.cpu1 = x100_cpu();
+    }
+
+    std::vector<slot>        slots;
+    std::vector<std::thread> threads;
+    std::atomic<bool>        halt{ false };
+};
+
+static double x100_ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// ms per call of g on backend: 1 warm-up repetition, then before(), then reps repetitions of calls computes each
+static std::vector<double> x100_time(ggml_backend_t backend, ggml_cgraph * g, int calls, int reps, bool & ok,
+                                     const std::function<void()> & before = nullptr) {
+    std::vector<double> ms;
+    for (int r = 0; r <= reps; r++) {
+        if (r == 1 && before) {
+            before();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < calls; i++) {
+            ok &= ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS;
+        }
+        if (r > 0) {
+            ms.push_back(x100_ms(t0, std::chrono::steady_clock::now()) / calls);
+        }
+    }
+    return ms;
+}
+
+// part 2's timing: per matmul the provider's graph and the CPU's graph released at the same instant to two
+// already-running host threads that spin on a start counter (nullptr leaves a side and its thread out); per
+// repetition, after 1 warm-up, ms per matmul over calls matmuls of the wall time (release to both done) and of each
+// side's own compute
+struct x100_split_times {
+    std::vector<double> wall, prov, cpu;
+    bool                ok = true;
+};
+
+static x100_split_times x100_shared(ggml_backend_t backend, ggml_cgraph * g_prov, ggml_backend_t cpu,
+                                    ggml_cgraph * g_cpu, int calls, int reps) {
+    using clock = std::chrono::steady_clock;
+    struct side {
+        ggml_backend_t    be;
+        ggml_cgraph *     g;
+        double            ms = 0.0;
+        clock::time_point end;
+        bool              ok = true;
+    };
+    std::vector<side> sides;
+    if (g_prov != nullptr) {
+        sides.push_back({ backend, g_prov, 0.0, clock::time_point(), true });
+    }
+    if (g_cpu != nullptr) {
+        sides.push_back({ cpu, g_cpu, 0.0, clock::time_point(), true });
+    }
+    std::atomic<int>         go{ 0 }, done{ 0 };
+    std::atomic<bool>        quit{ false };
+    std::vector<std::thread> threads;
+    for (side & s : sides) {
+        threads.emplace_back([&go, &done, &quit, &s] {
+            int seen = 0;
+            for (;;) {
+                int v;
+                while ((v = go.load(std::memory_order_acquire)) == seen) {
+                }
+                seen = v;
+                if (quit.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                const clock::time_point t0 = clock::now();
+                s.ok &= ggml_backend_graph_compute(s.be, s.g) == GGML_STATUS_SUCCESS;
+                s.end = clock::now();
+                s.ms  = x100_ms(t0, s.end);
+                done.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+    x100_split_times t;
+    for (int r = 0; r <= reps; r++) {
+        double wall = 0.0, ms[2] = { 0.0, 0.0 };
+        for (int i = 0; i < calls; i++) {
+            done.store(0, std::memory_order_relaxed);
+            const clock::time_point release = clock::now();
+            go.fetch_add(1, std::memory_order_release);
+            while (done.load(std::memory_order_acquire) < (int) sides.size()) {
+                std::this_thread::yield();
+            }
+            clock::time_point end = release;
+            for (size_t k = 0; k < sides.size(); k++) {
+                end = std::max(end, sides[k].end);
+                ms[k] += sides[k].ms;
+            }
+            wall += x100_ms(release, end);
+        }
+        if (r > 0) {
+            t.wall.push_back(wall / calls);
+            t.prov.push_back(g_prov != nullptr ? ms[0] / calls : 0.0);
+            t.cpu.push_back(g_cpu != nullptr ? ms[g_prov != nullptr ? 1 : 0] / calls : 0.0);
+        }
+    }
+    quit.store(true, std::memory_order_relaxed);
+    go.fetch_add(1, std::memory_order_release);
+    for (std::thread & th : threads) {
+        th.join();
+    }
+    for (const side & s : sides) {
+        t.ok &= s.ok;
+    }
+    return t;
+}
+
+// whether this build's CPU backend runs its threads on the AI cores: ggml-cpu built with GGML_CPU_RISCV64_SPACEMIT
+// defines GGML_USE_CPU_RISCV64_SPACEMIT for itself only (ggml-cpu/CMakeLists.txt), lists its IME buffer type among
+// its extra buffer types (ggml-cpu.cpp) and binds every compute thread to the AI cores (ggml-cpu.c,
+// ggml_graph_compute_thread), so this program sees the macro through that buffer type
+static bool x100_cpu_uses_ai_cores() {
+#if defined(GGML_USE_CPU_RISCV64_SPACEMIT)
+    return true;
+#else
+    ggml_backend_reg_t reg = ggml_backend_cpu_reg();
+    auto get = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"));
+    ggml_backend_buffer_type_t * b = get != nullptr ? get(ggml_backend_reg_dev_get(reg, 0)) : nullptr;
+    for (; b != nullptr && *b != nullptr; b++) {
+        if (std::strcmp(ggml_backend_buft_name(*b), "CPU_RISCV64_SPACEMIT") == 0) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+static int bench_x100(ggml_backend_dev_t dev) {
+    const int  reps  = x100_env("X100BENCH_REPS", 5);
+    const bool small = x100_env("X100BENCH_SMALL", 0) == 1;
+    struct x100_shape {
+        const char * name;
+        ggml_type    type;
+        int64_t      k, n;
+        bool         part1;
+        int          calls1, calls2;  // matmuls per repetition in parts 1 and 2
+    };
+    const x100_shape shapes[] = {
+        { "head", GGML_TYPE_Q6_K, small ? 256 : 2560, small ? 4096 : 151936, true, 1, 1 },
+        { "ffn_up", GGML_TYPE_Q4_0, small ? 256 : 2560, small ? 1024 : 9728, true, small ? 20 : 200, small ? 10 : 100 },
+        { "ffn_down", GGML_TYPE_Q4_0, small ? 1024 : 9728, small ? 256 : 2560, false, 0, small ? 10 : 100 },
+    };
+    const double fracs[]  = { 0.85, 0.75, 0.65, 0.5 };
+    const int    cs[]     = { 8, 4 };
+    int          n_checks = 0, n_passed = 0;
+    const auto   check    = [&](bool ok, const char * shape, const char * what, double f) {
+        n_checks++;
+        n_passed += ok;
+        if (!ok) {
+            std::fprintf(stderr, "FAIL (x100bench %s f=%.2f): %s\n", shape, f, what);
+            g_failures++;
+        }
+    };
+
+    ggml_backend_t backend = nullptr;
+    {
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM: the 1-row path (bench_mm)
+        backend = ggml_backend_dev_init(dev, nullptr);
+    }
+    REQUIRE(backend != nullptr);
+    const bool part2 = !x100_cpu_uses_ai_cores();
+    if (!part2) {
+        std::printf("x100bench: the CPU backend uses the AI cores in this build, part 2 skipped\n");
+    }
+    ggml_backend_t           cpu[2] = { nullptr, nullptr };
+    ggml_threadpool *        pool[2] = { nullptr, nullptr };
+    for (int i = 0; part2 && i < 2; i++) {
+        ggml_threadpool_params tp = ggml_threadpool_params_default(cs[i]);
+        cpu[i]                    = ggml_backend_cpu_init();
+        pool[i]                   = ggml_threadpool_new(&tp);
+        REQUIRE(cpu[i] != nullptr && pool[i] != nullptr);
+        ggml_backend_cpu_set_n_threads(cpu[i], cs[i]);
+        ggml_backend_cpu_set_threadpool(cpu[i], pool[i]);
+    }
+    x100_buffer rbuf((size_t) (small ? 64 : 1024) << 20);
+    REQUIRE(rbuf.p != nullptr);
+
+    ggml_backend_buffer_type_t buft_dev = ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
+    for (const x100_shape & s : shapes) {
+        if (!s.part1 && !part2) {
+            continue;
+        }
+        const char *               name  = s.name;
+        const size_t               row   = ggml_row_size(s.type, s.k);
+        const double               bytes = (double) s.n * ime_row_bytes(s.type, s.k);  // as bench_mm: 34/32 or 18/32
+        const std::vector<uint8_t> q     = quantize_weights(s.type, s.k, s.n, 61);
+        const std::vector<float>   xv    = random_values(s.k, 62, 2.0f);
+        x100_tensor                x;
+        REQUIRE(x.init(buft_cpu, GGML_TYPE_F32, s.k, 1, xv.data()));
+        auto w_full  = std::make_unique<x100_tensor>();
+        auto mm_full = std::make_unique<x100_mm>();
+        REQUIRE(w_full->init(buft_dev, s.type, s.k, s.n, q.data()) && mm_full->init(buft_dev, w_full->t, x.t));
+        uint64_t paths[3];
+        g_mm_paths_take(&paths[0], &paths[1], &paths[2]);
+
+        // part 1: a. the matmul alone; per T b. the readers alone, c. both; d. the matmul alone again
+        if (s.part1) {
+            bool            ok    = true;
+            const x100_stat alone = x100_stats(x100_time(backend, mm_full->g, s.calls1, reps, ok));
+            for (const int n_thr : { 4, 8 }) {
+                std::vector<double> gbs;
+                {
+                    x100_readers rd(rbuf, n_thr);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    for (int r = 0; r <= reps; r++) {
+                        const uint64_t b0 = rd.bytes();
+                        const auto     t0 = std::chrono::steady_clock::now();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        const uint64_t b1 = rd.bytes();
+                        const double   ms = x100_ms(t0, std::chrono::steady_clock::now());
+                        if (r > 0) {
+                            gbs.push_back((double) (b1 - b0) / 1e6 / ms);
+                        }
+                    }
+                }
+                const x100_stat     rd_alone = x100_stats(gbs);
+                uint64_t            b0 = 0, b1 = 0;
+                double              window = 0.0;
+                std::vector<double> with;
+                std::string         cpus;
+                {
+                    x100_readers rd(rbuf, n_thr);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    std::chrono::steady_clock::time_point t0;
+                    with = x100_time(backend, mm_full->g, s.calls1, reps, ok, [&] {
+                        b0 = rd.bytes();
+                        t0 = std::chrono::steady_clock::now();
+                    });
+                    b1     = rd.bytes();
+                    window = x100_ms(t0, std::chrono::steady_clock::now());
+                    cpus   = rd.stop();
+                }
+                const x100_stat ws      = x100_stats(with);
+                const double    rd_with = (double) (b1 - b0) / 1e6 / window;
+                const double    mm_a    = bytes / 1e6 / alone.med;
+                const double    mm_w    = bytes / 1e6 / ws.med;
+                std::printf("x100bench part1 %s T=%d: matmul alone %.3f (%.3f-%.3f), with readers %.3f (%.3f-%.3f), "
+                            "ratio %.3f; readers alone %.1f, with matmul %.1f; weight bytes %.1f -> matmul %.1f alone / "
+                            "%.1f with readers; sum with readers %.1f; cpus %s\n",
+                            name, n_thr, alone.med, alone.lo, alone.hi, ws.med, ws.lo, ws.hi, ws.med / alone.med,
+                            rd_alone.med, rd_with, bytes / 1048576.0, mm_a, mm_w, mm_w + rd_with, cpus.c_str());
+                std::fflush(stdout);
+            }
+            const x100_stat again = x100_stats(x100_time(backend, mm_full->g, s.calls1, reps, ok));
+            std::printf("x100bench part1 %s: matmul alone again %.3f (%.3f-%.3f), ratio to first %.3f\n", name,
+                        again.med, again.lo, again.hi, again.med / alone.med);
+            std::fflush(stdout);
+            check(ok, name, "part 1 computes", 1.0);
+        }
+        if (!part2) {
+            continue;
+        }
+
+        // part 2: f = 1.0 (the provider alone) and f = 0 (the CPU alone, C = 8), then each split
+        const auto line = [&](double f, int c, const x100_split_times & t, double ref) {
+            const x100_stat w = x100_stats(t.wall);
+            std::printf("x100bench part2 %s f=%.2f C=%d: wall %.3f (%.3f-%.3f), provider side %.3f, cpu side %.3f, "
+                        "ratio to f=1.0 %.3f\n",
+                        name, f, c, w.med, w.lo, w.hi, x100_stats(t.prov).med, x100_stats(t.cpu).med,
+                        ref > 0.0 ? w.med / ref : 1.0);
+            std::fflush(stdout);
+            return w.med;
+        };
+        x100_split_times t1 = x100_shared(backend, mm_full->g, nullptr, nullptr, s.calls2, reps);
+        const double     ref = line(1.0, 0, t1, 0.0);
+        check(t1.ok, name, "provider alone computes", 1.0);
+        const std::vector<float> y_prov = mm_full->out();
+        mm_full.reset();
+        w_full.reset();
+        std::vector<float> y_cpu;
+        {
+            x100_tensor w_cpu;
+            x100_mm     mm_cpu;
+            REQUIRE(w_cpu.init(buft_cpu, s.type, s.k, s.n, q.data()) && mm_cpu.init(buft_cpu, w_cpu.t, x.t));
+            const x100_split_times t0 = x100_shared(nullptr, nullptr, cpu[0], mm_cpu.g, s.calls2, reps);
+            line(0.0, cs[0], t0, ref);
+            check(t0.ok, name, "cpu alone computes", 0.0);
+            y_cpu = mm_cpu.out();
+        }
+        for (const double f : fracs) {
+            const int64_t nf = (int64_t) std::llround(f * (double) s.n / 32.0) * 32;
+            x100_tensor   w_p, w_c;
+            x100_mm       mm_p, mm_c;
+            REQUIRE(nf > 0 && nf < s.n);
+            REQUIRE(w_p.init(buft_dev, s.type, s.k, nf, q.data()) && mm_p.init(buft_dev, w_p.t, x.t));
+            REQUIRE(w_c.init(buft_cpu, s.type, s.k, s.n - nf, q.data() + nf * row) && mm_c.init(buft_cpu, w_c.t, x.t));
+            bool ok = true;
+            for (int i = 0; i < 2; i++) {
+                const x100_split_times t = x100_shared(backend, mm_p.g, cpu[i], mm_c.g, s.calls2, reps);
+                line(f, cs[i], t, ref);
+                ok &= t.ok;
+            }
+            check(ok, name, "split computes", f);
+            // the 1-row path gives each weight row's result from that row alone (the activation row quantized by K
+            // blocks, then 32-row slabs dealt to the tiles: ime.cpp gemv), so the first nf rows match bit for bit
+            const std::vector<float> yp = mm_p.out();
+            const std::vector<float> yc = mm_c.out();
+            check(std::memcmp(yp.data(), y_prov.data(), nf * sizeof(float)) == 0, name,
+                  "provider rows differ from the provider's full matmul", f);
+            check(nmse(yc.data(), y_cpu.data() + nf, s.n - nf) <= k_mul_mat_max_nmse, name,
+                  "cpu rows outside the MUL_MAT bound against the cpu's full matmul", f);
+        }
+        g_mm_paths_take(&paths[0], &paths[1], &paths[2]);
+        check(paths[0] == 0 && paths[1] == 0 && paths[2] == 0, name, "a provider matmul left the 1-row path", 1.0);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (cpu[i] != nullptr) {
+            ggml_backend_free(cpu[i]);
+            ggml_threadpool_free(pool[i]);
+        }
+    }
+    ggml_backend_free(backend);
+    std::printf("x100bench: checks %d/%d %s\n", n_passed, n_checks, n_passed == n_checks ? "PASS" : "FAIL");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     bool expect_device = false;
     bool expect_none   = false;
@@ -10361,6 +10889,7 @@ int main(int argc, char ** argv) {
     bool run_mm        = false;
     bool run_embd      = false;
     bool run_repack    = false;
+    bool run_x100      = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -10378,16 +10907,20 @@ int main(int argc, char ** argv) {
             run_embd = true;
         } else if (std::strcmp(argv[i], "--bench-repack") == 0) {
             run_repack = true;
+        } else if (std::strcmp(argv[i], "--bench-x100") == 0) {
+            run_x100 = true;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
-                         "--bench-embd | --bench-repack]\n"
+                         "--bench-embd | --bench-repack | --bench-x100]\n"
                          "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
                          "tokens\n"
                          "  --bench-embd: the token embedding lookup only, FLAGOS_SPACEMIT_EMBD=ggml against rvv and an "
                          "F32 copy\n"
                          "  --bench-repack: the weights' repack at load only, FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 "
-                         "and 8, and FLAGOS_SPACEMIT_REPACK_VIA=x100\n",
+                         "and 8, and FLAGOS_SPACEMIT_REPACK_VIA=x100\n"
+                         "  --bench-x100: the 1-row matmul beside readers on the X100 cores, and split between the "
+                         "provider and the CPU backend\n",
                          argv[0]);
             return 2;
         }
@@ -10412,6 +10945,9 @@ int main(int argc, char ** argv) {
     std::printf("registry %zu FlagOS device(s), %zu SpacemiT\n", ggml_backend_reg_dev_count(reg), n_spacemit);
 
     if (dev == nullptr) {
+        if (run_x100) {
+            std::printf("x100bench: no SpacemiT device, skipped\n");
+        }
         if (expect_device) {
             std::fprintf(stderr, "FAIL: no %s device\n", k_device_name);
             return 1;
@@ -10443,7 +10979,7 @@ int main(int argc, char ** argv) {
     if (run_bench ? bench(dev) != 0 :
                     (run_attn && (bench_attn(dev) != 0 || bench_attn_tiled(dev) != 0)) ||
                         (run_mm && bench_mm(dev) != 0) || (run_embd && bench_embd(dev) != 0) ||
-                        (run_repack && bench_repack(dev, !host) != 0)) {
+                        (run_repack && bench_repack(dev, !host) != 0) || (run_x100 && bench_x100(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {
