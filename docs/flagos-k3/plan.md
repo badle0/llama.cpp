@@ -3205,6 +3205,17 @@ deeper contexts. Wall time per graph, grouped by op (the names summed).
 - What it points to (my reading, nothing built): on 0.6B attention is the first target after the matmuls, a quarter
   of both the prompt and the token; on 4B the token's attention with its uneven tiles, and the output layer on both.
 
+### Output layer probe (2026-11-16)
+
+User request: the output layer (`token_embd`, Q6_K in the file, a Q8_0 copy in the provider), the largest step of a token: 22.4 ms of 113 on Qwen3.5-4B (644 MiB), 13.6 ms of 97.6 on Qwen3-4B (394 MiB). The record ("1-row matmul bandwidth", `build.md` section 7) already has its 1-row matmul at the AI cores' streaming rate, about 29 GB/s, tuned in October (`paired`, huge pages), so its time is its bytes over the bandwidth. Two ideas, one probe (`scripts/head-probe.sh`, standalone, no provider code), rules fixed before the run: build a kernel on the file's Q6_K layout (23% fewer bytes, no copy, no requantization at load) if its pass over the table takes at most 85% of today's time; pursue the X100 cores reading part of the table at the same time if both groups together deliver at least 1.15 times the AI cores alone.
+
+**On the K3 (`501dbfd11`, spine-runtime 0.6.3, logs `head-probe`, one run, medians of 5, 26/26 checks):**
+- The Q6_K kernel (RVV, VLEN 1024, 32 weights an operation, exact against the integer reference): 48 million weights a second a tile, the same in cache and over the table, and scaling with the tiles (1, 4, 8: 13.2, 3.3, 1.65 s for 248,320 rows). The table of Qwen3.5-4B takes 1,651 ms against the 19 ms the rule asks, Qwen3-4B's 1,010 ms. Compute-bound by 74 times. **By the rule: not built.** The rate the rule needs is 128 weights in about 30 ns a tile; the probe's plainest loop (one load and one add per 128 bytes) takes 18 ns per 128 bytes on one tile, so no unpacking scheme fits (my reading).
+- The read-only sum on the AI cores: 7.1, 12.2, 14.8 and 13.4 GB/s at 1, 2, 4 and 8 tiles; the X100 backend's 4 tiles 10.1, 8 threads 17.1. The sum reaches less than half of what the provider's 1-row matmul streams (644 MiB in 47.7 ms here, 22.4 ms in the model), so it is not at the memory's limit and its ratios do not answer the question. **The headroom question stays open.**
+- What it does show: with 8 threads on the X100 cores reading at the same time, the AI cores' sum was not slowed (15.3 GB/s on its 44% of the buffer, the threads 11.2 GB/s: 26.5 GB/s together while both ran, still under the matmul's 29). With the X100 backend's tiles instead of threads the AI cores fell to 5.2 GB/s in one of the two runs: two spine-runtime streams at once is not a safe route.
+
+To settle the headroom, if wanted: the real 1-row matmul of the output layer (`flagos-check-spacemit --bench`) timed while 8 threads on the X100 cores read another buffer. Unchanged matmul time and about 10 GB/s on the threads would mean the X100 cores could carry about a quarter of every 1-row matmul (88% of a token); that would be a new design (work shared by both core groups), not a kernel.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
