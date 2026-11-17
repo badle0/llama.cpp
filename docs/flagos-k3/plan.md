@@ -3278,6 +3278,22 @@ The rule (staged stays the default only if it beats both) holds. `MUL_MAT_ID` ov
 
 *Arm 1 as built (by a coder; the driver's diff read, the tests and one mutation rerun by me; Mac only, scalar references).* SpacemiT's `block_q4_1x32x256` with `gemm_kernel_i8i4_hpzp_m1` and `gemm_kernel_i8i4_hpzp_al_m4` and the aligned 4-row quantizer (`mtmd-backend` @ `ddfb41ddc`), for 3-D Q4_1 only. A weight is stored as `d (q - zp)` with `zp = clamp(round(-m / d), 0, 15)`: the block's offset rounded to a whole step, so every weight of a block moves by the same amount, up to half a step (a block of one sign is clamped and loses more). 19 bytes per 32 weights against the file's 20. The read-back returns the stored values (`m = -zp d` in fp16, within 0.0015 d). The driver gained a 4-row row size and a group alignment per format (304 bytes a row and 128 for this layout; the other formats keep their bytes). Check program: all checks pass in the default, with the reference kernels and with the switch set for the whole run; the new cases 7/7 (staged, grouped, 1 and 8 tiles bit for bit), max NMSE against the CPU on the read-back 2.13e-05 (bound 5e-04); **against the CPU on the file's bytes 1.19e-02, printed without a bound: the layout's own loss** on weights quantized from normal values. test-backend-ops MUL_MAT_ID 153/153 by default, 227/227 with `zp4` (its CPU reference computes on our read-back, so it tests the kernels, not the loss). Mutations: a group read at the 1-row stride fails (mine); the neighbour's zero point and the zero point's sign fail (the coder's). riscv64 syntax check 0 errors. Never executed: the two IME kernels and the RVV quantizer; unproven there: the scale index convention of the 4-row kernel, the alignment it needs.
 
+*Arm 1 on the K3 (one run, build `9ada84e8f`, logs `~/k3-logs/zp4`; both arms in the same run, 8 threads; KLD against the one-thread CPU base, 2 chunks of 512).* The check program passes with the real kernels, the first execution of the two `hpzp` IME kernels and the aligned quantizer: the new line 7/7, max NMSE on the read-back 2.42e-05, the layout's own loss 1.18e-02 as on the Mac.
+
+| | `cpu` | `zp4` |
+|---|---|---|
+| graph splits | 11 | 1 |
+| pp501, t/s (3 repeats) | 64.50 +- 0.33 | 79.33 +- 0.36 |
+| prompt of 501, ms (one run) | 7,923 | 6,251 |
+| generation, ms a token (31 tokens, one run) | 119.8 | 106.8 |
+| load, s (one run) | 36.6 | 42.9 |
+| mean KLD | 0.00572 +- 0.00068 | 0.02675 +- 0.00373 |
+| 99.9% KLD / maximum | 0.176 / 0.187 | 1.065 / 1.443 |
+| same top token | 94.1% | 89.6% |
+| PPL (base 7.259) | 7.250 | 7.433 |
+
+The speed is as estimated (78 t/s and 105 ms). The accuracy is not acceptable: the mean KLD is 4.7 times the `cpu` arm's and the worst tokens go from 0.19 to 1.44; 4.5 points of top tokens change. The 32 generated tokens are the same in both arms, which shows nothing here (the prompt is one repeated sentence). `zp4` stays off by default. The `cpu` arm's 0.0057 is also the first KLD with the 4-row expert kernel (0.0050 before it; the difference is within one error bar). The reference-kernel run still fails the same 6 `conv pair` cases and no other.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
