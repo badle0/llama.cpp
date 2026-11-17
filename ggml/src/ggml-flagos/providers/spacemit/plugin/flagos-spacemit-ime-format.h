@@ -9,10 +9,16 @@
 
 struct ggml_tensor;
 
-// one IME weight layout: its K block, its row sizes and its kernels
+// one IME weight layout: its K block, its row sizes and its kernels.
+// Most layouts pack a 4-row group as 4 rows of act_row_bytes, so one row's bytes do not depend on which quantizer
+// wrote it (act_4row_bytes == act_row_bytes, act_group_align 1). The q4_1 zp4 layout's 4-row kernel wants its own
+// pack, 304 bytes a row against the 1-row form's 290, whose groups want a 128-byte base: a caller stores row j of a
+// group at base + j * act_4row_bytes and aligns the base of a run of groups to act_group_align
 struct mm_format {
     int64_t k_block;  // K values per block, in the activations and in the weights
     size_t (*act_row_bytes)(size_t k);
+    size_t (*act_4row_bytes)(size_t k);  // one row inside a 4-row group; at least act_row_bytes
+    size_t act_group_align;              // the alignment a run of 4-row groups wants, 1 where there is none
     size_t (*weight_row_bytes)(size_t k);
     void (*quantize_row)(const float * a, size_t count_k, uint8_t * qa, bool reference);
     void (*quantize_4rows)(const float * a, size_t count_k, uint8_t * qa, bool reference);

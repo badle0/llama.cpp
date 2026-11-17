@@ -173,6 +173,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     spacemit_embd_read_switch();
     (void) spacemit_repack_threads();
     (void) spacemit_repack_via();
+    (void) spacemit_expert_q4_1();
     spacemit_gdn_read_switch();
     return SPACEMIT_STATUS_SUCCESS;
 }

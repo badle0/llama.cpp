@@ -43,7 +43,9 @@ struct mmid_dims {
     int64_t           ne11;          // activation rows per token: 1 (broadcast) or n_ids
     int64_t           ne12;          // tokens
     int64_t           k_blocks;
-    int64_t           a_row_bytes;   // quantized activation row
+    int64_t           a_row_bytes;   // quantized activation row, the 1-row pack
+    int64_t           a4_row_bytes;  // one row inside a 4-row group; a_row_bytes for every layout but q4_1 zp4
+    int64_t           a_align;       // the alignment an expert's run of 4-row groups wants (1: none)
     int64_t           b_row_bytes;   // repacked weight row
     size_t            act_bytes;     // the quantized activations, padded to a cache line
     size_t            start_bytes;   // a grouping's expert starts, n_as + 1 of them, padded
@@ -64,12 +66,17 @@ mmid_dims mmid_dims_of(const ggml_tensor * node) {
     d.n_ids       = ids->ne[0];
     d.ne11        = x->ne[1];
     d.ne12        = x->ne[2];
-    d.k_blocks    = d.k / d.f->k_block;
-    d.a_row_bytes = (int64_t) d.f->act_row_bytes((size_t) d.k);
-    d.b_row_bytes = (int64_t) d.f->weight_row_bytes((size_t) d.k);
-    // a row per activation row (one token, or rows) or a row per pair, whichever is larger: the size must not depend on
-    // the setting
-    d.act_bytes    = GGML_PAD((size_t) (std::max(d.ne11, d.n_ids) * d.ne12 * d.a_row_bytes), 64);
+    d.k_blocks     = d.k / d.f->k_block;
+    d.a_row_bytes  = (int64_t) d.f->act_row_bytes((size_t) d.k);
+    d.a4_row_bytes = (int64_t) d.f->act_4row_bytes((size_t) d.k);
+    d.a_align      = (int64_t) d.f->act_group_align;
+    d.b_row_bytes  = (int64_t) d.f->weight_row_bytes((size_t) d.k);
+    // a row per activation row in the 1-row pack (one token, or rows), or a row per pair in the 4-row pack with an
+    // aligned start per expert, whichever is larger: the size must not depend on the setting. With one row size and no
+    // alignment (every layout but q4_1 zp4) the two are the same count of a_row_bytes
+    d.act_bytes    = GGML_PAD(std::max((size_t) (std::max(d.ne11, d.n_ids) * d.ne12 * d.a_row_bytes),
+                                       (size_t) (d.n_ids * d.ne12 * d.a4_row_bytes + (d.n_as + 1) * (d.a_align - 1))),
+                              64);
     d.start_bytes  = GGML_PAD((size_t) (d.n_as + 1) * sizeof(int64_t), 64);
     d.group_bytes  = d.start_bytes + GGML_PAD((size_t) (d.n_ids * d.ne12) * sizeof(mmid_row), 64);
     d.gather_bytes = GGML_PAD((size_t) (row_align * d.k) * sizeof(float), 64);
@@ -165,6 +172,23 @@ int64_t group_size(int64_t g, int64_t r) {
     return g < r / row_align ? row_align : 1;
 }
 
+// the pair-ordered activations start at the first address of the workspace with the layout's alignment: the
+// workspace is 64-byte aligned (ggml_aligned_malloc), the q4_1 zp4 layout's 4-row groups want 128. For every other
+// layout a_align is 1 and this is the workspace base, the address the rows had before this layout existed
+uint8_t * pair_acts(void * workspace, const mmid_dims & d) {
+    const uintptr_t p = (uintptr_t) workspace;
+    return (uint8_t *) ((p + (uintptr_t) d.a_align - 1) & ~((uintptr_t) d.a_align - 1));
+}
+
+// where expert e's quantized rows start in the pair-ordered activations: the experts in order, each expert's r rows
+// r * a4_row_bytes, its start aligned up to the layout's a_align. Both steps walk the experts in order and keep this
+// offset as they go (expert_rows_next), from the grouping alone, so they agree. With a4_row_bytes == a_row_bytes and
+// a_align == 1 it is start[e] * a_row_bytes, the offset before this layout existed
+int64_t expert_rows_next(int64_t off, int64_t r, const mmid_dims & d) {
+    const int64_t end = off + r * d.a4_row_bytes;
+    return (end + d.a_align - 1) / d.a_align * d.a_align;
+}
+
 // one tile's part of the workspace, after the activations
 struct mmid_work {
     int64_t *  start;   // the grouping's expert starts
@@ -190,9 +214,10 @@ float * out_row(const ggml_tensor * node, const mmid_row & r, int64_t n0) {
 
 }  // namespace
 
-// the activations (one row per activation row, or one per pair, whichever is larger), then one grouping, one gathered
-// group and one result slab per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line. It must not depend on
-// the setting: the steps of one node may not all see the same value
+// the activations (one row per activation row in the 1-row pack, or one per pair in the 4-row pack with an aligned
+// start per expert, whichever is larger), then one grouping, one gathered group and one result slab per tile for
+// SPACEMIT_MAX_TILES tiles, each padded to a cache line. It must not depend on the setting: the steps of one node may
+// not all see the same value
 size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
     const mmid_dims d = mmid_dims_of(node);
     return d.act_bytes + SPACEMIT_MAX_TILES * d.tile_bytes;
@@ -202,7 +227,10 @@ size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
 // token) once, in the 1-row form, at row i11 + i12 * ne11; one row: the tiles split its K blocks, as mul_mat.quantize
 // does. Several tokens: one row per (token, slot) pair, at the pair's place in the grouping's order, so that an
 // expert's rows are consecutive; the 4 rows of a group are stored interleaved for the 4-row kernel, which wants them
-// contiguous, so the tile gathers them first. The groups are dealt to the tiles as contiguous ranges
+// contiguous, so the tile gathers them first. The groups are dealt to the tiles as contiguous ranges.
+// A pair takes its layout's 4-row row size (a4_row_bytes; a single row's 1-row pack may leave the rest of its place
+// unused) from its expert's start, which is aligned to the layout's a_align (expert_rows_next): the q4_1 zp4 layout's
+// 4-row pack is larger per row than its 1-row pack and wants an aligned group base
 bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * node) {
     const spacemit_tile & tile      = *tile_p;
     const mmid_dims       d         = mmid_dims_of(node);
@@ -219,7 +247,8 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
                            needed, tile.nth, tile.workspace_size);
             return false;
         }
-        mmid_work w = mmid_work_of(tile, d);
+        mmid_work       w     = mmid_work_of(tile, d);
+        uint8_t * const pairs = pair_acts(tile.workspace, d);
         if (!group_rows(node->src[2], d, w.start, w.rows)) {
             if (tile.ith == 0) {
                 GGML_LOG_ERROR("FlagOS SpacemiT: MUL_MAT_ID (%s) has an id outside [0, %lld)\n", node->name,
@@ -234,12 +263,15 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
         for (int64_t e = 0; e < d.n_as; e++) {
             n_groups += group_count(w.start[e + 1] - w.start[e]);
         }
-        const int64_t g0 = n_groups * tile.ith / tile.nth;
-        const int64_t g1 = n_groups * (tile.ith + 1) / tile.nth;
-        int64_t       g  = 0;
+        const int64_t g0  = n_groups * tile.ith / tile.nth;
+        const int64_t g1  = n_groups * (tile.ith + 1) / tile.nth;
+        int64_t       g   = 0;
+        int64_t       off = 0;  // expert e's rows start here (expert_rows_next)
         for (int64_t e = 0; e < d.n_as && g < g1; e++) {
             const int64_t r     = w.start[e + 1] - w.start[e];
             const int64_t count = group_count(r);
+            const int64_t base  = off;
+            off                 = expert_rows_next(off, r, d);
             if (g + count <= g0) {
                 g += count;
                 continue;
@@ -248,14 +280,16 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
                 if (g + i < g0) {
                     continue;
                 }
-                const int64_t j = w.start[e] + group_start(i, r);
+                const int64_t p   = group_start(i, r);  // the group's first pair in the expert's list
+                const int64_t j   = w.start[e] + p;
+                uint8_t *     dst = pairs + base + p * d.a4_row_bytes;
                 if (group_size(i, r) == row_align) {
                     for (int64_t t = 0; t < row_align; t++) {
                         std::memcpy(w.gather + t * d.k, pair_row(w.rows[j + t]), (size_t) d.k * sizeof(float));
                     }
-                    d.f->quantize_4rows(w.gather, (size_t) d.k, qa + j * d.a_row_bytes, reference);
+                    d.f->quantize_4rows(w.gather, (size_t) d.k, dst, reference);
                 } else {
-                    d.f->quantize_row(pair_row(w.rows[j]), (size_t) d.k, qa + j * d.a_row_bytes, reference);
+                    d.f->quantize_row(pair_row(w.rows[j]), (size_t) d.k, dst, reference);
                 }
             }
             g += count;
@@ -364,9 +398,14 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     const int64_t lo   = (int64_t) tile.ith * total;  // this tile takes the units with lo <= u * nth < lo + total
     const int64_t hi   = lo + total;
     int64_t       u    = 0;  // the weight of the units before the one at hand
+    int64_t       off  = 0;  // expert e's rows start here (expert_rows_next)
     bool          done = false;
+    // TCM holds the expert's rows only when its base keeps the layout's alignment; the copy starts at offset 0
+    const bool    tcm_aligned = tcm != nullptr && (uintptr_t) tcm % (uintptr_t) d.a_align == 0;
     for (int64_t e = 0; e < d.n_as && !done; e++) {
-        const int64_t r = w.start[e + 1] - w.start[e];
+        const int64_t r    = w.start[e + 1] - w.start[e];
+        const int64_t base = off;
+        off                = expert_rows_next(off, r, d);
         if (r == 0) {
             continue;
         }
@@ -375,10 +414,10 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
             u += per * unit;  // the whole expert lies before this tile's range
             continue;
         }
-        const int64_t   rows_bytes = r * d.a_row_bytes;  // the expert's quantized rows, consecutive in the workspace
-        const bool      hold_act   = stage && (int64_t) GGML_PAD((size_t) rows_bytes, 64) + slab_bytes <=
-                                            (int64_t) tile.tcm_size;
-        const uint8_t * acts     = qa + w.start[e] * d.a_row_bytes;
+        const int64_t   rows_bytes = r * d.a4_row_bytes;  // the expert's quantized rows, consecutive in the workspace
+        const bool      hold_act   = stage && tcm_aligned &&
+                                 (int64_t) GGML_PAD((size_t) rows_bytes, 64) + slab_bytes <= (int64_t) tile.tcm_size;
+        const uint8_t * acts     = pair_acts(tile.workspace, d) + base;
         uint8_t * const slab_buf = stage ? tcm + (hold_act ? GGML_PAD((size_t) rows_bytes, 64) : 0) : nullptr;
         const int64_t   count    = group_count(r);
         bool            held     = false;
@@ -401,17 +440,17 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
                 b = slab_buf;
             }
             for (int64_t g = 0; g < count; g++) {
-                const int64_t   off = group_start(g, r);
-                const uint8_t * a   = acts + off * d.a_row_bytes;
+                const int64_t   p = group_start(g, r);
+                const uint8_t * a = acts + p * d.a4_row_bytes;
                 if (group_size(g, r) == row_align) {
                     d.f->gemm(a, b, w.result, row_align, (size_t) nb_cols, (size_t) d.k_blocks, (size_t) nb_cols,
                               reference);
                     for (int64_t t = 0; t < row_align; t++) {
-                        std::memcpy(out_row(node, w.rows[w.start[e] + off + t], s * nb_cols), w.result + t * nb_cols,
+                        std::memcpy(out_row(node, w.rows[w.start[e] + p + t], s * nb_cols), w.result + t * nb_cols,
                                     (size_t) nb_cols * sizeof(float));
                     }
                 } else {
-                    d.f->gemm(a, b, out_row(node, w.rows[w.start[e] + off], s * nb_cols), 1, (size_t) nb_cols,
+                    d.f->gemm(a, b, out_row(node, w.rows[w.start[e] + p], s * nb_cols), 1, (size_t) nb_cols,
                               (size_t) d.k_blocks, (size_t) d.n, reference);
                 }
             }
