@@ -2651,6 +2651,80 @@ size_t q4_1_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
     return 1;
 }
 
+// flagos: the q4_1 min layout. One tile's q4_0 part through the q4_0 kernels, behind a call of its own: the 1-row
+// kernel's asm writes c but declares no "memory" clobber, so its writes and the correction's reads of c must not
+// share a function body
+static __attribute__((noinline)) size_t q4_1_min_q4_0_part(const uint8_t * qa, const uint8_t * tile, float * c,
+                                                           size_t count_m, size_t k_blocks, size_t ldc,
+                                                           bool reference) {
+    return q4_0_gemm(qa, tile, c, count_m, row_tile, k_blocks, ldc, reference);
+}
+
+// flagos: adds sum_b (m_b + 8 d_b) S_b to rows (1 or 4) rows of one tile's 32 columns of c, in float. S_b is the sum
+// of the row's activations over 32-value subblock b as the hp pack holds it (quantize_a_nrow_i8_hp_ref and the RVV
+// quantizers): a_sum = fp16(-sum(qa)) * 8, the subblock's a_scale = fp16(scale / avg) and the block's avg in fp16, so
+// S_b = -a_sum / 8 * a_scale * avg, the dequantized int8 values' sum. It is the sum the kernel's -8 offset multiplies,
+// so the two 8 d terms cancel but for the kernel's fp16 rounding; a_sum is exact for |sum(qa)| <= 2048, else rounded
+// to 11 bits. 4 rows: the pack of 4 rows a block, one a_scale and avg for the 4, an a_sum per row
+static __attribute__((noinline)) void q4_1_min_correct(const uint8_t * qa, const uint8_t * tile, float * c,
+                                                       size_t rows, size_t k_blocks, size_t ldc) {
+    constexpr size_t n_sub      = q4_0_k_block / 32;
+    const size_t     blk_stride = q8_hp_blk_size(q4_0_k_block, true, true) * rows;
+    const size_t     sub_stride = q8_hp_blk_size(32) * rows;
+    const auto *     q4         = reinterpret_cast<const block_q4_0x32x256 *>(tile);
+    const uint8_t *  mins       = tile + k_blocks * sizeof(block_q4_0x32x256);
+    float            acc[4][row_tile] = {};
+
+    for (size_t kb = 0; kb < k_blocks; kb++) {
+        const uint8_t * a = qa + kb * blk_stride;
+        _Float16        avg;
+        std::memcpy(&avg, a + blk_stride - sizeof(_Float16) * rows, sizeof(avg));
+        for (size_t b = 0; b < n_sub; b++) {
+            _Float16 a_scale;
+            std::memcpy(&a_scale, a + b * sub_stride, sizeof(a_scale));
+            const float unit = -0.125f * (float) a_scale * (float) avg;
+            float       s[4];
+            for (size_t r = 0; r < rows; r++) {
+                _Float16 a_sum;
+                std::memcpy(&a_sum, a + n_sub * sub_stride + (r * n_sub + b) * sizeof(_Float16), sizeof(a_sum));
+                s[r] = (float) a_sum * unit;
+            }
+            _Float16 d[row_tile], m[row_tile];
+            std::memcpy(d, q4[kb].blocks[b].d, sizeof(d));
+            std::memcpy(m, mins + (kb * n_sub + b) * row_tile * sizeof(_Float16), sizeof(m));
+            float w[row_tile];
+            for (size_t col = 0; col < row_tile; col++) {
+                w[col] = (float) m[col] + 8.0f * (float) d[col];
+            }
+            for (size_t r = 0; r < rows; r++) {
+                for (size_t col = 0; col < row_tile; col++) {
+                    acc[r][col] += w[col] * s[r];
+                }
+            }
+        }
+    }
+    for (size_t r = 0; r < rows; r++) {
+        for (size_t col = 0; col < row_tile; col++) {
+            c[r * ldc + col] += acc[r][col];
+        }
+    }
+}
+
+// the q4_1 min layout: per 32-column tile the q4_0 kernel (the reference flag picks its variant), then the correction
+// for the rows it did; the same contract as q4_0_gemm
+size_t q4_1_min_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n,
+                     size_t k_blocks, size_t ldc, bool reference) {
+    GGML_ASSERT(count_n > 0 && count_n % row_tile == 0);  // else the return value, the rows done, would be 0
+    const size_t tile_bytes = row_tile * q4_1_min_weight_row_bytes(k_blocks * q4_0_k_block);
+    size_t       done       = 0;
+    for (size_t n0 = 0; n0 < count_n; n0 += row_tile) {
+        const uint8_t * tile = qb + n0 / row_tile * tile_bytes;
+        done                 = q4_1_min_q4_0_part(qa, tile, c + n0, count_m, k_blocks, ldc, reference);
+        q4_1_min_correct(qa, tile, c + n0, done, k_blocks, ldc);
+    }
+    return done;
+}
+
 void i8_quantize_row(const float * a, size_t count_k, uint8_t * qa, bool reference) {
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
     if (!reference) {
@@ -2955,6 +3029,69 @@ void unpack_q4_1(const ggml_tensor * t, void * data) {
                     for (int64_t k = 0; k < QK4_1 / 4; k++) {
                         const uint8_t lo  = in.qs[i * QK4_1 / 2 + k];               // values 2k, 2k + 1
                         const uint8_t hi  = in.qs[i * QK4_1 / 2 + QK4_1 / 4 + k];   // values 2k + 16, 2k + 17
+                        out.qs[2 * k]     = (uint8_t) ((lo & 0x0F) | ((hi & 0x0F) << 4));
+                        out.qs[2 * k + 1] = (uint8_t) ((lo >> 4) | (hi & 0xF0));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// flagos: Q4_1 in the q4_1 min layout. Per 32-row tile: the Q4_1 blocks' d and nibbles as repack_q4_0 stores a Q4_0
+// block's (make_block_q4_0x32), then the minimums, [block][row]
+int repack_q4_1_min(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_1);
+    static_assert(QK4_1 == QK4_0, "one Q4_0 block per Q4_1 block");
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK4_1;
+    if (t->ne[0] % (int64_t) q4_0_k_block != 0 || nrow % (int64_t) row_tile != 0 || size != ggml_nbytes(t)) {
+        return -1;
+    }
+    const block_q4_1 * src        = static_cast<const block_q4_1 *>(data);
+    uint8_t *          dst        = static_cast<uint8_t *>(t->data);
+    const size_t       tile_bytes = row_tile * q4_1_min_weight_row_bytes((size_t) t->ne[0]);
+    block_q4_0         group[32];
+
+    for (int64_t b = 0; b < nrow; b += 32, src += 32 * nblocks, dst += tile_bytes) {
+        block_q4_0x32x256 * q4   = reinterpret_cast<block_q4_0x32x256 *>(dst);
+        ggml_half *         mins = reinterpret_cast<ggml_half *>(dst + nblocks / 8 * sizeof(block_q4_0x32x256));
+        for (int64_t x = 0; x < nblocks; x += 8, q4++) {
+            for (int64_t j = 0; j < 8; j++) {
+                for (int64_t i = 0; i < 32; i++) {
+                    const block_q4_1 & in = src[x + j + i * nblocks];
+                    group[i].d            = in.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
+                    std::memcpy(group[i].qs, in.qs, sizeof(group[i].qs));
+                    mins[(x + j) * 32 + i] = in.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m;
+                }
+                q4->blocks[j] = make_block_q4_0x32(group, 32);
+            }
+        }
+    }
+    return 0;
+}
+
+// flagos: the inverse of repack_q4_1_min, exact: unpack_q4_0's nibbles and d, and the stored minimum
+void unpack_q4_1_min(const ggml_tensor * t, void * data) {
+    const uint8_t * src        = static_cast<const uint8_t *>(t->data);
+    block_q4_1 *    dst        = static_cast<block_q4_1 *>(data);
+    const int64_t   nrow       = ggml_nrows(t);
+    const int64_t   nblocks    = t->ne[0] / QK4_1;
+    const size_t    tile_bytes = row_tile * q4_1_min_weight_row_bytes((size_t) t->ne[0]);
+
+    for (int64_t b = 0; b < nrow; b += 32, dst += 32 * nblocks, src += tile_bytes) {
+        const block_q4_0x32x256 * q4   = reinterpret_cast<const block_q4_0x32x256 *>(src);
+        const ggml_half *         mins = reinterpret_cast<const ggml_half *>(src + nblocks / 8 * sizeof(block_q4_0x32x256));
+        for (int64_t x = 0; x < nblocks; x += 8, q4++) {
+            for (int64_t j = 0; j < 8; j++) {
+                const block_q4_0x32 & in = q4->blocks[j];
+                for (int64_t i = 0; i < 32; i++) {
+                    block_q4_1 & out                            = dst[x + j + i * nblocks];
+                    out.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d = in.d[i];
+                    out.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m = mins[(x + j) * 32 + i];
+                    for (int64_t k = 0; k < QK4_1 / 4; k++) {
+                        const uint8_t lo  = in.qs[i * QK4_1 / 2 + k];              // values 2k, 2k + 1
+                        const uint8_t hi  = in.qs[i * QK4_1 / 2 + QK4_1 / 4 + k];  // values 2k + 16, 2k + 17
                         out.qs[2 * k]     = (uint8_t) ((lo & 0x0F) | ((hi & 0x0F) << 4));
                         out.qs[2 * k + 1] = (uint8_t) ((lo >> 4) | (hi & 0xF0));
                     }

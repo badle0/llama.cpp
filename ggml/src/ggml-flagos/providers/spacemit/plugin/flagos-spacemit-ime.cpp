@@ -45,6 +45,16 @@ const mm_format k_q4_1_zp4_32x256 = { (int64_t) spacemit_ime::q4_1_k_block,
                                       spacemit_ime::q4_1_quantize_row,
                                       spacemit_ime::q4_1_quantize_4rows,
                                       spacemit_ime::q4_1_gemm };
+// 3-D Q4_1 experts under FLAGOS_SPACEMIT_EXPERT_Q4_1=exact: the q4_0 activations and kernels on the tile's q4_0 part,
+// plus the minimum's correction (q4_1_min_gemm); only MUL_MAT_ID reaches this layout
+const mm_format k_q4_1_min_32x256 = { (int64_t) spacemit_ime::q4_0_k_block,
+                                      spacemit_ime::q4_0_act_row_bytes,
+                                      spacemit_ime::q4_0_act_row_bytes,
+                                      1,
+                                      spacemit_ime::q4_1_min_weight_row_bytes,
+                                      spacemit_ime::q4_0_quantize_row,
+                                      spacemit_ime::q4_0_quantize_4rows,
+                                      spacemit_ime::q4_1_min_gemm };
 
 }  // namespace
 
@@ -54,6 +64,8 @@ const mm_format & mm_format_of(const ggml_tensor * w) {
             return k_q4_0_32x256;
         case spacemit_layout::q4_1_zp4_32x256:
             return k_q4_1_zp4_32x256;
+        case spacemit_layout::q4_1_min_32x256:
+            return k_q4_1_min_32x256;
         case spacemit_layout::q4_1_q8_0_32x32:
         case spacemit_layout::q8_0_32x32:
         case spacemit_layout::q6_k_q8_0_32x32:

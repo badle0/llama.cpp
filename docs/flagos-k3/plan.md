@@ -3294,6 +3294,13 @@ The rule (staged stays the default only if it beats both) holds. `MUL_MAT_ID` ov
 
 The speed is as estimated (78 t/s and 105 ms). The accuracy is not acceptable: the mean KLD is 4.7 times the `cpu` arm's and the worst tokens go from 0.19 to 1.44; 4.5 points of top tokens change. The 32 generated tokens are the same in both arms, which shows nothing here (the prompt is one repeated sentence). `zp4` stays off by default. The `cpu` arm's 0.0057 is also the first KLD with the 4-row expert kernel (0.0050 before it; the difference is within one error bar). The reference-kernel run still fails the same 6 `conv pair` cases and no other.
 
+*Arms 2 and 3 as built (2026-11-17; by a coder; the correction's code read, the tests and one mutation rerun by me; Mac only, scalar references).* `FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu|zp4|q8|exact`, default still `cpu`.
+
+- `q8`: a 3-D Q4_1 weight takes the 2-D route's layout (requantized to Q8_0, 34 bytes per 32 weights: 272 MiB a tensor against 160). No new kernel. The check program bounds it against the CPU on the GGUF bytes, as the other requantized layouts: max NMSE 4.17e-05. `test-backend-ops` MUL_MAT_ID fails under it in 37 to 40 of 228 cases (two runs), 5.7e-04 to 7.9e-04 against 5e-04: the test gives the CPU the read-back, the nearest Q4_1 to the Q8_0 values, which is a second quantization. No bound changed. With that open `q8` cannot be a default.
+- `exact` (not in the user's request; added to the same run): layout `q4_1_min_32x256`. A Q4_1 weight is `d q + m = d (q - 8) + (m + 8 d)`. Per 32-row tile the scale and nibbles are stored as the q4_0 32x256 layout stores them, then the tile's fp16 minimums: 20 bytes per 32 weights, the file's size, and the read-back is the file's bytes. The q4_0 kernels (run on the K3 since M1) compute the first term; plain C++ adds `sum_b (m_b + 8 d_b) S_b`, `S_b` the sum of the quantized activations of a 32-value subblock, which the activation pack already holds for the kernel's own offset. The driver is unchanged. Max NMSE against the CPU on the GGUF bytes 2.14e-05 (the kernels' own error); `test-backend-ops` MUL_MAT_ID 227/227.
+
+Check program: all checks passed by default, with the reference kernels, and with the switch set to each of `zp4`, `q8`, `exact`. Mutations caught: the coder's two (no `8 d`; the neighbouring block's minimum) and mine (row 0's sums for every row of a group). Not measured: any speed; the correction's cost (estimate: a few percent of the kernel's work).
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.

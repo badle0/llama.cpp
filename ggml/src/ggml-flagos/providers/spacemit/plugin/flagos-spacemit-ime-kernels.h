@@ -1,7 +1,7 @@
 #pragma once
 
 // IME2 matrix multiplication pieces, copied from ggml-cpu/spacemit and from SpacemiT's fork (origin and changes: the
-// .cpp). Three weight layouts, all with 32 rows interleaved:
+// .cpp). Four weight layouts, all with 32 rows interleaved:
 // - "q4_0 32x256" (Q4_0): K in blocks of 256; activations quantized to int8 with fp16 scales per 32 values and a
 //   block scale ("hp"). Lossless: a byte permutation of the GGUF blocks.
 // - "q8_0 32x32" (Q8_0, Q4_1, Q6_K, Q5_0): K in blocks of 32, each [fp16 scale x 32][int8 x 32 x 32] (34 bytes per
@@ -13,6 +13,10 @@
 //   plus one unsigned 4-bit zero point per row and 32 values, which replaces the 2-byte minimum (19 bytes per 32
 //   weights, not 20). A stored weight is d * (q - zp), q the GGUF nibble, so the loss is the rounding of -m/d to a
 //   whole step. The activations are the "hp" ones; the 4-row kernel wants its own "aligned" pack (q8_hp_al_*).
+// - "q4_1 min 32x256" (3-D Q4_1 experts under FLAGOS_SPACEMIT_EXPERT_Q4_1=exact): each 32-row tile is the q4_0 32x256
+//   form of the Q4_1 d and nibbles, then the tile's fp16 minimums, [K/32 block][32 rows]. A weight d q + m is
+//   d (q - 8) + (m + 8 d): the q4_0 kernels give the first part, q4_1_min_gemm adds the second. Lossless, 20 bytes per
+//   32 weights as Q4_1; the activations are the q4_0 layout's.
 // A 3-D weight (MUL_MAT_ID's experts) is stored as the 2-D weight of its ggml_nrows rows in any layout.
 // Without GGML_FLAGOS_SPACEMIT_IME2 only the scalar references exist and are used.
 
@@ -78,6 +82,10 @@ constexpr size_t q4_1_act_4row_bytes(size_t k) {
 constexpr size_t q4_1_weight_row_bytes(size_t k) {
     return k / 32 * (sizeof(uint16_t) + sizeof(uint8_t) + 16);
 }
+// the q4_1 min layout: the q4_0 part (18 bytes per 32 weights) and the minimum (2)
+constexpr size_t q4_1_min_weight_row_bytes(size_t k) {
+    return q4_0_weight_row_bytes(k) + k / 32 * sizeof(uint16_t);
+}
 constexpr size_t i8_act_row_bytes(size_t k) {
     return k / i8_k_block * q8_blk_size(i8_k_block, true);
 }
@@ -106,6 +114,10 @@ void   q4_1_quantize_row(const float * a, size_t count_k, uint8_t * qa, bool ref
 void   q4_1_quantize_4rows(const float * a, size_t count_k, uint8_t * qa, bool reference);
 size_t q4_1_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n, size_t k_blocks,
                  size_t ldc, bool reference);
+// the q4_1 min layout: the q4_0 activations (q4_0_quantize_row, q4_0_quantize_4rows) and q4_0_gemm's contract, count_n
+// a multiple of row_tile
+size_t q4_1_min_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n,
+                     size_t k_blocks, size_t ldc, bool reference);
 
 // copy into or out of TCM
 void copy(void * dst, const void * src, size_t size);
@@ -130,5 +142,8 @@ void unpack_q5_0_q8_0(const ggml_tensor * t, void * data);
 // the repack rounds -m/d to a whole step)
 int  repack_q4_1(ggml_tensor * t, const void * data, size_t size);
 void unpack_q4_1(const ggml_tensor * t, void * data);
+// Q4_1 in the q4_1 min layout, exactly both ways: repack writes ggml_nbytes(t) bytes; unpack restores the GGUF bytes
+int  repack_q4_1_min(ggml_tensor * t, const void * data, size_t size);
+void unpack_q4_1_min(const ggml_tensor * t, void * data);
 
 }  // namespace spacemit_ime

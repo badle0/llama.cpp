@@ -429,7 +429,7 @@ static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, const spacemi
 
 // MUL_MAT_ID (the experts' matmuls, src/llama-graph.cpp build_moe_ffn): the experts' weight [K, N, n_expert] in an IME
 // layout, so in our buffer, never a view (the layout rule gives a 3-D weight one when each expert's N rows are whole
-// 32-row groups, and never to a 3-D Q4_1 weight); F32 activations [K, ne11, n_tokens] (ne11 1, broadcast, or
+// 32-row groups, and a 3-D Q4_1 weight one only under FLAGOS_SPACEMIT_EXPERT_Q4_1); F32 activations [K, ne11, n_tokens] (ne11 1, broadcast, or
 // n_used) and the F32 output contiguous; I32 ids [n_used, n_tokens] with any strides (build_moe_ffn's are a view of
 // ARGSORT's output, ggml_argsort_top_k). ggml_mul_mat_id asserts the shapes. As for MUL_MAT the answer does not depend
 // on the token count: llama.cpp asks once per weight, at load, with 512 tokens (src/llama-model-loader.cpp:938-946)
