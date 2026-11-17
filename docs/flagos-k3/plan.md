@@ -3318,6 +3318,20 @@ By the rule fixed before the run (KLD within the `cpu` arm's error bar, then the
 
 *The `exact` correction vectorized (2026-11-17; by a coder; the diff read and the Mac checks rerun by me).* An RVV path in `q4_1_min_correct`: the 32 scales and minimums of a subblock loaded and widened as vectors, the four rows' sums kept in registers; the scalar code stays for the reference kernels and for the Mac. Never executed: the Mac compiles only the scalar path, the riscv64 syntax check parses the vector one (0 errors). Next run: `cpu`, `q8`, `exact` on pp32, pp128, pp501, pp2048 and tg512 (3 repeats), splits and KLD.
 
+*The vectorized `exact` on the K3 (one run, build `32193cf25`, logs `~/k3-logs/ex2`; llama-bench 3 repeats, 8 threads).* The check program passes with the real kernels, the first execution of the vector correction (`exact` 2.17e-05, as before it).
+
+| t/s | `cpu` | `q8` | `exact` |
+|---|---|---|---|
+| pp32 | 40.76 +- 2.61 | 47.75 +- 0.71 | 47.13 +- 0.99 |
+| pp128 | 60.75 +- 0.27 | 73.88 +- 0.45 | 74.03 +- 0.42 |
+| pp501 | 64.04 +- 0.03 | 78.46 +- 0.02 | 78.54 +- 0.05 |
+| pp2048 | the process died | 71.80 +- 0.05 | 72.03 +- 0.09 |
+| tg512 | not reached | 9.50 +- 0.00 | 9.45 +- 0.00 |
+| `MUL_MAT_ID` per graph of 501, ms | - | 1,945 | 1,961 |
+| mean KLD | 0.00574 +- 0.00079 | 0.00593 +- 0.00074 | 0.00548 +- 0.00068 |
+
+`exact` now equals `q8` (pp501 +0.1%, tg512 -0.5%; the correction's 785 ms a prompt is gone), with the file's size and a bit-exact read-back: by the rule fixed before the run it is the arm to make the default (user's decision, not taken). Two open findings on the `cpu` arm, today's default: (1) its llama-bench died in pp2048 with nothing on stderr and no counters file (written at exit), so by a signal; the exit code was on the board's screen only; not diagnosed; pp2048 was never run on this model before. (2) Its KLD differs between three runs of unchanged code (0.00572, 0.00530, 0.00574) where `q8` and `exact` repeat to the last digit: the 11-split path is not reproducible; not diagnosed.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
