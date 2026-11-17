@@ -3258,6 +3258,18 @@ Build `d15f1b74a`, one K3 run, 8 tiles, logs `q36-prof`: `llama-bench -p 501 -n 
 
 *As built (2026-11-17, by a coder, the diff read and the tests rerun by me; Mac only, the scalar references).* `flagos-spacemit-ime-id.cpp`: with more than one token the pairs are grouped by expert; the quantize step writes one activation row per pair at its place in the sorted list, 4 rows of a group interleaved for the 4-row kernel; the multiply's unit is (expert, 32-column slab), dealt by weight (the expert's rows + 4, a guess), the slab copied into TCM once and multiplied by every group of the expert, the expert's quantized rows beside it where they fit. One token keeps the old path. Test-only `FLAGOS_SPACEMIT_MMID=staged|grouped|rows` (`rows` is the old path). Check program: all checks pass under each setting; the new cases 21/21 (staged with and without TCM, grouped, 1 and 8 tiles bit for bit; one token bit for bit with `rows`); max NMSE against the one-thread CPU 2.55e-05 grouped against 1.76e-06 by rows (bound 5e-04): the 4-row reference kernel's own rounding. test-backend-ops MUL_MAT_ID 153/153. Mutations: the slab placed over the staged rows fails (rc 1, mine); a wrong slab and a wrong output row fail (the coder's); the TCM room test loosened by one cache line passes unseen: no case sits on that boundary. Not tested: the IME kernels, the real TCM, any speed.
 
+*On the K3 (`01ff353c9`, 2026-11-17, one run, 8 tiles, logs `mmid3`).* The check program passes with the IME kernels (the new cases 21/21); with the reference kernels no MUL_MAT_ID case fails (6 older `conv pair` cases fail there bit for bit at about 1e-7, the code of `52898eb4d`, never run with the reference kernels on the board before: open, not this step). pp501, `llama-bench -r 3`:
+
+| `FLAGOS_SPACEMIT_MMID` | pp501 t/s | `MUL_MAT_ID` in a large graph |
+|---|---|---|
+| `rows` (the old path) | 28.52 +/- 0.03 | 5,408 ms |
+| `grouped` | 62.02 +/- 0.22 | 992 ms |
+| `staged` (default) | 64.01 +/- 0.23 | 848 ms |
+
+The rule (staged stays the default only if it beats both) holds. `MUL_MAT_ID` over a prompt falls from about 11.6 s to about 1.85 s, the prompt from 17.6 s to 7.8 s. The 32-token completion: prompt 60.2 t/s against 27.6, the text equal to the old path's and to the profile run's; generation 8.11 against 8.38 t/s, one run each on the same one-token code, so not shown to differ. Not measured: KLD with the 4-row kernel (the acceptance run repeats it); the weight constant 4 (imbalance is now about 90 ms of a large graph's 848 ms).
+
+*The board's clock (2026-11-17).* It fell back from November to 2026-04-27, so files dated after its "now" broke two builds: first ninja skipped the changed sources (objects newer than sources), then, after only the build tree was re-dated, CMake re-ran 100 times (`CMakeLists.txt` newer than `build.ninja`). `scripts/build-dates.sh fix <base>` re-dates in order (every tracked file, the build tree, the files changed since the last built commit) and changes no clock; `check` says whether it is needed. It is needed again only if the clock falls back again.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
