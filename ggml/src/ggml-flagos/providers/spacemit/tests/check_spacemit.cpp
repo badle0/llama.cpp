@@ -7028,6 +7028,251 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// the many-row path of MUL_MAT_ID (FLAGOS_SPACEMIT_MMID): from 2 tokens the (token, slot) pairs are sorted by expert,
+// an expert's rows go in groups of 4 through the 4-row kernel (the rest one by one) and each 32-column weight slab is
+// multiplied by all of them, so that the expert's weights are read once per node. staged (the default) copies the slab
+// into TCM, with the expert's quantized rows beside it where they fit; grouped reads it where it lies, with the same
+// kernel calls on the same bytes; rows is the path before, one 1-row kernel call per (pair, slab) from DRAM.
+// The ids of a case are built from a wanted row count per expert, so one node has experts with 0, 1, 2, 3, 4, 5, 7, 8,
+// 9 and 40 rows (groups of 4 with and without a tail, and experts no token uses), in that order and shuffled. Per
+// case: staged with TCM, staged without TCM and grouped bit for bit, the two steps called directly on 1 and on 8 tiles
+// likewise, every output against the CPU backend on one thread within MUL_MAT's bound, and at one token (ne12 == 1,
+// which keeps the 1-row path) bit for bit with rows. The 4-row kernel is not bit-equal to the 1-row one, so rows is
+// compared by the bound, not by its bytes. TCM: a stand-in of the K3's 384 KiB, as check_gemv and check_mm_paths get
+// one; the direct calls get a buffer of their own, zeroed first, so that a staged call must leave bytes in it
+static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
+    // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions
+    const bool     direct = host || *reference_label() != '\0';
+    ggml_backend_t cpu    = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    REQUIRE(kernels != nullptr);
+    const spacemit_plugin_kernel * step_q = nullptr, * step_g = nullptr;
+    for (uint32_t i = 0; i < n_kernels; i++) {
+        if (kernels[i].name != nullptr && std::strcmp(kernels[i].name, "mul_mat_id.quantize") == 0) {
+            step_q = &kernels[i];
+        }
+        if (kernels[i].name != nullptr && std::strcmp(kernels[i].name, "mul_mat_id.gemm") == 0) {
+            step_g = &kernels[i];
+        }
+    }
+    REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
+    env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
+
+    struct group_case {
+        const char *         what;
+        ggml_type            type;
+        int64_t              k, n, n_used, ne11, n_tok;
+        bool                 shuffled;
+        std::vector<int64_t> counts;  // the rows wanted per expert; its size is the expert count
+    };
+    // 10 tokens of 8 ids: 80 pairs over 12 experts, two of them unused. Expert 9's 40 pairs fill several tokens'
+    // slots, so an id repeats within a token whatever the order
+    const std::vector<int64_t> many = { 0, 1, 2, 3, 4, 5, 7, 8, 9, 40, 1, 0 };
+    const std::vector<int64_t> one  = { 0, 2, 1, 0, 3, 0, 0, 2, 0, 0, 0, 0 };  // 1 token of 8 ids, two repeated
+    std::vector<group_case>    cases;
+    for (const ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (const int64_t n : { (int64_t) 32, (int64_t) 96 }) {  // one slab, and three
+            for (const int64_t ne11 : { (int64_t) 1, (int64_t) 8 }) {
+                for (const bool shuffled : { false, true }) {
+                    cases.push_back({ shuffled ? "0-40 rows an expert, the ids shuffled" : "0-40 rows an expert", type,
+                                      256, n, 8, ne11, 10, shuffled, many });
+                }
+            }
+        }
+        cases.push_back({ "one token", type, 256, 96, 8, 1, 1, false, one });
+        cases.push_back({ "one token, a row per id", type, 256, 32, 8, 8, 1, false, one });
+    }
+    // 8 pairs of 9728 values: the slab fits in 384 KiB of TCM (330,752 bytes), an expert's quantized rows do not
+    cases.push_back({ "a long row: the rows do not fit beside the slab", GGML_TYPE_Q8_0, 9728, 32, 4, 4, 2, false,
+                      { 0, 1, 2, 0, 1, 0, 3, 1, 0, 0, 0, 0 } });
+
+    // the case's ids: each expert e repeated counts[e] times, filling the tokens' slots in order, shuffled first where
+    // the case asks (a partial Fisher-Yates with the other checks' generator)
+    const auto id_list = [](const group_case & c, uint32_t seed) {
+        std::vector<int32_t> list;
+        for (size_t e = 0; e < c.counts.size(); e++) {
+            list.insert(list.end(), (size_t) c.counts[e], (int32_t) e);
+        }
+        if (c.shuffled) {
+            uint32_t s = seed * 2654435761u + 1;
+            for (size_t i = list.size(); i > 1; i--) {
+                s = s * 1664525u + 1013904223u;
+                std::swap(list[i - 1], list[(s >> 8) % i]);
+            }
+        }
+        return list;
+    };
+
+    const char * const settings[3] = { nullptr, "grouped", "rows" };  // unset: staged, the default
+    int                n_cases = 0, n_ok = 0, n_same = 0, n_one = 0, n_one_ok = 0;
+    double             worst = 0.0, worst_rows = 0.0, worst_between = 0.0;
+    uint32_t           seed = 2600;
+    for (const group_case & c : cases) {
+        const int64_t              n_mats = (int64_t) c.counts.size();
+        const std::vector<int32_t> ids_in = id_list(c, seed);
+        REQUIRE((int64_t) ids_in.size() == c.n_used * c.n_tok);
+        ggml_init_params pw     = { ggml_tensor_overhead() * 4, nullptr, true };
+        ggml_context *   ctx_wd = ggml_init(pw);
+        ggml_context *   ctx_wc = ggml_init(pw);
+        REQUIRE(ctx_wd != nullptr && ctx_wc != nullptr);
+        ggml_tensor * w_dev = ggml_new_tensor_3d(ctx_wd, c.type, c.k, c.n, n_mats);
+        ggml_tensor * w_cpu = ggml_new_tensor_3d(ctx_wc, c.type, c.k, c.n, n_mats);
+        ggml_set_name(w_dev, "blk.0.ffn_down_exps.weight");
+        ggml_backend_buffer_t buf_wd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wd, buft);
+        ggml_backend_buffer_t buf_wc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wc, ggml_backend_cpu_buffer_type());
+        REQUIRE(buf_wd != nullptr && buf_wc != nullptr);
+        const std::vector<uint8_t> q = quantize_weights(c.type, c.k, c.n * n_mats, seed++);
+        ggml_backend_tensor_set(w_dev, q.data(), 0, q.size());
+        ggml_backend_tensor_set(w_cpu, q.data(), 0, q.size());
+
+        ggml_init_params p     = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
+        ggml_context *   ctx_h = ggml_init(p);
+        ggml_context *   ctx_d = ggml_init(p);
+        REQUIRE(ctx_h != nullptr && ctx_d != nullptr);
+        ggml_tensor * x       = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, c.k, c.ne11, c.n_tok);
+        ggml_tensor * ids     = ggml_new_tensor_2d(ctx_h, GGML_TYPE_I32, c.n_used, c.n_tok);
+        ggml_tensor * y_ref   = ggml_mul_mat_id(ctx_h, w_cpu, x, ids);
+        ggml_tensor * y       = ggml_mul_mat_id(ctx_d, w_dev, x, ids);
+        ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+        ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, buft);
+        REQUIRE(bh != nullptr && bd != nullptr);
+        const std::vector<float> xv = random_values(ggml_nelements(x), seed++, 2.0f);
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(ids, ids_in.data(), 0, ids_in.size() * sizeof(int32_t));
+
+        const int64_t            n_out = ggml_nelements(y);
+        const std::vector<float> junk((size_t) n_out, NAN);
+        ggml_cgraph *            g_cpu = ggml_new_graph(ctx_h);
+        ggml_build_forward_expand(g_cpu, y_ref);
+        ggml_cgraph * g_dev = ggml_new_graph(ctx_d);
+        ggml_build_forward_expand(g_dev, y);
+        bool ok = ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(cpu, g_cpu) == GGML_STATUS_SUCCESS;
+
+        // through the backend under each setting, the output filled with NaN first so an element no tile writes shows
+        const auto run = [&](ggml_backend_t backend, const char * setting) {
+            set_env("FLAGOS_SPACEMIT_MMID", setting);
+            ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
+            ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
+            std::vector<float> out((size_t) n_out, NAN);
+            ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
+            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
+            return out;
+        };
+        std::vector<float> out[3], staged_plain, staged_threads;
+        {
+            ggml_backend_t backend = tcm_backend(dev, nullptr);
+            REQUIRE(backend != nullptr);
+            for (int s = 0; s < 3; s++) {
+                out[s] = run(backend, settings[s]);
+            }
+            ggml_backend_free(backend);
+        }
+        if (host) {  // the tiles on threads, each staging into a TCM stand-in of its own
+            ggml_backend_t backend = tcm_backend(dev, "1");
+            REQUIRE(backend != nullptr);
+            staged_threads = run(backend, nullptr);
+            ggml_backend_free(backend);
+        }
+        {  // without TCM the staged setting reads the slabs where they lie, as grouped does
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(backend != nullptr);
+            staged_plain = run(backend, nullptr);
+            ggml_backend_free(backend);
+        }
+
+        // the two steps directly on 1 and on 8 tiles, staged with a TCM buffer of its own and grouped without
+        const size_t         ws = step_q->workspace_size(y);
+        std::vector<uint8_t> workspace(ws);
+        std::vector<uint8_t> tcm(393216);
+        std::vector<float>   d_out[4];
+        bool                 tcm_used = true;
+        for (int r = 0; r < 4 && direct; r++) {
+            const uint32_t nth    = (r % 2) == 0 ? 1u : 8u;
+            const bool     staged = r < 2;
+            set_env("FLAGOS_SPACEMIT_MMID", staged ? nullptr : "grouped");
+            std::fill(tcm.begin(), tcm.end(), uint8_t(0));
+            ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
+            for (const spacemit_plugin_kernel * step : { step_q, step_g }) {
+                for (uint32_t ith = 0; ith < nth; ith++) {
+                    const spacemit_tile tile = { ith,  nth, staged ? tcm.data() : nullptr, staged ? tcm.size() : 0,
+                                                 workspace.data(), ws, nullptr };
+                    ok &= step->fn(&tile, y);
+                }
+            }
+            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
+            d_out[r].assign((size_t) n_out, NAN);
+            ggml_backend_tensor_get(y, d_out[r].data(), 0, ggml_nbytes(y));
+            if (staged && c.n_tok > 1) {  // a staged call copies at least one slab into TCM
+                tcm_used = tcm_used && std::any_of(tcm.begin(), tcm.end(), [](uint8_t b) { return b != 0; });
+            }
+        }
+
+        // staged and grouped, with TCM and without, on 8 tiles and on 1: one kernel call per (group, slab) either way
+        const size_t out_bytes = (size_t) n_out * sizeof(float);
+        bool         same      = ok && std::memcmp(out[0].data(), out[1].data(), out_bytes) == 0 &&
+                     std::memcmp(out[0].data(), staged_plain.data(), out_bytes) == 0 && tcm_used &&
+                     (!host || std::memcmp(out[0].data(), staged_threads.data(), out_bytes) == 0);
+        for (int r = 0; r < 4 && direct && same; r++) {
+            same = std::memcmp(out[0].data(), d_out[r].data(), out_bytes) == 0;
+        }
+        const double e      = ok ? nmse(out[0].data(), (const float *) y_ref->data, n_out) : -1.0;
+        const double e_rows = ok ? nmse(out[2].data(), (const float *) y_ref->data, n_out) : -1.0;
+        const double e_both = ok ? nmse(out[0].data(), out[2].data(), n_out) : -1.0;
+        // one token keeps the 1-row path whatever the setting
+        const bool one_token = c.n_tok == 1;
+        const bool one_ok    = !one_token || (ok && std::memcmp(out[0].data(), out[2].data(), out_bytes) == 0);
+        const bool case_ok   = ok && same && one_ok && e >= 0.0 && e <= k_mul_mat_max_nmse && e_rows >= 0.0 &&
+                             e_rows <= k_mul_mat_max_nmse;
+        n_cases++;
+        n_ok += case_ok;
+        n_same += same;
+        n_one += one_token;
+        n_one_ok += one_token && one_ok;
+        worst         = std::max(worst, e);
+        worst_rows    = std::max(worst_rows, e_rows);
+        worst_between = std::max(worst_between, e_both);
+        if (!case_ok) {
+            std::fprintf(stderr,
+                         "FAIL: MUL_MAT_ID many rows, %s, %s [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld "
+                         "tokens: %s; staged, grouped and the tile counts %s; NMSE staged %.3e, rows %.3e (bound "
+                         "%.0e)%s%s\n",
+                         c.what, ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) n_mats,
+                         (long long) c.n_used, (long long) c.ne11, (long long) c.n_tok, ok ? "ran" : "failed",
+                         same ? "equal" : "differ", e, e_rows, k_mul_mat_max_nmse,
+                         tcm_used ? "" : ", a staged run left TCM untouched",
+                         one_ok ? "" : ", one token differs from rows");
+            g_failures++;
+        }
+        ggml_backend_buffer_free(bh);
+        ggml_backend_buffer_free(bd);
+        ggml_free(ctx_h);
+        ggml_free(ctx_d);
+        ggml_backend_buffer_free(buf_wd);
+        ggml_backend_buffer_free(buf_wc);
+        ggml_free(ctx_wd);
+        ggml_free(ctx_wc);
+    }
+
+    ggml_backend_free(cpu);
+    std::printf("mmid     the many-row path (FLAGOS_SPACEMIT_MMID=staged, the default, against grouped and rows) at "
+                "experts of 0, 1, 2, 3, 4, 5, 7, 8, 9 and 40 rows a node, ids designed and shuffled with repeats "
+                "within a token, Q4_0 and Q8_0, 1 and 3 column slabs, broadcast and a row per id, 10 tokens and 1, a "
+                "long row whose rows do not fit beside the slab: %d/%d cases; staged with TCM%s, staged without TCM and "
+                "grouped bit for bit%s in %d/%d; one token bit for bit with rows %d/%d; against the CPU on one thread "
+                "max NMSE staged %.2e, rows %.2e, between them %.2e (bound %.0e)%s\n",
+                n_ok, n_cases, host ? " (tiles in turn and on threads)" : "",
+                direct ? ", with the steps directly on 1 and on 8 tiles" : "", n_same, n_cases, n_one_ok, n_one, worst,
+                worst_rows, worst_between, k_mul_mat_max_nmse, reference_label());
+    return 0;
+}
+
 // MUL_MAT_ID, the experts' matmuls (Qwen3.6-35B-A3B): the claims and the refused forms, then the provider against the
 // CPU backend on one thread, for the IME layouts' types at the model's shapes (gate and up [2048, 512, 256] with one
 // activation row per token, down [512, 2048, 256] with one per id, 8 ids per token) and at small ones, 1 to 512
@@ -7417,7 +7662,7 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
                 "Q8_0, what test-backend-ops' CPU computes with): max NMSE %.2e, at test-backend-ops' three Q6_K "
                 "shapes quantized with an imatrix %.2e (bound %.0e)\n",
                 worst_readback[0], worst_readback[1], k_mul_mat_max_nmse);
-    return 0;
+    return check_mul_mat_id_groups(dev, host);
 }
 
 static int check_gdn(ggml_backend_dev_t dev) {
