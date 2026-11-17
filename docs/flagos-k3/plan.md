@@ -3227,6 +3227,26 @@ To settle the headroom, if wanted: the real 1-row matmul of the output layer (`f
 - Part 2, the rows split between the provider and ggml-cpu's threads released together: the output layer 14.4 ms alone; with 85% on the AI cores 14.3 to 14.6 ms (0.99 to 1.01), 75% 15.9, 65% 18.4, 50% 22.0; the CPU alone 30.6 ms. `ffn_up` 0.42 ms alone, no split under 0.61 ms; `ffn_down` 0.50 ms alone, none under 0.58 ms; the CPU alone 3.7 and 3.9 ms.
 - Closed: the output layer, and with it every 1-row matmul, runs at the memory's rate; a token's matmul time is the provider's weight bytes over about 31 GB/s. Only fewer bytes a token would shorten it (a smaller quantization, or a model that reads part of its weights a token, as Qwen3.6-35B-A3B's experts).
 
+### Qwen3.6-35B-A3B: the first run (2026-11-17)
+
+User decisions: the Q4_0 file (bartowski's `Qwen_Qwen3.6-35B-A3B-Q4_0.gguf`, 20,836,243,072 bytes, SHA-256 `52312daa...2bb85e`, the same on Hugging Face and ModelScope; downloaded on the board without the certificate check, its clock being months behind, and verified by the hash). Before the download, by reading: SpacemiT's fork (`mtmd-backend` `ddfb41d`, still the head) takes Q4_1 in `MUL_MAT_ID` with a 4-bit layout `block_q4_1x32x256` and the kernels `gemm_kernel_i8i4_hpzp_m1` / `_al_m4`, but it rounds each block's offset to a whole step clamped to 0-15, which its own comments call lossy; in-tree ggml-cpu has that 32x256 variant only as a commented `TODO`.
+
+**On the K3 (`scripts/qwen35-probe.sh` with `CPU=1`, the build of `592775210`, no code change, logs `q36-probe`, one run, "The capital of France is", 16 tokens):**
+- It loads and generates with every return code 0. 11 graph splits: 2,350 nodes on the provider, 5 on the CPU, the `MUL_MAT_ID` of the five Q4_1 `ffn_down_exps` (layers 0-4), as decided on 2026-11-14.
+- Buffers: the provider 18,087 MiB of weights (CPU_Mapped 2,347 MiB), KV 40, recurrent state 63, compute 497 MiB. It fits the 31 GiB board without swap.
+- Speed, not judged (15 tokens, two runs): 6.90 and 7.94 tokens a second, the 5-token prompt 0.89 and 0.53 s, the load 23.9 and 31.3 s. The one-thread CPU: 1.44 tokens a second, load 70.1 s.
+- **Open: the text differs from the one-thread CPU's after 30 characters** (the provider "... is Paris, a city renowned for its rich history, culture, and iconic landmarks.", the CPU "... is Paris. The capital of France is Paris. The capital of France is"), the same with flash attention on. Not explained: a near tie at one token is possible (the provider's matmuls are not the CPU's bits, and Qwen3.5-4B's texts were equal), and so is a fault in a path this model is the first to run (`MUL_MAT_ID`, the router, Q5_0, the untied output layer). To settle before any speed work: the KLD of the provider's logits against the one-thread CPU's, and the same text with op groups disabled by name.
+
+**The text difference settled (2026-11-17, the same build, logs `q36-kld`, one K3 run): no fault shown, a near tie.** `llama-perplexity`, 2 chunks of 512 tokens of `~/ppl.txt`, the base the one-thread CPU's logits (462.8 s a pass), the provider against it:
+
+| host threads | PPL (base 7.2594) | mean KLD | median | 99.9% | maximum | same top token |
+|---|---|---|---|---|---|---|
+| `-t 1` | 7.2602 | 0.004887 +- 0.000527 | 0.001826 | 0.1508 | 0.1653 | 95.10 +- 0.96 % |
+| `-t 8` | 7.2577 | 0.005032 +- 0.000538 | 0.001711 | 0.1508 | 0.1653 | 95.29 +- 0.94 % |
+
+- The perplexity is the CPU's within 0.02%. The provider's text with `-t 1` is its `-t 8` text, so the five CPU nodes on several threads are not the cause (my first suspect, rejected).
+- The KLD is of the size of Qwen3-4B's on the provider (0.0033 at 512-token batches) but higher, and the same-top-token share lower (95.1% against 98.6%): to watch, not a fault. Not measured: which op group carries it (`GGML_FLAGOS_DISABLE_OPS` by group), and the one-token path (`-ub 1`).
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
