@@ -3301,6 +3301,23 @@ The speed is as estimated (78 t/s and 105 ms). The accuracy is not acceptable: t
 
 Check program: all checks passed by default, with the reference kernels, and with the switch set to each of `zp4`, `q8`, `exact`. Mutations caught: the coder's two (no `8 d`; the neighbouring block's minimum) and mine (row 0's sums for every row of a group). Not measured: any speed; the correction's cost (estimate: a few percent of the kernel's work).
 
+*Arms 2 and 3 on the K3 (one run, build `48677c4e2`, logs `~/k3-logs/q8x`, after a reboot; 8 threads; KLD against the same base).* The check program passes with the real kernels, the three Q4_1 lines 7/7 each (`exact` 2.17e-05 against the CPU on the GGUF bytes, read-back the GGUF bytes in 7/7; `q8` 4.17e-05).
+
+| | `cpu` | `q8` | `exact` | `zp4` (run before) |
+|---|---|---|---|---|
+| graph splits | 11 | 1 | 1 | 1 |
+| pp501, t/s (3 repeats) | 63.86 +- 0.20 | 78.34 +- 0.17 | 69.91 +- 0.23 | 79.33 +- 0.36 |
+| prompt of 501, ms (one run) | 7,760 | 6,234 | 7,009 | 6,251 |
+| generation, ms a token (31 tokens, one run) | 117.2 | 106.2 | 108.6 | 106.8 |
+| `MUL_MAT_ID` per graph of 501, ms | - | 1,947 | 2,731 | 1,935 |
+| mean KLD | 0.00530 +- 0.00066 | 0.00593 +- 0.00074 | 0.00548 +- 0.00068 | 0.02675 |
+| maximum KLD | 0.238 | 0.258 | 0.220 | 1.443 |
+| same top token | 94.7% | 95.1% | 94.7% | 89.6% |
+
+By the rule fixed before the run (KLD within the `cpu` arm's error bar, then the faster pp501): both are acceptable, `q8` is the faster. My expectation that `exact` would be the faster was wrong: its `MUL_MAT_ID` costs 785 ms more a prompt than `q8`'s, which by subtraction is the correction (not profiled; by inference its 64 scalar fp16 conversions per subblock, about 150 ns a subblock and group). `q8`'s 8-bit weights cost nothing measurable against `zp4`'s 4-bit ones (1,947 against 1,935 ms). `q8` keeps its two costs: 112 MiB more a tensor (560 MiB for the five) and 37 to 40 `test-backend-ops` cases failing under it on the read-back. The generated text is the same in the three arms (shows little: one repeated sentence). The `cpu` arm after the reboot is within the earlier run's figures (63.86 against 64.50 t/s, KLD 0.0053 against 0.0057). The memory available in each arm was printed on the board's screen only.
+
+*The `exact` correction vectorized (2026-11-17; by a coder; the diff read and the Mac checks rerun by me).* An RVV path in `q4_1_min_correct`: the 32 scales and minimums of a subblock loaded and widened as vectors, the four rows' sums kept in registers; the scalar code stays for the reference kernels and for the Mac. Never executed: the Mac compiles only the scalar path, the riscv64 syntax check parses the vector one (0 errors). Next run: `cpu`, `q8`, `exact` on pp32, pp128, pp501, pp2048 and tg512 (3 repeats), splits and KLD.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.

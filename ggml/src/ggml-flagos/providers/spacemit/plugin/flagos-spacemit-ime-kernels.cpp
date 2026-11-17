@@ -2667,13 +2667,62 @@ static __attribute__((noinline)) size_t q4_1_min_q4_0_part(const uint8_t * qa, c
 // so the two 8 d terms cancel but for the kernel's fp16 rounding; a_sum is exact for |sum(qa)| <= 2048, else rounded
 // to 11 bits. 4 rows: the pack of 4 rows a block, one a_scale and avg for the 4, an a_sum per row
 static __attribute__((noinline)) void q4_1_min_correct(const uint8_t * qa, const uint8_t * tile, float * c,
-                                                       size_t rows, size_t k_blocks, size_t ldc) {
+                                                       size_t rows, size_t k_blocks, size_t ldc, bool reference) {
     constexpr size_t n_sub      = q4_0_k_block / 32;
     const size_t     blk_stride = q8_hp_blk_size(q4_0_k_block, true, true) * rows;
     const size_t     sub_stride = q8_hp_blk_size(32) * rows;
     const auto *     q4         = reinterpret_cast<const block_q4_0x32x256 *>(tile);
     const uint8_t *  mins       = tile + k_blocks * sizeof(block_q4_0x32x256);
-    float            acc[4][row_tile] = {};
+
+#if defined(GGML_FLAGOS_SPACEMIT_IME2)
+    // one f32m4 register holds the 32 columns when VLEN >= 256
+    if (!reference && __riscv_vsetvl_e32m4(row_tile) == row_tile) {
+        const size_t vl   = row_tile;
+        vfloat32m4_t acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+        vfloat32m4_t acc1 = acc0;
+        vfloat32m4_t acc2 = acc0;
+        vfloat32m4_t acc3 = acc0;
+        for (size_t kb = 0; kb < k_blocks; kb++) {
+            const uint8_t * a = qa + kb * blk_stride;
+            _Float16        avg;
+            std::memcpy(&avg, a + blk_stride - sizeof(_Float16) * rows, sizeof(avg));
+            for (size_t b = 0; b < n_sub; b++) {
+                _Float16 a_scale;
+                std::memcpy(&a_scale, a + b * sub_stride, sizeof(a_scale));
+                const float unit = -0.125f * (float) a_scale * (float) avg;
+                float       s[4];
+                for (size_t r = 0; r < rows; r++) {
+                    _Float16 a_sum;
+                    std::memcpy(&a_sum, a + n_sub * sub_stride + (r * n_sub + b) * sizeof(_Float16), sizeof(a_sum));
+                    s[r] = (float) a_sum * unit;
+                }
+                const uint8_t *    m_ptr = mins + (kb * n_sub + b) * row_tile * sizeof(_Float16);
+                const vfloat16m2_t d16   = __riscv_vle16_v_f16m2((const _Float16 *) q4[kb].blocks[b].d, vl);
+                const vfloat16m2_t m16   = __riscv_vle16_v_f16m2((const _Float16 *) m_ptr, vl);
+                const vfloat32m4_t d32   = __riscv_vfwcvt_f_f_v_f32m4(d16, vl);
+                const vfloat32m4_t w     = __riscv_vfmacc_vf_f32m4(__riscv_vfwcvt_f_f_v_f32m4(m16, vl), 8.0f, d32, vl);
+                acc0                     = __riscv_vfmacc_vf_f32m4(acc0, s[0], w, vl);
+                if (rows > 1) {
+                    acc1 = __riscv_vfmacc_vf_f32m4(acc1, s[1], w, vl);
+                }
+                if (rows > 2) {
+                    acc2 = __riscv_vfmacc_vf_f32m4(acc2, s[2], w, vl);
+                }
+                if (rows > 3) {
+                    acc3 = __riscv_vfmacc_vf_f32m4(acc3, s[3], w, vl);
+                }
+            }
+        }
+        for (size_t r = 0; r < rows; r++) {
+            const vfloat32m4_t acc = r == 0 ? acc0 : r == 1 ? acc1 : r == 2 ? acc2 : acc3;
+            float *            cr  = c + r * ldc;
+            __riscv_vse32_v_f32m4(cr, __riscv_vfadd_vv_f32m4(__riscv_vle32_v_f32m4(cr, vl), acc, vl), vl);
+        }
+        return;
+    }
+#endif
+
+    float acc[4][row_tile] = {};
 
     for (size_t kb = 0; kb < k_blocks; kb++) {
         const uint8_t * a = qa + kb * blk_stride;
@@ -2710,8 +2759,8 @@ static __attribute__((noinline)) void q4_1_min_correct(const uint8_t * qa, const
     }
 }
 
-// the q4_1 min layout: per 32-column tile the q4_0 kernel (the reference flag picks its variant), then the correction
-// for the rows it did; the same contract as q4_0_gemm
+// the q4_1 min layout: per 32-column tile the q4_0 kernel, then the correction for the rows it did (the reference
+// flag picks the variant of both); the same contract as q4_0_gemm
 size_t q4_1_min_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n,
                      size_t k_blocks, size_t ldc, bool reference) {
     GGML_ASSERT(count_n > 0 && count_n % row_tile == 0);  // else the return value, the rows done, would be 0
@@ -2720,7 +2769,7 @@ size_t q4_1_min_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t c
     for (size_t n0 = 0; n0 < count_n; n0 += row_tile) {
         const uint8_t * tile = qb + n0 / row_tile * tile_bytes;
         done                 = q4_1_min_q4_0_part(qa, tile, c + n0, count_m, k_blocks, ldc, reference);
-        q4_1_min_correct(qa, tile, c + n0, done, k_blocks, ldc);
+        q4_1_min_correct(qa, tile, c + n0, done, k_blocks, ldc, reference);
     }
     return done;
 }
