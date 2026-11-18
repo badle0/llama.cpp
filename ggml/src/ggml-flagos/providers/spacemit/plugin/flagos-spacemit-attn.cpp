@@ -581,7 +581,7 @@ void kvh_partial_ref(const ggml_tensor * dst, int64_t n_chunks, int64_t ith, int
 // query heads broadcast over the K and V heads (GQA), streams do not; mask absent or F16 covering n_kv and the rows,
 // broadcast over heads and streams as ggml allows; sinks absent or F32, one per query head; dst as ggml_flash_attn_ext
 // makes it (the kernels write whole rows of it, permuted). ALiBi and softcap included: the kernels and the reference
-// handle them, and the K3 run of test-backend-ops decides whether they stay (plan.md, M2e design)
+// handle them, and test-backend-ops passes their cases on the K3 (plan.md, M2e design)
 bool spacemit_flash_attn_supported(const ggml_tensor * op) {
     const ggml_tensor * q     = op->src[0];
     const ggml_tensor * k     = op->src[1];

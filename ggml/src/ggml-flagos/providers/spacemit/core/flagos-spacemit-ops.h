@@ -20,9 +20,6 @@ constexpr uint32_t SPACEMIT_MAX_TILES = 64;
 // differ after a step.
 bool spacemit_pair_wait(const spacemit_tile & tile);
 
-// computes this tile's share of one step of a node; false means the node failed and the graph fails
-using spacemit_kernel_fn = spacemit_step_fn;
-
 // how the provider runs one op: its steps run in order on every tile with a barrier after each, so a step may read
 // what all tiles wrote in the step before; kernels never wait inside a step (plan.md §2.4), except the two tiles of a
 // pair for each other in 1-row matmuls (spacemit_pair_wait)

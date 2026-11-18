@@ -1,7 +1,6 @@
-// FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15).
-// One IGPU device (D3, 2026-10-26; ACCEL before) with a buffer type and a backend; ops run on the AI cores through
-// spine-runtime (M2a: ADD; M2b, M2c: Q4_0, Q4_1, Q8_0 and Q6_K MUL_MAT on the IME, weights repacked in the buffer, Q6_K
-// requantized to Q8_0; M2d: the other ops of a layer except attention).
+// FlagOS provider for the SpacemiT K3 AI cores (A100, CPUs 8-15), the core in libggml-flagos.
+// One IGPU device (D3, 2026-10-26; ACCEL before) with a buffer type and a backend; the plugin
+// (libflagos-provider-spacemit) holds the buffers, the kernels and the launches on the AI cores.
 
 #include "flagos-spacemit-api.h"
 #include "flagos-spacemit-ops.h"
@@ -15,16 +14,12 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <string>
-#include <tuple>
 #include <vector>
 
 namespace {

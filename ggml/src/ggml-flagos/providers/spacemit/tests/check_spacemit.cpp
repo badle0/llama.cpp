@@ -1021,8 +1021,8 @@ constexpr double k_requant_max_nmse = 5e-6;
 // which tensors the provider claims for MUL_MAT: exactly Q4_0, Q4_1, Q8_0 and Q6_K weights in their IME layouts, in its
 // buffer; and what its buffer type allocates for them (Q4_1 and Q6_K are stored as Q8_0)
 static int check_mul_mat_claims(ggml_backend_dev_t dev) {
-    // today's default: a 3-D Q4_1 weight has no layout, so this check's claims and sizes do not depend on the caller's
-    // FLAGOS_SPACEMIT_EXPERT_Q4_1 (check_mul_mat_id_q4_1 sets it for its own weights)
+    // the default: a 3-D Q4_1 weight takes the q4_1 min layout, so this check's claims and sizes do not depend on the
+    // caller's FLAGOS_SPACEMIT_EXPERT_Q4_1
     env_override               q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_buffer_type_t buft   = ggml_backend_dev_buffer_type(dev);
     ggml_init_params           params = { ggml_tensor_overhead() * 128, nullptr, true };
@@ -1107,7 +1107,7 @@ static int check_mul_mat_claims(ggml_backend_dev_t dev) {
     CHECK(!ggml_backend_dev_supports_op(dev, probe_3d));
     ggml_backend_buffer_free(w_3d->buffer);
     w_3d->buffer = nullptr;
-    CHECK(ggml_backend_buft_get_alloc_size(buft, v1_3) == ggml_nbytes(v1_3));  // 3-D Q4_1: no layout (2-D only)
+    CHECK(ggml_backend_buft_get_alloc_size(buft, v1_3) == ggml_nbytes(v1_3));  // 3-D Q4_1: the q4_1 min layout
     CHECK(ggml_backend_buft_get_alloc_size(buft, w_3d) == ggml_nbytes(w_3d));
     // Q5_0, stored as Q8_0 exactly: any row length % 32, rows % 32, 2-D only, 34 bytes per 32 values instead of 22
     ggml_tensor * w5   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_0, 256, 64);
@@ -1151,8 +1151,8 @@ constexpr double k_q4_1_read_max_nmse = 5e-5;
 // set_tensor repacks; get_tensor restores the GGUF bytes (Q4_0, Q8_0) or returns the nearest Q4_1 or Q6_K to the
 // stored Q8_0 values (Q4_1, Q6_K); partial access works (whole writes only for the weights stored as Q8_0)
 static int check_weight_round_trip(ggml_backend_dev_t dev) {
-    // the layouts of today's default: a 3-D Q4_1 weight has none unless FLAGOS_SPACEMIT_EXPERT_Q4_1 asks for one,
-    // which check_mul_mat_id_q4_1 checks on its own weights
+    // the layouts of the default: a 3-D Q4_1 weight takes the q4_1 min layout, whatever the caller's
+    // FLAGOS_SPACEMIT_EXPERT_Q4_1
     env_override     q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_init_params params = { ggml_tensor_overhead() * 4, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
@@ -1289,8 +1289,9 @@ static int check_weight_round_trip(ggml_backend_dev_t dev) {
 
     // a 3-D weight (MUL_MAT_ID's experts, 3 of 64 rows) is stored as the 2-D weight of its 192 rows: the same alloc
     // size, stored bytes and read-back, whole and in part; for the lossless layouts that is the GGUF bytes, and a
-    // partial write inside the third expert reads back patched. A 3-D Q4_1 weight has no layout (Q4_1's is 2-D only): it
-    // is stored as the GGUF bytes in ggml_nbytes and reads back exactly
+    // partial write inside the third expert reads back patched. A 3-D Q4_1 weight takes the q4_1 min layout (2-D Q4_1
+    // the Q8_0 route): it is stored repacked in ggml_nbytes and reads back exactly, whole, in part and after a partial
+    // write
     {
         const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
         ggml_init_params                 p1   = { ggml_tensor_overhead(), nullptr, true };
@@ -1303,9 +1304,18 @@ static int check_weight_round_trip(ggml_backend_dev_t dev) {
         std::vector<uint8_t>       r1_3(q1_3.size());
         CHECK(ggml_backend_buft_get_alloc_size(buft, t1) == ggml_nbytes(t1));
         ggml_backend_tensor_set(t1, q1_3.data(), 0, q1_3.size());
-        CHECK(std::memcmp(t1->data, q1_3.data(), q1_3.size()) == 0);  // stored as given
+        CHECK(std::memcmp(t1->data, q1_3.data(), q1_3.size()) != 0);  // stored repacked
         ggml_backend_tensor_get(t1, r1_3.data(), 0, r1_3.size());
         CHECK(r1_3 == q1_3);
+        const size_t         at1 = ggml_nbytes(t1) / 3 + 1000;  // inside the second expert
+        std::vector<uint8_t> part1(300);
+        ggml_backend_tensor_get(t1, part1.data(), at1, part1.size());
+        CHECK(std::memcmp(part1.data(), q1_3.data() + at1, part1.size()) == 0);
+        std::vector<uint8_t> want1 = q1_3;
+        std::copy(patch.begin(), patch.end(), want1.begin() + 2 * ggml_nbytes(t1) / 3 + 700);  // the third expert
+        ggml_backend_tensor_set(t1, patch.data(), 2 * ggml_nbytes(t1) / 3 + 700, patch.size());
+        ggml_backend_tensor_get(t1, r1_3.data(), 0, r1_3.size());
+        CHECK(r1_3 == want1);
         ggml_backend_buffer_free(buf1);
         ggml_free(ctx1);
     }
@@ -1516,7 +1526,7 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
                 "activations, CPU-buffer weights); Q4_1, Q6_K and Q5_0 allocation sizes; repack round trip (Q4_1 read "
                 "as the nearest Q4_1, within NMSE 5e-5; Q6_K read as the nearest Q6_K, within NMSE 1e-5; Q5_0 stored "
                 "as the Q8_0 of its values, read exactly; 3-D weights stored and read as their 2-D rows, a 3-D Q4_1 "
-                "one plain); MUL_MAT->ADD graph: checked\n");
+                "one in the q4_1 min layout, read exactly); MUL_MAT->ADD graph: checked\n");
     std::printf("info     Q4_1 requantization to Q8_0 alone (CPU, GGUF against ggml's Q8_0 of the values), random weights "
                 "3072x1024, 16 rows: NMSE %.2e\n",
                 conversion);
@@ -2709,16 +2719,17 @@ static int count_lines_with(const std::string & text, const char * what) {
 }
 
 // per layout, weights of 32, 64, 96 and 4096 rows of 2560 columns, one group of 65536 columns (over 1 MiB in one
-// group) and, but for Q4_1 (2-D only), three 3-D weights (3 experts of 32 rows of 2560, 8 of 64 and 4 of 512 rows
-// of 2048), written with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 3, 8 and 16: the stored bytes (the whole alloc size,
-// past
-// ggml_nbytes for the layouts requantized to Q8_0) and the read-back are the one-thread ones, and by the counter the
-// threads ran, with min(n, groups) ranges, exactly for the weights of at least 1 MiB and several groups. Then a partial
+// group) and three 3-D weights (3 experts of 32 rows of 2560, 8 of 64 and 4 of 512 rows of 2048; Q4_1's in the q4_1
+// min layout, FLAGOS_SPACEMIT_EXPERT_Q4_1 unset), written with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 3, 8 and 16: the
+// stored bytes (the whole alloc size, past ggml_nbytes for the layouts requantized to Q8_0) and the read-back are the
+// one-thread ones, and by the counter the threads ran, with min(n, groups) ranges, exactly for the weights of at least
+// 1 MiB and several groups. Then a partial
 // write (Q4_0, Q8_0, Q5_0) on 8 threads, and the switch's values. All of it under FLAGOS_SPACEMIT_REPACK_VIA=threads; with
 // spine-runtime (spert) also each weight under x100 against the one-thread bytes. Then FLAGOS_SPACEMIT_REPACK_VIA's
 // values
 static int check_repack_threads(ggml_backend_dev_t dev, bool spert) {
     env_override               via_threads("FLAGOS_SPACEMIT_REPACK_VIA", "threads");
+    env_override               q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_buffer_type_t buft    = ggml_backend_dev_buffer_type(dev);
     const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_0 };
     // mats > 1: a 3-D weight of mats experts (MUL_MAT_ID's), cut on its ggml_nrows rows
@@ -2737,10 +2748,6 @@ static int check_repack_threads(ggml_backend_dev_t dev, bool spert) {
             ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
             ggml_context *   ctx    = ggml_init(params);
             REQUIRE(ctx != nullptr);
-            if (s.mats > 1 && type == GGML_TYPE_Q4_1) {
-                ggml_free(ctx);
-                continue;  // a 3-D Q4_1 weight has no layout (Q4_1's is 2-D only)
-            }
             ggml_tensor * w = ggml_new_tensor_3d(ctx, type, s.cols, s.rows, s.mats);
             ggml_set_name(w, s.mats > 1 ? "blk.0.ffn_up_exps.weight" : "blk.0.ffn_up.weight");
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -2964,8 +2971,8 @@ static int check_repack_threads(ggml_backend_dev_t dev, bool spert) {
 
     std::printf("repack   FLAGOS_SPACEMIT_REPACK_THREADS 2, 3, 8 and 16 against 1 (Q4_0, Q4_1 and Q6_K to Q8_0, Q8_0, "
                 "Q5_0 as Q8_0; "
-                "32, 64, 96 and 4096 rows of 2560, 32 of 65536; 3-D but Q4_1: 3 x 32 of 2560, 8 x 64 and 4 x 512 of "
-                "2048): "
+                "32, 64, 96 and 4096 rows of 2560, 32 of 65536; 3-D, Q4_1 in the q4_1 min layout: 3 x 32 of 2560, "
+                "8 x 64 and 4 x 512 of 2048): "
                 "stored bytes identical in %d/%d, read-back identical "
                 "in %d/%d; the threads by the counter as expected in %d/%d (%d threaded: at least 1 MiB and several "
                 "groups only); a partial write on 8 threads identical in %d/%d\n",
@@ -7047,7 +7054,7 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
 // compared by the bound, not by its bytes. TCM: a stand-in of the K3's 384 KiB, as check_gemv and check_mm_paths get
 // one; the direct calls get a buffer of their own, zeroed first, so that a staged call must leave bytes in it
 // weights quantized from random normal values, with the other checks' uniform generator through a Box-Muller
-// transform: a real weight's values are near normal, and the q4_1 zp4 layout's own loss is worth reading on those
+// transform: a real weight's values are near normal
 static std::vector<uint8_t> quantize_normal_weights(ggml_type type, int64_t k, int64_t n, uint32_t seed) {
     const size_t       count = (size_t) (k * n);
     std::vector<float> u(count + 1);
@@ -7067,38 +7074,14 @@ static std::vector<uint8_t> quantize_normal_weights(ggml_type type, int64_t k, i
     return q;
 }
 
-// one arm of FLAGOS_SPACEMIT_EXPERT_Q4_1: which comparison carries the bound, and what the read-back must be
-struct q41_arm {
-    const char * name;            // the switch value
-    const char * layout;          // the layout, for the line
-    bool         bound_readback;  // the bound applies to the CPU on the read-back weights
-    bool         bound_gguf;      // the bound applies to the CPU on the GGUF bytes
-    bool         stable;          // repack-unpack-repack must keep the bytes
-    bool         exact;           // the read-back must be the GGUF bytes
-};
-
-// the arms of FLAGOS_SPACEMIT_EXPERT_Q4_1, each as experiment arm 1 is checked. zp4 and q8 are lossy, so only the
-// comparison against the CPU on the weight's read-back (what the model and test-backend-ops see) carries a bound for
-// zp4; q8 is requantized to Q8_0, where the convention of the 2-D Q4_1 and 3-D Q6_K checks is to bound the comparison
-// against the CPU on the GGUF bytes (check_mul_mat, check_mul_mat_id), its read-back being only the nearest Q4_1.
-// exact is lossless, so both carry the bound and the read-back must be the GGUF bytes. Writing a read-back of q8 keeps
-// only the values, not the bytes: Q4_1 of a Q8_0 of a Q4_1 block need not be the same block, so q8 is the one arm
-// whose repack-unpack-repack is reported without a requirement
-static const q41_arm k_q41_arms[3] = {
-    { "zp4", "the 4-bit zero-point layout", true, false, true, false },
-    { "q8", "requantized to Q8_0", false, true, false, false },
-    { "exact", "the q4_1 min layout", true, true, true, true },
-};
-
-// MUL_MAT_ID with 3-D Q4_1 experts in one arm of FLAGOS_SPACEMIT_EXPERT_Q4_1 (the model's five blk.{0..4}.ffn_down_exps
-// of Qwen3.6-35B-A3B). A weight's layout is decided at its load, so every weight here is made, written and freed
-// inside the setting's scope. Both comparisons are printed: against the CPU on the weight's read-back (what the model
-// and test-backend-ops see) and against the CPU on the GGUF bytes (the layout's own loss); which of them carries the
-// bound is the arm's (k_q41_arms).
+// MUL_MAT_ID with 3-D Q4_1 experts in the q4_1 min layout, FLAGOS_SPACEMIT_EXPERT_Q4_1 unset (the default; the
+// model's five blk.{0..4}.ffn_down_exps of Qwen3.6-35B-A3B). A weight's layout is decided at its load, so every weight
+// here is made, written and freed inside the setting's scope. The layout is lossless, so both comparisons carry the
+// bound: against the CPU on the weight's read-back (what the model and test-backend-ops see) and on the GGUF bytes.
 // Checked: the staged, grouped and rows settings against each other and the steps directly on 1 and on 8 tiles,
 // experts of 0 to 40 rows, one token and ten, broadcast activations and a row per id, the model's down shape with 4
-// experts, repack-unpack-repack, and for a lossless arm that the read-back is the GGUF bytes
-static int check_mul_mat_id_q4_1_arm(ggml_backend_dev_t dev, bool direct, ggml_backend_t cpu, const q41_arm & arm,
+// experts, repack-unpack-repack, and that the read-back is the GGUF bytes
+static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_backend_t cpu,
                                      const spacemit_plugin_kernel * step_q, const spacemit_plugin_kernel * step_g) {
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
@@ -7135,7 +7118,7 @@ static int check_mul_mat_id_q4_1_arm(ggml_backend_dev_t dev, bool direct, ggml_b
     double   worst = 0.0, worst_rows = 0.0, worst_gguf = 0.0;
     uint32_t seed = 4100;
     for (const q41_case & c : cases) {
-        env_override               sw("FLAGOS_SPACEMIT_EXPERT_Q4_1", arm.name);
+        env_override               sw("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
         const int64_t              n_mats = (int64_t) c.counts.size();
         const std::vector<int32_t> ids_in = id_list(c);
         REQUIRE((int64_t) ids_in.size() == c.n_used * c.n_tok);
@@ -7243,11 +7226,9 @@ static int check_mul_mat_id_q4_1_arm(ggml_backend_dev_t dev, bool direct, ggml_b
         const double e      = ok ? nmse(out[0].data(), (const float *) y_ref->data, n_out) : -1.0;
         const double e_rows = ok ? nmse(out[2].data(), (const float *) y_ref->data, n_out) : -1.0;
         const double e_gguf = ok ? nmse(out[0].data(), (const float *) y_q41->data, n_out) : -1.0;
-        const bool   in_bound =
-            e >= 0.0 && e_rows >= 0.0 && e_gguf >= 0.0 &&
-            (!arm.bound_readback || (e <= k_mul_mat_max_nmse && e_rows <= k_mul_mat_max_nmse)) &&
-            (!arm.bound_gguf || e_gguf <= k_mul_mat_max_nmse);
-        const bool case_ok = ok && same && in_bound && (!arm.stable || stable) && (!arm.exact || bits);
+        const bool   in_bound = e >= 0.0 && e_rows >= 0.0 && e_gguf >= 0.0 && e <= k_mul_mat_max_nmse &&
+                              e_rows <= k_mul_mat_max_nmse && e_gguf <= k_mul_mat_max_nmse;
+        const bool   case_ok  = ok && same && in_bound && stable && bits;
         n_cases++;
         n_ok += case_ok;
         n_same += same;
@@ -7258,11 +7239,11 @@ static int check_mul_mat_id_q4_1_arm(ggml_backend_dev_t dev, bool direct, ggml_b
         worst_gguf = std::max(worst_gguf, e_gguf);
         if (!case_ok) {
             std::fprintf(stderr,
-                         "FAIL: MUL_MAT_ID Q4_1 %s, %s, [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld "
+                         "FAIL: MUL_MAT_ID Q4_1, %s, [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld "
                          "tokens: %s; the settings and the tile counts %s; repack-unpack-repack %s; the read-back %s "
                          "the GGUF bytes; NMSE against the read-back staged %.3e, rows %.3e, against the GGUF bytes "
                          "%.3e (bound %.0e)\n",
-                         arm.name, c.what, (long long) c.k, (long long) c.n, (long long) n_mats, (long long) c.n_used,
+                         c.what, (long long) c.k, (long long) c.n, (long long) n_mats, (long long) c.n_used,
                          (long long) c.ne11, (long long) c.n_tok, ok ? "ran" : "failed", same ? "equal" : "differ",
                          stable ? "stable" : "changed the bytes", bits ? "is" : "is not", e, e_rows, e_gguf,
                          k_mul_mat_max_nmse);
@@ -7278,29 +7259,25 @@ static int check_mul_mat_id_q4_1_arm(ggml_backend_dev_t dev, bool direct, ggml_b
         ggml_free(ctx_wc);
     }
 
-    std::printf("mmid     3-D Q4_1 experts under FLAGOS_SPACEMIT_EXPERT_Q4_1=%s (%s) at experts of 0, 1, 3, 4, 5, 8, "
-                "19 and 40 rows a node, 1 and 8 column slabs, broadcast and a row per id, 10 tokens and 1, the model's "
-                "down shape [512, 2048, 4]: %d/%d cases; staged, grouped, staged without TCM%s bit for bit in %d/%d; "
-                "repack-unpack-repack keeps the bytes in %d/%d%s; the read-back is the GGUF bytes in %d/%d%s; max NMSE "
-                "against the CPU on one thread computing on the read-back weights staged %.2e, rows %.2e%s, on the "
-                "GGUF bytes %.2e%s (bound %.0e)%s\n",
-                arm.name, arm.layout, n_ok, n_cases, direct ? ", with the steps directly on 1 and on 8 tiles" : "",
-                n_same, n_cases, n_stable, n_cases, arm.stable ? "" : " (not required)", n_bits, n_cases,
-                arm.exact ? "" : " (not required)", worst, worst_rows, arm.bound_readback ? "" : " (not bounded)",
-                worst_gguf, arm.bound_gguf ? "" : " (not bounded)", k_mul_mat_max_nmse, reference_label());
+    std::printf("mmid     3-D Q4_1 experts (the q4_1 min layout, the default) at experts of 0, 1, 3, 4, 5, 8, 19 and "
+                "40 rows a node, 1 and 8 column slabs, broadcast and a row per id, 10 tokens and 1, the model's down "
+                "shape [512, 2048, 4]: %d/%d cases; staged, grouped, staged without TCM%s bit for bit in %d/%d; "
+                "repack-unpack-repack keeps the bytes in %d/%d; the read-back is the GGUF bytes in %d/%d; max NMSE "
+                "against the CPU on one thread computing on the read-back weights staged %.2e, rows %.2e, on the GGUF "
+                "bytes %.2e (bound %.0e)%s\n",
+                n_ok, n_cases, direct ? ", with the steps directly on 1 and on 8 tiles" : "", n_same, n_cases,
+                n_stable, n_cases, n_bits, n_cases, worst, worst_rows, worst_gguf, k_mul_mat_max_nmse,
+                reference_label());
     return 0;
 }
 
-// the three arms of FLAGOS_SPACEMIT_EXPERT_Q4_1 (check_mul_mat_id_q4_1_arm), the claims under every value of the
-// switch, and for zp4 that weights whose minimum is a whole multiple of their scale read back bit for bit and match
-// the CPU on the GGUF bytes
+// the claims under every value of FLAGOS_SPACEMIT_EXPERT_Q4_1, and the default's layout (check_mul_mat_id_q4_1_min)
 static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
     // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions
     const bool     direct = host || *reference_label() != '\0';
     ggml_backend_t cpu    = ggml_backend_cpu_init();
     REQUIRE(cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
-    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -7319,16 +7296,16 @@ static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
     REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
     env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
 
-    // what each value of the switch claims. zp4, q8 and exact give a 3-D Q4_1 weight a layout, cpu and an unknown
-    // value (which warns) none. 2-D Q4_1 keeps its Q8_0 route under every value. The row rule stays (N % 32), and K
-    // must be a multiple of 256 but under q8, whose layout takes blocks of 32
+    // what each value of the switch claims. Unset, exact and an unknown value (which warns and keeps the default) give
+    // a 3-D Q4_1 weight a layout, cpu none. 2-D Q4_1 keeps its Q8_0 route under every value. The row rule stays
+    // (N % 32), and K must be a multiple of 256 under every value
     int n_claims = 0, n_claims_ok = 0;
-    for (const char * setting : { (const char *) nullptr, "cpu", "zp4", "q8", "exact", "bogus" }) {
+    for (const char * setting : { (const char *) nullptr, "exact", "cpu", "bogus" }) {
         env_override     sw("FLAGOS_SPACEMIT_EXPERT_Q4_1", setting);
-        const bool       q8   = setting != nullptr && std::strcmp(setting, "q8") == 0;
-        const bool       want = setting != nullptr && (std::strcmp(setting, "zp4") == 0 || q8 ||
-                                                 std::strcmp(setting, "exact") == 0);
-        const char *     name = setting != nullptr ? setting : "unset";
+        log_capture      log;
+        const bool       want  = setting == nullptr || std::strcmp(setting, "cpu") != 0;
+        const bool       bogus = setting != nullptr && std::strcmp(setting, "bogus") == 0;
+        const char *     name  = setting != nullptr ? setting : "unset";
         ggml_init_params p    = { ggml_tensor_overhead() * 32, nullptr, true };
         ggml_context *   ctx  = ggml_init(p);
         REQUIRE(ctx != nullptr);
@@ -7356,118 +7333,30 @@ static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
                          table->tensor_layout(w), want ? "a layout" : "none", table->tensor_layout(w2d));
             g_failures++;
         }
-        expect(q8,
+        expect(false,
                ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 128, 64, 4),
                                ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, 512), ids2),
                "Q4_1 rows of 128 (not a multiple of 256)");
         expect(false, ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 48, 4), x1, ids2),
                "48 rows per expert (not a multiple of 32)");
+        const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_EXPERT_Q4_1=");
+        n_claims++;
+        n_claims_ok += warnings == (bogus ? 1 : 0);
+        if (warnings != (bogus ? 1 : 0)) {
+            std::fprintf(stderr, "FAIL: EXPERT_Q4_1=%s: %d warnings (wanted %d)\n", name, warnings, bogus ? 1 : 0);
+            g_failures++;
+        }
         ggml_free(ctx);
     }
 
-    for (const q41_arm & arm : k_q41_arms) {
-        check_mul_mat_id_q4_1_arm(dev, direct, cpu, arm, step_q, step_g);
-    }
-
-    // weights whose minimum is a whole multiple of their scale: the zero point is exact and -zp d is exact in fp16, so
-    // the read-back is the GGUF bytes and the comparison with the CPU on them holds to the ordinary bound
-    int    n_exact = 0, n_exact_ok = 0;
-    double worst_exact = 0.0;
-    {
-        env_override     zp4("FLAGOS_SPACEMIT_EXPERT_Q4_1", "zp4");
-        const int64_t    k = 256, n = 64, n_mats = 4, n_used = 2, n_tok = 7;
-        ggml_init_params pw     = { ggml_tensor_overhead() * 4, nullptr, true };
-        ggml_context *   ctx_wd = ggml_init(pw);
-        ggml_context *   ctx_wc = ggml_init(pw);
-        REQUIRE(ctx_wd != nullptr && ctx_wc != nullptr);
-        ggml_tensor * w_dev = ggml_new_tensor_3d(ctx_wd, GGML_TYPE_Q4_1, k, n, n_mats);
-        ggml_tensor * w_cpu = ggml_new_tensor_3d(ctx_wc, GGML_TYPE_Q4_1, k, n, n_mats);
-        ggml_set_name(w_dev, "blk.0.ffn_down_exps.weight");
-        ggml_backend_buffer_t buf_wd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wd, buft);
-        ggml_backend_buffer_t buf_wc = ggml_backend_alloc_ctx_tensors_from_buft(ctx_wc, ggml_backend_cpu_buffer_type());
-        REQUIRE(buf_wd != nullptr && buf_wc != nullptr);
-
-        // d a power of two (exact in fp16, and zp d too), the zero point 0 to 15, the nibbles from the test generator
-        const int64_t        blocks = k / 32 * n * n_mats;
-        std::vector<uint8_t> q((size_t) blocks * 20);
-        uint32_t             s = 7701;
-        const auto           next = [&s] { return s = s * 1664525u + 1013904223u, s >> 8; };
-        for (int64_t b = 0; b < blocks; b++) {
-            uint8_t *     blk = q.data() + (size_t) b * 20;
-            const float   d   = std::ldexp(1.0f, -3 - (int) (b % 5));
-            const int     zp  = (int) (next() % 16);
-            const int16_t hd  = (int16_t) ggml_fp32_to_fp16(d);
-            const int16_t hm  = (int16_t) ggml_fp32_to_fp16(-(float) zp * d);
-            std::memcpy(blk, &hd, 2);
-            std::memcpy(blk + 2, &hm, 2);
-            for (int i = 0; i < 16; i++) {
-                blk[4 + i] = (uint8_t) (next() & 0xFF);
-            }
-        }
-        std::vector<uint8_t> read(q.size());
-        ggml_backend_tensor_set(w_dev, q.data(), 0, q.size());
-        ggml_backend_tensor_get(w_dev, read.data(), 0, read.size());
-        const bool bit_for_bit = read == q;
-
-        ggml_backend_tensor_set(w_cpu, q.data(), 0, q.size());
-        ggml_init_params p     = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
-        ggml_context *   ctx_h = ggml_init(p);
-        ggml_context *   ctx_d = ggml_init(p);
-        REQUIRE(ctx_h != nullptr && ctx_d != nullptr);
-        ggml_tensor * x     = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, k, n_used, n_tok);
-        ggml_tensor * ids   = ggml_new_tensor_2d(ctx_h, GGML_TYPE_I32, n_used, n_tok);
-        ggml_tensor * y_ref = ggml_mul_mat_id(ctx_h, w_cpu, x, ids);
-        ggml_tensor * y     = ggml_mul_mat_id(ctx_d, w_dev, x, ids);
-        ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
-        ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, buft);
-        REQUIRE(bh != nullptr && bd != nullptr);
-        const std::vector<float> xv = random_values(ggml_nelements(x), 7702, 2.0f);
-        std::vector<int32_t>     iv((size_t) (n_used * n_tok));
-        for (size_t i = 0; i < iv.size(); i++) {
-            iv[i] = (int32_t) (i % (size_t) n_mats);
-        }
-        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
-        ggml_backend_tensor_set(ids, iv.data(), 0, iv.size() * sizeof(int32_t));
-        ggml_cgraph * g_cpu = ggml_new_graph(ctx_h);
-        ggml_build_forward_expand(g_cpu, y_ref);
-        ggml_cgraph * g_dev = ggml_new_graph(ctx_d);
-        ggml_build_forward_expand(g_dev, y);
-        ggml_backend_t backend = tcm_backend(dev, nullptr);
-        REQUIRE(backend != nullptr);
-        const bool ran = ggml_backend_graph_compute(cpu, g_cpu) == GGML_STATUS_SUCCESS &&
-                         ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
-        std::vector<float> out((size_t) ggml_nelements(y), NAN);
-        ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-        worst_exact = ran ? nmse(out.data(), (const float *) y_ref->data, ggml_nelements(y)) : -1.0;
-        n_exact     = 1;
-        n_exact_ok  = ran && bit_for_bit && worst_exact >= 0.0 && worst_exact <= k_mul_mat_max_nmse;
-        if (n_exact_ok == 0) {
-            std::fprintf(stderr,
-                         "FAIL: MUL_MAT_ID Q4_1 zp4, an exact zero point: %s, the read-back %s the GGUF bytes, NMSE "
-                         "against the CPU on them %.3e (bound %.0e)\n",
-                         ran ? "ran" : "failed", bit_for_bit ? "is" : "is not", worst_exact, k_mul_mat_max_nmse);
-            g_failures++;
-        }
-        ggml_backend_free(backend);
-        ggml_backend_buffer_free(bh);
-        ggml_backend_buffer_free(bd);
-        ggml_free(ctx_h);
-        ggml_free(ctx_d);
-        ggml_backend_buffer_free(buf_wd);
-        ggml_backend_buffer_free(buf_wc);
-        ggml_free(ctx_wd);
-        ggml_free(ctx_wc);
-    }
+    check_mul_mat_id_q4_1_min(dev, direct, cpu, step_q, step_g);
 
     ggml_backend_free(cpu);
-    std::printf("mmid     claims under FLAGOS_SPACEMIT_EXPERT_Q4_1 (unset, cpu, zp4, q8, exact and an unknown value: a "
-                "3-D Q4_1 weight has a layout and MUL_MAT_ID takes it under zp4, q8 and exact; 2-D Q4_1 keeps its "
-                "layout and MUL_MAT under every value; rows per expert not a multiple of 32 refused, K not a multiple "
-                "of 256 taken under q8 only) %d/%d\n",
+    std::printf("mmid     claims under FLAGOS_SPACEMIT_EXPERT_Q4_1 (unset, exact, cpu and an unknown value: a 3-D Q4_1 "
+                "weight has a layout and MUL_MAT_ID takes it under all but cpu, the unknown value warning once and "
+                "keeping the default; 2-D Q4_1 keeps its layout and MUL_MAT under every value; rows per expert not a "
+                "multiple of 32 and K not a multiple of 256 refused under every value) %d/%d\n",
                 n_claims_ok, n_claims);
-    std::printf("mmid     MUL_MAT_ID Q4_1 zp4 with an exact zero point (the minimum a whole multiple of the scale): "
-                "the read-back is the GGUF bytes and the CPU on them agrees at %.2e in %d/%d (bound %.0e)%s\n",
-                worst_exact, n_exact_ok, n_exact, k_mul_mat_max_nmse, reference_label());
     return 0;
 }
 
@@ -7711,7 +7600,8 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
 // same for every token, repeating within a token; a view of a wider I32 tensor (ARGSORT's output, its unused entries
 // out of range) or a tensor of their own. The activations: broadcast (one row per token), one row per id, one per two
 // ids. Q6_K, stored requantized to Q8_0, is compared with the GGUF weights (bound 5e-4) and with ggml's Q8_0 of them
-// (5e-6), as check_mul_mat does; a 3-D Q4_1 weight has no layout (Q4_1's is 2-D only) and is refused. Every case runs
+// (5e-6), as check_mul_mat does; a 3-D Q4_1 weight is claimed in the q4_1 min layout (check_mul_mat_id_q4_1 checks
+// its results), but not with K 128 (no layout). Every case runs
 // twice through the backend (8 tiles) and its two kernel entries directly on 1 and on 8 tiles: the four outputs bit
 // for bit. An id outside the experts fails the graph.
 // --full adds the model's shapes for Q8_0, Q6_K and Q5_0
@@ -7719,8 +7609,8 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
     // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions, so
     // they run there only with the reference kernels
     const bool direct = host || *reference_label() != '\0';
-    // today's default: a 3-D Q4_1 weight has no layout, so this check's claims and bytes do not depend on the caller's
-    // FLAGOS_SPACEMIT_EXPERT_Q4_1 (check_mul_mat_id_q4_1 sets it for its own weights)
+    // the default: a 3-D Q4_1 weight takes the q4_1 min layout, so this check's claims do not depend on the caller's
+    // FLAGOS_SPACEMIT_EXPERT_Q4_1
     env_override   q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -7783,19 +7673,29 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
         expect(true, placed, "Q4_0 in a zero-size buffer of our type");
         ggml_backend_buffer_free(w->buffer);
         w->buffer = nullptr;
-        // Q4_1's layout is 2-D only: a 3-D Q4_1 weight has none, so MUL_MAT_ID refuses it, also in our buffer
-        ggml_tensor * w1  = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 64, 4);
-        ggml_tensor * w12 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 256, 64);
-        n_claims += 2;
-        n_claims_ok += table->tensor_layout(w1) == 0;
+        // a 3-D Q4_1 weight takes the q4_1 min layout and is claimed, also in our buffer; with K 128 (not a multiple
+        // of 256) it has none and is refused, also in our buffer
+        ggml_tensor * w1   = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 64, 4);
+        ggml_tensor * w1_k = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 128, 64, 4);
+        ggml_tensor * w12  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 256, 64);
+        n_claims += 3;
+        n_claims_ok += table->tensor_layout(w1) != 0;
+        n_claims_ok += table->tensor_layout(w1_k) == 0;
         n_claims_ok += table->tensor_layout(w12) != 0;
-        CHECK(table->tensor_layout(w1) == 0 && table->tensor_layout(w12) != 0);
-        expect(false, ggml_mul_mat_id(ctx, w1, x1, ids2), "a 3-D Q4_1 weight (no layout)");
+        CHECK(table->tensor_layout(w1) != 0 && table->tensor_layout(w1_k) == 0 && table->tensor_layout(w12) != 0);
+        expect(true, ggml_mul_mat_id(ctx, w1, x1, ids2), "a 3-D Q4_1 weight");
         ggml_tensor * placed1 = ggml_mul_mat_id(ctx, w1, x2, ids_v);
         w1->buffer            = ggml_backend_buft_alloc_buffer(buft, 0);
-        expect(false, placed1, "a 3-D Q4_1 weight in a zero-size buffer of our type");
+        expect(true, placed1, "a 3-D Q4_1 weight in a zero-size buffer of our type");
         ggml_backend_buffer_free(w1->buffer);
-        w1->buffer = nullptr;
+        w1->buffer         = nullptr;
+        ggml_tensor * x1_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, 512);
+        expect(false, ggml_mul_mat_id(ctx, w1_k, x1_k, ids2), "a 3-D Q4_1 weight of K 128 (no layout)");
+        ggml_tensor * placed1_k = ggml_mul_mat_id(ctx, w1_k, x1_k, ids2);
+        w1_k->buffer            = ggml_backend_buft_alloc_buffer(buft, 0);
+        expect(false, placed1_k, "a 3-D Q4_1 weight of K 128 in a zero-size buffer of our type");
+        ggml_backend_buffer_free(w1_k->buffer);
+        w1_k->buffer = nullptr;
 
         expect(false, ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 48, 4), x1, ids2),
                "48 rows per expert (not a multiple of 32)");
@@ -8087,10 +7987,10 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
                 "%.2e), Q5_0 %.2e (%d) (bounds %.0e and %.0e)%s\n",
                 n_ok, n_total, n_same, n_total, worst[0], n_runs[0], worst[1], n_runs[1], worst[2], n_runs[2],
                 worst_q8[2], worst[3], n_runs[3], k_mul_mat_max_nmse, k_requant_max_nmse, kernels_used);
-    std::printf("mmid     claims and refused forms (a 3-D Q4_1 weight has no layout, also in our buffer; rows per "
-                "expert not a multiple of 32, Q4_0 rows not a multiple of 256, F32 and Q4_K weights, a viewed weight, "
-                "F16 or strided activations, a CPU-buffer weight, MUL_MAT on a 3-D weight) %d/%d; ids outside the "
-                "experts fail the graph %d/%d\n",
+    std::printf("mmid     claims and refused forms (a 3-D Q4_1 weight claimed, but not of K 128, also in our buffer; "
+                "rows per expert not a multiple of 32, Q4_0 rows not a multiple of 256, F32 and Q4_K weights, a viewed "
+                "weight, F16 or strided activations, a CPU-buffer weight, MUL_MAT on a 3-D weight) %d/%d; ids outside "
+                "the experts fail the graph %d/%d\n",
                 n_claims_ok, n_claims, n_bad_ok, n_bad);
     std::printf("info     MUL_MAT_ID Q6_K against the CPU on the weight's read-back (the nearest Q6_K to the stored "
                 "Q8_0, what test-backend-ops' CPU computes with): max NMSE %.2e, at test-backend-ops' three Q6_K "

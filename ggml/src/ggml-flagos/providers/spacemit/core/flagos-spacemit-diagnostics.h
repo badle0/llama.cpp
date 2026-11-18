@@ -55,7 +55,7 @@ bool spacemit_quantize_shared();
 bool spacemit_ssm_conv_fused();
 
 // FLAGOS_SPACEMIT_STATE: unset, empty or direct (the default) runs each state pass (spacemit_state_pass) as one step
-// that reads and writes the persistent state row itself; copy keeps today's GET_ROWS, GATED_DELTA_NET and CPY steps.
+// that reads and writes the persistent state row itself; copy runs it as its GET_ROWS, GATED_DELTA_NET and CPY steps.
 // Read at every graph, as FLAGOS_SPACEMIT_SSM_CONV; an unknown value is reported once and ignored (direct)
 bool spacemit_state_direct();
 

@@ -104,7 +104,7 @@ bool spacemit_ai_gate_available() {
 
 //
 // memory: host memory on huge pages where the system has them, else 64-byte aligned; Q4_0, Q4_1, Q8_0, Q6_K and Q5_0
-// matmul weights (2-D, and 3-D experts; a 3-D Q4_1 one only under FLAGOS_SPACEMIT_EXPERT_Q4_1) are stored in IME
+// matmul weights (2-D, and 3-D experts; a 3-D Q4_1 one not under FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu) are stored in IME
 // layouts (flagos-spacemit-weights.h), a Q4_1, Q6_K or Q5_0 weight in more than ggml_nbytes
 // (tensor_alloc_size). set, get and fill work in ggml's layout within ggml_nbytes; only the repack and its inverse
 // touch the stored bytes beyond it.
