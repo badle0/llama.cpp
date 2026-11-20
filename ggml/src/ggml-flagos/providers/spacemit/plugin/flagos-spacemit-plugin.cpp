@@ -175,6 +175,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     (void) spacemit_repack_via();
     (void) spacemit_expert_q4_1();
     spacemit_gdn_read_switch();
+    spacemit_mm_f32_read_switch();
     return SPACEMIT_STATUS_SUCCESS;
 }
 

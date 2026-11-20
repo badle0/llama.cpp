@@ -9,7 +9,9 @@
 #include "../../../../ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 // Reference kernels for the Gated DeltaNet layers' remaining ops (plan.md "Step 2 spec", pieces D to G). Each follows
@@ -237,11 +239,110 @@ void ssm_conv_stashed_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     }
 }
 
+// FLAGOS_SPACEMIT_MM_F32: blocked (unset or empty, the default): the tiles split the larger of the weight rows and
+// the token rows, and a tile takes its token rows in blocks of 16; rows: the split over the token rows and the order
+// before it, kept for the comparison run and removed with it (plan.md "The float matmul: all tiles for one token,
+// blocks for a prompt"). Parsed once (spacemit_cached_switch; the check program resets between its settings);
+// anything else warns once per parse generation and keeps the default
+enum class mm_f32_setting { blocked, rows };
+
+int parse_mm_f32_setting() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_MM_F32");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "blocked") == 0) {
+        return (int) mm_f32_setting::blocked;
+    }
+    if (std::strcmp(v, "rows") == 0) {
+        return (int) mm_f32_setting::rows;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MM_F32=%s: not blocked or rows, the default (blocked) kept\n", __func__, v);
+    }
+    return (int) mm_f32_setting::blocked;
+}
+
+mm_f32_setting mm_f32_setting_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return static_cast<mm_f32_setting>(spacemit_cached_switch(value, seen, parse_mm_f32_setting));
+}
+
 // MUL_MAT of an F32 2-D weight by F32 activations (spacemit_mul_mat_f32_supported): one dot product per output
 // element, a weight row against an activation row, summed in float; the weight broadcasts over the activations'
-// higher dimensions. The output's rows are split over the tiles. ggml-cpu adds in vector lanes (ggml_vec_dot_f32) or
-// through llamafile's sgemm, so these sums are not its bits, only within test-backend-ops' bound
+// higher dimensions. ggml-cpu adds in vector lanes (ggml_vec_dot_f32) or through llamafile's sgemm, so these sums are
+// not its bits, only within test-backend-ops' bound.
+//
+// The default (blocked) splits the larger of the N weight rows and the R token rows over the tiles, as ggml-cpu does
+// for the op (ggml-cpu.c:1413), and takes a tile's token rows in blocks of 16: one token then uses every tile, and a
+// group of 4 weight rows is read once per block instead of once per token row. The rows setting keeps the split over
+// the token rows, where one token was one tile's work and a prompt read the whole weight once per token row; it and
+// its functions go once the K3 comparison run has decided. No output depends on another and each keeps its operations
+// in its order, so both forms give the same bytes
+
+// a tile's share: the weight rows in units of 4, all token rows, where the weight rows outnumber them; else all weight
+// rows and today's split of the token rows
+void mm_f32_share(int64_t n_weight, int64_t n_token, const spacemit_tile & tile, int64_t & w0, int64_t & w1,
+                  int64_t & t0, int64_t & t1) {
+    if (n_weight > n_token) {
+        int64_t u0, u1;
+        tile_range((n_weight + 3) / 4, tile, u0, u1);
+        w0 = std::min(n_weight, 4 * u0);
+        w1 = std::min(n_weight, 4 * u1);
+        t0 = 0;
+        t1 = n_token;
+        return;
+    }
+    w0 = 0;
+    w1 = n_weight;
+    tile_range(n_token, tile, t0, t1);
+}
+
+constexpr int64_t mm_f32_block = 16;  // token rows per block, ggml-cpu's blck_1 (ggml-cpu.c:1203)
+
+// one output element, the reference's sum in its order
+float mm_f32_dot_ref(const float * w, const float * x, int64_t k_end) {
+    float sum = 0.0f;
+    for (int64_t k = 0; k < k_end; ++k) {
+        sum += w[k] * x[k];
+    }
+    return sum;
+}
+
 void mul_mat_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // the weight [K, N]
+    const ggml_tensor * src1 = dst->src[1];  // the activations [K, rows, ...]
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    int64_t w0, w1, t0, t1;
+    mm_f32_share(ne0, ne1 * ne2 * ne3, tile, w0, w1, t0, t1);
+    for (int64_t tb = t0; tb < t1; tb += mm_f32_block) {
+        const int64_t n_rows = std::min(mm_f32_block, t1 - tb);
+        const float * xs[mm_f32_block];
+        float *       ys[mm_f32_block];
+        for (int64_t j = 0; j < n_rows; ++j) {
+            const int64_t ir = tb + j;
+            const int64_t i3 = ir / (ne2 * ne1);
+            const int64_t i2 = (ir / ne1) % ne2;
+            const int64_t i1 = ir % ne1;
+
+            xs[j] = (const float *) ((const char *) src1->data + i1 * nb11 + i2 * nb12 + i3 * nb13);
+            ys[j] = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        }
+        for (int64_t r = w0; r < w1; r += 4) {
+            const int64_t n_w = std::min((int64_t) 4, w1 - r);
+            for (int64_t j = 0; j < n_rows; ++j) {
+                for (int64_t i = 0; i < n_w; ++i) {
+                    const float * w = (const float *) ((const char *) src0->data + (r + i) * nb01);
+                    ys[j][r + i]    = mm_f32_dot_ref(w, xs[j], ne00);
+                }
+            }
+        }
+    }
+}
+
+// the rows setting's reference: the output's rows split over the tiles, each token row through every weight row
+void mul_mat_f32_rows_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // the weight [K, N]
     const ggml_tensor * src1 = dst->src[1];  // the activations [K, rows, ...]
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -626,11 +727,87 @@ float rvv_sum_f32m2(vfloat32m2_t acc, size_t vlmax) {
     return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m2_f32m1(acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlmax));
 }
 
-// ours, not a port: the reference's rows and split, each dot product in m2 lanes over strips of K (a short last strip
-// keeps the lanes past its vl, tail undisturbed) and summed across the lanes at the end, so the sums are not the
-// reference's bits. Four weight rows share each strip of x: 4 accumulators, x and 4 weight strips take 18 of the 32
-// registers. A row's sum does not depend on its block, so the rows past the last 4 take the same order one at a time
+// ours, not a port: each dot product in m2 lanes over strips of K (a short last strip keeps the lanes past its vl,
+// tail undisturbed) and summed across the lanes at the end, so the sums are not the reference's bits. Four weight rows
+// share each strip of x: 4 accumulators, x and 4 weight strips take 18 of the 32 registers. A row's sum does not
+// depend on its group, so the rows past the last 4 take the same order one at a time
+void rvv_dot4_f32m2(const float * w0, const float * w1, const float * w2, const float * w3, const float * x,
+                    int64_t k_end, size_t vlmax, float * y) {
+    vfloat32m2_t a0 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+    vfloat32m2_t a1 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+    vfloat32m2_t a2 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+    vfloat32m2_t a3 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+    for (int64_t k = 0; k < k_end;) {
+        const size_t       vl = __riscv_vsetvl_e32m2(k_end - k);
+        const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + k, vl);
+        a0 = __riscv_vfmacc_vv_f32m2_tu(a0, __riscv_vle32_v_f32m2(w0 + k, vl), xv, vl);
+        a1 = __riscv_vfmacc_vv_f32m2_tu(a1, __riscv_vle32_v_f32m2(w1 + k, vl), xv, vl);
+        a2 = __riscv_vfmacc_vv_f32m2_tu(a2, __riscv_vle32_v_f32m2(w2 + k, vl), xv, vl);
+        a3 = __riscv_vfmacc_vv_f32m2_tu(a3, __riscv_vle32_v_f32m2(w3 + k, vl), xv, vl);
+        k += (int64_t) vl;
+    }
+    y[0] = rvv_sum_f32m2(a0, vlmax);
+    y[1] = rvv_sum_f32m2(a1, vlmax);
+    y[2] = rvv_sum_f32m2(a2, vlmax);
+    y[3] = rvv_sum_f32m2(a3, vlmax);
+}
+
+void rvv_dot1_f32m2(const float * w, const float * x, int64_t k_end, size_t vlmax, float * y) {
+    vfloat32m2_t a = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
+    for (int64_t k = 0; k < k_end;) {
+        const size_t       vl = __riscv_vsetvl_e32m2(k_end - k);
+        const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + k, vl);
+        a                     = __riscv_vfmacc_vv_f32m2_tu(a, __riscv_vle32_v_f32m2(w + k, vl), xv, vl);
+        k += (int64_t) vl;
+    }
+    y[0] = rvv_sum_f32m2(a, vlmax);
+}
+
+// the reference's share and blocks with the dots above
 void mul_mat_f32_rvv(const spacemit_tile & tile, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // the weight [K, N]
+    const ggml_tensor * src1 = dst->src[1];  // the activations [K, rows, ...]
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t vlmax = __riscv_vsetvlmax_e32m2();
+    int64_t      w0, w1, t0, t1;
+    mm_f32_share(ne0, ne1 * ne2 * ne3, tile, w0, w1, t0, t1);
+    for (int64_t tb = t0; tb < t1; tb += mm_f32_block) {
+        const int64_t n_rows = std::min(mm_f32_block, t1 - tb);
+        const float * xs[mm_f32_block];
+        float *       ys[mm_f32_block];
+        for (int64_t j = 0; j < n_rows; ++j) {
+            const int64_t ir = tb + j;
+            const int64_t i3 = ir / (ne2 * ne1);
+            const int64_t i2 = (ir / ne1) % ne2;
+            const int64_t i1 = ir % ne1;
+
+            xs[j] = (const float *) ((const char *) src1->data + i1 * nb11 + i2 * nb12 + i3 * nb13);
+            ys[j] = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        }
+        for (int64_t r = w0; r < w1; r += 4) {
+            if (r + 4 <= w1) {
+                const float * p0 = (const float *) ((const char *) src0->data + (r + 0) * nb01);
+                const float * p1 = (const float *) ((const char *) src0->data + (r + 1) * nb01);
+                const float * p2 = (const float *) ((const char *) src0->data + (r + 2) * nb01);
+                const float * p3 = (const float *) ((const char *) src0->data + (r + 3) * nb01);
+                for (int64_t j = 0; j < n_rows; ++j) {
+                    rvv_dot4_f32m2(p0, p1, p2, p3, xs[j], ne00, vlmax, ys[j] + r);
+                }
+                continue;
+            }
+            for (int64_t rr = r; rr < w1; ++rr) {
+                const float * p = (const float *) ((const char *) src0->data + rr * nb01);
+                for (int64_t j = 0; j < n_rows; ++j) {
+                    rvv_dot1_f32m2(p, xs[j], ne00, vlmax, ys[j] + rr);
+                }
+            }
+        }
+    }
+}
+
+// the rows setting's kernel: the output's rows split over the tiles, each token row through every weight row
+void mul_mat_f32_rows_rvv(const spacemit_tile & tile, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // the weight [K, N]
     const ggml_tensor * src1 = dst->src[1];  // the activations [K, rows, ...]
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -651,34 +828,11 @@ void mul_mat_f32_rvv(const spacemit_tile & tile, ggml_tensor * dst) {
             const float * w1 = (const float *) ((const char *) src0->data + (r + 1) * nb01);
             const float * w2 = (const float *) ((const char *) src0->data + (r + 2) * nb01);
             const float * w3 = (const float *) ((const char *) src0->data + (r + 3) * nb01);
-            vfloat32m2_t  a0 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
-            vfloat32m2_t  a1 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
-            vfloat32m2_t  a2 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
-            vfloat32m2_t  a3 = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
-            for (int64_t k = 0; k < ne00;) {
-                const size_t       vl = __riscv_vsetvl_e32m2(ne00 - k);
-                const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + k, vl);
-                a0 = __riscv_vfmacc_vv_f32m2_tu(a0, __riscv_vle32_v_f32m2(w0 + k, vl), xv, vl);
-                a1 = __riscv_vfmacc_vv_f32m2_tu(a1, __riscv_vle32_v_f32m2(w1 + k, vl), xv, vl);
-                a2 = __riscv_vfmacc_vv_f32m2_tu(a2, __riscv_vle32_v_f32m2(w2 + k, vl), xv, vl);
-                a3 = __riscv_vfmacc_vv_f32m2_tu(a3, __riscv_vle32_v_f32m2(w3 + k, vl), xv, vl);
-                k += (int64_t) vl;
-            }
-            y[r + 0] = rvv_sum_f32m2(a0, vlmax);
-            y[r + 1] = rvv_sum_f32m2(a1, vlmax);
-            y[r + 2] = rvv_sum_f32m2(a2, vlmax);
-            y[r + 3] = rvv_sum_f32m2(a3, vlmax);
+            rvv_dot4_f32m2(w0, w1, w2, w3, x, ne00, vlmax, y + r);
         }
         for (; r < ne0; ++r) {
             const float * w = (const float *) ((const char *) src0->data + r * nb01);
-            vfloat32m2_t  a = __riscv_vfmv_v_f_f32m2(0.0f, vlmax);
-            for (int64_t k = 0; k < ne00;) {
-                const size_t       vl = __riscv_vsetvl_e32m2(ne00 - k);
-                const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + k, vl);
-                a                     = __riscv_vfmacc_vv_f32m2_tu(a, __riscv_vle32_v_f32m2(w + k, vl), xv, vl);
-                k += (int64_t) vl;
-            }
-            y[r] = rvv_sum_f32m2(a, vlmax);
+            rvv_dot1_f32m2(w, x, ne00, vlmax, y + r);
         }
     }
 }
@@ -784,13 +938,26 @@ bool spacemit_kernel_ssm_conv_f32_stashed(const spacemit_tile * tile_p, ggml_ten
     return true;
 }
 
+void spacemit_mm_f32_read_switch() {
+    (void) mm_f32_setting_from_env();
+}
+
 bool spacemit_kernel_mul_mat_f32(const spacemit_tile * tile_p, ggml_tensor * dst) {
+    const bool rows = mm_f32_setting_from_env() == mm_f32_setting::rows;
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference()) {
-        mul_mat_f32_rvv(*tile_p, dst);
+        if (rows) {
+            mul_mat_f32_rows_rvv(*tile_p, dst);
+        } else {
+            mul_mat_f32_rvv(*tile_p, dst);
+        }
         return true;
     }
 #endif
-    mul_mat_f32_ref(*tile_p, dst);
+    if (rows) {
+        mul_mat_f32_rows_ref(*tile_p, dst);
+    } else {
+        mul_mat_f32_ref(*tile_p, dst);
+    }
     return true;
 }

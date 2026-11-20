@@ -14,6 +14,8 @@ bool spacemit_kernel_l2_norm_f32(const spacemit_tile * tile, ggml_tensor * dst);
 bool spacemit_kernel_ssm_conv_f32(const spacemit_tile * tile, ggml_tensor * dst);
 bool spacemit_kernel_concat_f32(const spacemit_tile * tile, ggml_tensor * dst);
 bool spacemit_kernel_mul_mat_f32(const spacemit_tile * tile, ggml_tensor * dst);
+// reads FLAGOS_SPACEMIT_MM_F32 (blocked or rows) at registration, as spacemit_embd_read_switch does
+void spacemit_mm_f32_read_switch();
 
 // the convolution pair (core/flagos-spacemit-ops.h spacemit_conv_pair; layout in the .cpp): concat.f32.tail writes the
 // CONCAT's true last 3 columns and, in the rest of its buffer, the convolution's input token-major; ssm_conv.f32.stashed
