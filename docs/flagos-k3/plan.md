@@ -3459,7 +3459,7 @@ On the Mac (rerun by me): the build without warnings. The check program fails on
 
 ### The token table's pages: load without mmap (2026-11-20)
 
-**Status:** built 2026-11-20 after the probe below: one line and its check, by me; checked on the Mac; not run on the K3. It changes llama.cpp's default load mode on this device for every model, so the user decides at the commit. If the K3 run fails the rule below, the line goes back and the provider keeps the table in memory itself.
+**Status:** built 2026-11-20 after the probe below (one line and its check, by me), committed by the user as `f7ac31ef8` and run on the K3 the same day. The lookup is fixed. The load was 6.8% slower in the one pair of that run, over the 5% bar; the user asked for repeated loads before anything changed, and over twelve loads the two modes do not differ (1.6% on the loads that decide, inside either mode's own spread). So the rule holds on all four points and the change stays: the default load mode on the K3 is `none`.
 
 **The probe (2026-11-20, the user's run with the removal's; logs `~/k3-logs/f32r`; no code).** Two llama-bench loads of Qwen3.6-35B-A3B one after the other (`-p 32 -n 0 -r 3`): before each, the model file's bytes in the page cache (`fincore`); during each, the process's page faults once a second (`/proc/<pid>/stat`); after each, the op table.
 
@@ -3495,6 +3495,44 @@ On the Mac (rerun by me): the build without warnings. The check program fails on
 If 3 fails, the reading above is wrong. If only 4 fails, the line goes back and the provider pins the table itself (a spec then).
 
 **Estimates.** The lookup back at 0.06 ms a 32-token graph and pp32 near 52.4 t/s (32 tokens in 610 ms); a few major faults under the default; its load between 15% faster and 5% slower than `-lm mmap`'s.
+
+*On the K3 (2026-11-20; build `f7ac31ef8`, logs `~/k3-logs/lm`; the user's run; one session, `-lm mmap` first, each mode's llama-bench before its completion; the op counters on in all four).* The build has no error line and compiled the core file once; the check program prints no FAIL line and "all checks passed".
+
+| | `-lm mmap` | the default (`load_mode = none`) |
+|---|---|---|
+| The file's bytes in the page cache before: the bench, the completion | 11.42, 11.41 GiB | 11.30, 10.82 GiB |
+| Major page faults: the bench, the completion | 2,651, 2,382 | 14, 9 |
+| The lookup, ms a 32-token graph: the first graph, then the 3 counted | 41.0, 14.3 | 10.3, 0.045 |
+| The 32-token graph, ms: all of it, without the lookup | 630.5, 616.2 | 616.8, 616.8 |
+| pp32, t/s | 50.56 +- 0.50 | 51.69 +- 0.58 |
+| The completion's load time | 31.32 s | 33.46 s (+6.8%) |
+| Its tensors: to the buffers' sizes, then to the context | 11.87 + 18.13 s | 0.02 + 32.02 s |
+| The lookup at the 501-token prompt, ms | 15.72 | 1.07 |
+| Prompt, ms for 501 tokens; a generated token, ms | 6,073.12; 105.80 | 6,092.58; 105.95 |
+| The processes by the sampler: the bench, the completion | 32, 43 s | 32, 46 s |
+
+- **The rule in this run:** 1 holds; 2 holds (the log says `load_mode = none`, the two texts are the same bytes and the f32 run's); 3 holds, the counted lookups at 0.045 ms; 4 fails on its one pair, the default's load 6.8% above `-lm mmap`'s against a bar of 5%.
+- **One pair does not carry point 4.** mmap's own load had been 26.17 s (the f32 run), 26.91 s (the run before it) and 31.32 s here, its copy part 13.0 s in the f32 run and 18.1 s here, and the two benches' processes lasted the same 32 s by the sampler. Hence the repeated loads below.
+- **The reading of the probe holds.** With the table in anonymous memory the counted lookups are warm and the process takes no major fault after its start. The first graph's 10.3 ms under the default is not storage: a process's first graph cost 9.18 ms with a warm table before (`~/k3-logs/ex3`).
+- **The text prompt hardly shows it.** Its lookup is 15.72 ms with the file mapped and 1.07 ms without, in a prompt of 6.07 s; the prompt repeats one sentence, about ten distinct tokens, so it is the mild case. A varied first prompt is not measured yet (the next section's run).
+- **The sampler's new column is empty:** the board gave nothing from `/proc/<pid>/io`, so the bytes read from storage are not measured (the one part of the block not tried on the Mac but on a stand-in file).
+- With the file mapped the counted lookups took 14.3 ms in this session, against 31 to 52 ms in the earlier ones: which pages the kernel drops differs from load to load.
+
+*Repeated loads (2026-11-20, the user's question before any change: is 6.8% over the bar, or noise? Logs `~/k3-logs/ld`; the same build, flags only, no code).* Twelve loads of the model, a one-token completion each, the load time from its log: pairs of `-lm mmap` and of `-lm none` in turn, three pairs of each. The second load of a pair follows a load of its own mode, the usual case, so by the rule set before the run the three second loads of each mode decide.
+
+| Load time, s | `-lm mmap` | `-lm none` | `none` against `mmap` |
+|---|---|---|---|
+| The second load of each pair (decides) | 33.44, 36.29, 40.19: mean 36.64 | 35.41, 37.55, 38.69: mean 37.22 | +1.6% |
+| The first load of each pair (after the other mode) | 35.43, 41.64, 40.94: mean 39.34 | 36.99, 40.20, 34.97: mean 37.39 | -5.0% |
+| All six | mean 37.99, standard deviation 3.38 | mean 37.30, standard deviation 1.97 | -1.8% |
+
+- **Point 4 holds:** 1.6% against a bar of 5%. The two modes do not differ measurably: a mode's own loads spread over 8.2 s (`mmap`) and 5.2 s (`none`), the means lie 0.6 s apart, and over all twelve loads `none` is the faster by 1.8%. The 6.8% of the first pair was the spread.
+- `none` is the steadier, and a mapped load after a `none` load is the slowest kind (39.34 s): the page cache holds 11.4 GiB of the file after a mapped load and 10.9 GiB after a read one (`fincore` before each load).
+- Every load of this run is slower than the earlier sessions' (33 to 42 s against 26 to 31 s), in both modes and in each part: with the file mapped, 15.6 to 20.2 s to the buffers' sizes (11.8 s before) and 16.4 to 21.0 s for the copy. Twelve loads within about eight minutes, or another user of the board; not looked into.
+
+*Kept (2026-11-20).* `mmap_support` stays `false` as committed in `f7ac31ef8`, which the board already runs. The cost stands: small models start 5 to 6% slower (2026-11-05). `--load-mode mmap` gives the former behaviour, and with it the cold table on a model this large.
+
+*Not taken: the table read in by the provider.* After the first pair, asked with the three ways open, the user chose to go back to mmap and have the core read the table through once at the first checked graph (a byte a page, once per backend context and table, a comparison switch for one K3 run). It was built by a coder and checked on the Mac by me (the diff read, the build and the check programs rerun: its check 33/33, the 6 known `conv pair` failures only, the same text with and without it), then set aside uncommitted when the repeated loads showed the default has no load-time cost to avoid. The patch is `~/k3-logs/pre-read-2026-11-20.patch` on the Mac and applies on `f7ac31ef8`; it is the fix if `--load-mode mmap` ever has to be fast on a large model. Not run on the K3; its Linux-only residency test was never compiled.
 
 ### Not planned
 
