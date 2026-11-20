@@ -154,7 +154,8 @@ Each gap: the deck, our code, what it costs today, what closes it, and whose it 
 - Fits: events optional. Ours reports no async and no events (`:847-861`, `:766-783`); the deck says the core then
   runs synchronously, which is what the scheduler does with us today.
 - Fits, with a note: `mmap_support` true (`:858`): llama.cpp reads the file through its mapping and writes each weight
-  whole into our buffer (`plan.md` §1), which the repack needs.
+  whole into our buffer (`plan.md` §1), which the repack needs. False since 2026-11-20: llama.cpp then reads each
+  tensor into a buffer and still writes it whole (`plan.md` "The token table's pages: load without mmap").
 
 ### 4.2 L1, Common planning (fusion scan, required outputs and aliases, plan cache)
 

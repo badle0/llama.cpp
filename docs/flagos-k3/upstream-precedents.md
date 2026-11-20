@@ -158,7 +158,7 @@ Who reports what (read in the code):
 | Hexagon | false (`:968-971`) | false (`:3034`) | false | false | tiles in `set_tensor` |
 | CANN | false (`U ggml-cann.cpp:1585-1588`) | | | | NZ and Q4_0/Q8_0 conversions (F10) |
 | OpenCL, RPC, virtgpu | null | | | | |
-| ours | false (`flagos-spacemit.cpp:225`) | false (`:858`, `:907`) | false (`:857`, `:906`) | true | IME layouts in `set_tensor`, converted back in `get_tensor` |
+| ours | false (`flagos-spacemit.cpp:225`) | false (`:858`, `:907`) | false (`:857`, `:906`) | false since 2026-11-20, true before (`plan.md` "The token table's pages: load without mmap") | IME layouts in `set_tensor`, converted back in `get_tensor` |
 
 The reason is the definition: `is_host` means "tensor data is in host memory and uses standard ggml tensor layout"
 (`U ggml-backend-impl.h:31`), and llama.cpp relies on both halves: without mmap it reads the file straight into such a

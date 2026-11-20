@@ -3455,6 +3455,47 @@ On the Mac (rerun by me): the build without warnings. The check program fails on
 
 *Next for this kernel, by these figures (none planned yet).* At 3.7e9 multiply-adds a second per tile the blocked form is at the rate the inner loop gives with everything in cache, so more needs the loop itself (4 weight rows by 2 token rows, or more per pass: estimate 1.3 to 1.5 times, 80 to 115 ms of a 501-token graph) or the router in int8. One token is memory bound at 22 GB/s: staging a tile's 262 KB share through its TCM, as the int8 path does, is worth at most about 0.9 ms a token if it reaches that path's 28 GB/s (estimate).
 
+*The removal on the K3 (2026-11-20; build `e3e636276`, logs `~/k3-logs/f32r`; the user's run).* The build has no error line and compiled `flagos-spacemit-seq.cpp` once; the check program prints no FAIL line, `mmf32` 16/16 shapes and 179/179, and "all checks passed". `--bench-f32` gives the default column of the run before: 0.118, 0.660, 2.367 and 9.180 ms a call at [2048, 256] by 1, 32, 128 and 501 tokens, 0.030 and 1.206 ms at [2048, 32] by 1 and 501 (before: 0.118, 0.660, 2.365, 9.176, 0.030, 1.209). Two llama-bench loads at 32 tokens: the graph without the token lookup 610.1 and 612.4 ms (610.1 before), pp32 49.25 +- 0.77 and 49.56 +- 1.13 with the lookup slow in both (next section).
+
+### The token table's pages: load without mmap (2026-11-20)
+
+**Status:** built 2026-11-20 after the probe below: one line and its check, by me; checked on the Mac; not run on the K3. It changes llama.cpp's default load mode on this device for every model, so the user decides at the commit. If the K3 run fails the rule below, the line goes back and the provider keeps the table in memory itself.
+
+**The probe (2026-11-20, the user's run with the removal's; logs `~/k3-logs/f32r`; no code).** Two llama-bench loads of Qwen3.6-35B-A3B one after the other (`-p 32 -n 0 -r 3`): before each, the model file's bytes in the page cache (`fincore`); during each, the process's page faults once a second (`/proc/<pid>/stat`); after each, the op table.
+
+| | load 1 | load 2 |
+|---|---|---|
+| The file's bytes in the page cache before the load, of 19.40 GiB | 9.07 GiB (47%) | 11.41 GiB (59%) |
+| Major page faults by the end | 1,979 | 2,045 |
+| Of them in the load's first part | 0 in the first 24 s of 40 | 19 in the first 19 s of 32 |
+| `GET_ROWS token_embd`, ms a 32-token graph: the first graph, then the 3 counted | 63.0, 37.5 | 31.5, 31.2 |
+| The 8 tiles of the counted graphs, 4 rows each | 14.4 to 33.7 ms | 10.0 to 25.1 ms |
+| The graph without the lookup, ms | 610.1 | 612.4 |
+| pp32, t/s | 49.25 +- 0.77 | 49.56 +- 1.13 |
+
+- **The lookups wait on storage.** A warm lookup of 32 rows takes 0.06 ms (the op table of `~/k3-logs/ex3`); here a tile needs 2.5 to 8.4 ms a row. In each load's last three seconds, where the 4 graphs run, the process takes 90 and 63 major faults for 128 looked-up rows (the sampler is a second coarse, so the load's last faults may be among them).
+- **llama-bench makes every repetition the worst case.** It draws each prompt's tokens from `std::rand()`, never seeded (`tools/llama-bench/llama-bench.cpp:2127-2129`), so each repetition looks up 32 other rows of the table's 248,320 (1,152 bytes a row, 272.81 MiB), and by the code both loads draw the same rows in the same order. Load 2 needed storage for rows load 1 had read half a minute before, so their pages were dropped in between, during load 2's own load. A text prompt repeats tokens: it pays for the distinct pages it touches, once (not measured).
+- **The file and the provider's copy do not fit together.** The default load maps the file and populates the mapping (`src/llama-mmap.cpp:455`, `MAP_POPULATE`), copies each weight into the provider's buffer (`src/llama-model-loader.cpp:1569`) and then unmaps all but the tensors the CPU keeps (`:1677-1685`): the token table, the only one. 19.40 GiB of file and 18.44 GiB of copy are 37.8 GiB on a board with 31.3 GiB and no swap, so the kernel drops file pages during every load. The file was at most 59% cached, so by those figures each load fetches 8 to 10 GiB again (the bytes read are measured in the next run), and the load's second part, where the copy runs, takes about 2,000 major faults (by the timing; the probe does not mark the load's parts). Nothing touches the table during the load, so its pages are among those the kernel may drop. Which go is its choice, and the sessions differ: 0.06 ms in one first load, 3.1 ms in another, 31 to 63 ms otherwise.
+- The completion run of the same day (`~/k3-logs/f32/gen.err`) shows the load's two parts: 11.8 s from the start of the tensors to the buffers' sizes (the file mapped and populated, the buffers made), 13.0 s for the copy.
+
+**What upstream does.** llama.cpp's default load mode is `auto` since #26081 (2026-08-11, `153d324bc`, "add default load-mode auto, which avoids mmap on iGPUs"): mmap, unless a device reports that it does not support it (`src/llama-model.cpp:1276-1284`). The pull request's description, fetched 2026-11-20 through a summarizing tool: "mmap is detrimental on iGPUs that have to copy the model to device-visible, but still shared memory, as that means during loading it will have the model in RAM twice, doubling the memory requirements temporarily and slowing down the process if it overflows." Vulkan reports no mmap support for integrated GPUs (`ggml-vulkan.cpp:17894`), the AMD provider for its IGPU (`providers/amd/flagos-amd.cpp:5767`), the Denglin provider always (`providers/denglin/flagos-denglin.cpp:2446`). Our device is an IGPU by type (D3) and reported `true`.
+
+**The change.** `spacemit_device_props` reports `mmap_support` false (`core/flagos-spacemit.cpp`), and `flagos-check-spacemit` checks it. Under `auto` llama.cpp then reads each tensor into a buffer and hands it whole to `set_tensor` (`src/llama-model-loader.cpp:1636-1640`; the chunked upload beside it needs `async`, `host_buffer` and `events`, none of which the device has), as `--load-mode none` did in the start-up split of 2026-11-05. The token table is read into the CPU's own buffer: anonymous memory, which a board without swap cannot drop. `--load-mode mmap` (llama-bench `-lm mmap`) gives the former behaviour.
+
+**Known cost.** Small models start slower: `--load-mode none` took 6.2% longer to `/health` on Qwen3-4B (11.72 against 11.04 s) and 5.1% on Qwen3-0.6B (4.51 against 4.29 s) on 2026-11-05 ("The start-up split"), the weights stage 0.86 and 0.23 s longer; their first requests took the same. On Qwen3.6-35B-A3B the load time is not predicted: the read adds a copy, and the mapping's populate pass and the re-reads go.
+
+**Checks on the Mac** (simulated device). The two changed files compile without warnings. The four FlagOS check programs pass; `flagos-check-spacemit` fails the 6 known `conv pair` cases only, the new check among its passes. Qwen3.5-4B's completion (the 501-token prompt, 16 tokens) is the same text under the default, `-lm mmap` and `-lm none`; the default's log says `load_mode = none` and "CPU model buffer size" where `-lm mmap`'s says "CPU_Mapped model buffer size". The K3 block's four runs on Qwen3.5-0.8B, in bash and in zsh: both tools take the flag, the two modes the same text.
+
+**The K3 run and its rule (set before the run).** One session, the build and the check program first. Then for `-lm mmap` and for the default: a llama-bench at 32 tokens and a completion of the 501-token prompt, the bench first so that the completion's load follows a load of its own mode; each under the once-a-second sampler, now with the bytes read from storage (`/proc/<pid>/io`), and with the op table. The change stays if all four hold:
+1. the check program passes;
+2. the default's log says `load_mode = none`, and its text is `-lm mmap`'s;
+3. the default's lookup takes at most 1 ms a 32-token graph;
+4. the default's load time, by the completion's log, is at most 5% above `-lm mmap`'s.
+
+If 3 fails, the reading above is wrong. If only 4 fails, the line goes back and the provider pins the table itself (a spec then).
+
+**Estimates.** The lookup back at 0.06 ms a 32-token graph and pp32 near 52.4 t/s (32 tokens in 610 ms); a few major faults under the default; its load between 15% faster and 5% slower than `-lm mmap`'s.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.

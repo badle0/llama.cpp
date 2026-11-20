@@ -205,6 +205,7 @@ static int check_registry(ggml_backend_dev_t dev, size_t global_index) {
     CHECK(props.memory_total > 0);
     CHECK(props.memory_free > 0 && props.memory_free <= props.memory_total);
     CHECK(!props.caps.async && !props.caps.events && !props.caps.host_buffer);
+    CHECK(!props.caps.mmap_support);  // llama.cpp's default load mode then reads the file, it does not map it
 
     flagos_device_info info;
     REQUIRE(flagos_registry_get_device_info(global_index, &info));

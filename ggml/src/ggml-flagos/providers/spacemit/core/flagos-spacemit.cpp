@@ -572,7 +572,9 @@ void spacemit_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
         /* .host_buffer          = */ false,
         /* .buffer_from_host_ptr = */ false,
         /* .events               = */ false,
-        /* .mmap_support         = */ true,
+        // off, as upstream has it for shared-memory devices: our copy and the mapped file share the DRAM, and the
+        // token table, which stays in the mapping, loses its pages when a large model's load fills it
+        /* .mmap_support         = */ false,
     };
 }
 
