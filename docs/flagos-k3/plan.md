@@ -3332,7 +3332,7 @@ By the rule fixed before the run (KLD within the `cpu` arm's error bar, then the
 
 `exact` now equals `q8` (pp501 +0.1%, tg512 -0.5%; the correction's 785 ms a prompt is gone), with the file's size and a bit-exact read-back: by the rule fixed before the run it is the arm to make the default (the user's decision, taken 2026-11-18, below). Two open findings on the `cpu` arm, the default at the time: (1) its llama-bench died in pp2048 with nothing on stderr and no counters file (written at exit), so by a signal; the exit code was on the board's screen only; not diagnosed; pp2048 was never run on this model before. (2) Its KLD differs between three runs of unchanged code (0.00572, 0.00530, 0.00574) where `q8` and `exact` repeat to the last digit: the 11-split path is not reproducible; not diagnosed.
 
-**Decided 2026-11-18: `exact` is the default; `zp4` and `q8` removed** (the user: "i decide to make exact the default"; "remove as your recommendation as the first step"). Not yet run on the K3: the board was unavailable.
+**Decided 2026-11-18: `exact` is the default; `zp4` and `q8` removed** (the user: "i decide to make exact the default"; "remove as your recommendation as the first step"). Built and checked on the Mac while the board was unavailable; run on the K3 2026-11-20, after this list.
 
 - The switch is now `FLAGOS_SPACEMIT_EXPERT_Q4_1=exact|cpu`. Unset, empty or `exact`: the `q4_1 min 32x256` layout. `cpu`: no layout, the node on the CPU, kept as a fallback. Any other value, `zp4` and `q8` included, warns once and keeps `exact`.
 - Removed: the `zp4` layout with everything only it reached (the fork's two hpzp kernels, its aligned 4-row quantizer, our scalar references of them, its repack and read-back, its format row, its constants), the two `mm_format` fields it needed (`act_4row_bytes`, `act_group_align`) and the alignment arithmetic in `flagos-spacemit-ime-id.cpp`, which is byte for byte the file before arm 1 again; the `q8` value (2-D Q4_1 keeps the Q8_0 route). Also two functions nothing called (`spacemit_tensor_is_repacked`, the alias `spacemit_kernel_fn`), five unused includes and three stale comments. 14 files, 187 lines added, 1,193 removed, all under `providers/spacemit/`.
@@ -3341,6 +3341,85 @@ By the rule fixed before the run (KLD within the `cpu` arm's error bar, then the
 - On the Mac (rerun by me): the build without warnings; `test-backend-ops` `MUL_MAT_ID` 227/227 by default and 153/153 under `cpu`, `MUL_MAT` 32/32 under both; the riscv64 syntax check of the five changed plugin files, 0 errors. By the coder, not rerun by me: a mutation (the `8 d` term dropped: the 7 Q4_1 cases fail at NMSE 1.8 to 8.6).
 - **A finding beside it: the check program no longer passes on the Mac, on unchanged code too.** 6 failures, all `conv pair` (5 cases and the scheduler case), under the default, the reference kernels and both switch values; every other line passes. They want the fused pair's output to be the CPU's bit for bit and miss at NMSE 3e-15. The Mac's Command Line Tools were updated the same morning (Apple clang 16.0.0 to 21.0.0), and the build tree recompiled whole. Read in the object files: the stashed reference (`ssm_conv_stashed_f32_ref`, inlined in its kernel) is 4 fused multiply-adds, while ggml-cpu's loop and our plain copy of it are vector code of separate multiplies and adds. The three are the same C expression, `sumf += x * c`, which a compiler may fuse or not, loop by loop. Inferred, not tested: the same 6 cases failing with the reference kernels on the K3 (open since item 82) have this cause under GCC. Not fixed: the bound is "bit for bit", and what replaces it is the user's decision.
 - Open as before: the `cpu` value's death in pp2048 and its KLD that does not repeat, both on the path that is no longer the default.
+
+*The new default on the K3 (2026-11-20; one run, build `dd4fdb6cc`, the switch unset; llama-bench 3 repeats, 8 threads; KLD against the same base; the figures are the run's printed summary, the log files in `~/ex3` on the board not yet copied or read).* The check program passes with the real kernels: the Q4_1 line 7/7 (staged, grouped and staged without TCM bit for bit; repack-unpack-repack and the read-back the GGUF bytes; NMSE against the one-thread CPU 2.17e-05 staged and 4.39e-06 by rows on the read-back, 2.17e-05 on the GGUF bytes, bound 5e-04), the claims 28/28. 1 graph split.
+
+| | `exact` at `32193cf25` (logs `ex2`) | the default at `dd4fdb6cc` |
+|---|---|---|
+| pp32, t/s | 47.13 +- 0.99 | 51.74 +- 0.55 |
+| pp128 | 74.03 +- 0.42 | 75.79 +- 0.33 |
+| pp501 | 78.54 +- 0.05 | 78.59 +- 0.03 |
+| pp2048 | 72.03 +- 0.09 | 73.17 +- 0.04 |
+| tg512 | 9.45 +- 0.00 | 9.58 +- 0.00 |
+| prompt of 501, ms (one run) | 6,296 | 6,302 |
+| generation, ms a token (31 tokens, one run) | 105.0 | 104.4 |
+| load, s (one run) | 28.1 | 26.9 |
+| mean KLD | 0.005482 +- 0.000680 | 0.005482 +- 0.000680 |
+| maximum KLD | 0.219900 | 0.219900 |
+| same top token | 94.706% | 94.706% |
+
+The accuracy figures are the earlier `exact` arm's to every printed digit: the removal changed no arithmetic on this path. pp501 and the completion's prompt are unchanged. pp128, pp2048 and tg512 are 1.4 to 2.4% higher and pp32 9.8% higher than in the earlier run; one run each in different sessions (there this arm ran third, after the `cpu` arm's death), so not shown to come from the code. For pp32, by inference: the earlier run's op table has the token lookup (`GET_ROWS token_embd`) at 46.9 ms of a 676.8 ms graph of 32 tokens with every tile slow, 33.6 ms at 128 tokens, 9.5 ms at 501 and 0.9 to 3.1 ms for the 512-token graphs of pp2048 later in the same process, which looks like page faults on the mapped embedding table that the process warms up; such a cost would differ from session to session. This run's op table (`~/ex3/ops.txt`) says whether that step is what moved.
+
+The `cpu` value's pp2048 alone (`-p 2048 -n 0 -r 1`, a fresh process, under the crash reporter): rc 0, 60.27 t/s; 31.75 of 32.83 GB available after the runs, no swap. So the death of 2026-11-17 is not reproduced by pp2048 alone; there it was the fourth test of one process, after pp32, pp128 and pp501 at 3 repeats each. That sequence was not rerun. Open on the fallback path, with its KLD that does not repeat.
+
+### The float matmul: all tiles for one token, blocks for a prompt (2026-11-20, spec for review)
+
+**Status:** written for review 2026-11-20, on the user's word ("explain more about the float matmul as you write the spec; are there any references to this design to split over weight rows?"). Nothing built. It is the step that "Qwen3.6-35B-A3B: the profile" names after the Q4_1 tensors (the router's one-tile matmul), widened by what the op tables show for prompts.
+
+*What it is.* `MUL_MAT` of an F32 2-D weight by F32 activations: contract `mul_mat.f32` (`spacemit_mul_mat_f32_supported`, `core/flagos-spacemit-ops.cpp:286`), kernel `spacemit_kernel_mul_mat_f32` (`plugin/flagos-spacemit-seq.cpp:787`). Qwen3.6-35B-A3B has three such weights a layer, none with an IME layout: the MoE router `ffn_gate_inp` [2048, 256] in all 40 layers (`src/models/qwen35moe.cpp:99`; llama.cpp's quantizer leaves it in F32 on purpose, `src/llama-quant.cpp:308`), and the Gated DeltaNet's `ssm_alpha` and `ssm_beta` [2048, 32] in 30. An output element is one dot product of K = 2,048 terms, a weight row against a token's row; N is the number of weight rows (256 or 32), R the number of token rows.
+
+*What it costs (the op tables of 2026-11-17, logs `ex2`, the `exact` arm; the kernel's file is unchanged since).*
+
+| a graph of | the router | `ssm_alpha` + `ssm_beta` | together |
+|---|---|---|---|
+| 1 token | 5.50 ms, tile 0 alone | 1.13 ms, tile 0 alone | 6.6 of 103.7 ms (6.4%) |
+| 32 tokens | 35.2 ms | 5.3 ms | 40.5 of 676.8 ms (6.0%) |
+| 128 tokens | 143.5 ms | 19.1 ms | 162.6 of 1,725.9 ms (9.4%) |
+| 501 tokens | 542.5 ms | 71.0 ms | 613.5 of 6,372.7 ms (9.6%) |
+
+*Why (read in `mul_mat_f32_rvv`, `flagos-spacemit-seq.cpp:633-671`).* The tiles split the token rows, and each token row goes through every weight row, 4 at a time. So:
+- One token is one tile's work while seven wait: 0.137 ms a router call, one core reading the 2.1 MB weight.
+- In a prompt each token row reads the whole weight again: 501 x 2.1 MB = 1.05 GB a router call. Computed from the table: 2.4e9 multiply-adds a second per tile on the router (19e9 on 8 tiles, the same at 32, 128 and 501 tokens), against 3.4e9 per tile for the same kernel on `ssm_alpha`'s 262 KB weight at 501 tokens.
+
+*The change: two parts, no arithmetic changed.*
+1. **The tiles split the larger dimension**, ggml-cpu's rule for the same op (`ggml-cpu.c:1413-1416`). With more weight rows than token rows (N > R) the tiles split the weight rows, in units of the kernel's 4 rows (`tile_range` over `ceil(N / 4)` units), and each tile takes all R token rows. Otherwise they split the token rows, as today. The router: the weight rows up to 255 tokens (one token: 32 weight rows a tile), the token rows from 256. `ssm_alpha` and `ssm_beta`: the weight rows up to 31 tokens (one token: 4 a tile). `ffn_gate_inp_shexp` (N = 1) stays as it is.
+2. **Inside a tile, the token rows in blocks of 16** (ggml-cpu's `blck_1`, `ggml-cpu.c:1203`). For each block the tile's weight rows go 4 at a time, and each group of 4 multiplies the block's token rows before the next group is loaded. A group of weight rows (32 KB at K = 2,048) is then fetched once per 16 token rows instead of once per token row, and what streams past it is the block's 16 token rows (128 KB).
+
+Each output element keeps today's operations in today's order (on the K3 the m2 lanes over strips of K, the tail undisturbed, one `vfredusum`; in the reference one float sum in order), and no element depends on another. So the outputs are today's bit for bit on the K3 and on the Mac: only the order of the visits changes, and which tile computes an element.
+
+*The switch, for the comparison only.* `FLAGOS_SPACEMIT_MM_F32=rows` gives today's split and order; unset, empty or `blocked` the new form; any other value warns once and keeps the default. Parsed once (`spacemit_cached_switch`, as `FLAGOS_SPACEMIT_MM` in `plugin/flagos-spacemit-ime.cpp:110`). Removed with the old loops once the K3 run has decided.
+
+*Files.* `plugin/flagos-spacemit-seq.cpp` (`mul_mat_f32_ref` and `mul_mat_f32_rvv`: one shared helper that gives a tile its rectangle of weight rows and token rows, then the loop nest of part 2; the old loops under `rows`), `tests/check_spacemit.cpp`, `build.md` (the switch's row). The contract, the core and the driver do not change.
+
+*References for splitting over the weight rows.*
+- ggml-cpu, the same op (`ggml/src/ggml-cpu/ggml-cpu.c`): the threads go to the larger of the two dimensions, `nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows` (1413-1416), so one token is split over the weight rows; inside a chunk 16 x 16 blocks, "block-tiling" (1201-1213); the chunks handed out by an atomic counter (1424-1450).
+- Our int8 matmul for one token, `gemv` (`plugin/flagos-spacemit-ime.cpp:154-228`): the weight's rows in slabs of 32, dealt round-robin to the tiles. SpacemiT's in-tree path B is the same (`ggml/src/ggml-cpu/spacemit/ime.cpp:444`, `:465`: `ni = ith * NB_COLS`, then `ni += NB_COLS * nth`). For many rows both hold a slab of weight rows and multiply every row of the batch by it before the next slab, which is part 2's order.
+- Two kernels of ours that already change their split for one row: `get_rows_f32_ref` (`plugin/flagos-spacemit-kernels.cpp:380-392`, "a single row is split by columns instead") and SpacemiT's DIV (`plugin/flagos-spacemit-moe.cpp:399-401`).
+- The literature. Goto and van de Geijn, "Anatomy of High-Performance Matrix Multiplication" (ACM TOMS, 2008): blocks sized so that the inner kernel's operands stay in cache (from memory, not re-read). Smith, van de Geijn, Smelyanskiy, Hammond and Van Zee, "Anatomy of High-Performance Many-Threaded Matrix Multiplication" (IPDPS 2014): which loops of a blocked matmul to give to threads. Their course text (read 2026-11-20, `cs.utexas.edu/~flame/laff/pfhp/week4-parallelizing-the-fourth-loop.html`) on the one loop that is not an output dimension, the summed one: "all iterations update the same part of C", which "creates something called a 'race' condition".
+- FlagTree PR #1498, tutorial 01 for AMD: "output-only sharding left the GEMV on 16 of 128 CTAs": the same fault, a matmul split along a dimension too short for the workers. Their fix splits K and adds a reduction over the workers; here a second output dimension is free, so no reduction.
+
+*Alternatives, and why they lose.*
+- Splitting K over the tiles (the PR's way): every tile would sum a part of each dot product and a further step would add the parts. It needs that step and its barrier, and the bits would change with the number of tiles. Not needed: N is 256 or 32, so every tile has whole outputs.
+- The router in int8 on the IME kernels (by the op table's `attn_qkv`, more than 20 times the multiply-adds a second; its shape is my reading of the row counts): llama.cpp keeps this weight in F32 because it picks the experts, and a lossy router needs a KLD study first. Kept for later, if the float kernel stays the limit.
+- ggml-cpu's llamafile sgemm on the tiles: it is built on ggml-cpu's thread parameters, and its sums are other bits.
+- A claim queue as ggml-cpu's: the units here are equal work and the static split is balanced (3 ms of the router's 542 at 501 tokens). It belongs to `MUL_MAT_ID`, whose units are not equal.
+
+*Tests on the Mac (the reference kernels; the RVV loops only parsed).*
+- `check_seq_ops`, the float matmul's cases extended: [2048, 256] by 1, 2, 31, 255, 256 and 501 token rows; [2048, 32] by 1, 31, 32 and 33; [64, 7] by 1, 3 and 9 (rows left over after the groups of 4, fewer units than tiles); [2048, 1] by 1 and 40; activations [2048, 5, 3] (the weight broadcast over a higher dimension). Each as the present cases (against the one-thread CPU within `k_seq_mul_mat`, 1 tile against 8 bit for bit) and, new, the default against `rows` bit for bit.
+- Who computes what: a test-only count of the outputs each tile computed (as `spacemit_mm_tail_take`): [2048, 256] by 1 gives 32 per tile on 8 tiles, [2048, 32] by 1 gives 4, [2048, 256] by 501 gives `tile_range`'s token rows times 256.
+- The switch: unset, `blocked`, `rows`, an unknown value warning once.
+- `test-backend-ops -o MUL_MAT` under the default and under `rows`.
+- Mutations that must fail: the rule forced to the token rows (the count); a block's last token row skipped (the values); the weight units shifted by one (the values).
+- The riscv64 syntax check of `plugin/flagos-spacemit-seq.cpp`, 0 errors.
+- `--bench-mm` gains the float shapes: [2048, 256] at 1, 32, 128 and 501 rows and [2048, 32] at 1 and 501, under `rows` and under the default: ms a call, multiply-adds a second per tile, and for one row the weights' GB/s; the weights read from DRAM as its other shapes are (the next of enough copies).
+
+*The K3 run (one), and the rule set before it.* The usual block (the TCM guard, the dates, the build, the check program with the device, `--bench-mm`), then `llama-bench -p 32,128,501 -n 512 -r 3` under the default and under `rows` with the op counters, the 32-token completion, and the KLD of 2 chunks under the default. The new form stays the default if: (a) the check program passes, the default equal to `rows` bit for bit on the real kernel; (b) the KLD's printed figures are those of 2026-11-20 (0.005482, 0.219900, 94.706%) and the text is unchanged; (c) no llama-bench figure is below `rows` by more than the repeats' spread; (d) the op table shows the router's one-token step on 8 tiles. Then `rows` and the switch are removed. If (c) fails at some row count, the bench's lines say whether the rule or the block size is what to change.
+
+*Estimates, not measured.*
+- One token: the router from 5.5 to about 2.7 ms (84 MB of weights a token at about 31 GB/s; the multiply-adds alone on 8 tiles would take 0.7 ms), `ssm_alpha` and `ssm_beta` from 1.13 to about 0.5 ms. About 3.4 ms of a 104.4 ms token: tg512 from 9.58 to about 9.9 t/s.
+- A prompt of 501: at least the rate `ssm_alpha` has today, which puts the router at about 382 ms (2.5% of the prompt, pp501 from 78.6 to about 80.6 t/s). More if what limits the kernel today is the weight strips arriving from outside the first-level cache; the A100's cache sizes and vector costs are not in our notes, so the bench's line is what says.
+
+*Not in this step.* A kernel of 4 weight rows by 2 token rows (8 sums a pass, the same bits): next if the bench shows the blocked form no faster per tile than `ssm_alpha` is today, which would mean the loads and multiply-adds themselves are the limit. The weight block staged in TCM as the int8 path does. The router in int8 (above). The other one-tile steps of a token (`UNARY`, `ARGSORT`: 2.4 ms in 150 calls, too small a call to share).
 
 ### Not planned
 
