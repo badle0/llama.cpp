@@ -3534,6 +3534,49 @@ If 3 fails, the reading above is wrong. If only 4 fails, the line goes back and 
 
 *Not taken: the table read in by the provider.* After the first pair, asked with the three ways open, the user chose to go back to mmap and have the core read the table through once at the first checked graph (a byte a page, once per backend context and table, a comparison switch for one K3 run). It was built by a coder and checked on the Mac by me (the diff read, the build and the check programs rerun: its check 33/33, the 6 known `conv pair` failures only, the same text with and without it), then set aside uncommitted when the repeated loads showed the default has no load-time cost to avoid. The patch is `~/k3-logs/pre-read-2026-11-20.patch` on the Mac and applies on `f7ac31ef8`; it is the fix if `--load-mode mmap` ever has to be fast on a large model. Not run on the K3; its Linux-only residency test was never compiled.
 
+### The state pass at a sequence's start (spec, 2026-11-20)
+
+**Status:** written for review 2026-11-20, on the user's word ("go ahead and write the spec"). Nothing built.
+
+**What it is about.** Each Gated DeltaNet layer keeps two saved states, a convolution state (96 KiB a row on Qwen3.6-35B-A3B) and a recurrent state (S_v x S_v x H floats, 2 MiB a row; 30 layers, the RS buffer's 62.81 MiB). llama.cpp's `build_rs` (`src/llama-graph.cpp:3344-3378`) puts three kinds of node around them, and `build_recurrent_attn` a fourth (`src/models/delta-net-base.cpp:553-558`): a `SCALE` by 0 in place that clears the state when a sequence starts (a view of zero size otherwise), a `GET_ROWS` that copies the state out, the layer, and a `CPY` that writes the new state back. In the op tables these are `SCALE r1`, `GET_ROWS r1` and `CPY r1`.
+
+**What they cost (op tables of 2026-11-20, `~/k3-logs/lm`, the default arm; ms a graph).**
+
+| | `SCALE r1` | `GET_ROWS r1` | `CPY r1` | together |
+|---|---|---|---|---|
+| A sequence's first graph, 32 tokens | 8.44 (60 calls, tile 0 alone) | 7.49 (61) | 9.05 (60) | 24.98 of 616.8, 4.0% |
+| The same, 501 tokens | 8.45 | 7.87 | 8.40 | 24.72 of 6,068.7, 0.4% |
+| A later graph of one token | none | 0.28 (31) | 1.15 (30) | 1.43 of 103.2 |
+| A later graph of 512 tokens (`~/k3-logs/ex3`) | none | 0.40 (30) | 6.95 (30) | 7.35 |
+| A sequence's first graph, 512 tokens (same run) | 8.50 | 8.28 (60) | 13.77 (60) | 30.55 |
+
+So a fresh prompt pays about 25 ms whatever its length, and a later graph does not: there the state pass of 2026-11-15 (`spacemit_state_pass`, `core/flagos-spacemit-ops.cpp`) runs the layer as one step, `gated_delta_net.f32.direct`, that reads and writes the recurrent state's row itself, so its `GET_ROWS` and `CPY` emit no steps. The later graphs' remaining copies are the convolution state's.
+
+**Why a sequence's first graph is refused.** Not the token count: the pass takes 512-token graphs. Its check lets nothing but its own `CPY` write the persistent tensor (`flagos-spacemit-ops.cpp`, "nothing else in g computes that tensor"), and at a sequence's start the clearing `SCALE` does. That is every request without a cached prefix, the TTFT case.
+
+**The change, two parts.**
+
+1. *The pass admits a writer that comes before its `GET_ROWS`.* A node that writes the persistent tensor at a graph position before the pass's `GET_ROWS` has written before the row was read in the original order, and still has when the direct step reads it at the `CPY`'s position; the check between the two copies stays as it is. Core only, a few lines in `spacemit_state_pass`. The `SCALE` keeps its own step. Removes the recurrent state's `GET_ROWS` and `CPY`: by the two 512-token rows above, 14.7 ms a graph (measured on graphs that differ only in this; the 32-token figure is an estimate from them).
+2. *The clearing folded into the step.* The `SCALE` runs on tile 0 alone, 8.4 ms for 63 MiB. Where it clears exactly the row the pass's `CPY` writes, the direct step does it: each tile multiplies its own heads' part of that row by 0 and then runs them, and the `SCALE` emits no step. Conditions, all structural: the node is a `SCALE` in place with factor 0 and bias 0 over one whole contiguous row of the persistent tensor, at the same address and size as the `CPY`'s destination; it comes before the pass's `GET_ROWS`; and between it and the `CPY` nothing but the pass's own two copies reads or writes that tensor. Otherwise part 1 alone applies and the `SCALE` stays a step. A new step name, `gated_delta_net.f32.direct.cleared`, with its kernel entry in `plugin/flagos-spacemit-gdn.cpp` beside `spacemit_kernel_gated_delta_net_direct`: the same `gdn_tile_run`, after the tile's multiply. With one sequence and no rollback rows, as the server and llama-bench run, the memory has one row a layer, so the cleared row is the written one.
+
+**Why the result is the same bytes.** Part 1 changes no arithmetic: the same kernel, reading the row from where it lies, as every later graph does today. In part 2 the row is cleared by the same multiply, `x * 0.0f` an element as ggml-cpu's `ggml_vec_scale_f32`, so a NaN, an infinity or a negative value in the old state gives the CPU's bits; only which tile does it and when changes, and the tiles' heads are disjoint and cover the row. Whichever row the `GET_ROWS`' index names at run time, the cleared one or another, the step reads what the original order read: the cleared row is cleared before any tile reads its own part of it, and no other row is touched.
+
+**Not in this step.** The convolution state's own copies and clearing (about 2 ms of the 25, an estimate from the one-token row) and its `CPY` at long prompts; splitting the one-row `SCALE` over the tiles instead of folding it (little to gain: one tile already moves 7.3 GiB/s of it, eight tiles copying the same rows 8.2).
+
+**For one K3 run:** `FLAGOS_SPACEMIT_STATE` gets a third value beside `direct` and `copy`: `later`, the pass only where nothing clears the state, the form before. `direct` stays the default and becomes the new form. `later` goes after the run has decided.
+
+**Tests (`check_state_pass`).** The graph as `build_rs` and `build_recurrent_attn` build it at a sequence's start, against the CPU: the layer's output and every row of the persistent tensor the same bytes, at 1, 2, 32 and 501 tokens and at the models' shapes; the pass counted; by the step names, `direct.cleared` and no `SCALE` where the fold applies. The index naming the cleared row, and another row. The old state holding NaN, infinities and negative values. Part 1 without the fold, the `SCALE` still a step: a factor other than 0, a `SCALE` over part of a row or over two rows, a cleared row that is not the written one, a reader of the tensor between the `SCALE` and the `GET_ROWS`. Still refused: a writer between the two copies. `later` and `copy` as before, and an unknown value. Mutations by the coder: the fold without the multiply, the multiply on a wrong part of the row, the admission widened to a writer between the copies.
+
+**The K3 run and its rule (set before the run).** One session: the build and the check program; then `later` and the default in turn, twice each, a llama-bench at 32 tokens with the op table (four loads, so each arm has two runs of three counted graphs); and one completion of the 501-token prompt each. The change stays and `later` goes if all four hold:
+1. the check program passes;
+2. the two completions are the same text, and the f32 run's;
+3. under the default a 32-token graph has 30 `GATED_DELTA_NET.direct.cleared` steps, 30 `SCALE r1`, 31 `GET_ROWS r1` and 30 `CPY r1`;
+4. the default's 32-token graph without the token lookup, the mean of its two runs, is at least 12 ms below `later`'s, and no llama-bench figure is lower.
+
+llama-perplexity is not in the run: it decodes four sequences at once, which the pass does not take.
+
+**Estimates.** About 22 ms off every fresh prompt graph: 14.7 from part 1, about 8 from the fold, less the multiply now inside the step (under 1 ms). At 32 tokens 617 to about 595 ms, pp32 51.7 to about 53.7 t/s; at 501 tokens 0.4%; generation unchanged.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
