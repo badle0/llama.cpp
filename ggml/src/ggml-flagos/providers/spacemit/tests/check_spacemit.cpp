@@ -10,8 +10,8 @@
 //   --bench          also measure launch cost, per-node cost, bandwidth, Q4_0, Q4_1 and Q6_K (run as Q8_0) matmul time
 //                    and flash attention time (Qwen3-4B's heads: a token at n_kv 256-8192, 128 tokens at n_kv 128
 //                    and 4096, 512 at n_kv 512 and 4608) against the CPU (Q4_1 on the provider only), and the default
-//                    matmul setting (fit,staged) against split at the row counts of --bench-mm, and the F32 matmul's
-//                    two settings (--bench-f32)
+//                    matmul setting (fit,staged) against split at the row counts of --bench-mm, and the F32 matmul
+//                    (--bench-f32)
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default; at 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=off
 //                    against the default), then at 9-64 tokens FLAGOS_SPACEMIT_ATTN_TILED=64 (the kernels before
@@ -19,7 +19,7 @@
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
 //   --bench-f32      of the benchmarks only the F32 matmul (the router's [2048, 256] at 1, 32, 128 and 501 token rows
-//                    and [2048, 32] at 1 and 501) under FLAGOS_SPACEMIT_MM_F32=rows against the blocked default
+//                    and [2048, 32] at 1 and 501)
 //   --bench-embd     of the benchmarks only the token embedding lookup: one call of 1-512 rows of 1024 and 2560
 //                    columns from 32768, Q6_K by FLAGOS_SPACEMIT_EMBD=ggml against rvv, and the same values as F32
 //                    copied by get_rows.f32 (not run by --bench)
@@ -6567,7 +6567,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
                  in.push_back(x);
                  return ggml_mul_mat(ctx, w, ggml_view_2d(ctx, x, 2560, 0, x->nb[1], 0));
              });
-    // the split rule's and the blocks' shapes, under the default setting (check_mul_mat_f32_split takes the settings)
+    // the split rule's and the blocks' shapes (check_mul_mat_f32_split compares the splits with each other)
     for (const mm_f32_shape & s : k_mm_f32_shapes) {
         run_case(mm_f32_what(s).c_str(), k_mm, k_seq_mul_mat,
                  [&s](ggml_context * ctx, std::vector<ggml_tensor *> & in) { return mm_f32_build(s, ctx, in); });
@@ -6726,14 +6726,12 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
 }
 
 //
-// FLAGOS_SPACEMIT_MM_F32 (plan.md "The float matmul: all tiles for one token, blocks for a prompt"): the blocked
-// default against the rows setting, the form before it. check_seq_ops compares every run with the CPU and not runs
-// with each other, so the same-bytes comparisons live here. Each shape's node is built as seq_op_run builds its third
-// copy (every tensor in a CPU buffer) and the kernel entry called directly, the output filled with 0xA5 bytes first so
-// that a share no tile took stays visible: rows on 1 and 8 tiles and the default on 1, 3 and 8 tiles must give the
-// same bytes. Through the backend the two settings are compared with each other only, not with the direct calls: on
-// the K3 the device's cores have another vector length than this thread. Who computes what is read from the floats one
-// tile alone changed, so the plugin keeps its interface, and checked against the share rule computed here
+// The F32 matmul's split and blocks (plan.md "The float matmul: all tiles for one token, blocks for a prompt").
+// check_seq_ops compares every run with the CPU and not runs with each other, so the same-bytes comparisons live here.
+// Each shape's node is built as seq_op_run builds its third copy (every tensor in a CPU buffer) and the kernel entry
+// called directly, the output filled with 0xA5 bytes first so that a share no tile took stays visible: 1, 3 and 8 tiles
+// must give the same bytes. Who computes what is read from the floats one tile alone changed, so the plugin keeps its
+// interface, and checked against the share rule computed here
 //
 
 // one MUL_MAT node of a shape, every tensor in one buffer (the CPU's, or the device's for a backend run), its inputs
@@ -6780,8 +6778,6 @@ static std::vector<uint8_t> mm_f32_out(const ggml_tensor * y) {
 }
 
 static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
-    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    REQUIRE(backend != nullptr);
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
     uint32_t                       n_kernels = 0;
@@ -6793,10 +6789,8 @@ static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
         }
     }
     REQUIRE(k_mm != nullptr);
-    env_override            mm_f32("FLAGOS_SPACEMIT_MM_F32", nullptr);  // the default, whatever the run was given
-    constexpr uint32_t      n_tiles = 8;
-    constexpr uint8_t       junk[4] = { 0xA5, 0xA5, 0xA5, 0xA5 };
-    const mm_f32_shape      router  = { 2048, 256, 1, 1 };  // the one-token case of the literal counts
+    constexpr uint32_t n_tiles = 8;
+    constexpr uint8_t  junk[4] = { 0xA5, 0xA5, 0xA5, 0xA5 };
 
     // [begin, end) of n items for one tile, as the kernel's tile_range splits them
     const auto range = [](int64_t n, uint32_t ith, uint32_t nth, int64_t & begin, int64_t & end) {
@@ -6804,12 +6798,12 @@ static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
         begin             = std::min(n, per * (int64_t) ith);
         end               = std::min(n, begin + per);
     };
-    // the output floats a tile's share holds: the weight rows in units of 4 where they outnumber the token rows (the
-    // default), else the token rows
-    const auto share_floats = [&](const mm_f32_shape & s, uint32_t ith, bool rows_setting) {
+    // the output floats a tile's share holds: the weight rows in units of 4 where they outnumber the token rows, else
+    // the token rows
+    const auto share_floats = [&](const mm_f32_shape & s, uint32_t ith) {
         const int64_t n_weight = s.n, n_token = s.rows * s.ne2;
         int64_t       begin, end;
-        if (!rows_setting && n_weight > n_token) {
+        if (n_weight > n_token) {
             range((n_weight + 3) / 4, ith, n_tiles, begin, end);
             return (std::min(n_weight, 4 * end) - std::min(n_weight, 4 * begin)) * n_token;
         }
@@ -6834,79 +6828,45 @@ static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
         REQUIRE(host.init(dev, s, false, seed));
         seed += 8;
         const int64_t n_floats = ggml_nelements(host.y);
-        // one tile's share computed on the junk-filled output, and the floats it changed
-        const auto one_tile = [&](const char * value, uint32_t ith, uint32_t nth) {
-            env_override sw("FLAGOS_SPACEMIT_MM_F32", value);
+        // tiles [first, last) of nth computed on the junk-filled output
+        const auto tiles = [&](uint32_t first, uint32_t last, uint32_t nth) {
             const std::vector<uint8_t> filled(ggml_nbytes(host.y), 0xA5);
             ggml_backend_tensor_set(host.y, filled.data(), 0, filled.size());
-            const spacemit_tile tile = { ith, nth, nullptr, 0, nullptr, 0, nullptr };
-            CHECK(k_mm->fn(&tile, host.y));
-            return mm_f32_out(host.y);
-        };
-        // every tile of a setting, into the one output: what the whole kernel gives
-        const auto whole = [&](const char * value, uint32_t nth) {
-            env_override sw("FLAGOS_SPACEMIT_MM_F32", value);
-            const std::vector<uint8_t> filled(ggml_nbytes(host.y), 0xA5);
-            ggml_backend_tensor_set(host.y, filled.data(), 0, filled.size());
-            for (uint32_t ith = 0; ith < nth; ith++) {
+            for (uint32_t ith = first; ith < last; ith++) {
                 const spacemit_tile tile = { ith, nth, nullptr, 0, nullptr, 0, nullptr };
                 CHECK(k_mm->fn(&tile, host.y));
             }
             return mm_f32_out(host.y);
         };
 
-        const std::vector<uint8_t> want = whole("rows", 1);
-        const struct {
-            const char * value;
-            uint32_t     nth;
-        } runs[] = { { "rows", 8 }, { nullptr, 1 }, { nullptr, 3 }, { nullptr, 8 } };
-        for (const auto & r : runs) {
-            expect(whole(r.value, r.nth) == want, s,
-                   std::string("the direct calls under ") + (r.value != nullptr ? r.value : "the default") + " on " +
-                       std::to_string(r.nth) + " tiles are not rows' bytes on 1 tile");
-        }
-
-        {
-            mm_f32_node run;
-            REQUIRE(run.init(dev, s, true, seed));
-            seed += 8;
-            std::vector<uint8_t> out[2];
-            for (int k = 0; k < 2; k++) {
-                env_override sw("FLAGOS_SPACEMIT_MM_F32", k == 0 ? "rows" : nullptr);
-                CHECK(ggml_backend_graph_compute(backend, run.g) == GGML_STATUS_SUCCESS);
-                out[k] = mm_f32_out(run.y);
-            }
-            expect(out[0] == out[1], s, "the backend's bytes under rows and under the default differ");
+        const std::vector<uint8_t> want = tiles(0, 1, 1);
+        for (const uint32_t nth : { 3u, 8u }) {
+            expect(tiles(0, nth, nth) == want, s,
+                   "the direct calls on " + std::to_string(nth) + " tiles are not the bytes of 1 tile");
         }
 
         // who computes what: one tile at a time of 8, its floats against the share rule, the eight sets disjoint and
         // the output covered
-        const auto coverage = [&](const char * value, bool rows_setting) {
-            std::vector<int64_t> counts(n_tiles, 0);
-            std::vector<int>     by(n_floats, 0);
-            for (uint32_t ith = 0; ith < n_tiles; ith++) {
-                const std::vector<uint8_t> got = one_tile(value, ith, n_tiles);
-                for (int64_t i = 0; i < n_floats; i++) {
-                    const bool changed = std::memcmp(got.data() + i * sizeof(float), junk, sizeof(junk)) != 0;
-                    counts[ith] += changed;
-                    by[i] += changed;
-                }
-                expect(counts[ith] == share_floats(s, ith, rows_setting), s,
-                       "tile " + std::to_string(ith) + " of 8 under " +
-                           (value != nullptr ? value : "the default") + " computed " + std::to_string(counts[ith]) +
-                           " floats, the share rule " + std::to_string(share_floats(s, ith, rows_setting)));
+        std::vector<int64_t> counts(n_tiles, 0);
+        std::vector<int>     by(n_floats, 0);
+        for (uint32_t ith = 0; ith < n_tiles; ith++) {
+            const std::vector<uint8_t> got = tiles(ith, ith + 1, n_tiles);
+            for (int64_t i = 0; i < n_floats; i++) {
+                const bool changed = std::memcmp(got.data() + i * sizeof(float), junk, sizeof(junk)) != 0;
+                counts[ith] += changed;
+                by[i] += changed;
             }
-            int64_t n_once = 0;
-            for (const int c : by) {
-                n_once += c == 1;
-            }
-            expect(n_once == n_floats, s,
-                   std::string("under ") + (value != nullptr ? value : "the default") + " " +
-                       std::to_string(n_once) + " of " + std::to_string(n_floats) +
-                       " floats were computed by exactly one of the 8 tiles");
-            return counts;
-        };
-        const std::vector<int64_t> counts = coverage(nullptr, false);
+            expect(counts[ith] == share_floats(s, ith), s,
+                   "tile " + std::to_string(ith) + " of 8 computed " + std::to_string(counts[ith]) +
+                       " floats, the share rule " + std::to_string(share_floats(s, ith)));
+        }
+        int64_t n_once = 0;
+        for (const int c : by) {
+            n_once += c == 1;
+        }
+        expect(n_once == n_floats, s,
+               std::to_string(n_once) + " of " + std::to_string(n_floats) +
+                   " floats were computed by exactly one of the 8 tiles");
         // plan.md's own figures for three shapes
         const auto literal = [&](int64_t first, int64_t last) {
             bool ok = true;
@@ -6914,17 +6874,11 @@ static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
                 ok = ok && counts[ith] == (ith + 1 < n_tiles ? first : last);
             }
             expect(ok, s,
-                   "the default's counts are not " + std::to_string(first) + " floats on tiles 0-6 and " +
+                   "the counts are not " + std::to_string(first) + " floats on tiles 0-6 and " +
                        std::to_string(last) + " on tile 7");
         };
         if (s.k == 2048 && s.n == 256 && s.rows == 1 && s.ne2 == 1) {
             literal(32, 32);
-            const std::vector<int64_t> rows_counts = coverage("rows", true);
-            bool                       ok          = rows_counts[0] == 256;
-            for (uint32_t ith = 1; ith < n_tiles; ith++) {
-                ok = ok && rows_counts[ith] == 0;
-            }
-            expect(ok, s, "under rows the first tile must compute all 256 floats and the others none");
         } else if (s.k == 2048 && s.n == 32 && s.rows == 1) {
             literal(4, 4);
         } else if (s.k == 2048 && s.n == 256 && s.rows == 501) {
@@ -6934,48 +6888,12 @@ static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
         n_shapes_ok += n_ok - n_checks == before;
     }
 
-    // the switch's values on the router's one token: unset, blocked and rows, and an unknown value, which warns
-    // exactly once and keeps the default's 32 floats a tile
-    {
-        mm_f32_node host;
-        REQUIRE(host.init(dev, router, false, seed));
-        for (const char * value : { (const char *) nullptr, "blocked", "rows", "bogus" }) {
-            env_override sw("FLAGOS_SPACEMIT_MM_F32", value);
-            log_capture  log;
-            const bool   rows_setting = value != nullptr && std::strcmp(value, "rows") == 0;
-            const bool   unknown      = value != nullptr && std::strcmp(value, "bogus") == 0;
-            const char * name         = value != nullptr ? value : "unset";
-            bool         ok           = true;
-            for (uint32_t ith = 0; ith < n_tiles; ith++) {
-                const std::vector<uint8_t> filled(ggml_nbytes(host.y), 0xA5);
-                ggml_backend_tensor_set(host.y, filled.data(), 0, filled.size());
-                const spacemit_tile tile = { ith, n_tiles, nullptr, 0, nullptr, 0, nullptr };
-                CHECK(k_mm->fn(&tile, host.y));
-                const std::vector<uint8_t> got = mm_f32_out(host.y);
-                int64_t                    n_changed = 0;
-                for (int64_t i = 0; i < ggml_nelements(host.y); i++) {
-                    n_changed += std::memcmp(got.data() + i * sizeof(float), junk, sizeof(junk)) != 0;
-                }
-                ok = ok && n_changed == share_floats(router, ith, rows_setting);
-            }
-            const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_MM_F32=");
-            expect(ok, router, std::string("FLAGOS_SPACEMIT_MM_F32=") + name + ": the tiles' floats are not " +
-                                   (rows_setting ? "rows'" : "the default's"));
-            expect(warnings == (unknown ? 1 : 0), router,
-                   std::string("FLAGOS_SPACEMIT_MM_F32=") + name + ": " + std::to_string(warnings) +
-                       " warnings, wanted " + std::to_string(unknown ? 1 : 0));
-        }
-    }
-
-    ggml_backend_free(backend);
-    std::printf("mmf32    FLAGOS_SPACEMIT_MM_F32, the blocked default against rows, at %d shapes ([2048, 256] by 1, "
-                "2, 31, 255, 256 and 501 token rows, [2048, 32] by 1, 31, 32 and 33, [64, 7] by 1, 3 and 9, "
-                "[2048, 1] by 1 and 40, a 3-D batch): %d/%d shapes, the direct calls under rows on 1 and 8 tiles and "
-                "under the default on 1, 3 and 8 the same bytes, the backend's two settings the same bytes, every "
-                "tile's floats the share rule's and the 8 tiles disjoint and whole (32 a tile at [2048, 256] by 1, 4 "
-                "at [2048, 32] by 1, 63 and 60 rows of 256 at 501 rows, rows 256 on tile 0 alone), and the four "
-                "values of the switch (unset, blocked, rows and an unknown one, which warns once and keeps the "
-                "default): %d/%d\n",
+    std::printf("mmf32    the F32 matmul split over the larger of the weight rows and the token rows, in blocks of 16 "
+                "token rows, at %d shapes ([2048, 256] by 1, 2, 31, 255, 256 and 501 token rows, [2048, 32] by 1, 31, "
+                "32 and 33, [64, 7] by 1, 3 and 9, [2048, 1] by 1 and 40, a 3-D batch): %d/%d shapes, the direct "
+                "calls on 1, 3 and 8 tiles the same bytes, every tile's floats the share rule's and the 8 tiles "
+                "disjoint and whole (32 a tile at [2048, 256] by 1, 4 at [2048, 32] by 1, 63 and 60 rows of 256 at "
+                "501 rows): %d/%d\n",
                 (int) (sizeof(k_mm_f32_shapes) / sizeof(k_mm_f32_shapes[0])), n_shapes_ok, n_shapes, n_ok, n_checks);
     return 0;
 }
@@ -10805,11 +10723,10 @@ static uint32_t device_tiles(ggml_backend_dev_t dev) {
     return tiles;
 }
 
-// plan.md "The float matmul: all tiles for one token, blocks for a prompt", --bench-f32 only: one MUL_MAT node of an
-// F32 weight through the backend under FLAGOS_SPACEMIT_MM_F32=rows and under the blocked default, at the router's
-// [2048, 256] and the Gated DeltaNet's [2048, 32]. The two settings take turns twice in opposite orders, the faster
-// turn of each kept (as bench_attn_tiled). As in the model, where a token reads each weight once, every call reads its
-// weight from DRAM: it takes the next of enough copies of the weight (32 MB together, as bench_mm)
+// plan.md "The float matmul: all tiles for one token, blocks for a prompt", --bench-f32 and --bench: one MUL_MAT node
+// of an F32 weight through the backend, at the router's [2048, 256] and the Gated DeltaNet's [2048, 32], two turns,
+// the faster kept. As in the model, where a token reads each weight once, every call reads its weight from DRAM: it
+// takes the next of enough copies of the weight (32 MB together, as bench_mm)
 static int bench_mm_f32(ggml_backend_dev_t dev) {
     const uint32_t tiles   = device_tiles(dev);
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -10832,22 +10749,12 @@ static int bench_mm_f32(ggml_backend_dev_t dev) {
         };
         const double probe = time_us(call, 1);
         const int    iters = std::max(20, (int) std::min(1000.0, 2e5 / std::max(probe, 1.0)));  // about 0.2 s a turn
-        const auto   dev_us = [&](int k) {
-            env_override sw("FLAGOS_SPACEMIT_MM_F32", k == 0 ? "rows" : nullptr);
-            return time_us(call, iters);
-        };
-        double t[2] = { HUGE_VAL, HUGE_VAL };
-        t[0]        = std::min(t[0], dev_us(0));
-        t[1]        = std::min(t[1], dev_us(1));
-        t[1]        = std::min(t[1], dev_us(1));
-        t[0]        = std::min(t[0], dev_us(0));
+        const double t     = std::min(time_us(call, iters), time_us(call, iters));
         CHECK(ok);
         const double mac = (double) s.rows * s.ne2 * s.k * s.n;
-        std::printf("f32mm [%lld, %4lld] by %3lld rows: rows %9.3f ms (%6.3f Gmac/s per tile, %6.2f GB/s of weights), "
-                    "default %9.3f ms (%6.3f Gmac/s per tile, %6.2f GB/s), rows/default %.2f\n",
-                    (long long) s.k, (long long) s.n, (long long) (s.rows * s.ne2), t[0] / 1e3,
-                    mac / t[0] / tiles / 1e3, weight_bytes / t[0] / 1e3, t[1] / 1e3, mac / t[1] / tiles / 1e3,
-                    weight_bytes / t[1] / 1e3, t[0] / t[1]);
+        std::printf("f32mm [%lld, %4lld] by %3lld rows: %9.3f ms (%6.3f Gmac/s per tile, %6.2f GB/s of weights)\n",
+                    (long long) s.k, (long long) s.n, (long long) (s.rows * s.ne2), t / 1e3, mac / t / tiles / 1e3,
+                    weight_bytes / t / 1e3);
         std::fflush(stdout);
     }
     ggml_backend_free(backend);
@@ -11861,8 +11768,7 @@ int main(int argc, char ** argv) {
                          "--bench-f32 | --bench-embd | --bench-repack | --bench-x100]\n"
                          "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
                          "tokens\n"
-                         "  --bench-f32: the F32 matmul only, FLAGOS_SPACEMIT_MM_F32=rows against the blocked "
-                         "default\n"
+                         "  --bench-f32: the F32 matmul only\n"
                          "  --bench-embd: the token embedding lookup only, FLAGOS_SPACEMIT_EMBD=ggml against rvv and an "
                          "F32 copy\n"
                          "  --bench-repack: the weights' repack at load only, FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 "
