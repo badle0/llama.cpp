@@ -100,8 +100,7 @@ void     spacemit_conv_pairs_add(uint64_t n);
 // row the CPY writes (the same address and byte size), has factor 0 and bias 0, passes its own contract and nothing
 // but the pass's two copies reads or writes the tensor between it and the CPY, the step
 // gated_delta_net.f32.direct.cleared multiplies that row by 0 itself, each tile its own heads' part, and the SCALE
-// emits no step. FLAGOS_SPACEMIT_STATE=later asks for the form before 2026-11-20, with neither the admission nor the
-// fold.
+// emits no step.
 // Limit, as the convolution pair's: a consumer placed in another backend's split is not in g, so not seen
 bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g, int gi,
                          int * ri, int * ci, int * zi);

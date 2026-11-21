@@ -8632,16 +8632,14 @@ static int check_gdn(ggml_backend_dev_t dev) {
 // bit and stay within the bound; they equal the device's bytes only where both run the same kernels (the reference
 // ones, or any host but the K3, whose calling core has another vector length - as check_gdn's direct calls).
 // Then one graph through the scheduler (its allocator reusing memory) under the plan cache: a miss, a trusted hit
-// counting no pass, FLAGOS_SPACEMIT_STATE=copy a miss by the configuration word, =later another miss (the pass still
-// taken, the graph having no clear), the default a miss again, the same bytes; and two computes in a row with the
-// state carried over, against the CPU doing the same.
+// counting no pass, FLAGOS_SPACEMIT_STATE=copy a miss by the configuration word, the default a miss again, the same
+// bytes; and two computes in a row with the state carried over, against the CPU doing the same.
 //
 // A case with zrow >= 0 is a sequence's first graph: build_rs' SCALE by 0 really clears row zrow there (clear says
 // how). Where it clears exactly the row the CPY writes, the pass folds it into its step
 // (gated_delta_net.f32.direct.cleared, by the trace's step names, with no scale.f32 of its own); otherwise the SCALE
 // keeps its step and the pass takes the graph all the same, except with a write of the states between the two copies,
-// which refuses it. Each such case also runs under FLAGOS_SPACEMIT_STATE=later, the form before 2026-11-20, which
-// takes no pass where anything else writes the tensor, and the bytes of all three forms are compared.
+// which refuses it.
 //
 struct state_case {
     const char * what;
@@ -8991,17 +8989,6 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                 copy_ok = run(passes_copy, out_copy, st_copy, more_copy) && passes_copy == 0 &&
                           same_bytes(out_copy, out) && same_bytes(st_copy, st) && same_bytes(more_copy, more);
             }
-            // FLAGOS_SPACEMIT_STATE=later, the form before 2026-11-20: no pass where anything else writes the tensor,
-            // and the same bytes as the other two forms
-            bool later_ok = true;
-            if (dev_ok && prefill == nullptr) {
-                uint64_t           passes_later = 0;
-                std::vector<float> out_later, st_later, more_later;
-                env_override       later("FLAGOS_SPACEMIT_STATE", "later");
-                later_ok = run(passes_later, out_later, st_later, more_later) &&
-                           passes_later == (c.pass && c.zrow < 0 ? 1u : 0u) && same_bytes(out_later, out) &&
-                           same_bytes(st_later, st) && same_bytes(more_later, more);
-            }
             // the scores and the state against ggml-cpu, and the rows the CPY does not write bit for bit the inputs
             const double e_out = dev_ok && out.size() == want.size() ? nmse(out.data(), want.data(), (int64_t) out.size()) : -1.0;
             const double e_st  = dev_ok && st.size() == want_st.size() ? nmse(st.data(), want_st.data(), (int64_t) st.size()) : -1.0;
@@ -9107,7 +9094,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             if (!c.wild) {
                 worst_nmse = std::max(worst_nmse, std::max(e_out, e_st));
             }
-            const bool ok = dev_ok && copy_ok && later_ok && names_ok && kept && clear_ok && direct_ok &&
+            const bool ok = dev_ok && copy_ok && names_ok && kept && clear_ok && direct_ok &&
                             passes == (c.pass ? 1u : 0u) && close && wild_ok;
             n_ok += ok;
             n_passed += passes == 1;
@@ -9118,8 +9105,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                              "FLAGOS_SPACEMIT_GDN_PREFILL=%s: the CPU reference %s, the run %s, %llu passes (expected "
                              "%d); NMSE scores %.3e, states %.3e, other output %.3e (bound %.0e), the bytes with a "
                              "wild old state %s; the rows the CPY does not write %s, the cleared rows %s; copy %s; "
-                             "later %s; the direct calls %s; the step names %d cleared, %d direct, %d scale (expected "
-                             "%d/%d/%d)\n",
+                             "the direct calls %s; the step names %d cleared, %d direct, %d scale (expected %d/%d/%d)\n",
                              c.what, (long long) c.S_v, (long long) c.H, (long long) c.n_tokens, (long long) c.n_seqs,
                              (long long) c.K, (long long) c.idx, (long long) c.head, (long long) c.slots, c.variant,
                              c.clear, (long long) c.zrow, prefill != nullptr ? prefill : "(unset)",
@@ -9127,7 +9113,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                              c.pass ? 1 : 0, e_out, e_st, e_more, k_gdn_max_nmse, wild_ok ? "as the CPU's" : "other",
                              kept ? "unchanged" : "changed", clear_ok ? "as the CPU's" : "other",
                              copy_ok ? "no pass, the same bytes" : "a pass or other bytes",
-                             later_ok ? "as expected" : "a pass or other bytes", direct_ok ? "as expected" : "failed",
+                             direct_ok ? "as expected" : "failed",
                              n_names[0], n_names[1], n_names[2], c.cleared ? 1 : 0, c.pass && !c.cleared ? 1 : 0,
                              c.cleared ? 0 : 1);
                 g_failures++;
@@ -9214,7 +9200,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     // through the scheduler (the inputs and the states in our buffer, the rest in its compute buffer) under the plan
     // cache's uid trust
     bool     sched_ok = false;
-    uint64_t sched_passes[5] = {}, sched_hits[5] = {}, sched_misses[5] = {};
+    uint64_t sched_passes[4] = {}, sched_hits[4] = {}, sched_misses[4] = {};
     {
         const state_case c = { "the scheduler", 16, 4, 2, 1, 1, 4, 1, 1, 0, true };
         state_graph      sg, ref;
@@ -9241,8 +9227,8 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                 }
 #endif
             };
-            const char * const settings[5] = { nullptr, nullptr, "copy", "later", nullptr };
-            for (int i = 0; i < 5 && ok; i++) {
+            const char * const settings[4] = { nullptr, nullptr, "copy", nullptr };
+            for (int i = 0; i < 4 && ok; i++) {
                 set_raw(settings[i]);
                 sg.reset();
                 spacemit_state_passes_take();
@@ -9270,27 +9256,22 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             worst_nmse = std::max(worst_nmse, std::max(e, e_st));
             sched_ok   = ok && on_device && e >= 0.0 && e <= k_gdn_max_nmse && e_st >= 0.0 && e_st <= k_gdn_max_nmse &&
                        sched_passes[0] == 1 && sched_misses[0] == 1 && sched_hits[1] == 1 && sched_passes[1] == 0 &&
-                       sched_misses[2] == 1 && sched_passes[2] == 0 && sched_misses[3] == 1 && sched_passes[3] == 1 &&
-                       sched_misses[4] == 1 && sched_passes[4] == 1;
+                       sched_misses[2] == 1 && sched_passes[2] == 0 && sched_misses[3] == 1 && sched_passes[3] == 1;
             if (sched != nullptr) {
                 ggml_backend_sched_free(sched);
             }
         }
         if (!sched_ok) {
             std::fprintf(stderr,
-                         "FAIL: state pass through the scheduler: passes %llu/%llu/%llu/%llu/%llu (expected "
-                         "1/0/0/1/1), plan hits %llu/%llu/%llu/%llu/%llu (expected 0/1/0/0/0), misses "
-                         "%llu/%llu/%llu/%llu/%llu (expected 1/0/1/1/1), or the outputs, the placement or the bound "
-                         "failed\n",
+                         "FAIL: state pass through the scheduler: passes %llu/%llu/%llu/%llu (expected 1/0/0/1), plan "
+                         "hits %llu/%llu/%llu/%llu (expected 0/1/0/0), misses %llu/%llu/%llu/%llu (expected 1/0/1/1), "
+                         "or the outputs, the placement or the bound failed\n",
                          (unsigned long long) sched_passes[0], (unsigned long long) sched_passes[1],
                          (unsigned long long) sched_passes[2], (unsigned long long) sched_passes[3],
-                         (unsigned long long) sched_passes[4],
                          (unsigned long long) sched_hits[0], (unsigned long long) sched_hits[1],
                          (unsigned long long) sched_hits[2], (unsigned long long) sched_hits[3],
-                         (unsigned long long) sched_hits[4],
                          (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1],
-                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3],
-                         (unsigned long long) sched_misses[4]);
+                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3]);
             g_failures++;
         }
     }
@@ -9308,12 +9289,10 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                 "and refused (a write of the states between the copies)%s: %d/%d cases, %d passes by the counter; "
                 "against the CPU on one thread max NMSE %.2e (bound %.0e), the rows the CPY does not write bit for "
                 "bit and the cleared rows the CPU's bytes, the step names the fold's where it applies and no "
-                "scale.f32 there, FLAGOS_SPACEMIT_STATE=copy without a pass and with the same bytes, =later without "
-                "a pass where anything else writes the states and with the same bytes, =abc reported once and taken "
-                "as direct: %s; the step directly on 1, 3 and 8 tiles %d/%d; two computes with the state carried "
-                "over: %s; through the scheduler a miss, a hit by uid (no pass), copy a miss by the configuration "
-                "word, later another miss (a pass, the graph having no clear), the default a miss again, the same "
-                "bytes: %s\n",
+                "scale.f32 there, FLAGOS_SPACEMIT_STATE=copy without a pass and with the same bytes, =abc reported "
+                "once and taken as direct: %s; the step directly on 1, 3 and 8 tiles %d/%d; two computes with the "
+                "state carried over: %s; through the scheduler a miss, a hit by uid (no pass), copy a miss by the "
+                "configuration word, the default a miss again, the same bytes: %s\n",
                 reference_label(), n_ok, n_cases, n_passed, worst_nmse, k_gdn_max_nmse,
                 unknown_ok ? "checked" : "FAILED", n_direct_ok, n_direct, carried_ok ? "checked" : "FAILED",
                 sched_ok ? "checked" : "FAILED");

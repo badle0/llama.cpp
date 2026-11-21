@@ -887,17 +887,15 @@ bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t ow
     }
 
     // nothing after the GET_ROWS but the pass's CPY computes that tensor, and nothing between the two copies reads it.
-    // A writer before the GET_ROWS wrote before the row was read in the original order, so it is admitted (the form
-    // before 2026-11-20, FLAGOS_SPACEMIT_STATE=later, admits none)
-    const bool admit   = spacemit_state_mode() == spacemit_state_kind::direct;
-    int        writers = 0, zero = -1;
+    // A writer before the GET_ROWS wrote before the row was read in the original order, so it is admitted
+    int writers = 0, zero = -1;
     for (int t = 0; t < g->n_nodes; t++) {
         const ggml_tensor * n = g->nodes[t];
         if (n == cp || spacemit_node_empty(n)) {
             continue;
         }
         if (spacemit_base_of(n) == persistent) {
-            if (!admit || t >= rows_at) {
+            if (t >= rows_at) {
                 return false;
             }
             writers++;

@@ -282,15 +282,14 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     ctx->steps.clear();
     ctx->step_names.clear();
     // the configuration word is the activation-sharing fact (bit 0), FLAGOS_SPACEMIT_SSM_CONV=split (bit 1),
-    // FLAGOS_SPACEMIT_STATE (bits 2 and 3: direct 0, later 1, copy 2) and, above them, the plugin's switch generation,
-    // which moves whenever a kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading
-    // a plugin switch); a different word is a miss
+    // FLAGOS_SPACEMIT_STATE=copy (bit 2) and, above them, the plugin's switch generation, which moves whenever a
+    // kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a plugin switch); a
+    // different word is a miss
     uint64_t word = 0;
     if (cached) {
         const uint64_t generation = ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
-        const uint64_t state      = state_mode == spacemit_state_kind::later ? 1 :
-                                    state_mode == spacemit_state_kind::copy  ? 2 : 0;
-        word = (generation << 4) | (state << 2) | (fuse_conv ? 0 : 2) | (share ? 1 : 0);
+        word = (generation << 3) | (state_mode == spacemit_state_kind::copy ? 4 : 0) | (fuse_conv ? 0 : 2) |
+               (share ? 1 : 0);
     }
     // the key alone, before the contract check
     spacemit_plan_result plan = spacemit_plan_result::off;

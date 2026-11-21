@@ -273,9 +273,6 @@ spacemit_state_kind spacemit_state_mode() {
     if (v == nullptr || *v == '\0' || std::strcmp(v, "direct") == 0) {
         return spacemit_state_kind::direct;
     }
-    if (std::strcmp(v, "later") == 0) {
-        return spacemit_state_kind::later;
-    }
     if (std::strcmp(v, "copy") == 0) {
         return spacemit_state_kind::copy;
     }
