@@ -27,6 +27,9 @@ constexpr int64_t row_align = 4;                       // rows of the 4-row kern
 // what a unit (expert, slab) costs beside its expert's rows: the slab's bytes, in units of one row's work. A guess, not
 // measured: a slab is 32 weight rows, a row of the unit's work is one quantized activation row times those 32 rows
 constexpr int64_t slab_weight = 4;
+// the chunks a tile's share of the weight is cut into; 16 measured against 64 on the K3 (plan.md "The expert matmul's
+// claim queue"): 64 leaves less waiting at the step's end but costs more kernel time
+constexpr int64_t mmid_chunks = 16;
 
 // one pair of ggml-cpu's mmid_row_mapping: the slot of the token's ids (i1: the output row, and the activation row
 // i1 % ne11) and the token (i2)
@@ -115,68 +118,6 @@ mmid_setting mmid_setting_from_env() {
     static std::atomic<int>      value{ 0 };
     static std::atomic<uint32_t> seen{ 0 };
     return static_cast<mmid_setting>(spacemit_cached_switch(value, seen, parse_mmid_setting));
-}
-
-// test-only, for the comparison (plan.md "The expert matmul's claim queue"): FLAGOS_SPACEMIT_MMID_DEAL=queue (unset or
-// empty, the default): several tokens' (expert, slab) units are cut into chunks that the tiles claim from one counter;
-// static: the units dealt as contiguous ranges of cumulative weight before any work starts. Parsed once
-// (spacemit_cached_switch); anything else warns once per parse generation and keeps the default
-enum class mmid_deal { queue, fixed };
-
-int parse_mmid_deal() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_MMID_DEAL");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "queue") == 0) {
-        return (int) mmid_deal::queue;
-    }
-    if (std::strcmp(v, "static") == 0) {
-        return (int) mmid_deal::fixed;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MMID_DEAL=%s: not queue or static, the default (queue) kept\n", __func__, v);
-    }
-    return (int) mmid_deal::queue;
-}
-
-mmid_deal mmid_deal_from_env() {
-    static std::atomic<int>      value{ 0 };
-    static std::atomic<uint32_t> seen{ 0 };
-    return static_cast<mmid_deal>(spacemit_cached_switch(value, seen, parse_mmid_deal));
-}
-
-// test-only: FLAGOS_SPACEMIT_MMID_CHUNKS=<n>, the chunks a tile's share of the queue's weight is cut into, n decimal
-// digits only, 1 to 1024; unset or empty: 16. Parsed once (spacemit_cached_switch); anything else keeps the default
-// with a warning, once per parse generation
-constexpr int mmid_default_chunks = 16;
-constexpr int mmid_max_chunks     = 1024;
-
-int parse_mmid_chunks() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_MMID_CHUNKS");
-    if (v == nullptr || *v == '\0') {
-        return mmid_default_chunks;
-    }
-    int          n = 0;
-    const char * c = v;
-    for (; *c >= '0' && *c <= '9' && n <= mmid_max_chunks; ++c) {  // stops past 1024, so no overflow
-        n = n * 10 + (*c - '0');
-    }
-    if (*c == '\0' && n >= 1 && n <= mmid_max_chunks) {
-        return n;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MMID_CHUNKS=%s: not a chunk count from 1 to 1024, the default %d kept\n",
-                      __func__, v, mmid_default_chunks);
-    }
-    return mmid_default_chunks;
-}
-
-int mmid_chunks_from_env() {
-    static std::atomic<int>      value{ mmid_default_chunks };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_mmid_chunks);
 }
 
 // the queue's counter: after the tiles' parts, at the workspace's end, on a cache line of its own when the workspace is
@@ -273,11 +214,6 @@ float * out_row(const ggml_tensor * node, const mmid_row & r, int64_t n0) {
 size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
     const mmid_dims d = mmid_dims_of(node);
     return d.act_bytes + SPACEMIT_MAX_TILES * d.tile_bytes + 64;
-}
-
-void spacemit_mul_mat_id_read_switch() {
-    (void) mmid_deal_from_env();
-    (void) mmid_chunks_from_env();
 }
 
 // step 1: quantize the activations into the workspace's first part. One token (or rows): every activation row (ne11 per
@@ -383,14 +319,13 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
 // One token (or rows): the units are (pair j, 32 columns c), numbered j * (N / 32) + c in the grouping's order and
 // dealt as contiguous ranges; each run of one pair's columns is one 1-row kernel call on the expert's rows.
 // Several tokens: the units are (active expert e, 32-column slab s), expert-major, each weighted by the expert's rows
-// plus the slab (slab_weight). By default (FLAGOS_SPACEMIT_MMID_DEAL=queue) an expert's slabs are cut into chunks of
-// about a 16th of a tile's share of the weight, which the tiles claim in order from the counter that tile 0 of step 1
-// reset; static deals the units as contiguous ranges of cumulative weight. A slab belongs to one tile either way, so an
-// expert's weights are read once per node. For a unit the tile multiplies the slab by every group of the expert: a
-// group of 4 into a 4 x 32 temporary whose rows are then scattered to their output rows, a single straight to its
-// output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per run of
-// the expert's units where they fit beside it; a slab is copied whatever the group count, since staging a slab is also
-// faster for one kernel call (plan.md "1-row matmul bandwidth").
+// plus the slab (slab_weight). An expert's slabs are cut into chunks of about a 16th of a tile's share of the weight
+// (mmid_chunks), which the tiles claim in order from the counter that tile 0 of step 1 reset. A slab belongs to one
+// tile, so an expert's weights are read once per node. For a unit the tile multiplies the slab by every group of the
+// expert: a group of 4 into a 4 x 32 temporary whose rows are then scattered to their output rows, a single straight to
+// its output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per run
+// of the expert's units where they fit beside it; a slab is copied whatever the group count, since staging a slab is
+// also faster for one kernel call (plan.md "1-row matmul bandwidth").
 // Either way every output element comes from one kernel call on one (group or pair, slab), so neither the tile count
 // nor the staging can change it
 bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
@@ -494,38 +429,8 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
         }
     };
 
-    if (mmid_deal_from_env() == mmid_deal::fixed) {
-        const int64_t lo   = (int64_t) tile.ith * total;  // this tile takes the units with lo <= u * nth < lo + total
-        const int64_t hi   = lo + total;
-        int64_t       u    = 0;  // the weight of the units before the one at hand
-        bool          done = false;
-        for (int64_t x = 0; x < d.n_as && !done; x++) {
-            const int64_t rx = w.start[x + 1] - w.start[x];
-            if (rx == 0) {
-                continue;
-            }
-            const int64_t weight = rx + slab_weight;
-            if ((u + per * weight) * nth <= lo) {
-                u += per * weight;  // the whole expert lies before this tile's range
-                continue;
-            }
-            enter(x);
-            for (int64_t s = 0; s < per; s++, u += weight) {
-                if (u * nth < lo) {
-                    continue;
-                }
-                if (u * nth >= hi) {
-                    done = true;
-                    break;
-                }
-                unit(s);
-            }
-        }
-        return true;
-    }
-
-    // the queue: an expert's slabs in chunks of c, c about a chunks-th of a tile's share, numbered expert-major
-    const int64_t target      = std::max<int64_t>(1, total / (nth * mmid_chunks_from_env()));
+    // the queue: an expert's slabs in chunks of c, c about a 16th of a tile's share, numbered expert-major
+    const int64_t target      = std::max<int64_t>(1, total / (nth * mmid_chunks));
     const auto    chunk_slabs = [&](int64_t rx) { return std::clamp(target / (rx + slab_weight), int64_t(1), per); };
     int64_t       n_chunks    = 0;
     for (int64_t x = 0; x < d.n_as; x++) {

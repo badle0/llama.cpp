@@ -7812,14 +7812,13 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
     return 0;
 }
 
-// the many-row path's claim queue (plan.md "The expert matmul's claim queue"): FLAGOS_SPACEMIT_MMID_DEAL unset (queue)
-// against static, which deals the units before any work starts. Every output element comes from the same kernel call
-// under both, so the bytes are static's for any tile count, claim order, chunk count and staging. Through the backend:
-// with TCM, without, grouped, at 64 chunks a share, twice in a row on one backend (the second compute needs step 1's
-// reset), on threads 20 times. Directly: on 1 and 8 tiles, in reverse, one tile first (it claims every chunk), on
-// threads 20 times; after each the counter (at the workspace's end, which the test aligns to 64) holds the chunk count
-// plus the tile count, each tile's last claim being past the end, 0 under static. The switches' values on the skewed
-// draw, and the two steps' labels in the op counters
+// the many-row path's claim queue (plan.md "The expert matmul's claim queue"). Every output element comes from one
+// kernel call whoever claims its chunk, so the bytes are the first backend run's (with TCM) for any tile count, claim
+// order and staging. Through the backend: grouped, without TCM, twice in a row on one backend (the second compute
+// needs step 1's reset), on threads 20 times. Directly: on 1 tile (it claims every chunk in order) and 8, in reverse,
+// one tile first, on threads 20 times; after each the counter (at the workspace's end, which the test aligns to 64)
+// holds the chunk count plus the tile count, each tile's last claim being past the end. The two steps' labels in the
+// op counters
 static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
     const bool     direct = host || *reference_label() != '\0';
     ggml_backend_t cpu    = ggml_backend_cpu_init();
@@ -7843,8 +7842,6 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
     }
     REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
     env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
-    env_override deal_default("FLAGOS_SPACEMIT_MMID_DEAL", nullptr);
-    env_override chunks_default("FLAGOS_SPACEMIT_MMID_CHUNKS", nullptr);
 
     struct queue_case {
         const char *         what;
@@ -7853,8 +7850,7 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         bool                 shuffled;
         std::vector<int64_t> counts;  // the rows wanted per expert; its size is the expert count
     };
-    // the skewed draw (half the pairs on expert 1) cuts its experts into chunks of 1 to 4 slabs at 16 chunks a share
-    // on 8 tiles, into single slabs at 64
+    // the skewed draw (half the pairs on expert 1) cuts its experts into chunks of 1 to 4 slabs on 8 tiles
     const std::vector<int64_t>    skew  = { 1, 160, 1, 2, 30, 0, 50, 4, 72 };
     const std::vector<queue_case> cases = {
         { "every pair on one expert", GGML_TYPE_Q4_0, 256, 4, 1, 6, false, { 0, 0, 24, 0 } },
@@ -7865,18 +7861,17 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         { "experts of 0 rows between active ones", GGML_TYPE_Q4_0, 256, 2, 1, 8, false,
          { 0, 3, 0, 0, 5, 0, 0, 0, 2, 0, 6, 0 } },
     };
-    const size_t   k_skewed = 2;       // the case the switches run on
     const int64_t  k        = 256;
     const size_t   tcm_size = 393216;  // the K3's 384 KiB
     const uint32_t k_runs   = 20;      // the runs with the tiles at the same time
 
-    // the queue's chunk count as the plugin cuts it (slab_weight 4, flagos-spacemit-ime-id.cpp)
-    const auto chunk_count = [](const std::vector<int64_t> & counts, int64_t per, int64_t nth, int64_t chunks) {
+    // the queue's chunk count as the plugin cuts it (slab_weight 4 and mmid_chunks 16, flagos-spacemit-ime-id.cpp)
+    const auto chunk_count = [](const std::vector<int64_t> & counts, int64_t per, int64_t nth) {
         int64_t total = 0;
         for (const int64_t r : counts) {
             total += r > 0 ? per * (r + 4) : 0;
         }
-        const int64_t target = std::max<int64_t>(1, total / (nth * chunks));
+        const int64_t target = std::max<int64_t>(1, total / (nth * 16));
         int64_t       n      = 0;
         for (const int64_t r : counts) {
             if (r > 0) {
@@ -7902,7 +7897,7 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
     };
 
     int      n_cases = 0, n_ok = 0, n_backend = 0, n_backend_ok = 0, n_direct = 0, n_direct_ok = 0;
-    int      n_switch = 0, n_switch_ok = 0, n_design = 0, n_design_ok = 0;
+    int      n_design = 0, n_design_ok = 0;
     double   worst = 0.0, worst_rows = 0.0;
     uint32_t seed = 3100;
     for (size_t ci = 0; ci < cases.size(); ci++) {
@@ -7960,19 +7955,15 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         const auto same = [&](const std::vector<float> & a, const std::vector<float> & b) {
             return a.size() == b.size() && std::memcmp(a.data(), b.data(), bytes) == 0;
         };
-        // through the backend under the given switches, the output filled with NaN first so an element no tile writes
-        // shows
-        const auto run = [&](ggml_backend_t backend, const char * mmid, const char * deal, const char * chunks) {
+        // through the backend under the given FLAGOS_SPACEMIT_MMID, the output filled with NaN first so an element no
+        // tile writes shows
+        const auto run = [&](ggml_backend_t backend, const char * mmid) {
             set_env("FLAGOS_SPACEMIT_MMID", mmid);
-            set_env("FLAGOS_SPACEMIT_MMID_DEAL", deal);
-            set_env("FLAGOS_SPACEMIT_MMID_CHUNKS", chunks);
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
             std::vector<float> out((size_t) n_out, NAN);
             ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
             set_env("FLAGOS_SPACEMIT_MMID", nullptr);
-            set_env("FLAGOS_SPACEMIT_MMID_DEAL", nullptr);
-            set_env("FLAGOS_SPACEMIT_MMID_CHUNKS", nullptr);
             return out;
         };
         const auto backend_same = [&](bool good, const char * what) {
@@ -7982,7 +7973,7 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
 
         // the design: one expert's chunks are single slabs; fewer chunks than tiles
         if (ci == 0 || ci == 4) {
-            const int64_t n8 = chunk_count(c.counts, per, 8, 16);
+            const int64_t n8 = chunk_count(c.counts, per, 8);
             const bool    as = ci == 0 ? n8 == per : n8 < 8;
             n_design++;
             n_design_ok += note(as, ci == 0 ? "not single-slab chunks" : "not fewer chunks than tiles");
@@ -7992,19 +7983,16 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         {
             ggml_backend_t backend = tcm_backend(dev, nullptr);
             REQUIRE(backend != nullptr);
-            ref = run(backend, nullptr, "static", nullptr);
-            backend_same(same(run(backend, nullptr, nullptr, nullptr), ref), "queue with TCM");
-            backend_same(same(run(backend, nullptr, "queue", "64"), ref), "queue at 64 chunks");
-            backend_same(same(run(backend, "grouped", nullptr, nullptr), ref), "grouped");
-            backend_same(same(run(backend, "grouped", "static", nullptr), ref), "grouped, static");
-            out_rows = run(backend, "rows", nullptr, nullptr);
+            ref = run(backend, nullptr);
+            backend_same(same(run(backend, "grouped"), ref), "grouped");
+            out_rows = run(backend, "rows");
             ggml_backend_free(backend);
         }
         {  // without TCM, and the same graph twice on one backend: the second compute finds the first's counter
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             REQUIRE(backend != nullptr);
-            const std::vector<float> first  = run(backend, nullptr, nullptr, nullptr);
-            const std::vector<float> second = run(backend, nullptr, nullptr, nullptr);
+            const std::vector<float> first  = run(backend, nullptr);
+            const std::vector<float> second = run(backend, nullptr);
             backend_same(same(first, ref), "queue without TCM");
             backend_same(same(second, ref), "the second compute in a row");
             ggml_backend_free(backend);
@@ -8014,10 +8002,9 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
             REQUIRE(backend != nullptr);
             bool all = true;
             for (uint32_t i = 0; i < k_runs; i++) {
-                all = same(run(backend, nullptr, nullptr, nullptr), ref) && all;
+                all = same(run(backend, nullptr), ref) && all;
             }
             backend_same(all, "queue on threads");
-            backend_same(same(run(backend, nullptr, "static", nullptr), ref), "static on threads");
             ggml_backend_free(backend);
         }
 
@@ -8065,37 +8052,25 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
             uint32_t     nth;
             int          order;
             bool         staged;
-            const char * deal;
-            const char * chunks;
             uint32_t     runs;
         };
         const std::vector<direct_form> forms = {
-            { "1 tile", 1, 0, true, nullptr, nullptr, 1 },
-            { "8 tiles", 8, 0, true, nullptr, nullptr, 1 },
-            { "8 tiles in reverse", 8, 1, true, nullptr, nullptr, 1 },
-            { "8 tiles, one first", 8, 2, true, nullptr, nullptr, 1 },
-            { "8 tiles without TCM", 8, 0, false, nullptr, nullptr, 1 },
-            { "8 tiles at 64 chunks", 8, 0, true, nullptr, "64", 1 },
-            { "1 tile at 64 chunks", 1, 0, true, nullptr, "64", 1 },
-            { "8 tiles, static", 8, 0, true, "static", nullptr, 1 },
-            { "8 tiles on threads", 8, 3, true, nullptr, nullptr, k_runs },
-            { "8 tiles on threads without TCM", 8, 3, false, nullptr, nullptr, k_runs },
-            { "8 tiles on threads at 64 chunks", 8, 3, true, nullptr, "64", k_runs },
+            { "1 tile", 1, 0, true, 1 },
+            { "8 tiles", 8, 0, true, 1 },
+            { "8 tiles in reverse", 8, 1, true, 1 },
+            { "8 tiles, one first", 8, 2, true, 1 },
+            { "8 tiles without TCM", 8, 0, false, 1 },
+            { "8 tiles on threads", 8, 3, true, k_runs },
+            { "8 tiles on threads without TCM", 8, 3, false, k_runs },
         };
         for (size_t f = 0; f < forms.size() && direct; f++) {
-            const direct_form & form = forms[f];
-            const bool          fixed = form.deal != nullptr;
-            const int64_t       want =
-                fixed ? 0 : chunk_count(c.counts, per, form.nth, form.chunks != nullptr ? 64 : 16) + form.nth;
-            set_env("FLAGOS_SPACEMIT_MMID_DEAL", form.deal);
-            set_env("FLAGOS_SPACEMIT_MMID_CHUNKS", form.chunks);
-            bool    good   = true;
-            int64_t claims = -1;
+            const direct_form & form   = forms[f];
+            const int64_t       want   = chunk_count(c.counts, per, form.nth) + form.nth;
+            bool                good   = true;
+            int64_t             claims = -1;
             for (uint32_t i = 0; i < form.runs; i++) {
                 good = same(direct_run(form.nth, form.order, form.staged, claims), ref) && claims == want && good;
             }
-            set_env("FLAGOS_SPACEMIT_MMID_DEAL", nullptr);
-            set_env("FLAGOS_SPACEMIT_MMID_CHUNKS", nullptr);
             n_direct++;
             n_direct_ok += note(good, form.what);
             if (!good) {
@@ -8103,47 +8078,6 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
                              c.what, form.what, (long long) claims, (long long) want);
                 g_failures++;
             }
-        }
-
-        // the switches on the skewed draw, directly on 8 tiles, two runs each: the bytes, the counter, the warnings
-        if (direct && ci == k_skewed) {
-            const int64_t n16 = chunk_count(c.counts, per, 8, 16) + 8;
-            const int64_t n64 = chunk_count(c.counts, per, 8, 64) + 8;
-            const auto    check_switch = [&](const char * name, const char * value, int64_t want, int warns) {
-                log_capture  log;
-                env_override sw(name, value);
-                bool         good   = true;
-                int64_t      claims = -1;
-                for (int i = 0; i < 2; i++) {
-                    good = same(direct_run(8, 0, true, claims), ref) && claims == want && good;
-                }
-                const int warnings = count_lines_with(log.take(), (std::string(name) + "=").c_str());
-                good               = good && warnings == warns;
-                n_switch++;
-                n_switch_ok += good;
-                if (!good) {
-                    std::fprintf(stderr,
-                                 "FAIL: MUL_MAT_ID queue, %s=%s: counter %lld (wanted %lld), %d warnings (wanted %d)%s\n",
-                                 name, value != nullptr ? value : "(unset)", (long long) claims, (long long) want,
-                                 warnings, warns, ok ? "" : ", a step failed");
-                    g_failures++;
-                }
-            };
-            n_design++;
-            n_design_ok += note(n16 != n64, "64 chunks cut as 16");
-            check_switch("FLAGOS_SPACEMIT_MMID_DEAL", nullptr, n16, 0);
-            check_switch("FLAGOS_SPACEMIT_MMID_DEAL", "", n16, 0);
-            check_switch("FLAGOS_SPACEMIT_MMID_DEAL", "queue", n16, 0);
-            check_switch("FLAGOS_SPACEMIT_MMID_DEAL", "static", 0, 0);
-            check_switch("FLAGOS_SPACEMIT_MMID_DEAL", "bogus", n16, 1);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", nullptr, n16, 0);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "", n16, 0);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "0", n16, 1);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "-4", n16, 1);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "abc", n16, 1);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "16x", n16, 1);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "1025", n16, 1);
-            check_switch("FLAGOS_SPACEMIT_MMID_CHUNKS", "64", n64, 0);
         }
 
         const double e      = ok ? nmse(ref.data(), (const float *) y_ref->data, n_out) : -1.0;
@@ -8157,7 +8091,8 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         if (!case_ok) {
             std::fprintf(stderr,
                          "FAIL: MUL_MAT_ID queue, %s, %s [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld tokens: "
-                         "%s; not static's bytes or not as designed: %s; NMSE static %.3e, rows %.3e (bound %.0e)\n",
+                         "%s; not the first run's bytes or not as designed: %s; NMSE queue %.3e, rows %.3e "
+                         "(bound %.0e)\n",
                          c.what, ggml_type_name(c.type), (long long) k, (long long) c.n, (long long) n_mats,
                          (long long) c.n_used, (long long) c.ne11, (long long) c.n_tok, ok ? "ran" : "failed",
                          bad.empty() ? "none" : bad.c_str(), e, e_rows, k_mul_mat_max_nmse);
@@ -8219,17 +8154,15 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         }
     }
 
-    std::printf("mmid     the claim queue (FLAGOS_SPACEMIT_MMID_DEAL unset, queue, against static) at every pair on one "
-                "expert, one row an expert, a skewed draw (Q4_0, and Q8_0 with a row per id), fewer chunks than tiles, "
-                "experts of 0 rows between active ones: %d/%d cases; through the backend (with TCM, at 64 chunks, "
-                "grouped, without TCM, twice in a row%s) static's bytes in %d/%d; directly (1 and 8 tiles, in reverse, "
-                "one tile first, without TCM, at 64 chunks%s) static's bytes and the counter at chunks + tiles in "
-                "%d/%d; as designed %d/%d; FLAGOS_SPACEMIT_MMID_DEAL and _CHUNKS values (unset, empty, queue, static, "
-                "unknown; 0, -4, abc, 16x, 1025 warning once and taken as 16, 64) %d/%d; the two steps' labels %d/2; "
-                "against the CPU on one thread max NMSE static %.2e, rows %.2e (bound %.0e)%s\n",
+    std::printf("mmid     the claim queue (16 chunks a tile's share) at every pair on one expert, one row an expert, a "
+                "skewed draw (Q4_0, and Q8_0 with a row per id), fewer chunks than tiles, experts of 0 rows between "
+                "active ones: %d/%d cases; through the backend (grouped, without TCM, twice in a row%s) the first "
+                "run's bytes in %d/%d; directly (1 and 8 tiles, in reverse, one tile first, without TCM%s) the first "
+                "run's bytes and the counter at chunks + tiles in %d/%d; as designed %d/%d; the two steps' labels "
+                "%d/2; against the CPU on one thread max NMSE queue %.2e, rows %.2e (bound %.0e)%s\n",
                 n_ok, n_cases, host ? ", on threads 20 times" : "", n_backend_ok, n_backend,
-                direct ? ", on threads 20 times" : "", n_direct_ok, n_direct, n_design_ok, n_design, n_switch_ok,
-                n_switch, n_labels, worst, worst_rows, k_mul_mat_max_nmse, reference_label());
+                direct ? ", on threads 20 times" : "", n_direct_ok, n_direct, n_design_ok, n_design, n_labels, worst,
+                worst_rows, k_mul_mat_max_nmse, reference_label());
     return 0;
 }
 

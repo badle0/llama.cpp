@@ -17,9 +17,6 @@
 // result per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line, then the cache line of step 2's claim
 // counter (several tokens)
 size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node);
-// reads FLAGOS_SPACEMIT_MMID_DEAL and FLAGOS_SPACEMIT_MMID_CHUNKS (test-only) at registration, as
-// spacemit_embd_read_switch, so a bad value's warning shows
-void   spacemit_mul_mat_id_read_switch();
 bool   spacemit_mul_mat_id_quantize(const spacemit_tile * tile, ggml_tensor * node);
 // false (the graph fails) when an id is outside [0, n_expert), which ggml-cpu asserts in debug builds only
 bool   spacemit_mul_mat_id_gemm(const spacemit_tile * tile, ggml_tensor * node);
