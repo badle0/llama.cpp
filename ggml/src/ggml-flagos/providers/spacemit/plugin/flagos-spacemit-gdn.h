@@ -15,6 +15,11 @@ bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile, ggml_tensor * d
 // state into the CPY's destination row, usually the same row. Its workspace is the op's (spacemit_gdn_workspace)
 bool spacemit_kernel_gated_delta_net_direct(const spacemit_tile * tile, ggml_tensor * cpy);
 
+// the same step with the clearing SCALE of a sequence's first graph folded in (spacemit_state_pass): before the
+// computation each tile multiplies its own heads' part of the CPY's destination row by 0, as ggml_vec_scale_f32 does,
+// so the tiles' parts together clear the row with the CPU's bits
+bool spacemit_kernel_gated_delta_net_direct_cleared(const spacemit_tile * tile, ggml_tensor * cpy);
+
 // the scratch per tile: 3 * S_v floats (the RVV kernel's delta, decay and attention sums; ggml-cpu's kernel and the
 // reference use the first S_v, delta), plus S_v * S_v for the working state when K > 1; with K 1 and 16 tokens and up
 // at least the chunkwise form's S_v * S_v + 112 * S_v + 832; padded to a cache line, for SPACEMIT_MAX_TILES tiles

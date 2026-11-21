@@ -37,10 +37,13 @@ struct spacemit_ops {
     spacemit_op                ops[32];  // one per contract, in the contract table's order
     uint32_t                   n_ops = 0;
     // not contracts: the steps of a convolution pair (spacemit_conv_pair), concat.f32.tail for its CONCAT and
-    // ssm_conv.f32.stashed for its SSM_CONV, one step each, and a state pass's one step (spacemit_state_pass)
+    // ssm_conv.f32.stashed for its SSM_CONV, one step each, and a state pass's one step (spacemit_state_pass), in its
+    // two forms. The folding one is optional: n_steps 0 when the plugin does not offer it, and the pass keeps
+    // state_direct with the clearing SCALE as its own step
     spacemit_op                conv_pair_concat;
     spacemit_op                conv_pair_ssm_conv;
     spacemit_op                state_direct;
+    spacemit_op                state_direct_cleared;
 };
 
 // binds every contract's step names to table->kernels(); false, with detail naming the step, when a name is missing
@@ -83,15 +86,25 @@ void     spacemit_conv_pairs_add(uint64_t n);
 // the op passes gdn.f32; the GET_ROWS reads one I32 index and its source's rows are the state's S_v * S_v * H floats,
 // contiguous; the row read in has no other consumer than the op; of the op's output only the attention scores are read
 // elsewhere, its state region by that one CPY alone, whose destination is a whole contiguous row of the same
-// persistent tensor; nothing else in g computes that tensor, and nothing between the two copies reads or writes it;
-// and all three nodes pass their contracts (spacemit_find_op), so GGML_FLAGOS_DISABLE_OPS still sends them to the CPU.
+// persistent tensor; nothing after the GET_ROWS but that CPY computes the tensor, and nothing between the two copies
+// reads or writes it; and all three nodes pass their contracts (spacemit_find_op), so GGML_FLAGOS_DISABLE_OPS still
+// sends them to the CPU.
 // Then the one step gated_delta_net.f32.direct, running on the CPY node, reads the persistent row and writes the new
 // state into the CPY's destination, and the GET_ROWS and the CPY emit no steps (about 10 ms of a Qwen3.5 token on the
 // K3). The model: src/llama-graph.cpp build_rs with src/models/delta-net-base.cpp build_recurrent_attn (the !keep
-// branch), whose other build_rs nodes (a zero-sized SCALE, the extra GET_ROWS and its CPY) are empty and ignored.
+// branch), whose other build_rs nodes (the extra GET_ROWS and its CPY) are empty and ignored.
+// A node that writes the tensor before the GET_ROWS is admitted: it wrote before the row was read in the original
+// order, and still has when the direct step reads it at the CPY's position. Such a writer keeps its own step, except
+// for one clearing node (*zi, -1 without it) folded into the step: at a sequence's start build_rs clears the state
+// with a SCALE by 0 in place, and where that SCALE is the only admitted writer, covers exactly the whole contiguous
+// row the CPY writes (the same address and byte size), has factor 0 and bias 0, passes its own contract and nothing
+// but the pass's two copies reads or writes the tensor between it and the CPY, the step
+// gated_delta_net.f32.direct.cleared multiplies that row by 0 itself, each tile its own heads' part, and the SCALE
+// emits no step. FLAGOS_SPACEMIT_STATE=later asks for the form before 2026-11-20, with neither the admission nor the
+// fold.
 // Limit, as the convolution pair's: a consumer placed in another backend's split is not in g, so not seen
 bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g, int gi,
-                         int * ri, int * ci);
+                         int * ri, int * ci, int * zi);
 
 // test-only: the state passes graph_compute expanded since the last call (a trusted plan-cache hit reuses its stored
 // steps and counts none), over all backends

@@ -59,6 +59,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -8631,8 +8632,16 @@ static int check_gdn(ggml_backend_dev_t dev) {
 // bit and stay within the bound; they equal the device's bytes only where both run the same kernels (the reference
 // ones, or any host but the K3, whose calling core has another vector length - as check_gdn's direct calls).
 // Then one graph through the scheduler (its allocator reusing memory) under the plan cache: a miss, a trusted hit
-// counting no pass, FLAGOS_SPACEMIT_STATE=copy a miss by the configuration word, the default a miss again, the same
-// bytes; and two computes in a row with the state carried over, against the CPU doing the same.
+// counting no pass, FLAGOS_SPACEMIT_STATE=copy a miss by the configuration word, =later another miss (the pass still
+// taken, the graph having no clear), the default a miss again, the same bytes; and two computes in a row with the
+// state carried over, against the CPU doing the same.
+//
+// A case with zrow >= 0 is a sequence's first graph: build_rs' SCALE by 0 really clears row zrow there (clear says
+// how). Where it clears exactly the row the CPY writes, the pass folds it into its step
+// (gated_delta_net.f32.direct.cleared, by the trace's step names, with no scale.f32 of its own); otherwise the SCALE
+// keeps its step and the pass takes the graph all the same, except with a write of the states between the two copies,
+// which refuses it. Each such case also runs under FLAGOS_SPACEMIT_STATE=later, the form before 2026-11-20, which
+// takes no pass where anything else writes the tensor, and the bytes of all three forms are compared.
 //
 struct state_case {
     const char * what;
@@ -8641,6 +8650,21 @@ struct state_case {
     int          variant;  // 0 the model's graph, 1 a second consumer of the row read in, 2 another view of the new
                            // state, 3 a read of the states between the two copies, 4 the CPY into another tensor
     bool         pass;
+    int64_t      zrow    = -1;     // the row build_rs' SCALE clears; -1 its zero-sized view, as a later graph has it
+    int          clear   = 0;      // how that SCALE is built (state_clear)
+    bool         cleared = false;  // the fold expected: the step clears the row itself and the SCALE emits none
+    bool         wild    = false;  // NaN, infinities, negative values and -0.0 in the cleared row (then bytes, not
+                                   // NMSE, against the CPU: with a NaN in the state every value computed is a NaN)
+};
+
+// how a case builds build_rs' clearing SCALE (zrow >= 0)
+enum state_clear {
+    clear_whole = 0,  // the whole row zrow in place by 0, before the GET_ROWS, as build_rs has it
+    clear_half,       // its first half only
+    clear_two,        // rows zrow and zrow + 1
+    clear_factor,     // the whole row by 0.5
+    clear_reader,     // the whole row, with a read of the states between it and the GET_ROWS
+    clear_late,       // the whole row, between the GET_ROWS and the CPY
 };
 
 // one copy of a case: the persistent states in their own context and buffer, the inputs and the graph in another
@@ -8694,10 +8718,14 @@ struct state_graph {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         }
 
-        // build_rs: the reshape, the clear of one slot (zero-sized with rs_zero -1, as a generation graph has it), the
-        // row of this sequence, and the extra rows (none here) copied back
+        // build_rs: the reshape, the clear of one slot (zero-sized with rs_zero -1, as a generation graph has it; one
+        // row of it at a sequence's start), the row of this sequence, and the extra rows (none here) copied back
         ggml_tensor * states = ggml_reshape_2d(ctx, persist, state_size, c.slots);
-        ggml_tensor * zero   = ggml_view_1d(ctx, states, 0, 0);
+        const int64_t zn     = c.zrow < 0            ? 0 :
+                               c.clear == clear_half ? state_size / 2 :
+                               c.clear == clear_two  ? 2 * state_size : state_size;
+        ggml_tensor * zero   = ggml_view_1d(ctx, states, zn, c.zrow < 0 ? 0 : (size_t) c.zrow * states->nb[1]);
+        ggml_tensor * clear  = ggml_scale_inplace(ctx, zero, c.clear == clear_factor ? 0.5f : 0.0f);
         rows                 = ggml_get_rows(ctx, states, ggml_view_1d(ctx, idx, c.n_seqs, 0));
         ggml_tensor * rows_x = ggml_get_rows(ctx, states,
                                              ggml_view_1d(ctx, idx, 0, (size_t) c.n_seqs * ggml_element_size(idx)));
@@ -8721,25 +8749,34 @@ struct state_graph {
                        c.variant == 4 ? target :
                                         ggml_view_2d(ctx, persist, state_size, c.n_seqs, persist->nb[1],
                                                      (size_t) c.head * row_size));
-        extra = c.variant == 1 ? ggml_cont(ctx, rows) :
-                c.variant == 2 ? ggml_cont(ctx, new_st) :
-                c.variant == 3 ? ggml_cont(ctx, persist) :
-                c.variant == 4 ? target :
-                                 nullptr;
+        extra = c.variant == 1          ? ggml_cont(ctx, rows) :
+                c.variant == 2          ? ggml_cont(ctx, new_st) :
+                c.variant == 3          ? ggml_cont(ctx, persist) :
+                c.variant == 4          ? target :
+                c.clear == clear_reader ? ggml_cont(ctx, persist) :
+                                          nullptr;
         if (extra != nullptr) {
             ggml_set_output(extra);
         }
 
         g = ggml_new_graph(ctx);
-        ggml_build_forward_expand(g, ggml_scale_inplace(ctx, zero, 0.0f));
+        if (c.clear != clear_late) {
+            ggml_build_forward_expand(g, clear);
+        }
+        if (c.clear == clear_reader) {
+            ggml_build_forward_expand(g, extra);  // between the clear and the GET_ROWS
+        }
         ggml_build_forward_expand(g, rows);
         ggml_build_forward_expand(g, cpy_x);
         ggml_build_forward_expand(g, scores);
+        if (c.clear == clear_late) {
+            ggml_build_forward_expand(g, clear);  // a write of the states between the two copies
+        }
         if (c.variant == 3) {
             ggml_build_forward_expand(g, extra);  // between the op and the CPY: it must read the row as it was
         }
         ggml_build_forward_expand(g, cpy);
-        if (extra != nullptr && c.variant != 3) {
+        if (extra != nullptr && c.variant != 3 && c.clear != clear_reader) {
             ggml_build_forward_expand(g, extra);
         }
         if (!ops_unallocated) {
@@ -8776,6 +8813,16 @@ struct state_graph {
         std::vector<float> s = random_values(ggml_nelements(persist), seed + 5, 1.0f);
         for (float & x : s) {
             x *= 0.5f;
+        }
+        if (c.wild) {  // the old state of the row the clear must handle bit for bit
+            const float wild[8] = { std::nanf(""),           std::numeric_limits<float>::infinity(),
+                                    -std::numeric_limits<float>::infinity(), -0.0f,
+                                    -3.5f,                   0.0f,
+                                    1e30f,                   -1e-30f };
+            float * row = s.data() + c.zrow * c.S_v * c.S_v * c.H;
+            for (int64_t i = 0; i < c.S_v * c.S_v * c.H; i++) {
+                row[i] = wild[i % 8];
+            }
         }
         ggml_backend_tensor_set(persist, s.data(), 0, ggml_nbytes(persist));
         const uint8_t * p = (const uint8_t *) s.data();
@@ -8814,6 +8861,11 @@ struct state_graph {
     }
 };
 
+// the same bytes, so that a NaN counts equal to the same NaN (float == does not) and +0.0 differs from -0.0
+static bool same_bytes(const std::vector<float> & a, const std::vector<float> & b) {
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
 static int check_state_pass(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -8825,12 +8877,20 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     uint32_t                       n_kernels = 0;
     const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
     const spacemit_plugin_kernel * k_direct  = nullptr;
+    const spacemit_plugin_kernel * k_cleared = nullptr;
     for (uint32_t k = 0; k < n_kernels; k++) {
-        if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, "gated_delta_net.f32.direct") == 0) {
+        if (kernels[k].name == nullptr) {
+            continue;
+        }
+        if (std::strcmp(kernels[k].name, "gated_delta_net.f32.direct") == 0) {
             k_direct = &kernels[k];
+        }
+        if (std::strcmp(kernels[k].name, "gated_delta_net.f32.direct.cleared") == 0) {
+            k_cleared = &kernels[k];
         }
     }
     REQUIRE(k_direct != nullptr && k_direct->fn != nullptr && k_direct->workspace_size != nullptr);
+    REQUIRE(k_cleared != nullptr && k_cleared->fn != nullptr && k_cleared->workspace_size != nullptr);
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     env_override                     state_default("FLAGOS_SPACEMIT_STATE", nullptr);
     env_override                     prefill_default("FLAGOS_SPACEMIT_GDN_PREFILL", nullptr);
@@ -8858,6 +8918,29 @@ static int check_state_pass(ggml_backend_dev_t dev) {
         { "K 2",                                       16,  4,   2,   1, 2,     4,   1,    1,       0, false },
         { "a read of the states between the copies",   16,  4,   2,   1, 1,     4,   1,    1,       3, false },
         { "the CPY into another tensor",               16,  4,   2,   1, 1,     4,   1,    1,       4, false },
+  // a sequence's first graph: the clear folded into the step (zrow the row the CPY writes)
+  // what,                                            S_v,  H, tok, seq, K, slots, idx, head, variant, pass, zrow, clear, cleared, wild
+        { "a sequence's start, 1 token",               16,  4,   1,   1, 1,     4,   2,    2,       0, true,    2, clear_whole,  true  },
+        { "a sequence's start, 2 tokens",              16,  4,   2,   1, 1,     4,   1,    1,       0, true,    1, clear_whole,  true  },
+        { "a sequence's start, 32 tokens",             16,  4,  32,   1, 1,     4,   0,    0,       0, true,    0, clear_whole,  true  },
+        { "a sequence's start, 501 tokens",            16,  4, 501,   1, 1,     4,   3,    3,       0, true,    3, clear_whole,  true  },
+        { "a sequence's start, 3 rows, the cleared row read",
+                                                       16,  4,   2,   1, 1,     3,   1,    1,       0, true,    1, clear_whole,  true  },
+        { "a sequence's start, 3 rows, another row read",
+                                                       16,  4,   2,   1, 1,     3,   0,    2,       0, true,    2, clear_whole,  true  },
+        { "a sequence's start, the old state wild",    16,  4,   2,   1, 1,     3,   1,    1,       0, true,    1, clear_whole,  true, true },
+        { "Qwen3.6-35B: S_v 128, 32 heads, 1 token",  128, 32,   1,   1, 1,     3,   1,    1,       0, true,    1, clear_whole,  true  },
+        { "Qwen3.6-35B: S_v 128, 32 heads, 32 tokens",
+                                                      128, 32,  32,   1, 1,     3,   1,    1,       0, true,    1, clear_whole,  true  },
+  // the pass without the fold: the clear keeps its own step
+        { "a clear by 0.5",                            16,  4,   2,   1, 1,     4,   1,    1,       0, true,    1, clear_factor, false },
+        { "a clear over half a row",                   16,  4,   2,   1, 1,     4,   1,    1,       0, true,    1, clear_half,   false },
+        { "a clear over two rows",                     16,  4,   2,   1, 1,     4,   1,    1,       0, true,    1, clear_two,    false },
+        { "the cleared row not the row written",       16,  4,   2,   1, 1,     4,   1,    1,       0, true,    2, clear_whole,  false },
+        { "a read of the states between the clear and the GET_ROWS",
+                                                       16,  4,   2,   1, 1,     4,   1,    1,       0, true,    1, clear_reader, false },
+  // refused: a write of the states between the two copies
+        { "a write of the states between the copies",  16,  4,   2,   1, 1,     4,   1,    1,       0, false,   2, clear_late,   false },
     };
     // the kernel choice must not change the pass: a multi-token case runs under every value
     const char * const prefills[] = { nullptr, "recurrence", "chunk", "tcm" };
@@ -8905,31 +8988,64 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             bool               copy_ok = false, direct_ok = true;
             if (dev_ok) {
                 env_override copy("FLAGOS_SPACEMIT_STATE", "copy");
-                copy_ok = run(passes_copy, out_copy, st_copy, more_copy) && passes_copy == 0 && out_copy == out &&
-                          st_copy == st && more_copy == more;
+                copy_ok = run(passes_copy, out_copy, st_copy, more_copy) && passes_copy == 0 &&
+                          same_bytes(out_copy, out) && same_bytes(st_copy, st) && same_bytes(more_copy, more);
+            }
+            // FLAGOS_SPACEMIT_STATE=later, the form before 2026-11-20: no pass where anything else writes the tensor,
+            // and the same bytes as the other two forms
+            bool later_ok = true;
+            if (dev_ok && prefill == nullptr) {
+                uint64_t           passes_later = 0;
+                std::vector<float> out_later, st_later, more_later;
+                env_override       later("FLAGOS_SPACEMIT_STATE", "later");
+                later_ok = run(passes_later, out_later, st_later, more_later) &&
+                           passes_later == (c.pass && c.zrow < 0 ? 1u : 0u) && same_bytes(out_later, out) &&
+                           same_bytes(st_later, st) && same_bytes(more_later, more);
             }
             // the scores and the state against ggml-cpu, and the rows the CPY does not write bit for bit the inputs
             const double e_out = dev_ok && out.size() == want.size() ? nmse(out.data(), want.data(), (int64_t) out.size()) : -1.0;
             const double e_st  = dev_ok && st.size() == want_st.size() ? nmse(st.data(), want_st.data(), (int64_t) st.size()) : -1.0;
             const double e_more = dev_ok && more.size() == want_more.size() && !more.empty() ?
                                       nmse(more.data(), want_more.data(), (int64_t) more.size()) : 0.0;
-            bool         kept  = dev_ok;
+            // with a wild old state every value the kernels compute is a NaN (a NaN or an infinity times 0 is one), so
+            // there the bytes must be the CPU's and NMSE says nothing (nmse answers HUGE_VAL on a NaN)
+            const bool wild_ok = !c.wild || (dev_ok && same_bytes(out, want) && same_bytes(st, want_st) &&
+                                             same_bytes(more, want_more));
+            const bool close   = c.wild || (e_out >= 0.0 && e_out <= k_gdn_max_nmse && e_st >= 0.0 &&
+                                          e_st <= k_gdn_max_nmse && e_more <= k_gdn_max_nmse);
+            bool         kept  = dev_ok, clear_ok = dev_ok;
             {
                 const size_t row = (size_t) (c.S_v * c.S_v * c.H) * sizeof(float);
                 const size_t lo  = c.variant == 4 ? 0 : (size_t) c.head * row;
                 const size_t hi  = c.variant == 4 ? 0 : lo + (size_t) c.n_seqs * row;
-                const uint8_t * got_bytes = (const uint8_t *) st.data();
+                // what build_rs' clear writes: inside the row the CPY writes, or rows of its own, which must then
+                // hold the CPU's bytes (x * 0 and x * 0.5 are exact on both sides, -0.0 and NaN among them)
+                const size_t zlo = c.zrow < 0 ? 0 : (size_t) c.zrow * row;
+                const size_t zhi = c.zrow < 0 ? 0 :
+                                   zlo + (c.clear == clear_half ? row / 2 : c.clear == clear_two ? 2 * row : row);
+                const uint8_t * got_bytes  = (const uint8_t *) st.data();
+                const uint8_t * want_bytes = (const uint8_t *) want_st.data();
+                const bool      sized      = st.size() * sizeof(float) == dv.persist_in.size() &&
+                                        want_st.size() == st.size();
+                kept = kept && sized;
+                clear_ok = clear_ok && sized;
                 for (size_t i = 0; kept && i < dv.persist_in.size(); i++) {
-                    kept = (i >= lo && i < hi) || got_bytes[i] == dv.persist_in[i];
+                    kept = (i >= lo && i < hi) || (i >= zlo && i < zhi) || got_bytes[i] == dv.persist_in[i];
+                }
+                for (size_t i = zlo; clear_ok && i < zhi; i++) {
+                    clear_ok = (i >= lo && i < hi) || got_bytes[i] == want_bytes[i];
                 }
             }
-            // the step called directly on 1, 3 and 8 tiles, on a CPU-buffer copy
-            if (dev_ok && c.pass) {
-                state_graph dir;
+            // the step called directly on 1, 3 and 8 tiles, on a CPU-buffer copy: the folding step where the fold
+            // applies, which clears the row itself, so its result is the CPU's whole graph. Where the clear keeps its
+            // own step it is left out: the step alone does not do that node's work
+            if (dev_ok && c.pass && (c.zrow < 0 || c.cleared)) {
+                const spacemit_plugin_kernel * entry = c.cleared ? k_cleared : k_direct;
+                state_graph                    dir;
                 direct_ok = dir.init(c, ggml_backend_cpu_buffer_type(), ggml_backend_cpu_buffer_type());
                 if (direct_ok) {
                     dir.fill(c, seed);
-                    const size_t       ws = k_direct->workspace_size(dir.gdn);
+                    const size_t       ws = entry->workspace_size(dir.gdn);
                     std::vector<float> workspace(ws / sizeof(float) + 1, NAN);
                     for (uint32_t nth : { 1u, 3u, 8u }) {
                         n_direct++;
@@ -8937,7 +9053,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                         bool ok = true;
                         for (uint32_t ith = 0; ith < nth; ith++) {
                             const spacemit_tile tile = { ith, nth, nullptr, 0, workspace.data(), ws, nullptr };
-                            ok &= k_direct->fn(&tile, dir.cpy);
+                            ok &= entry->fn(&tile, dir.cpy);
                         }
                         const std::vector<float> got    = dir.gdn_scores(c);
                         const std::vector<float> got_st = state_graph::floats(dir.persist);
@@ -8949,10 +9065,15 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                             direct_out = got;
                             direct_st  = got_st;
                         }
-                        const bool same = ok && got == direct_out && got_st == direct_st && e >= 0.0 &&
-                                          e <= k_gdn_max_nmse && e_s >= 0.0 && e_s <= k_gdn_max_nmse &&
-                                          (!exact_direct || (got == dv.gdn_scores(c) && got_st == st));
-                        worst_nmse = std::max(worst_nmse, std::max(e, e_s));
+                        const bool tiles = same_bytes(got, direct_out) && same_bytes(got_st, direct_st);
+                        const bool near  = c.wild ? same_bytes(got, want) && same_bytes(got_st, want_st) :
+                                                   e >= 0.0 && e <= k_gdn_max_nmse && e_s >= 0.0 &&
+                                                       e_s <= k_gdn_max_nmse;
+                        const bool same  = ok && tiles && near &&
+                                          (!exact_direct || (same_bytes(got, dv.gdn_scores(c)) && same_bytes(got_st, st)));
+                        if (!c.wild) {
+                            worst_nmse = std::max(worst_nmse, std::max(e, e_s));
+                        }
                         n_direct_ok += same;
                         direct_ok = direct_ok && same;
                         if (!same) {
@@ -8960,34 +9081,92 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                                          "FAIL: state pass %s, the step called directly on %u tiles: %s, NMSE scores "
                                          "%.3e state %.3e (bound %.0e), the tile counts %s%s\n",
                                          c.what, nth, ok ? "ran" : "failed", e, e_s, k_gdn_max_nmse,
-                                         got == direct_out && got_st == direct_st ? "equal" : "differ",
+                                         tiles ? "equal" : "differ",
                                          exact_direct ? ", against the device's bytes checked" : "");
                             g_failures++;
                         }
                     }
                 }
             }
-            worst_nmse    = std::max(worst_nmse, std::max(e_out, e_st));
-            const bool ok = dev_ok && copy_ok && kept && direct_ok && passes == (c.pass ? 1u : 0u) && e_out >= 0.0 &&
-                            e_out <= k_gdn_max_nmse && e_st >= 0.0 && e_st <= k_gdn_max_nmse && e_more <= k_gdn_max_nmse;
+            // the step names (GGML_FLAGOS_TRACE_LAUNCH): the folding step where the fold applies and no scale.f32 for
+            // the clearing node, the plain step and that node's own step otherwise
+            bool names_ok = true;
+            int  n_names[3] = {};
+            if (dev_ok && prefill == nullptr && c.zrow >= 0) {
+                env_override trace("GGML_FLAGOS_TRACE_LAUNCH", "1");
+                log_capture  log;
+                dv.reset();
+                const bool        ran  = ggml_backend_graph_compute(backend, dv.g) == GGML_STATUS_SUCCESS;
+                const std::string text = log.take();
+                n_names[0]             = count_lines_with(text, " gated_delta_net.f32.direct.cleared ");
+                n_names[1]             = count_lines_with(text, " gated_delta_net.f32.direct ");
+                n_names[2]             = count_lines_with(text, " scale.f32 ");
+                names_ok = ran && n_names[0] == (c.cleared ? 1 : 0) &&
+                           n_names[1] == (c.pass && !c.cleared ? 1 : 0) && n_names[2] == (c.cleared ? 0 : 1);
+            }
+            if (!c.wild) {
+                worst_nmse = std::max(worst_nmse, std::max(e_out, e_st));
+            }
+            const bool ok = dev_ok && copy_ok && later_ok && names_ok && kept && clear_ok && direct_ok &&
+                            passes == (c.pass ? 1u : 0u) && close && wild_ok;
             n_ok += ok;
             n_passed += passes == 1;
             if (!ok) {
                 std::fprintf(stderr,
                              "FAIL: state pass %s (S_v %lld, %lld heads, %lld tokens, %lld sequences, K %lld, row "
-                             "%lld to row %lld of %lld, variant %d), FLAGOS_SPACEMIT_GDN_PREFILL=%s: the CPU "
-                             "reference %s, the run %s, %llu passes (expected %d); NMSE scores %.3e, states %.3e, "
-                             "other output %.3e (bound %.0e); the rows the CPY does not write %s; copy %s; the direct "
-                             "calls %s\n",
+                             "%lld to row %lld of %lld, variant %d, clear %d of row %lld), "
+                             "FLAGOS_SPACEMIT_GDN_PREFILL=%s: the CPU reference %s, the run %s, %llu passes (expected "
+                             "%d); NMSE scores %.3e, states %.3e, other output %.3e (bound %.0e), the bytes with a "
+                             "wild old state %s; the rows the CPY does not write %s, the cleared rows %s; copy %s; "
+                             "later %s; the direct calls %s; the step names %d cleared, %d direct, %d scale (expected "
+                             "%d/%d/%d)\n",
                              c.what, (long long) c.S_v, (long long) c.H, (long long) c.n_tokens, (long long) c.n_seqs,
                              (long long) c.K, (long long) c.idx, (long long) c.head, (long long) c.slots, c.variant,
-                             prefill != nullptr ? prefill : "(unset)", ref_ok ? "ran" : "failed",
-                             dev_ok ? "ran" : "failed", (unsigned long long) passes, c.pass ? 1 : 0, e_out, e_st,
-                             e_more, k_gdn_max_nmse, kept ? "unchanged" : "changed",
+                             c.clear, (long long) c.zrow, prefill != nullptr ? prefill : "(unset)",
+                             ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", (unsigned long long) passes,
+                             c.pass ? 1 : 0, e_out, e_st, e_more, k_gdn_max_nmse, wild_ok ? "as the CPU's" : "other",
+                             kept ? "unchanged" : "changed", clear_ok ? "as the CPU's" : "other",
                              copy_ok ? "no pass, the same bytes" : "a pass or other bytes",
-                             direct_ok ? "as expected" : "failed");
+                             later_ok ? "as expected" : "a pass or other bytes", direct_ok ? "as expected" : "failed",
+                             n_names[0], n_names[1], n_names[2], c.cleared ? 1 : 0, c.pass && !c.cleared ? 1 : 0,
+                             c.cleared ? 0 : 1);
                 g_failures++;
             }
+        }
+        seed += 8;
+    }
+
+    // FLAGOS_SPACEMIT_STATE=abc: reported once and taken as direct, so a sequence's first graph still folds its clear
+    bool unknown_ok = false;
+    {
+        const state_case c = { "an unknown setting", 16, 4, 2, 1, 1, 4, 1, 1, 0, true, 1, clear_whole, true };
+        state_graph      dv;
+        uint64_t         passes[2] = {};
+        int              warnings = 0, cleared = 0;
+        bool             ran = false;
+        if (dv.init(c, buft, buft)) {
+            dv.fill(c, seed);
+            env_override bogus("FLAGOS_SPACEMIT_STATE", "abc");
+            env_override trace("GGML_FLAGOS_TRACE_LAUNCH", "1");
+            log_capture  log;
+            ran = true;
+            for (int r = 0; r < 2; r++) {
+                dv.reset();
+                spacemit_state_passes_take();
+                ran       = ran && ggml_backend_graph_compute(backend, dv.g) == GGML_STATUS_SUCCESS;
+                passes[r] = spacemit_state_passes_take();
+            }
+            const std::string text = log.take();
+            warnings               = count_lines_with(text, "FLAGOS_SPACEMIT_STATE=abc");
+            cleared                = count_lines_with(text, " gated_delta_net.f32.direct.cleared ");
+        }
+        unknown_ok = ran && passes[0] == 1 && passes[1] == 1 && warnings == 1 && cleared == 2;
+        if (!unknown_ok) {
+            std::fprintf(stderr,
+                         "FAIL: state pass under FLAGOS_SPACEMIT_STATE=abc: %s, passes %llu and %llu (expected 1 and "
+                         "1), %d warning lines (expected 1), %d folding steps (expected 2)\n", ran ? "ran" : "failed",
+                         (unsigned long long) passes[0], (unsigned long long) passes[1], warnings, cleared);
+            g_failures++;
         }
         seed += 8;
     }
@@ -9035,7 +9214,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     // through the scheduler (the inputs and the states in our buffer, the rest in its compute buffer) under the plan
     // cache's uid trust
     bool     sched_ok = false;
-    uint64_t sched_passes[4] = {}, sched_hits[4] = {}, sched_misses[4] = {};
+    uint64_t sched_passes[5] = {}, sched_hits[5] = {}, sched_misses[5] = {};
     {
         const state_case c = { "the scheduler", 16, 4, 2, 1, 1, 4, 1, 1, 0, true };
         state_graph      sg, ref;
@@ -9062,8 +9241,8 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                 }
 #endif
             };
-            const char * const settings[4] = { nullptr, nullptr, "copy", nullptr };
-            for (int i = 0; i < 4 && ok; i++) {
+            const char * const settings[5] = { nullptr, nullptr, "copy", "later", nullptr };
+            for (int i = 0; i < 5 && ok; i++) {
                 set_raw(settings[i]);
                 sg.reset();
                 spacemit_state_passes_take();
@@ -9079,7 +9258,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                     first    = out;
                     first_st = out_st;
                 }
-                ok = ok && out == first && out_st == first_st;
+                ok = ok && same_bytes(out, first) && same_bytes(out_st, first_st);
             }
             set_raw(nullptr);
             const bool on_device = sched != nullptr && ggml_backend_sched_get_tensor_backend(sched, sg.gdn) == backend &&
@@ -9091,22 +9270,27 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             worst_nmse = std::max(worst_nmse, std::max(e, e_st));
             sched_ok   = ok && on_device && e >= 0.0 && e <= k_gdn_max_nmse && e_st >= 0.0 && e_st <= k_gdn_max_nmse &&
                        sched_passes[0] == 1 && sched_misses[0] == 1 && sched_hits[1] == 1 && sched_passes[1] == 0 &&
-                       sched_misses[2] == 1 && sched_passes[2] == 0 && sched_misses[3] == 1 && sched_passes[3] == 1;
+                       sched_misses[2] == 1 && sched_passes[2] == 0 && sched_misses[3] == 1 && sched_passes[3] == 1 &&
+                       sched_misses[4] == 1 && sched_passes[4] == 1;
             if (sched != nullptr) {
                 ggml_backend_sched_free(sched);
             }
         }
         if (!sched_ok) {
             std::fprintf(stderr,
-                         "FAIL: state pass through the scheduler: passes %llu/%llu/%llu/%llu (expected 1/0/0/1), plan "
-                         "hits %llu/%llu/%llu/%llu (expected 0/1/0/0), misses %llu/%llu/%llu/%llu (expected 1/0/1/1), "
-                         "or the outputs, the placement or the bound failed\n",
+                         "FAIL: state pass through the scheduler: passes %llu/%llu/%llu/%llu/%llu (expected "
+                         "1/0/0/1/1), plan hits %llu/%llu/%llu/%llu/%llu (expected 0/1/0/0/0), misses "
+                         "%llu/%llu/%llu/%llu/%llu (expected 1/0/1/1/1), or the outputs, the placement or the bound "
+                         "failed\n",
                          (unsigned long long) sched_passes[0], (unsigned long long) sched_passes[1],
                          (unsigned long long) sched_passes[2], (unsigned long long) sched_passes[3],
+                         (unsigned long long) sched_passes[4],
                          (unsigned long long) sched_hits[0], (unsigned long long) sched_hits[1],
                          (unsigned long long) sched_hits[2], (unsigned long long) sched_hits[3],
+                         (unsigned long long) sched_hits[4],
                          (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1],
-                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3]);
+                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3],
+                         (unsigned long long) sched_misses[4]);
             g_failures++;
         }
     }
@@ -9117,13 +9301,22 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                 "16, S_v 128 with 16 heads at 1 and 33 tokens, the row read in the row written or not, every "
                 "FLAGOS_SPACEMIT_GDN_PREFILL value above one token; refused: a second consumer of the row read in, "
                 "another view of the new state, 2 sequences, K 2, a read of the states between the copies, the CPY "
-                "into another tensor)%s: %d/%d cases, %d passes by the counter; against the CPU on one thread max "
-                "NMSE %.2e (bound %.0e), the rows the CPY does not write bit for bit, FLAGOS_SPACEMIT_STATE=copy "
-                "without a pass and with the same bytes; the step directly on 1, 3 and 8 tiles %d/%d; two computes "
-                "with the state carried over: %s; through the scheduler a miss, a hit by uid (no pass), copy a miss "
-                "by the configuration word, the default a miss again, the same bytes: %s\n",
-                reference_label(), n_ok, n_cases, n_passed, worst_nmse, k_gdn_max_nmse, n_direct_ok, n_direct,
-                carried_ok ? "checked" : "FAILED", sched_ok ? "checked" : "FAILED");
+                "into another tensor), and a sequence's first graph with build_rs' clear of a whole row (1, 2, 32 and "
+                "501 tokens of S_v 16, Qwen3.6-35B's S_v 128 with 32 heads at 1 and 32 tokens, 3 rows with the "
+                "cleared row read or not, a wild old state) folding it into the step, without the fold (a factor 0.5, "
+                "half a row, two rows, the cleared row not the written one, a read of the states before the GET_ROWS) "
+                "and refused (a write of the states between the copies)%s: %d/%d cases, %d passes by the counter; "
+                "against the CPU on one thread max NMSE %.2e (bound %.0e), the rows the CPY does not write bit for "
+                "bit and the cleared rows the CPU's bytes, the step names the fold's where it applies and no "
+                "scale.f32 there, FLAGOS_SPACEMIT_STATE=copy without a pass and with the same bytes, =later without "
+                "a pass where anything else writes the states and with the same bytes, =abc reported once and taken "
+                "as direct: %s; the step directly on 1, 3 and 8 tiles %d/%d; two computes with the state carried "
+                "over: %s; through the scheduler a miss, a hit by uid (no pass), copy a miss by the configuration "
+                "word, later another miss (a pass, the graph having no clear), the default a miss again, the same "
+                "bytes: %s\n",
+                reference_label(), n_ok, n_cases, n_passed, worst_nmse, k_gdn_max_nmse,
+                unknown_ok ? "checked" : "FAILED", n_direct_ok, n_direct, carried_ok ? "checked" : "FAILED",
+                sched_ok ? "checked" : "FAILED");
     return 0;
 }
 
@@ -9368,10 +9561,6 @@ struct plan_layer {
         return cpu_done ? nmse(out.data(), static_cast<const float *>(oc.full->data), (int64_t) out.size()) : HUGE_VAL;
     }
 };
-
-static bool same_bytes(const std::vector<float> & a, const std::vector<float> & b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
-}
 
 // the key probe's stand-in kernels: never run, only compared as the cached steps a hit hands back
 static bool plan_fake_kernel_1(const spacemit_tile *, ggml_tensor *) {

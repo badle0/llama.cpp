@@ -390,6 +390,8 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "gdn.f32",          spacemit_kernel_gated_delta_net, nullptr,                   spacemit_gdn_workspace               },
         // the state pass's step runs on the CPY node; the core asks its workspace for the op (spacemit_state_pass)
         { "gated_delta_net.f32.direct", spacemit_kernel_gated_delta_net_direct, nullptr,  spacemit_gdn_workspace               },
+        { "gated_delta_net.f32.direct.cleared", spacemit_kernel_gated_delta_net_direct_cleared, nullptr,
+          spacemit_gdn_workspace                                                                                               },
         { "silu.f32",         spacemit_kernel_silu_f32,      nullptr,                     nullptr                              },
         { "sigmoid.f32",      spacemit_kernel_sigmoid_f32,   nullptr,                     nullptr                              },
         { "softplus.f32",     spacemit_kernel_softplus_f32,  nullptr,                     nullptr                              },

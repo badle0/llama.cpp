@@ -955,28 +955,61 @@ bool spacemit_kernel_gated_delta_net(const spacemit_tile * tile_p, ggml_tensor *
                         (float *) dst->data + sh.S_v * sh.H * sh.n_tokens * sh.n_seqs, "gdn.f32");
 }
 
-bool spacemit_kernel_gated_delta_net_direct(const spacemit_tile * tile_p, ggml_tensor * cpy) {
-    // the state pass's step runs on the CPY (core/flagos-spacemit-ops.h spacemit_state_pass): its source views the
-    // op's new state, the op's own state comes from the GET_ROWS' row of the persistent tensor, and the CPY's
-    // destination is the row to write
-    ggml_tensor * const node = cpy->src[0]->view_src;
-    const ggml_tensor * st   = node->src[5];
+// the state pass's step runs on the CPY (core/flagos-spacemit-ops.h spacemit_state_pass): its source views the op's
+// new state, the op's own state comes from the GET_ROWS' row of the persistent tensor, and the CPY's destination is
+// the row to write. False, with the step named, when the row index or the rows are not as the pass promised
+static bool gdn_direct_rows(ggml_tensor * cpy, const char * name, ggml_tensor ** node, const float ** state_in,
+                            float ** state_out) {
+    *node                    = cpy->src[0]->view_src;
+    const ggml_tensor * st   = (*node)->src[5];
     const ggml_tensor * rows = st->view_src != nullptr ? st->view_src : st;
     const ggml_tensor * src  = rows->src[0];
     const int64_t       idx  = ((const int32_t *) rows->src[1]->data)[0];
     if (idx < 0 || idx >= src->ne[1]) {
-        GGML_LOG_ERROR("FlagOS SpacemiT: gated_delta_net.f32.direct: state row %lld of %lld\n", (long long) idx,
+        GGML_LOG_ERROR("FlagOS SpacemiT: %s: state row %lld of %lld\n", name, (long long) idx,
                        (long long) src->ne[1]);
         return false;
     }
-    const float * state_in  = (const float *) ((const char *) src->data + (size_t) idx * src->nb[1]);
-    float *       state_out = (float *) cpy->data;
-    const size_t  bytes     = ggml_nbytes(cpy);
-    const char *  in        = (const char *) state_in;
-    const char *  out       = (const char *) state_out;
+    *state_in          = (const float *) ((const char *) src->data + (size_t) idx * src->nb[1]);
+    *state_out         = (float *) cpy->data;
+    const size_t bytes = ggml_nbytes(cpy);
+    const char * in    = (const char *) *state_in;
+    const char * out   = (const char *) *state_out;
     if (in != out && in < out + bytes && out < in + bytes) {  // whole rows: the same row or disjoint ones
-        GGML_LOG_ERROR("FlagOS SpacemiT: gated_delta_net.f32.direct: the state rows overlap in part\n");
+        GGML_LOG_ERROR("FlagOS SpacemiT: %s: the state rows overlap in part\n", name);
         return false;
     }
-    return gdn_tile_run(*tile_p, node, state_in, state_out, "gated_delta_net.f32.direct");
+    return true;
+}
+
+bool spacemit_kernel_gated_delta_net_direct(const spacemit_tile * tile_p, ggml_tensor * cpy) {
+    const char * const name      = "gated_delta_net.f32.direct";
+    ggml_tensor *      node      = nullptr;
+    const float *      state_in  = nullptr;
+    float *            state_out = nullptr;
+    if (!gdn_direct_rows(cpy, name, &node, &state_in, &state_out)) {
+        return false;
+    }
+    return gdn_tile_run(*tile_p, node, state_in, state_out, name);
+}
+
+bool spacemit_kernel_gated_delta_net_direct_cleared(const spacemit_tile * tile_p, ggml_tensor * cpy) {
+    const char * const name      = "gated_delta_net.f32.direct.cleared";
+    ggml_tensor *      node      = nullptr;
+    const float *      state_in  = nullptr;
+    float *            state_out = nullptr;
+    if (!gdn_direct_rows(cpy, name, &node, &state_in, &state_out)) {
+        return false;
+    }
+    // the clearing SCALE of a sequence's first graph folded in (spacemit_state_pass): this tile multiplies its own
+    // heads' part of the row the CPY writes by 0, element by element as ggml_vec_scale_f32, so that a NaN, an
+    // infinity or a negative value in the old state gives the CPU's bits
+    const gdn_shape sh = gdn_shape_of(node);
+    int64_t         ir0, ir1;
+    tile_range(sh.H * sh.n_seqs, *tile_p, ir0, ir1);
+    float * const y = state_out + ir0 * sh.S_v * sh.S_v;
+    for (int64_t i = 0; i < (ir1 - ir0) * sh.S_v * sh.S_v; i++) {
+        y[i] = y[i] * 0.0f;
+    }
+    return gdn_tile_run(*tile_p, node, state_in, state_out, name);
 }

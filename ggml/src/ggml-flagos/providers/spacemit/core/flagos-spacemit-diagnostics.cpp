@@ -188,13 +188,16 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
                           std::strcmp(name, "ssm_conv.f32.stashed") == 0 ? ".stashed" : "", r);
             break;
         case GGML_OP_CPY:  // a state pass's step runs on the CPY, for the op it replaces (spacemit_state_pass)
-            if (std::strcmp(name, "gated_delta_net.f32.direct") == 0) {
-                std::snprintf(buf, sizeof(buf), "GATED_DELTA_NET.direct r%lld",
-                              static_cast<long long>(ggml_nrows(n->src[0]->view_src)));
-            } else {
-                std::snprintf(buf, sizeof(buf), "CPY r%lld", r);
+            {
+                const bool cleared = std::strcmp(name, "gated_delta_net.f32.direct.cleared") == 0;
+                if (cleared || std::strcmp(name, "gated_delta_net.f32.direct") == 0) {
+                    std::snprintf(buf, sizeof(buf), "GATED_DELTA_NET.direct%s r%lld", cleared ? ".cleared" : "",
+                                  static_cast<long long>(ggml_nrows(n->src[0]->view_src)));
+                } else {
+                    std::snprintf(buf, sizeof(buf), "CPY r%lld", r);
+                }
+                break;
             }
-            break;
         default:
             std::snprintf(buf, sizeof(buf), "%s r%lld", ggml_op_name(n->op), r);
             break;
@@ -265,19 +268,22 @@ bool spacemit_ssm_conv_fused() {
     return true;
 }
 
-bool spacemit_state_direct() {
+spacemit_state_kind spacemit_state_mode() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_STATE");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "direct") == 0) {
-        return true;
+        return spacemit_state_kind::direct;
+    }
+    if (std::strcmp(v, "later") == 0) {
+        return spacemit_state_kind::later;
     }
     if (std::strcmp(v, "copy") == 0) {
-        return false;
+        return spacemit_state_kind::copy;
     }
     static std::atomic<bool> warned{ false };
     if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_STATE=%s: unknown setting ignored (direct)\n", __func__, v);
     }
-    return true;
+    return spacemit_state_kind::direct;
 }
 
 bool spacemit_embd_on_cpu() {

@@ -3536,7 +3536,7 @@ If 3 fails, the reading above is wrong. If only 4 fails, the line goes back and 
 
 ### The state pass at a sequence's start (spec, 2026-11-20)
 
-**Status:** written for review 2026-11-20, on the user's word ("go ahead and write the spec"). Nothing built.
+**Status:** written for review 2026-11-20, on the user's word ("go ahead and write the spec"); both parts approved the same day ("agreed to both parts, start building it") and built by a coder, the diff read and the tests rerun by me ("As built" below). Not run on the K3.
 
 **What it is about.** Each Gated DeltaNet layer keeps two saved states, a convolution state (96 KiB a row on Qwen3.6-35B-A3B) and a recurrent state (S_v x S_v x H floats, 2 MiB a row; 30 layers, the RS buffer's 62.81 MiB). llama.cpp's `build_rs` (`src/llama-graph.cpp:3344-3378`) puts three kinds of node around them, and `build_recurrent_attn` a fourth (`src/models/delta-net-base.cpp:553-558`): a `SCALE` by 0 in place that clears the state when a sequence starts (a view of zero size otherwise), a `GET_ROWS` that copies the state out, the layer, and a `CPY` that writes the new state back. In the op tables these are `SCALE r1`, `GET_ROWS r1` and `CPY r1`.
 
@@ -3576,6 +3576,15 @@ So a fresh prompt pays about 25 ms whatever its length, and a later graph does n
 llama-perplexity is not in the run: it decodes four sequences at once, which the pass does not take.
 
 **Estimates.** About 22 ms off every fresh prompt graph: 14.7 from part 1, about 8 from the fold, less the multiply now inside the step (under 1 ms). At 32 tokens 617 to about 595 ms, pp32 51.7 to about 53.7 t/s; at 501 tokens 0.4%; generation unchanged.
+
+**As built (2026-11-20; by a coder; the diff read, the build, the check programs and the board block's dry run rerun by me; Mac only).** As specified, with these points settled in the code:
+- The fold's factor must be +0.0: by -0.0 the multiply would flip signs the CPU's does not, and `-0.0 == 0.0` in C, so the check reads the sign.
+- The fold needs the clearing node to be the only writer admitted, and no reader of the tensor between it and the pass's `GET_ROWS`; from there to the `CPY` the pass's own check holds.
+- `gated_delta_net.f32.direct.cleared` is a required kernel, so the plugin's list and the core's agree; the core still binds it softly and uses the fold only when it is there. The five loader test plugins name it too.
+- `FLAGOS_SPACEMIT_STATE` is `direct`, `later` or `copy`; the plan cache's configuration word carries all three (bits 2 and 3).
+- The kernel entry clears with the tile range `gdn_tile_run` uses (the heads), then runs it; plain C++, so the reference setting runs it too.
+
+On the Mac (simulated device): the build without warnings; the four FlagOS check programs pass; `flagos-check-spacemit` fails the 6 known `conv pair` cases only, by default and with the reference kernels; `statepass` 97/97 cases with 69 passes by the counter and the step directly on 1, 3 and 8 tiles 147/147 (15 new cases: the fold at 1, 2, 32 and 501 tokens and at Qwen3.6-35B's S_v 128 with 32 heads, 3 rows with the cleared row read or not, an old state of NaN, infinities, -0.0 and negative values the CPU's bytes, the five forms without the fold, the write between the copies refused; `later`, `copy` and an unknown value; the plan cache telling the three values apart); `test-backend-ops` `GATED_DELTA_NET` 36/36, `SCALE` 1/1, `GET_ROWS` 43/43, `CPY` 72/72; the riscv64 syntax check of the kernel file 0 errors. Qwen3.5-0.8B end to end: a 32-token graph has 18 `GATED_DELTA_NET.direct.cleared` steps and 18 `SCALE r1`, 19 `GET_ROWS r1`, 18 `CPY r1` against 36, 37 and 36 under `later`, and the completion is the same text under both. By the coder, not rerun by me: three mutations caught (the fold without the multiply 88 more failing lines, the multiply shifted by one head 30, a writer admitted between the copies 4), and the same text under `copy`. Not tested: a plugin without the new entry (the loader refuses it first). Not run on the K3: everything, the RVV kernel under the new entry among it.
 
 ### Not planned
 

@@ -5,6 +5,7 @@
 #include "../../../../ggml-impl.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -524,7 +525,7 @@ const char * const spacemit_required_kernels[] = {
     "ssm_conv.f32",     "concat.f32",       "mul_mat.f32",
     "soft_max.f32",     "argsort.f32",      "sum_rows.f32",             "clamp.f32",
     "div.f32",          "concat.f32.tail",  "ssm_conv.f32.stashed",
-    "gated_delta_net.f32.direct",
+    "gated_delta_net.f32.direct",           "gated_delta_net.f32.direct.cleared",
 };
 const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 
@@ -588,6 +589,17 @@ bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std
     if (out->conv_pair_concat.steps[0] == nullptr || out->conv_pair_ssm_conv.steps[0] == nullptr ||
         out->state_direct.steps[0] == nullptr) {
         return false;
+    }
+    // the folding form of a state pass's step is not refused when it is missing: graph_compute then leaves the
+    // clearing SCALE its own step (spacemit_state_pass)
+    out->state_direct_cleared.n_steps  = 0;
+    out->state_direct_cleared.steps[0] = nullptr;
+    for (uint32_t k = 0; k < n_kernels; k++) {
+        if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, "gated_delta_net.f32.direct.cleared") == 0) {
+            out->state_direct_cleared.steps[0] = &kernels[k];
+            out->state_direct_cleared.n_steps  = 1;
+            break;
+        }
     }
     out->table = table;
     out->n_ops = (uint32_t) k_n_contracts;
@@ -752,8 +764,39 @@ static int spacemit_state_region(const ggml_tensor * v, const ggml_tensor * gdn,
     return end <= scores ? 0 : -1;
 }
 
+// whether node zero of g is the clearing node a state pass folds into its step: a SCALE by 0 with bias 0, in place
+// over exactly the whole row the pass's CPY cp writes, passing its contract, and with no other node than the pass's
+// own two copies reading or writing the persistent tensor between it and the CPY
+static bool spacemit_state_clear(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g,
+                                 int zero, int rows_at, const ggml_tensor * cp, const ggml_tensor * persistent) {
+    const ggml_tensor * z = g->nodes[zero];
+    if (z->op != GGML_OP_SCALE || z->type != GGML_TYPE_F32 || z->src[0] == nullptr || z->data != z->src[0]->data ||
+        !ggml_is_contiguous(z) || z->data != cp->data || ggml_nbytes(z) != ggml_nbytes(cp)) {
+        return false;
+    }
+    float params[2];  // the factor and the bias, as spacemit_scale_f32_supported reads them
+    std::memcpy(params, z->op_params, sizeof(params));
+    // +0.0 only: by -0.0 the multiply would flip the signs the CPU's does not
+    if (params[0] != 0.0f || std::signbit(params[0]) || params[1] != 0.0f) {
+        return false;
+    }
+    // the readers between the SCALE and the GET_ROWS; from there to the CPY the pass checked them already
+    for (int t = zero + 1; t < rows_at; t++) {
+        const ggml_tensor * n = g->nodes[t];
+        if (spacemit_node_empty(n)) {
+            continue;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (n->src[i] != nullptr && spacemit_base_of(n->src[i]) == persistent) {
+                return false;
+            }
+        }
+    }
+    return spacemit_find_op(ops, z, own_buft) != nullptr;
+}
+
 bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g, int gi,
-                         int * ri, int * ci) {
+                         int * ri, int * ci, int * zi) {
     const ggml_tensor * gdn = g->nodes[gi];
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1) {
         return false;
@@ -843,14 +886,23 @@ bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t ow
         return false;
     }
 
-    // nothing else in g computes that tensor, and nothing between the two copies reads it
+    // nothing after the GET_ROWS but the pass's CPY computes that tensor, and nothing between the two copies reads it.
+    // A writer before the GET_ROWS wrote before the row was read in the original order, so it is admitted (the form
+    // before 2026-11-20, FLAGOS_SPACEMIT_STATE=later, admits none)
+    const bool admit   = spacemit_state_mode() == spacemit_state_kind::direct;
+    int        writers = 0, zero = -1;
     for (int t = 0; t < g->n_nodes; t++) {
         const ggml_tensor * n = g->nodes[t];
         if (n == cp || spacemit_node_empty(n)) {
             continue;
         }
         if (spacemit_base_of(n) == persistent) {
-            return false;
+            if (!admit || t >= rows_at) {
+                return false;
+            }
+            writers++;
+            zero = t;
+            continue;
         }
         if (t < rows_at || t > cpy || n == rows) {
             continue;
@@ -866,6 +918,7 @@ bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t ow
     }
     *ri = rows_at;
     *ci = cpy;
+    *zi = writers == 1 && spacemit_state_clear(ops, own_buft, g, zero, rows_at, cp, persistent) ? zero : -1;
     return true;
 }
 

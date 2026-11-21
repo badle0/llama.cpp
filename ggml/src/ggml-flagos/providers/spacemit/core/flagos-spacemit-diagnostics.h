@@ -54,10 +54,17 @@ bool spacemit_quantize_shared();
 // FLAGOS_SPACEMIT_PLAN and QUANTIZE, so a test can switch; an unknown value is reported once and ignored (fused)
 bool spacemit_ssm_conv_fused();
 
-// FLAGOS_SPACEMIT_STATE: unset, empty or direct (the default) runs each state pass (spacemit_state_pass) as one step
-// that reads and writes the persistent state row itself; copy runs it as its GET_ROWS, GATED_DELTA_NET and CPY steps.
-// Read at every graph, as FLAGOS_SPACEMIT_SSM_CONV; an unknown value is reported once and ignored (direct)
-bool spacemit_state_direct();
+// FLAGOS_SPACEMIT_STATE: how a state pass (spacemit_state_pass) runs
+enum class spacemit_state_kind {
+    direct,  // unset, empty or direct (the default): one step that reads and writes the persistent state row itself
+    later,   // test-only, the form before 2026-11-20: that step only where nothing else writes the tensor, so a
+             // sequence's first graph, whose clearing SCALE writes it, keeps its three steps
+    copy,    // the pass's GET_ROWS, GATED_DELTA_NET and CPY steps, no pass
+};
+
+// FLAGOS_SPACEMIT_STATE: unset, empty or direct (the default), later or copy, as spacemit_state_kind says. Read at
+// every graph, as FLAGOS_SPACEMIT_SSM_CONV; an unknown value is reported once and ignored (direct)
+spacemit_state_kind spacemit_state_mode();
 
 // test-only: FLAGOS_SPACEMIT_EMBD=cpu refuses the quantized GET_ROWS (get_rows.quant), so the token embedding's lookup
 // stays on the CPU as before 2026-11-11 and the F32 row pick stays here; unset, empty, ggml or rvv: the provider takes

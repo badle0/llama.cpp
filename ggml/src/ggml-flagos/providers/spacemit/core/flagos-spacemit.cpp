@@ -31,8 +31,8 @@ constexpr uint64_t SPACEMIT_MEMORY_DOMAIN_ID  = 0x53504D544B330001ULL;  // K3 DR
 constexpr size_t   SPACEMIT_BUFFER_ALIGNMENT  = 64;
 constexpr uint32_t SPACEMIT_A100_VECTOR_BITS  = 1024;
 
-// spacemit_backend_context::state_role: the node is in no state pass, or it is a pass's GET_ROWS or CPY, whose copy
-// the pass's one step does (spacemit_state_pass)
+// spacemit_backend_context::state_role: the node is in no state pass, or it is a pass's GET_ROWS, CPY or folded
+// clearing SCALE, whose work the pass's one step does (spacemit_state_pass)
 constexpr int32_t SPACEMIT_STATE_NONE = -1;
 constexpr int32_t SPACEMIT_STATE_SKIP = -2;
 
@@ -70,6 +70,7 @@ struct spacemit_backend_context {
     std::vector<uint8_t>              conv_role;   // per node of a checked graph: 1 a pair's CONCAT, 2 its SSM_CONV
     // per node of a checked graph: SPACEMIT_STATE_NONE or _SKIP, else the index of the CPY a state pass's step runs on
     std::vector<int32_t>              state_role;
+    std::vector<uint8_t>              state_cleared;  // 1 at a pass's op when its step clears the row itself
     spacemit_plan_cache               plan;        // the plan cache (FLAGOS_SPACEMIT_PLAN; plan.md "S1 step 3c spec")
     void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                            workspace_size = 0;
@@ -271,8 +272,8 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     // FLAGOS_SPACEMIT_SSM_CONV and FLAGOS_SPACEMIT_STATE: the convolution pairs (spacemit_conv_pair) expanded into
     // their stashed steps and the state passes (spacemit_state_pass) into their one step, structural decisions, so the
     // plan cache keeps them under the uid's trust
-    const bool          fuse_conv = spacemit_ssm_conv_fused();
-    const bool          direct_state = spacemit_state_direct();
+    const bool                fuse_conv  = spacemit_ssm_conv_fused();
+    const spacemit_state_kind state_mode = spacemit_state_mode();
     // no plan cache under FLAGOS_SPACEMIT_QUANTIZE=shared (test-only): its sharing decisions read data addresses
     // (spacemit_overlaps), which the key does not cover
     const bool          cached = plan_mode == spacemit_plan_mode::uid_trust && !share;
@@ -281,13 +282,15 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     ctx->steps.clear();
     ctx->step_names.clear();
     // the configuration word is the activation-sharing fact (bit 0), FLAGOS_SPACEMIT_SSM_CONV=split (bit 1),
-    // FLAGOS_SPACEMIT_STATE=copy (bit 2) and, above them, the plugin's switch generation, which moves whenever a
-    // kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a plugin switch); a
-    // different word is a miss
+    // FLAGOS_SPACEMIT_STATE (bits 2 and 3: direct 0, later 1, copy 2) and, above them, the plugin's switch generation,
+    // which moves whenever a kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading
+    // a plugin switch); a different word is a miss
     uint64_t word = 0;
     if (cached) {
         const uint64_t generation = ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
-        word = (generation << 3) | (direct_state ? 0 : 4) | (fuse_conv ? 0 : 2) | (share ? 1 : 0);
+        const uint64_t state      = state_mode == spacemit_state_kind::later ? 1 :
+                                    state_mode == spacemit_state_kind::copy  ? 2 : 0;
+        word = (generation << 4) | (state << 2) | (fuse_conv ? 0 : 2) | (share ? 1 : 0);
     }
     // the key alone, before the contract check
     spacemit_plan_result plan = spacemit_plan_result::off;
@@ -366,24 +369,32 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             }
         }
         // the state passes, once per checked graph with a GATED_DELTA_NET: the op's step reads and writes the
-        // persistent state row itself, so its GET_ROWS and its CPY get no steps below
+        // persistent state row itself, so its GET_ROWS and its CPY get no steps below, and where the pass folds the
+        // clearing SCALE in, that node gets none either
         ctx->state_role.clear();
-        for (int i = 0; direct_state && i < n_nodes; i++) {
+        ctx->state_cleared.clear();
+        for (int i = 0; state_mode != spacemit_state_kind::copy && i < n_nodes; i++) {
             if (ggml_graph_node(cgraph, i)->op == GGML_OP_GATED_DELTA_NET) {
                 ctx->state_role.assign((size_t) n_nodes, SPACEMIT_STATE_NONE);
+                ctx->state_cleared.assign((size_t) n_nodes, 0);
                 break;
             }
         }
         for (int i = 0; i < (int) ctx->state_role.size(); i++) {
-            int r = -1, c = -1;
+            int r = -1, c = -1, z = -1;
             if (ggml_graph_node(cgraph, i)->op == GGML_OP_GATED_DELTA_NET && computed(ggml_graph_node(cgraph, i)) &&
                 ctx->state_role[i] == SPACEMIT_STATE_NONE &&
-                spacemit_state_pass(dev->ops, &dev->buffer_type, cgraph, i, &r, &c) &&
+                spacemit_state_pass(dev->ops, &dev->buffer_type, cgraph, i, &r, &c, &z) &&
                 computed(ggml_graph_node(cgraph, r)) && computed(ggml_graph_node(cgraph, c)) &&
                 ctx->state_role[r] == SPACEMIT_STATE_NONE && ctx->state_role[c] == SPACEMIT_STATE_NONE) {
                 ctx->state_role[i] = c;
                 ctx->state_role[r] = SPACEMIT_STATE_SKIP;
                 ctx->state_role[c] = SPACEMIT_STATE_SKIP;
+                if (z >= 0 && dev->ops.state_direct_cleared.n_steps == 1 && computed(ggml_graph_node(cgraph, z)) &&
+                    ctx->state_role[z] == SPACEMIT_STATE_NONE) {
+                    ctx->state_role[z]    = SPACEMIT_STATE_SKIP;
+                    ctx->state_cleared[i] = 1;
+                }
                 n_passes++;
             }
         }
@@ -413,10 +424,12 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             }
             const int32_t state = ctx->state_role.empty() ? SPACEMIT_STATE_NONE : ctx->state_role[i];
             if (state == SPACEMIT_STATE_SKIP) {
-                continue;  // a state pass's GET_ROWS or CPY: its one step does both copies
+                continue;  // a state pass's GET_ROWS, CPY or folded SCALE: its one step does their work
             }
             if (state != SPACEMIT_STATE_NONE) {
-                expand(ggml_graph_node(cgraph, state), &dev->ops.state_direct, node);
+                const spacemit_op * pass = ctx->state_cleared[i] != 0 ? &dev->ops.state_direct_cleared :
+                                                                        &dev->ops.state_direct;
+                expand(ggml_graph_node(cgraph, state), pass, node);
                 continue;
             }
             const uint8_t role = ctx->conv_role.empty() ? 0 : ctx->conv_role[i];
