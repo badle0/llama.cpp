@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 // MUL_MAT_ID (plan.md "Step 2 spec", Qwen3.6-35B-A3B): ggml-cpu's ggml_compute_forward_mul_mat_id (ggml-cpu.c) on the
 // IME formats of MUL_MAT. One token keeps the 1-row path: one kernel call per (token, slot) pair, the weights read
@@ -116,6 +117,82 @@ mmid_setting mmid_setting_from_env() {
     return static_cast<mmid_setting>(spacemit_cached_switch(value, seen, parse_mmid_setting));
 }
 
+// test-only, for the comparison (plan.md "The expert matmul's claim queue"): FLAGOS_SPACEMIT_MMID_DEAL=queue (unset or
+// empty, the default): several tokens' (expert, slab) units are cut into chunks that the tiles claim from one counter;
+// static: the units dealt as contiguous ranges of cumulative weight before any work starts. Parsed once
+// (spacemit_cached_switch); anything else warns once per parse generation and keeps the default
+enum class mmid_deal { queue, fixed };
+
+int parse_mmid_deal() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_MMID_DEAL");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "queue") == 0) {
+        return (int) mmid_deal::queue;
+    }
+    if (std::strcmp(v, "static") == 0) {
+        return (int) mmid_deal::fixed;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MMID_DEAL=%s: not queue or static, the default (queue) kept\n", __func__, v);
+    }
+    return (int) mmid_deal::queue;
+}
+
+mmid_deal mmid_deal_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return static_cast<mmid_deal>(spacemit_cached_switch(value, seen, parse_mmid_deal));
+}
+
+// test-only: FLAGOS_SPACEMIT_MMID_CHUNKS=<n>, the chunks a tile's share of the queue's weight is cut into, n decimal
+// digits only, 1 to 1024; unset or empty: 16. Parsed once (spacemit_cached_switch); anything else keeps the default
+// with a warning, once per parse generation
+constexpr int mmid_default_chunks = 16;
+constexpr int mmid_max_chunks     = 1024;
+
+int parse_mmid_chunks() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_MMID_CHUNKS");
+    if (v == nullptr || *v == '\0') {
+        return mmid_default_chunks;
+    }
+    int          n = 0;
+    const char * c = v;
+    for (; *c >= '0' && *c <= '9' && n <= mmid_max_chunks; ++c) {  // stops past 1024, so no overflow
+        n = n * 10 + (*c - '0');
+    }
+    if (*c == '\0' && n >= 1 && n <= mmid_max_chunks) {
+        return n;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MMID_CHUNKS=%s: not a chunk count from 1 to 1024, the default %d kept\n",
+                      __func__, v, mmid_default_chunks);
+    }
+    return mmid_default_chunks;
+}
+
+int mmid_chunks_from_env() {
+    static std::atomic<int>      value{ mmid_default_chunks };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_mmid_chunks);
+}
+
+// the queue's counter: after the tiles' parts, at the workspace's end, on a cache line of its own when the workspace is
+// 8-byte aligned (the core's is 64), else 8-byte aligned. Tile 0 of the first step constructs it at 0
+using mmid_counter = std::atomic<int64_t>;
+static_assert(mmid_counter::is_always_lock_free, "the claim counter must be lock-free");
+
+void * mmid_counter_at(void * workspace, const mmid_dims & d) {
+    const uintptr_t p = reinterpret_cast<uintptr_t>(workspace) + d.act_bytes + SPACEMIT_MAX_TILES * d.tile_bytes;
+    uintptr_t       q = GGML_PAD(p, 64);
+    if (q - p > 64 - sizeof(mmid_counter)) {
+        q = GGML_PAD(p, alignof(mmid_counter));
+    }
+    return reinterpret_cast<void *>(q);
+}
+
 // ggml-cpu's grouping: every (token, slot) pair, the tokens in order and the slots in order within a token, appended
 // to its expert's list. Here one list ordered by expert, a stable counting sort: expert e's pairs are rows[start[e]]
 // to rows[start[e + 1] - 1], in ggml-cpu's order. It reads only the ids, so every tile that builds it holds the same
@@ -191,11 +268,16 @@ float * out_row(const ggml_tensor * node, const mmid_row & r, int64_t n0) {
 }  // namespace
 
 // the activations (one row per activation row, or one per pair, whichever is larger), then one grouping, one gathered
-// group and one result slab per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line. It must not depend on
-// the setting: the steps of one node may not all see the same value
+// group and one result slab per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line, then a cache line for
+// the queue's counter. It must not depend on the setting: the steps of one node may not all see the same value
 size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
     const mmid_dims d = mmid_dims_of(node);
-    return d.act_bytes + SPACEMIT_MAX_TILES * d.tile_bytes;
+    return d.act_bytes + SPACEMIT_MAX_TILES * d.tile_bytes + 64;
+}
+
+void spacemit_mul_mat_id_read_switch() {
+    (void) mmid_deal_from_env();
+    (void) mmid_chunks_from_env();
 }
 
 // step 1: quantize the activations into the workspace's first part. One token (or rows): every activation row (ne11 per
@@ -212,12 +294,16 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
     const bool            by_pair   = d.ne12 > 1 && mmid_setting_from_env() != mmid_setting::rows;
 
     if (by_pair) {
-        const size_t needed = d.act_bytes + (size_t) tile.nth * d.tile_bytes;
+        const size_t needed = spacemit_mul_mat_id_workspace(node);
         if (tile.nth == 0 || tile.nth > SPACEMIT_MAX_TILES || tile.workspace == nullptr ||
             tile.workspace_size < needed) {
             GGML_LOG_ERROR("FlagOS SpacemiT: mul_mat_id.quantize needs %zu workspace bytes for %u tiles, has %zu\n",
                            needed, tile.nth, tile.workspace_size);
             return false;
+        }
+        // the queue's reset, made visible to the second step's claims by the barrier between the steps
+        if (tile.ith == 0) {
+            new (mmid_counter_at(tile.workspace, d)) mmid_counter(0);
         }
         mmid_work w = mmid_work_of(tile, d);
         if (!group_rows(node->src[2], d, w.start, w.rows)) {
@@ -297,12 +383,14 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
 // One token (or rows): the units are (pair j, 32 columns c), numbered j * (N / 32) + c in the grouping's order and
 // dealt as contiguous ranges; each run of one pair's columns is one 1-row kernel call on the expert's rows.
 // Several tokens: the units are (active expert e, 32-column slab s), expert-major, each weighted by the expert's rows
-// plus the slab (slab_weight) and dealt as contiguous ranges of cumulative weight; a slab belongs to one tile, so an
+// plus the slab (slab_weight). By default (FLAGOS_SPACEMIT_MMID_DEAL=queue) an expert's slabs are cut into chunks of
+// about a 16th of a tile's share of the weight, which the tiles claim in order from the counter that tile 0 of step 1
+// reset; static deals the units as contiguous ranges of cumulative weight. A slab belongs to one tile either way, so an
 // expert's weights are read once per node. For a unit the tile multiplies the slab by every group of the expert: a
 // group of 4 into a 4 x 32 temporary whose rows are then scattered to their output rows, a single straight to its
-// output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per expert
-// where they fit beside it; a slab is copied whatever the group count, since staging a slab is also faster for one
-// kernel call (plan.md "1-row matmul bandwidth").
+// output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per run of
+// the expert's units where they fit beside it; a slab is copied whatever the group count, since staging a slab is also
+// faster for one kernel call (plan.md "1-row matmul bandwidth").
 // Either way every output element comes from one kernel call on one (group or pair, slab), so neither the tile count
 // nor the staging can change it
 bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
@@ -310,7 +398,7 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     const mmid_dims       d         = mmid_dims_of(node);
     const bool            reference = mm_use_reference();
     const mmid_setting    setting   = mmid_setting_from_env();
-    const size_t          needed    = d.act_bytes + (size_t) tile.nth * d.tile_bytes;
+    const size_t          needed    = spacemit_mul_mat_id_workspace(node);
     if (tile.nth == 0 || tile.nth > SPACEMIT_MAX_TILES || tile.workspace == nullptr || tile.workspace_size < needed) {
         GGML_LOG_ERROR("FlagOS SpacemiT: mul_mat_id.gemm needs %zu workspace bytes for %u tiles, has %zu\n", needed,
                        tile.nth, tile.workspace_size);
@@ -361,60 +449,111 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     const int64_t   slab_bytes = nb_cols * d.b_row_bytes;
     const bool      stage      = setting == mmid_setting::staged && tcm != nullptr &&
                        (int64_t) tile.tcm_size >= slab_bytes;
-    const int64_t lo   = (int64_t) tile.ith * total;  // this tile takes the units with lo <= u * nth < lo + total
-    const int64_t hi   = lo + total;
-    int64_t       u    = 0;  // the weight of the units before the one at hand
-    bool          done = false;
-    for (int64_t e = 0; e < d.n_as && !done; e++) {
-        const int64_t r = w.start[e + 1] - w.start[e];
-        if (r == 0) {
-            continue;
+
+    // the expert at hand: its rows, read from the workspace or, once held, from TCM, and where its slabs are staged
+    int64_t         e = -1, r = 0, rows_bytes = 0, count = 0;
+    bool            hold_act = false, held = false;
+    const uint8_t * acts     = nullptr;
+    uint8_t *       slab_buf = nullptr;
+    const auto      enter    = [&](int64_t expert) {
+        e          = expert;
+        r          = w.start[e + 1] - w.start[e];
+        rows_bytes = r * d.a_row_bytes;  // the expert's quantized rows, consecutive in the workspace
+        hold_act   = stage && (int64_t) GGML_PAD((size_t) rows_bytes, 64) + slab_bytes <= (int64_t) tile.tcm_size;
+        acts       = qa + w.start[e] * d.a_row_bytes;
+        slab_buf   = stage ? tcm + (hold_act ? GGML_PAD((size_t) rows_bytes, 64) : 0) : nullptr;
+        count      = group_count(r);
+        held       = false;
+    };
+    // the unit (e, slab s): the slab staged, then every group of the expert
+    const auto unit = [&](int64_t s) {
+        const uint8_t * b = weights + (e * d.n + s * nb_cols) * d.b_row_bytes;
+        if (stage) {
+            if (hold_act && !held) {
+                spacemit_ime::copy(tcm, acts, (size_t) rows_bytes);
+                acts = tcm;
+                held = true;
+            }
+            spacemit_ime::copy(slab_buf, b, (size_t) slab_bytes);
+            b = slab_buf;
         }
-        const int64_t unit = r + slab_weight;
-        if ((u + per * unit) * nth <= lo) {
-            u += per * unit;  // the whole expert lies before this tile's range
-            continue;
+        for (int64_t g = 0; g < count; g++) {
+            const int64_t   off = group_start(g, r);
+            const uint8_t * a   = acts + off * d.a_row_bytes;
+            if (group_size(g, r) == row_align) {
+                d.f->gemm(a, b, w.result, row_align, (size_t) nb_cols, (size_t) d.k_blocks, (size_t) nb_cols,
+                          reference);
+                for (int64_t t = 0; t < row_align; t++) {
+                    std::memcpy(out_row(node, w.rows[w.start[e] + off + t], s * nb_cols), w.result + t * nb_cols,
+                                (size_t) nb_cols * sizeof(float));
+                }
+            } else {
+                d.f->gemm(a, b, out_row(node, w.rows[w.start[e] + off], s * nb_cols), 1, (size_t) nb_cols,
+                          (size_t) d.k_blocks, (size_t) d.n, reference);
+            }
         }
-        const int64_t   rows_bytes = r * d.a_row_bytes;  // the expert's quantized rows, consecutive in the workspace
-        const bool      hold_act   = stage && (int64_t) GGML_PAD((size_t) rows_bytes, 64) + slab_bytes <=
-                                            (int64_t) tile.tcm_size;
-        const uint8_t * acts     = qa + w.start[e] * d.a_row_bytes;
-        uint8_t * const slab_buf = stage ? tcm + (hold_act ? GGML_PAD((size_t) rows_bytes, 64) : 0) : nullptr;
-        const int64_t   count    = group_count(r);
-        bool            held     = false;
-        for (int64_t s = 0; s < per; s++, u += unit) {
-            if (u * nth < lo) {
+    };
+
+    if (mmid_deal_from_env() == mmid_deal::fixed) {
+        const int64_t lo   = (int64_t) tile.ith * total;  // this tile takes the units with lo <= u * nth < lo + total
+        const int64_t hi   = lo + total;
+        int64_t       u    = 0;  // the weight of the units before the one at hand
+        bool          done = false;
+        for (int64_t x = 0; x < d.n_as && !done; x++) {
+            const int64_t rx = w.start[x + 1] - w.start[x];
+            if (rx == 0) {
                 continue;
             }
-            if (u * nth >= hi) {
-                done = true;
-                break;
+            const int64_t weight = rx + slab_weight;
+            if ((u + per * weight) * nth <= lo) {
+                u += per * weight;  // the whole expert lies before this tile's range
+                continue;
             }
-            const uint8_t * b = weights + (e * d.n + s * nb_cols) * d.b_row_bytes;
-            if (stage) {
-                if (hold_act && !held) {
-                    spacemit_ime::copy(tcm, acts, (size_t) rows_bytes);
-                    acts = tcm;
-                    held = true;
+            enter(x);
+            for (int64_t s = 0; s < per; s++, u += weight) {
+                if (u * nth < lo) {
+                    continue;
                 }
-                spacemit_ime::copy(slab_buf, b, (size_t) slab_bytes);
-                b = slab_buf;
-            }
-            for (int64_t g = 0; g < count; g++) {
-                const int64_t   off = group_start(g, r);
-                const uint8_t * a   = acts + off * d.a_row_bytes;
-                if (group_size(g, r) == row_align) {
-                    d.f->gemm(a, b, w.result, row_align, (size_t) nb_cols, (size_t) d.k_blocks, (size_t) nb_cols,
-                              reference);
-                    for (int64_t t = 0; t < row_align; t++) {
-                        std::memcpy(out_row(node, w.rows[w.start[e] + off + t], s * nb_cols), w.result + t * nb_cols,
-                                    (size_t) nb_cols * sizeof(float));
-                    }
-                } else {
-                    d.f->gemm(a, b, out_row(node, w.rows[w.start[e] + off], s * nb_cols), 1, (size_t) nb_cols,
-                              (size_t) d.k_blocks, (size_t) d.n, reference);
+                if (u * nth >= hi) {
+                    done = true;
+                    break;
                 }
+                unit(s);
             }
+        }
+        return true;
+    }
+
+    // the queue: an expert's slabs in chunks of c, c about a chunks-th of a tile's share, numbered expert-major
+    const int64_t target      = std::max<int64_t>(1, total / (nth * mmid_chunks_from_env()));
+    const auto    chunk_slabs = [&](int64_t rx) { return std::clamp(target / (rx + slab_weight), int64_t(1), per); };
+    int64_t       n_chunks    = 0;
+    for (int64_t x = 0; x < d.n_as; x++) {
+        const int64_t rx = w.start[x + 1] - w.start[x];
+        n_chunks += rx > 0 ? div_up(per, chunk_slabs(rx)) : 0;
+    }
+    mmid_counter & next = *std::launder(static_cast<mmid_counter *>(mmid_counter_at(tile.workspace, d)));
+    int64_t        x = -1, first = 0, n_x = 0, c = 1;  // the last claim's expert, its first chunk, its chunks, its c
+    for (;;) {
+        const int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= n_chunks) {
+            break;
+        }
+        while (i >= first + n_x) {  // a tile's claims only grow, so its walk only moves forward
+            first += n_x;
+            do {
+                x++;
+            } while (w.start[x + 1] == w.start[x]);
+            c   = chunk_slabs(w.start[x + 1] - w.start[x]);
+            n_x = div_up(per, c);
+        }
+        if (x != e) {
+            enter(x);
+        }
+        const int64_t s0 = (i - first) * c;
+        const int64_t s1 = std::min(per, s0 + c);
+        for (int64_t s = s0; s < s1; s++) {
+            unit(s);
         }
     }
     return true;

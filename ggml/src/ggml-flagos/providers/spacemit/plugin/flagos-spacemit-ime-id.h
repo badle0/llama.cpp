@@ -9,13 +9,17 @@
 // (pair, 32 columns) units over the tiles in the grouping's order and multiplies each pair's activation row by its
 // expert's rows with the 1-row kernels, the weights read from DRAM.
 // Several tokens: step 1 quantizes one row per pair, at the pair's place in that order, the 4 rows of a group
-// interleaved for the 4-row kernel; step 2 deals (expert, 32-column slab) units over the tiles, so an expert's weights
-// are read once per node, and multiplies a slab by every group of its expert, staged through TCM by default. The
+// interleaved for the 4-row kernel; step 2's tiles claim chunks of (expert, 32-column slab) units, so an expert's
+// weights are read once per node, and multiply a slab by every group of its expert, staged through TCM by default. The
 // output rows are ggml-cpu's.
 
 // the shared workspace: the quantized activations, then one id grouping, one gathered group of 4 rows and one 4 x 32
-// result per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line
+// result per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line, then the cache line of step 2's claim
+// counter (several tokens)
 size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node);
+// reads FLAGOS_SPACEMIT_MMID_DEAL and FLAGOS_SPACEMIT_MMID_CHUNKS (test-only) at registration, as
+// spacemit_embd_read_switch, so a bad value's warning shows
+void   spacemit_mul_mat_id_read_switch();
 bool   spacemit_mul_mat_id_quantize(const spacemit_tile * tile, ggml_tensor * node);
 // false (the graph fails) when an id is outside [0, n_expert), which ggml-cpu asserts in debug builds only
 bool   spacemit_mul_mat_id_gemm(const spacemit_tile * tile, ggml_tensor * node);

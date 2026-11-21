@@ -104,9 +104,9 @@ std::string spacemit_role(const ggml_tensor * t) {
     return n.empty() ? "-" : n;
 }
 
-// a step's name in the op counters: the op (and the step of a MUL_MAT or a split attention, a convolution pair's two
-// steps and a state pass's one, by the step's contract name), the role its tensors' names give, and its rows (r: the
-// output's; m: a matmul's activations', after its weight type)
+// a step's name in the op counters: the op (and the step of a MUL_MAT, a MUL_MAT_ID or a split attention, a
+// convolution pair's two steps and a state pass's one, by the step's contract name), the role its tensors' names give,
+// and its rows (r: the output's; m: a matmul's activations', after its weight type)
 std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
                                 const std::vector<const char *> & names, size_t i) {
     const spacemit_plugin_step & step = steps[i];
@@ -120,6 +120,10 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
                           std::strcmp(name, "mul_mat.quantize") == 0 ? "quantize" : "gemm",
                           spacemit_role(n->src[0]).c_str(), ggml_type_name(n->src[0]->type),
                           static_cast<long long>(ggml_nrows(n->src[1])));
+            break;
+        case GGML_OP_MUL_MAT_ID:
+            std::snprintf(buf, sizeof(buf), "MUL_MAT_ID.%s r%lld",
+                          std::strcmp(name, "mul_mat_id.quantize") == 0 ? "quantize" : "gemm", r);
             break;
         case GGML_OP_RMS_NORM:
             {

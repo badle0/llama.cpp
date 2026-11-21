@@ -3619,6 +3619,93 @@ On the Mac (simulated device): the build without warnings; the four FlagOS check
 - **A token is 2.0 ms slower than on 2026-11-20 (103.68 against 101.68 ms a graph), and it is not this step.** The 2.0 ms are spread over the memory-bound matmuls, 1 to 3% each (`MUL_MAT_ID` +0.78, the output layer +0.45, `GATED_DELTA_NET.direct` +0.32, `attn_gate` +0.21), none of them touched by this step; the router is 0.10 faster. The same graph took 103.2 to 103.5 ms in the load-mode session of 2026-11-20 (`f7ac31ef8`, before this step), under `none` and under `-lm mmap` alike, so it is not the load mode either. The completions say the same: 103.40 ms a token in the float matmul's session, 105.8 and 105.95 in the load-mode session, 106.2 to 106.6 today. So the board has been about 2% slower on memory-bound steps since the afternoon of 2026-11-20, the session whose loads were also slower (33 to 42 s against 26 to 31). Not explained; it is why pp501 shows no gain across sessions while the same-session comparison had 62 ms.
 - What is left in a 32-token graph: `MUL_MAT_ID` 249.3 ms (45.5%, 25.8 of it tiles waiting on each other), the layer 66.1 (12.1%), `attn_qkv` 32.5, the router 24.1, the output layer 17.4.
 
+### The expert matmul's claim queue (spec, 2026-11-21)
+
+**Status:** written 2026-11-21 on the user's word ("go ahead and write the spec for the claim queue"), approved with its three points the same day ("agreed to all three points, start building"). Built and checked on the Mac 2026-11-21 ("As built" below). Not run on the K3: the real kernels, the eight A100 tiles and every speed figure are open.
+
+**What it is about.** `MUL_MAT_ID` with several tokens (`plugin/flagos-spacemit-ime-id.cpp`, the many-row path of 2026-11-17). Its second step multiplies units of (active expert, 32-column weight slab). Today the units are dealt to the tiles before any work starts: each unit gets a weight, the expert's rows plus a constant 4 for the slab (`slab_weight`, "a guess, not measured", `:26-28`), and tile *i* takes the contiguous run of units that covers its eighth of the total weight (`:355-392`). A tile whose run is in fact heavier than its weight says finishes late, and the other seven wait at the step's end. The op counters call this waiting imbalance (per step the slowest tile's time less the tiles' mean).
+
+**What it costs (op table of 2026-11-21, `~/k3-logs/lr`, build `5f6a9b75e`; ms a graph, the node's two steps together, 240 steps).**
+
+| a graph of | `MUL_MAT_ID` | of it imbalance | the graph | the imbalance's share of the graph |
+|---|---|---|---|---|
+| 1 token | 24.9 | 0.9 | 103.7 | 0.9% |
+| 32 tokens | 249.3 | 25.8 | 548.4 | 4.7% |
+| 128 tokens | 574.5 | 49.2 | 1,625.9 | 3.0% |
+| 501 tokens | 1,977.3 | 199.6 | 6,136.0 | 3.3% |
+| 512 tokens, n_kv 2048 | 2,029.2 | 216.0 | 7,096.1 | 3.0% |
+
+The node is the largest step of every prompt graph (45.5% at 32 tokens, 32.2% at 501). Over a graph the eight tiles' summed times are within 1.9% of each other at 32 tokens and 3.8% at 501, and every tile is the slowest in some of the 720 counted steps (63 to 183 times at 32 tokens, tile 0 most often; 26 to 182 at 501, tile 4 most often; the counters' `slowest` field). So no tile is slow by itself: the deal is uneven step by step. Not known from these tables: how the imbalance divides between the node's two steps, which the counters report under one name (part 0 below).
+
+**Why a fixed deal is uneven (read in the code, not measured).**
+- The weight is a model with a guessed constant. A unit's real cost is the slab's copy into TCM plus one kernel call per group of the expert's rows, and a group of 4 rows costs less per row than a single row; `r + 4` has neither.
+- A unit is not divided, and the runs are cut where the cumulative weight says, so a tile's run can be over its share by most of a unit.
+- A tile that starts in the middle of an expert copies that expert's rows into its TCM again (`:395-399`), a cost the weights do not have.
+
+**The change.**
+
+0. *The counters name the two steps* (`core/flagos-spacemit-diagnostics.cpp`, `spacemit_step_label`): `MUL_MAT_ID.quantize` and `MUL_MAT_ID.gemm`, as `MUL_MAT`'s. Diagnostics only. The run then shows where the waiting is, and what the first step's own deal (groups as contiguous ranges, a group of 4 counted as a single, `:233-238`) costs.
+
+1. *The multiply's units are claimed, not dealt* (several tokens, `staged` and `grouped`; one token and `rows` stay as they are).
+   - **Chunks.** The unit list stays as it is, the active experts in id order and each expert's slabs in order. An expert's slabs are cut into chunks of `c` consecutive slabs, `c = clamp(target / (r + slab_weight), 1, slabs of an expert)`, with `r` the expert's rows and `target` the total weight over (tiles x 16). So a chunk is about a sixteenth of a tile's share or less: an expert with few rows is one chunk, an expert with many rows is cut down to single slabs. The weight model now only sizes the chunks; it no longer decides who does what.
+   - **The counter.** One `std::atomic<int64_t>` on a cache line of its own in the node's workspace, which all tiles share (the workspace grows by 64 bytes, whatever the setting). Tile 0 of the first step stores 0; the executor's barrier between the two steps makes that visible before any claim, which is ggml-cpu's pattern (thread 0 resets, then `ggml_barrier`, `ggml-cpu.c:1639-1645`). In the second step each tile loops: `i = next.fetch_add(1)`; stop when `i` is past the last chunk; else do chunk `i`. A tile's claims only grow, so it finds a chunk's expert and slabs by walking forward from its last one, with no table.
+   - **TCM.** For a chunk of an expert whose rows the tile does not hold in its TCM, it copies them first (where they fit beside a slab, as today); each slab is copied once, as today.
+   - **The bytes.** Every output element still comes from one kernel call on one (group, slab), the same call as today. Only which tile makes the call changes, and that now differs from run to run. So the outputs are today's bit for bit, on the K3 and on the Mac, for any tile count and any order of claims.
+
+2. *The switches, for the comparison only.* `FLAGOS_SPACEMIT_MMID_DEAL=queue|static`: unset, empty or `queue` the new form, `static` today's deal; another value warns once and keeps the default. `FLAGOS_SPACEMIT_MMID_CHUNKS=<n>`: the chunks a tile's share is cut into, 16 unset, for one more arm at 64. Both parsed once as `FLAGOS_SPACEMIT_MMID` is, both removed with the static deal once the K3 run has decided.
+
+**Files.** `plugin/flagos-spacemit-ime-id.cpp` (the workspace's size, the reset in the first step, the claim loop beside the static one), `core/flagos-spacemit-diagnostics.cpp` (the two labels), `tests/check_spacemit.cpp`, `build.md` (the switches' rows). The contract, the core's steps, the plugin interface and the kernels do not change.
+
+**References.**
+- ggml-cpu, `MUL_MAT` (`ggml/src/ggml-cpu/ggml-cpu.c:1397-1450`): chunks of 16 x 16 rows (64 when either side is one row), each thread starting at chunk `ith` and then taking `atomic_fetch_add(&current_chunk, 1)`; with fewer than 4 chunks a thread it falls back to one chunk a thread (`:1413-1416`).
+- ggml-cpu, `MUL_MAT_ID` (`:1580`, `:1639-1645`, `:1661-1704`): one such counter per expert on a cache line each, reset by thread 0 before a barrier, every thread then visiting every expert. Here one counter for the node and a chunk owned by one tile, because our unit carries a slab staged in one tile's TCM, and an expert visited by eight tiles would put its rows in eight TCMs.
+- OpenMP's `schedule(dynamic, chunk)` is the same scheme (from memory, not re-read).
+- Not read for this spec: how SpacemiT's fork deals its experts over the tiles.
+
+**Alternatives, and why they lose.**
+- A better weight model for the fixed deal: it needs a measured cost per format and shape, and it still cannot follow a tile that runs slow in one step.
+- Work stealing with a list per tile: it would keep each tile on neighbouring experts, but it is more code, and one counter is enough while a chunk is a sixteenth of a share.
+- The heaviest experts first: it shortens the tail of a claimed step further. Later, if the tail still shows.
+- One expert's rows split over several tiles for the same slab: the slab would be staged in several TCMs. Only if single slabs of one expert turn out too heavy to balance.
+
+**Tests on the Mac (reference kernels; tiles serial, or at the same time on host threads with `FLAGOS_SPACEMIT_TEST_THREADS=1`).**
+- `check_mul_mat_id_groups` extended. Through the backend: the default against `static` the same bytes, and both against `grouped` and `rows` as now; 1 tile against 8; with and without the test TCM; at 16 and at 64 chunks a share.
+- Shapes for the claims: every pair on one expert (single-slab chunks), one row an expert, a skewed draw (one expert with half the pairs), fewer chunks than tiles, experts of 0 rows between active ones.
+- Threads: each case 20 times with the tiles at the same time, every run the same bytes. The counter after a step is the chunk count plus the tile count (each tile makes one claim past the end), which says every chunk was claimed once.
+- Direct calls of the step: the tiles in reverse order, and one tile alone called first (it claims everything): the same bytes.
+- Two computes of one graph in a row: the second's bytes the first's (the reset).
+- The labels: a step table of a `MUL_MAT_ID` node has one `MUL_MAT_ID.quantize` and one `MUL_MAT_ID.gemm`.
+- The switches: unset, `queue`, `static`, an unknown value warning once; a chunk count of 0 or text refused with a warning.
+- ThreadSanitizer on the check program's `mmid` checks with the tiles on threads: clean.
+- `test-backend-ops -o MUL_MAT_ID` under the default and under `static`.
+- Mutations that must fail: no reset in the first step (the second compute); a chunk's first slab off by one; the expert's rows not copied again when the claimed expert changes (with the test TCM).
+- The riscv64 syntax check of `plugin/flagos-spacemit-ime-id.cpp`, 0 errors.
+
+**The K3 run (one), and the rule set before it.** The usual block (the TCM guard, the dates, the build, the check program with the device). Then `static`, the default and the default at 64 chunks in turn, twice each: `llama-bench -p 32,128,501 -n 0 -r 3` with the op tables (six loads, about 8 minutes, my estimate). Then one completion of the 501-token prompt under `static` and under the default, and the KLD of 2 chunks under the default. The queue stays the default and `static` goes if all four hold:
+1. the check program passes, the two deals the same bytes on the real kernels;
+2. the KLD's printed figures are 0.005482, 0.219900 and 94.706%, and both completions are the f32 run's text;
+3. at 32, 128 and 501 tokens the graph, the mean of the default's two runs, is below `static`'s by more than the two runs of an arm differ, and by at least 8 ms at 32 tokens;
+4. no llama-bench figure is lower.
+
+64 chunks replace 16 if they are faster at all three sizes by more than the runs differ. If point 3 fails, the two labels say whether the waiting sits in the first step or the queue did not remove it.
+
+**Estimates, not measured.** If most of the imbalance is the multiply's and the queue removes two thirds of it (a guess: the tail of a claimed step is about one chunk): 17 ms at 32 tokens, 33 at 128, 133 at 501, so pp32 58.1 to about 60.0 t/s, pp128 78.6 to about 80.2, pp501 81.6 to about 83.4. Generation unchanged: one token keeps its path. Less if the many-row multiply is partly memory-bound, since a tile that waits today leaves its share of the memory's rate to the others.
+
+**Not in this step.** The first step's deal (decided by its label's figures). The one-token path (0.9 ms of imbalance). The float matmul's inner loop. The heaviest experts first.
+
+**For the user's word.**
+1. Part 0 renames the node's row in every op table from now on (`MUL_MAT_ID r256` becomes two rows). I recommend it: without it the run cannot say which step waits.
+2. The third arm (64 chunks) adds two loads, about 3 minutes, to settle a constant in the same run. I recommend it.
+3. The first-request TTFT of this model is still not measured. `tools/spacemit_ttft.py` was sized for Qwen3 (its cases and times); I have not sized it for a 19 GiB model, so it is not in this run. I propose to size it after this step.
+
+**As built (2026-11-21, Mac only; written by the coder subagent, the diff read and the checks below rerun by me unless said).**
+- *The code.* `spacemit_mul_mat_id_gemm` keeps one routine for a unit (the slab staged, then every group of the expert) and one for entering an expert, and both deals call them, so the kernel calls are the same under `static` and the queue. The counter is a `std::atomic<int64_t>` built by placement-new at 0 by tile 0 of the first step's several-token branch (under `static` too) and claimed with `fetch_add(1, relaxed)`; the barrier between the steps publishes it.
+- *Different from the spec.* The counter sits after all `SPACEMIT_MAX_TILES` tile parts, at the workspace's last 64 bytes, not after the first `nth`: a fixed place the check can read without a new plugin entry. Both steps now ask for the full workspace size. The tests are a check of their own, `check_mul_mat_id_queue` (a fourth `mmid` line), not an extension of `check_mul_mat_id_groups`. The two new switches are also read at registration (`spacemit_mul_mat_id_read_switch`), so a bad value warns at start.
+- *The check program* (`--expect-device`; default, `GGML_FLAGOS_KERNEL_VARIANTS=0`, `FLAGOS_SPACEMIT_MMID_DEAL=static`, `FLAGOS_SPACEMIT_TEST_THREADS=1`): the 6 known `conv pair` failures and no other in each. The queue line: 6/6 cases; through the backend `static`'s bytes in 48/48 (with TCM, at 64 chunks, grouped, without TCM, twice in a row, on threads 20 times); the steps directly 66/66 (1 and 8 tiles, in reverse, one tile first, without TCM, at 64 chunks, on threads 20 times), each with the counter at the chunk count plus the tile count; the switches' values 13/13; the labels 2/2. On the K3 the direct calls and the switch values do not run (a test thread must not call an IME kernel), so that line will read 36/36, 0/0, 0/0 there.
+- *Other checks.* The four other check programs pass; `test-backend-ops -o MUL_MAT_ID` 227/227 under the default and under `static`; the riscv64 syntax check of `plugin/flagos-spacemit-ime-id.cpp` 0 errors. ThreadSanitizer on the whole check program with the tiles on threads: 0 reports (the coder's run, not repeated by me).
+- *Mutations, each caught.* No reset in the first step (4 `MUL_MAT_ID` cases fail, then the program spins on the stale counter: a claim index from another op's bytes never ends the loop; the coder's run sat on it for three hours, its loop having no time limit); a chunk's first slab off by one (229 failures more); the rows not copied again when the claimed expert changes (79 more, only where TCM is used); the last chunk never claimed (229 more, mine).
+- *Not tested.* The K3: the spine-runtime executor's barrier (`exec.cpp:161`, read, not run), the real IME kernels under the queue, any timing. No model run on the Mac either: none of the small models there has experts.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
