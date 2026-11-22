@@ -13,7 +13,7 @@
 //   form of the Q4_1 d and nibbles, then the tile's fp16 minimums, [K/32 block][32 rows]. A weight d q + m is
 //   d (q - 8) + (m + 8 d): the q4_0 kernels give the first part, q4_1_min_gemm adds the second. Lossless, 20 bytes per
 //   32 weights as Q4_1; the activations are the q4_0 layout's.
-// - "q4_0s 32x256" (3-D Q4_0 experts under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8): the q4_0 32x256 bytes with every
+// - "q4_0s 32x256" (3-D Q4_0 experts unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain): the q4_0 32x256 bytes with every
 //   nibble byte ^ 0x88, so a nibble holds q - 8 as a signed 4-bit value (SpacemiT's fork). Lossless, same size. Its
 //   kernels take the activations in groups of 8, 4 or 1 rows (the fork's packs) and need no sum(a) correction.
 // A 3-D weight (MUL_MAT_ID's experts) is stored as the 2-D weight of its ggml_nrows rows in any layout.

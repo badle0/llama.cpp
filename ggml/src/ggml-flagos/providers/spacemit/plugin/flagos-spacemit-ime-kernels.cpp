@@ -27,9 +27,9 @@
 // guards against was met by none of our runs (question 8's report). The in-tree Q4_1 layout (q4_1 32x32, an integer
 // zero point) was replaced by the requantization to Q8_0 on 2026-10-23 (+5.5% perplexity on Llama-3.2-1B) and removed
 // on 2026-11-02 with its kernels.
-// The q4_0s layout (3-D Q4_0 experts, FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8; plan.md "The Q4_0 experts: the fork's
-// signed layout and 8-row kernel") is copied from SpacemiT's fork (spacemit-com/llama.cpp mtmd-backend b847bf396,
-// ggml/src/ggml-spacemit):
+// The q4_0s layout (3-D Q4_0 experts, the default; FLAGOS_SPACEMIT_EXPERT_Q4_0=plain keeps q4_0 32x256; plan.md "The
+// Q4_0 experts: the fork's signed layout and 8-row kernel") is copied from SpacemiT's fork (spacemit-com/llama.cpp
+// mtmd-backend b847bf396, ggml/src/ggml-spacemit):
 //   ime2_kernels.cpp  HP_AL_MM8, HP_AL_LOAD_Y, HP_AL_LOAD_X_NEXT, HP_AL_COMPUTE (2393-2436),
 //                     gemm_kernel_i8i4_hp_al_m4 (2438-2561), M8_SCALE, M8_MM, M8_LOAD (2570-2596),
 //                     gemm_kernel_i8i4_hp_al_m8 (2598-2721), gemm_kernel_i8i4_hp_al_m1 (2727-2827)
@@ -38,9 +38,9 @@
 // Its 1-row pack, quantize_a_i8_r1_hp (rvv_kernels.cpp 2274-2383), is quantize_a_row_i8_hp but for its name, so it is
 // not copied again. Changes, marked "flagos": BLOCK_QNK_LEN spelled q4_0_k_block; quantize_a_i8_r4_hp_al's fallback
 // below VLEN 1024 calls quantize_a_4row_i8_hp, the fork's quantize_a_i8_r4_hp under our name; the 4-row and 8-row packs
-// take their stable factor as a parameter: the fork's 0.1 (scales * 0.1, average / 0.1) by default, 1 under the
-// test-only FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE=1 (scales / average, the average itself, as the plain 4-row pack). Their
-// scalar references are new.
+// do not take the fork's stable factor 0.1 (scales scale / avg, the average avg, as the plain 4-row pack): on the K3 on
+// 2026-11-22 (Qwen3.6-35B-A3B, m8, 2 chunks) the mean KLD was 0.007111 at 0.1 and 0.005115 at 1, maximum 0.250 and
+// 0.089 (plan.md "The Q4_0 experts: the fork's signed layout and 8-row kernel"). Their scalar references are new.
 //
 // The IME and RVV code is built only with GGML_FLAGOS_SPACEMIT_IME2 (riscv64, GCC >= 15); the scalar references
 // (*_ref, plain C++) are built everywhere, so hosts without the AI cores can run the whole path.
@@ -49,7 +49,6 @@
 #include "../../../../ggml-common.h"
 #include "../../../../ggml-impl.h"
 #include "flagos-spacemit-ime-kernels.h"
-#include "flagos-spacemit-weights.h"  // spacemit_expert_q4_0_stable_factor
 
 #include <algorithm>
 #include <cassert>
@@ -597,9 +596,8 @@ void gemm_kernel_i8i8_mrow_ref(size_t          blk_len,
 // as quantize_a_i8_r8_hp: 8 rows (row stride count_k) per 256 values into q8_hp_m8_blk_size bytes. Per 32-value
 // subblock kk one scale for the 8 rows (their largest magnitude / 127), the subblock's int8 values of row r split into
 // a lane of low nibbles at kk * 256 + r * 16 and one of high nibbles 128 bytes on (byte j: values 2j and 2j + 1, the
-// even one low); then the 8 fp16 scales (scale / average * f) at 2048 and the fp16 average / f after them, f the
-// stable factor. No sums
-static void quantize_a_r8_hp_ref(const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr, float stable_factor) {
+// even one low); then the 8 fp16 scales (scale / average) at 2048 and the fp16 average after them. No sums
+static void quantize_a_r8_hp_ref(const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len  = 32;
     constexpr size_t subblk_count  = q4_0_k_block / k_subblk_len;
     constexpr size_t a_scale_off   = 8 * 8 * k_subblk_len;
@@ -618,9 +616,9 @@ static void quantize_a_r8_hp_ref(const float * a_ptr, size_t count_k, uint8_t * 
             scale_avg += scale_temp[kk];
         }
         scale_avg /= subblk_count;
-        const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
+        const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
         _Float16    scale[subblk_count + 1];
-        scale[subblk_count] = static_cast<_Float16>(scale_avg / stable_factor);
+        scale[subblk_count] = static_cast<_Float16>(scale_avg);
 
         for (size_t kk = 0; kk < subblk_count; kk++) {
             const float rep_scale_a = scale_temp[kk] ? 1.0f / scale_temp[kk] : 0.0f;
@@ -644,10 +642,10 @@ static void quantize_a_r8_hp_ref(const float * a_ptr, size_t count_k, uint8_t * 
 }
 
 // as quantize_a_i8_r4_hp_al at VLEN 1024: 4 rows per 256 values into q8_hp_m4al_blk_size bytes. Per subblock kk the
-// 4 rows' int8 values at kk * 128 + r * 32 and one fp16 scale for the 4 at 1024 + kk * 8 (scale / average * f); the
-// sums fp16(-sum(qa)) * 8 at 1088, [row][subblock] (the signed kernels do not read them); the fp16 average / f at
+// 4 rows' int8 values at kk * 128 + r * 32 and one fp16 scale for the 4 at 1024 + kk * 8 (scale / average); the
+// sums fp16(-sum(qa)) * 8 at 1088, [row][subblock] (the signed kernels do not read them); the fp16 average at
 // 1152. The other bytes are not written
-static void quantize_a_r4_hp_al_ref(const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr, float stable_factor) {
+static void quantize_a_r4_hp_al_ref(const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len  = 32;
     constexpr size_t subblk_count  = q4_0_k_block / k_subblk_len;
     constexpr size_t data_bytes    = subblk_count * 4 * k_subblk_len;
@@ -668,8 +666,8 @@ static void quantize_a_r4_hp_al_ref(const float * a_ptr, size_t count_k, uint8_t
             scale_avg += scale_temp[kk];
         }
         scale_avg /= subblk_count;
-        const float    scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
-        const _Float16 avg          = static_cast<_Float16>(scale_avg / stable_factor);
+        const float    scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
+        const _Float16 avg          = static_cast<_Float16>(scale_avg);
         std::memcpy(quant_a_ptr + old_stride - sizeof(_Float16) * 4, &avg, sizeof(avg));
 
         for (size_t kk = 0; kk < subblk_count; kk++) {
@@ -2514,8 +2512,7 @@ void gemm_kernel_i8i4_hp_al_m1(const uint8_t * quant_a_ptr,
     }
 }
 
-void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr,
-                            float stable_factor) {
+void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     constexpr size_t subblk_count = 256 / k_subblk_len;
     constexpr size_t data_bytes   = subblk_count * 4 * k_subblk_len;
@@ -2525,7 +2522,7 @@ void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k,
     static_assert(data_bytes + subblk_count * 8 == subblk_count * old_subblk, "trailer offset must not move");
     GGML_ASSERT(blk_len == 256);
 
-    // flagos: stable_factor a parameter, the fork's 0.1 or 1 (FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE)
+    // flagos: the fork's stable factor 0.1 not taken: scale / avg and avg stored (the file's head)
 
     if (__riscv_vlenb() == 128) {
         float scale_temp[subblk_count];
@@ -2551,8 +2548,8 @@ void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k,
             }
 
             scale_avg /= subblk_count;
-            const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
-            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg / stable_factor);
+            const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
+            scale_avg_ptr[0]         = static_cast<_Float16>(scale_avg);
 
             for (size_t kk = 0; kk < subblk_count; ++kk) {
                 _Float16 * scale_a_ptr = reinterpret_cast<_Float16 *>(quant_a_ptr + data_bytes + kk * 8);
@@ -2595,14 +2592,13 @@ void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k,
     }
 }
 
-void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr,
-                         float stable_factor) {
+void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     constexpr size_t subblk_count = 256 / k_subblk_len;
     constexpr size_t a_scale_off  = 8 * 8 * k_subblk_len;  // FP16 scales follow all eight K32 payloads.
     GGML_ASSERT(blk_len == 256);
 
-    // flagos: stable_factor a parameter, the fork's 0.1 or 1 (FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE)
+    // flagos: the fork's stable factor 0.1 not taken: scale / avg and avg stored (the file's head)
     float       scale_temp[subblk_count];
 
     for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_hp_m8_blk_size) {
@@ -2622,8 +2618,8 @@ void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, ui
         }
 
         scale_avg /= subblk_count;
-        const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
-        scale_ptr[8]             = static_cast<_Float16>(scale_avg / stable_factor);
+        const float scale_factor = scale_avg ? 1.0f / scale_avg : 0.0f;
+        scale_ptr[8]             = static_cast<_Float16>(scale_avg);
 
         for (size_t kk = 0; kk < subblk_count; ++kk) {
             const float rep_scale_a = scale_temp[kk] ? 1.0f / scale_temp[kk] : 0.0f;
@@ -2832,21 +2828,21 @@ size_t q4_1_min_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t c
 void q4_0s_quantize_8rows(const float * a, size_t count_k, uint8_t * qa, bool reference) {
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
     if (!reference) {
-        quantize_a_i8_r8_hp(q4_0_k_block, a, count_k, qa, spacemit_expert_q4_0_stable_factor());
+        quantize_a_i8_r8_hp(q4_0_k_block, a, count_k, qa);
         return;
     }
 #endif
-    quantize_a_r8_hp_ref(a, count_k, qa, spacemit_expert_q4_0_stable_factor());
+    quantize_a_r8_hp_ref(a, count_k, qa);
 }
 
 void q4_0s_quantize_4rows(const float * a, size_t count_k, uint8_t * qa, bool reference) {
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
     if (!reference) {
-        quantize_a_i8_r4_hp_al(q4_0_k_block, a, count_k, qa, spacemit_expert_q4_0_stable_factor());
+        quantize_a_i8_r4_hp_al(q4_0_k_block, a, count_k, qa);
         return;
     }
 #endif
-    quantize_a_r4_hp_al_ref(a, count_k, qa, spacemit_expert_q4_0_stable_factor());
+    quantize_a_r4_hp_al_ref(a, count_k, qa);
 }
 
 // gemm_i8i4_k256's Q4_0 branch (ime2_kernels.cpp 4675-4687) with the group size given, not derived from count_m

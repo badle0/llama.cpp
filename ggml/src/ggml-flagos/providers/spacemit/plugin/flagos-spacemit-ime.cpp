@@ -60,7 +60,7 @@ const mm_format k_q4_1_min_32x256 = { (int64_t) spacemit_ime::q4_0_k_block,
                                       0,
                                       0,
                                       nullptr };
-// 3-D Q4_0 experts under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8: SpacemiT's fork's signed kernels on groups of 8, 4 or
+// 3-D Q4_0 experts (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain): SpacemiT's fork's signed kernels on groups of 8, 4 or
 // 1 rows; one row is the q4_0 1-row pack (the fork's quantize_a_i8_r1_hp writes the same bytes). Only MUL_MAT_ID
 // reaches this layout, and every one of its multiplies goes by group
 const mm_format k_q4_0s_32x256    = { (int64_t) spacemit_ime::q4_0_k_block,

@@ -3730,7 +3730,7 @@ The node is the largest step of every prompt graph (45.5% at 32 tokens, 32.2% at
 
 ### The Q4_0 experts: the fork's signed layout and 8-row kernel (spec, 2026-11-22)
 
-**Status:** written 2026-11-22 on the user's word ("write the spec for testing q4_0 expert path"), approved with its four points the same day ("agreed to all 4 rules, start building it"). Built and checked on the Mac the same day ("As built" below). Not run on the K3: the assembly kernels and the RVV packers have never executed.
+**Status:** written 2026-11-22 on the user's word ("write the spec for testing q4_0 expert path"), approved with its four points the same day ("agreed to all 4 rules, start building it"). Built and checked on the Mac the same day ("As built" below). Run on the K3 the same day ("On the K3" below): `m8` passes the rule at the stable factor 1 and fails its accuracy point at the fork's 0.1; `pad8` fails the speed point at 4 and 32 tokens. `m8` at factor 1 is the default since then, `pad8` and the factor's switch removed (Mac only so far; "The default" below).
 
 **What it is about.** `MUL_MAT_ID` on the 3-D Q4_0 expert tensors of Qwen3.6-35B-A3B: 115 of its 120 expert tensors (the other 5 are Q4_1, `blk.{0..4}.ffn_down_exps`), most of the file's bytes. The provider stores them in the dense matmul's layout (`q4_0_32x256`) and multiplies an expert's rows with the dense matmul's 4-row and 1-row kernels (`q4_0_gemm`). SpacemiT's fork has had a path of its own for these tensors since its PR #53 (2026-11-09, `3dea41375`; read at `mtmd-backend` `b847bf396`, item 102). The provider has never run it. This step builds it beside today's path and measures it.
 
@@ -3834,6 +3834,43 @@ If both arms pass, the one with the shorter 501-token graph wins, unless the oth
 - *Not tested.* The K3: the three assembly kernels and the two RVV packers have never executed (their clobber lists were read by the coder: every written register and "memory" declared), nor has any timing or model run. The new line's bounds have not met the real kernels.
 
 **The K3 run as it will be (changes from the plan above).** The KLD runs under `m8` and `pad8` at both factors (four loads, not two). An arm passes point 2 at whichever factor it passes; the factor that passes becomes the arm's. If an arm passes at both, the fork's 0.1 stays unless factor 1 is better by more than an error bar.
+
+**On the K3 (2026-11-22, build `6f1f28d49`, logs `~/k3-logs/q4`; `plain`, `m8` and `pad8` in turn, twice; each run is one llama-bench of 3 repetitions, so 3 graphs a size; the factor at its default 0.1 in the speed runs).** The check program passes with the real kernels, the first run of the three assembly kernels and the two RVV packers: the new line reads the switch 6/6, the bytes 8/8, against the CPU the 8-row kernel 1.88e-05, 4-row 1.31e-05, 1-row 1.46e-05, a padded group 1.38e-05, at factor 1 1.54e-05 and 1.47e-05, the kernels against each other at most 7.98e-07, the groups 8/8, the first run's bytes in 24/24 through the backend (the direct calls do not run there). Ms a graph and llama-bench's t/s, the two runs:
+
+| tokens | arm | the graph, two runs | mean | multiply: wall | quantize: wall | its imbalance | llama-bench t/s, two runs |
+|---|---|---|---|---|---|---|---|
+| 4 | `plain` | 170.5, 173.9 | 172.2 | 66.3 | 3.7 | 0.5 | 23.21, 22.77 |
+| 4 | `m8` | 173.4, 175.2 | 174.3 | 67.4 | 4.3 | 0.5 | 22.82, 22.61 |
+| 4 | `pad8` | 194.3, 193.9 | 194.1 | 73.5 | 17.3 | 1.6 | 20.40, 20.45 |
+| 32 | `plain` | 540.1, 536.7 | 538.4 | 217.0 | 24.7 | 5.4 | 59.00, 59.37 |
+| 32 | `m8` | 535.9, 539.3 | 537.6 | 210.5 | 27.4 | 7.3 | 59.47, 59.10 |
+| 32 | `pad8` | 554.0, 555.1 | 554.6 | 212.5 | 44.7 | 4.8 | 57.52, 57.42 |
+| 128 | `plain` | 1,626.6, 1,628.0 | 1,627.3 | 484.6 | 92.5 | 18.1 | 78.55, 78.48 |
+| 128 | `m8` | 1,554.8, 1,557.0 | 1,555.9 | 403.6 | 101.9 | 28.9 | 82.16, 82.06 |
+| 128 | `pad8` | 1,586.6, 1,587.4 | 1,587.0 | 398.6 | 138.0 | 34.5 | 80.52, 80.49 |
+| 501 | `plain` | 6,033.5, 6,046.4 | 6,040.0 | 1,514.1 | 336.7 | 27.9 | 82.95, 82.78 |
+| 501 | `m8` | 5,429.8, 5,434.7 | 5,432.3 | 910.2 | 332.4 | 45.9 | 92.17, 92.08 |
+| 501 | `pad8` | 5,411.8, 5,410.5 | 5,411.2 | 883.2 | 340.3 | 22.5 | 92.47, 92.50 |
+
+The KLD of 2 chunks against the float base (`plain`'s known figures: mean 0.005482 +- 0.000680, maximum 0.219900, the same top token 94.706 +- 0.992%):
+
+| arm | factor | mean KLD | maximum | same top token | point 2 (at most 0.006162, at least 93.714%) |
+|---|---|---|---|---|---|
+| `m8` | 0.1 | 0.007111 +- 0.000921 | 0.249723 | 95.098 +- 0.957% | fails on the mean |
+| `m8` | 1 | 0.005115 +- 0.000427 | 0.089103 | 94.510 +- 1.010% | holds |
+| `pad8` | 0.1 | 0.005793 +- 0.000673 | 0.216501 | 94.118 +- 1.043% | holds |
+| `pad8` | 1 | 0.005575 +- 0.000620 | 0.177790 | 95.490 +- 0.920% | holds |
+
+- *The rule for `m8`.* (1) holds. (2) holds at factor 1 and fails at 0.1, so by the run's plan the arm's factor is 1. (3) holds: its graph is below `plain`'s by 71.4 ms at 128 tokens (4.4%; an arm's two runs differ by 1.4 and 2.2) and by 607.7 ms at 501 (10.1%; they differ by 12.9 and 4.9). (4) holds: at 4 tokens its graph is 2.1 ms above `plain`'s in the means, inside the 3.4 ms that `plain`'s own two runs differ by; at 32 tokens it is 0.8 ms below; the completion's generated token takes 106.45 ms against 106.89 (one run each, the one-token graph 103.9 against 104.9 ms); llama-bench's pp4 is 22.72 against 22.99 in the means with errors of 0.3 to 1.0 on each figure, pp32 59.29 against 59.19, pp128 82.11 against 78.52 (+4.6%), pp501 92.13 against 82.87 (+11.2%). So `m8` replaces `plain` as the default, at factor 1.
+- *What the rule does not cover.* The speed runs used the factor 0.1 and the KLD that passes used 1. The factor changes two stored fp16 values of a pack and no instruction, so the speed at factor 1 is the same by inference, not by measurement; the run that confirms the new default measures it.
+- *`pad8` loses.* Point 4 fails: its graph is 21.9 ms longer than `plain`'s at 4 tokens (12.7%) and 16.2 ms at 32 (3.0%), pp4 20.4 against 23.0 and pp32 57.5 against 59.2. The cost is in the quantize step, which packs 8 rows for an expert that has 1 (17.3 against 3.7 ms at 4 tokens, 44.7 against 24.7 at 32). At 501 tokens it is 21 ms shorter than `m8` (0.4%), at 128 tokens 31 ms longer.
+- *Where the gain is.* The multiply itself: 1,514 to 910 ms at 501 tokens (40% less), 485 to 404 at 128; unchanged at 4 and 32 tokens, where few experts have 8 rows. The estimate's upper end was a kernel twice as fast and 94.6 t/s; the multiply is 1.66 times as fast and pp501 is 92.1.
+- *The text.* All three completions are the f32 run's text, byte for byte (compared on the Mac from the logs).
+- *The stable factor.* The fork's 0.1 costs accuracy here as it did on the dense kernels on 2026-10-28: under `m8` the mean KLD is 0.007111 at 0.1 and 0.005115 at 1, the maximum 0.250 and 0.089. With 2 chunks the two means are about two error bars apart. What the factor guards against, an fp16 overflow, did not show in these 1,024 tokens at factor 1 (no figure is inf or nan), and the `plain` path has always run at factor 1.
+- *Seen beside.* Under `m8` the quantize step's waiting grows (45.9 against 27.9 ms at 501 tokens, 28.9 against 18.1 at 128): its deal counts a group as one unit whatever its size. The step is now 332 ms of the 5,432 ms graph at 501 tokens and the multiply 910.
+- *Not run.* The chat stage without checkpoints left no files in `~/q4`; by the block's logic that means `~/ck/chat.out` exists on the board (the earlier block was run and its logs not copied to the Mac). Not confirmed.
+
+**The default: `m8` at factor 1; `pad8` and the factor's switch removed (2026-11-22 on the Mac, by the coder subagent, the diff read and the checks rerun by me unless said; the K3 run still to come).** `FLAGOS_SPACEMIT_EXPERT_Q4_0=m8|plain`: unset, empty or `m8` is the signed layout and the 8-row path; `plain` stays as the fallback until the K3 has confirmed the default; any other value, `pad8` included, warns once and keeps `m8`. `FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE` is gone: the two copied packers and their references store the scale over the average and the average, the fork's 0.1 not taken (marked in the copies, the K3's figures in the file's head). The driver lost the padded group, its zero rows and the workspace's `pad8` bound. Checks on the Mac: the check program's older `mmid` lines are, figure for figure, what the build before printed under `m8` with factor 1, and under `plain` what it printed under `plain` (6 lines each, compared by me against the saved outputs); the 6 known `conv pair` failures and no other under the default, `plain`, `GGML_FLAGOS_KERNEL_VARIANTS=0` and `FLAGOS_SPACEMIT_TEST_THREADS=1`; the new line 6/6, 4/4, the kernels against the CPU at most 1.65e-05, against each other exactly 0 on rows of equal magnitude (at factor 1 the three packs store the same scales), the groups 4/4, the first run's bytes in 44/44, one token against `plain` 1.43e-06; `test-backend-ops -o MUL_MAT_ID` 227/227 under the default and `plain` (mine), the whole sweep 3745/3745 under the default and the four other check programs (the coder's); the riscv64 syntax check of the five plugin files 0 errors. Mutations caught: the 8-row reference storing the scale times 0.1 (30 failures more), the parse giving `plain` when unset (1), a single row's offset ignoring the group of 4 (38; the coder's three), an expert's last single row not counted (34; mine). Not tested: the K3 with this build; the speed at factor 1, which the confirming run measures against `plain` in one session.
 
 ### Not planned
 

@@ -3,7 +3,6 @@
 #include "flagos-spacemit-ime-format.h"
 #include "flagos-spacemit-ime-kernels.h"
 #include "flagos-spacemit-kernels.h"
-#include "flagos-spacemit-weights.h"
 
 #include "../../../../ggml-impl.h"
 
@@ -20,11 +19,11 @@
 // the sorted list, an expert's pairs go through the 4-row kernel in groups of 4 (the rest one by one) and a 32-column
 // weight slab is staged through TCM for all of them. Its row map has a stride of n_tokens per expert, which overflows
 // when an id repeats within a token; the counting sort below has room for every pair.
-// A weight in the q4_0s layout (FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8; plan.md "The Q4_0 experts: the fork's signed
-// layout and 8-row kernel") keeps the steps, the grouping, the slabs, the staging and the queue, but packs an expert's
-// rows as the fork does: groups of 8, then under m8 one group of 4 if 4 rows remain and single rows, under pad8 one
-// more group of 8 filled with zero rows, whose outputs stay in the tile's scratch. Each group starts at a multiple of
-// 128 bytes, an expert's groups one after another; one token keeps the 1-row pack and the signed 1-row kernel.
+// A weight in the q4_0s layout (3-D Q4_0 unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain; plan.md "The Q4_0 experts: the
+// fork's signed layout and 8-row kernel") keeps the steps, the grouping, the slabs, the staging and the queue, but packs
+// an expert's rows as the fork does: groups of 8, then one group of 4 if 4 rows remain, then single rows (the m8 arm).
+// Each group starts at a multiple of 128 bytes, an expert's groups one after another; one token keeps the 1-row pack
+// and the signed 1-row kernel.
 
 namespace {
 
@@ -98,17 +97,15 @@ mmid_dims mmid_dims_of(const ggml_tensor * node) {
     size_t act = (size_t) (std::max(d.ne11, d.n_ids) * d.ne12 * d.a_row_bytes);
     d.g8_bytes = d.g4_bytes = d.g1_bytes = 0;
     if (d.sgroups) {
-        // the packed groups at their worst under either arm, P pairs on E active experts: pad8 at most E + P / 8
-        // groups of 8 (ceil(r / 8) <= r / 8 + 1 an expert); m8 at most P times the dearest row of a group; then the
-        // slack to align the groups' base
+        // the packed groups at their worst, P pairs: at most P times the dearest row of a group (8, 4 or 1 rows); then
+        // the slack to align the groups' base
         const int64_t align = (int64_t) d.f->group_align;
         d.g8_bytes          = pad_to(d.k_blocks * (int64_t) d.f->group8_blk_bytes, align);
         d.g4_bytes          = pad_to(d.k_blocks * (int64_t) d.f->group4_blk_bytes, align);
         d.g1_bytes          = pad_to(d.k_blocks * (int64_t) d.f->group1_blk_bytes, align);
         const int64_t pairs = d.n_ids * d.ne12;
-        const int64_t pad8  = (std::min(pairs, d.n_as) + pairs / 8) * d.g8_bytes;
-        const int64_t m8    = pairs * std::max({ div_up(d.g8_bytes, 8), div_up(d.g4_bytes, 4), d.g1_bytes });
-        act                 = std::max(act, (size_t) (std::max(pad8, m8) + align));
+        const int64_t worst = pairs * std::max({ div_up(d.g8_bytes, 8), div_up(d.g4_bytes, 4), d.g1_bytes });
+        act                 = std::max(act, (size_t) (worst + align));
     }
     d.act_bytes    = GGML_PAD(act, 64);
     d.start_bytes  = GGML_PAD((size_t) (d.n_as + 1) * sizeof(int64_t), 64);
@@ -217,41 +214,38 @@ int64_t group_size(int64_t g, int64_t r) {
     return g < r / row_align ? row_align : 1;
 }
 
-// the q4_0s layout's groups of an expert's r pairs, in list order: groups of 8; then under pad8 one more group of 8
-// for the 1 to 7 rows left (real < size), under m8 one group of 4 if 4 or more are left, then single rows. Group g
-// holds the pairs from start of the expert's list, its pack at byte off of the expert's packed groups
+// the q4_0s layout's groups of an expert's r pairs, in list order: groups of 8, then one group of 4 if 4 or more are
+// left, then single rows. Group g holds size pairs from start of the expert's list, its pack at byte off of the
+// expert's packed groups
 struct sgroup {
-    int64_t start, size, real, off;
+    int64_t start, size, off;
 };
 
-int64_t sgroup_count(int64_t r, bool pad8) {
-    if (pad8) {
-        return div_up(r, 8);
-    }
+int64_t sgroup_count(int64_t r) {
     const int64_t left = r % 8;
     return r / 8 + (left >= row_align ? 1 + left - row_align : left);
 }
 
-sgroup sgroup_at(int64_t g, int64_t r, bool pad8, const mmid_dims & d) {
-    const int64_t n8 = pad8 ? div_up(r, 8) : r / 8;
+sgroup sgroup_at(int64_t g, int64_t r, const mmid_dims & d) {
+    const int64_t n8 = r / 8;
     if (g < n8) {
-        return { 8 * g, 8, std::min<int64_t>(8, r - 8 * g), g * d.g8_bytes };
+        return { 8 * g, 8, g * d.g8_bytes };
     }
     const int64_t has4 = r - 8 * n8 >= row_align ? 1 : 0;
     if (has4 && g == n8) {
-        return { 8 * n8, row_align, row_align, n8 * d.g8_bytes };
+        return { 8 * n8, row_align, n8 * d.g8_bytes };
     }
     const int64_t j = g - n8 - has4;
-    return { 8 * n8 + row_align * has4 + j, 1, 1, n8 * d.g8_bytes + has4 * d.g4_bytes + j * d.g1_bytes };
+    return { 8 * n8 + row_align * has4 + j, 1, n8 * d.g8_bytes + has4 * d.g4_bytes + j * d.g1_bytes };
 }
 
 // the bytes of an expert's packed groups
-int64_t sexpert_bytes(int64_t r, bool pad8, const mmid_dims & d) {
-    const int64_t count = sgroup_count(r, pad8);
+int64_t sexpert_bytes(int64_t r, const mmid_dims & d) {
+    const int64_t count = sgroup_count(r);
     if (count == 0) {
         return 0;
     }
-    const sgroup last = sgroup_at(count - 1, r, pad8, d);
+    const sgroup last = sgroup_at(count - 1, r, d);
     return last.off + (last.size == 8 ? d.g8_bytes : last.size == row_align ? d.g4_bytes : d.g1_bytes);
 }
 
@@ -261,7 +255,7 @@ struct mmid_work {
     int64_t *  offs;    // sgroups: the experts' byte offsets in the packed groups (offs[e], n_as + 1 of them)
     mmid_row * rows;    // the grouping's pairs
     float *    gather;  // a group's g_rows source rows, for quantize_4rows or quantize_8rows (row stride k)
-    float *    result;  // a group's g_rows x 32 output slab (ldc 32); a padded group's extra rows stay here
+    float *    result;  // a group's g_rows x 32 output slab (ldc 32)
 };
 
 mmid_work mmid_work_of(const spacemit_tile & tile, const mmid_dims & d) {
@@ -276,10 +270,10 @@ mmid_work mmid_work_of(const spacemit_tile & tile, const mmid_dims & d) {
 }
 
 // sgroups: every expert's byte offset in the packed groups, from the grouping's starts (every tile alike)
-void sgroup_offsets(const mmid_dims & d, const mmid_work & w, bool pad8) {
+void sgroup_offsets(const mmid_dims & d, const mmid_work & w) {
     w.offs[0] = 0;
     for (int64_t e = 0; e < d.n_as; e++) {
-        w.offs[e + 1] = w.offs[e] + sexpert_bytes(w.start[e + 1] - w.start[e], pad8, d);
+        w.offs[e + 1] = w.offs[e] + sexpert_bytes(w.start[e + 1] - w.start[e], d);
     }
 }
 
@@ -321,7 +315,7 @@ size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
 // expert's rows are consecutive; the 4 rows of a group are stored interleaved for the 4-row kernel, which wants them
 // contiguous, so the tile gathers them first. The groups are dealt to the tiles as contiguous ranges. The q4_0s layout:
 // an expert's rows as its packed groups (sgroup_at) at its offset after the aligned base, a group of 8 or 4 gathered
-// first (pad8's missing rows zero), a single packed from its row
+// first, a single packed from its row
 bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * node) {
     const spacemit_tile & tile      = *tile_p;
     const mmid_dims       d         = mmid_dims_of(node);
@@ -354,21 +348,20 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
             return (const float *) ((const char *) x->data + (r.i1 % d.ne11) * x->nb[1] + r.i2 * x->nb[2]);
         };
         if (d.sgroups) {
-            const bool pad8 = spacemit_expert_q4_0() == 2;
-            sgroup_offsets(d, w, pad8);
+            sgroup_offsets(d, w);
             uint8_t * const base     = sgroup_base(tile.workspace, d);
             int64_t         n_groups = 0;
             for (int64_t e = 0; e < d.n_as; e++) {
-                n_groups += sgroup_count(w.start[e + 1] - w.start[e], pad8);
+                n_groups += sgroup_count(w.start[e + 1] - w.start[e]);
             }
             const int64_t g0 = n_groups * tile.ith / tile.nth;
             const int64_t g1 = n_groups * (tile.ith + 1) / tile.nth;
             int64_t       g  = 0;
             for (int64_t e = 0; e < d.n_as && g < g1; e++) {
                 const int64_t r     = w.start[e + 1] - w.start[e];
-                const int64_t count = sgroup_count(r, pad8);
+                const int64_t count = sgroup_count(r);
                 for (int64_t i = std::max<int64_t>(0, g0 - g); i < count && g + i < g1; i++) {
-                    const sgroup    s   = sgroup_at(i, r, pad8, d);
+                    const sgroup    s   = sgroup_at(i, r, d);
                     const int64_t   j   = w.start[e] + s.start;
                     uint8_t * const dst = base + w.offs[e] + s.off;
                     if (s.size == 1) {
@@ -376,11 +369,7 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
                         continue;
                     }
                     for (int64_t t = 0; t < s.size; t++) {
-                        if (t < s.real) {
-                            std::memcpy(w.gather + t * d.k, pair_row(w.rows[j + t]), (size_t) d.k * sizeof(float));
-                        } else {
-                            std::fill(w.gather + t * d.k, w.gather + (t + 1) * d.k, 0.0f);  // pad8's zero rows
-                        }
+                        std::memcpy(w.gather + t * d.k, pair_row(w.rows[j + t]), (size_t) d.k * sizeof(float));
                     }
                     (s.size == 8 ? d.f->quantize_8rows : d.f->quantize_4rows_al)(w.gather, (size_t) d.k, dst,
                                                                                  reference);
@@ -463,7 +452,7 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
 // its output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per run
 // of the expert's units where they fit beside it; a slab is copied whatever the group count, since staging a slab is
 // also faster for one kernel call (plan.md "1-row matmul bandwidth"). The q4_0s layout: the expert's packed groups
-// (sgroup_at), a group of 8 or 4 into the 8 x 32 temporary, of which only its real rows are scattered.
+// (sgroup_at), a group of 8 or 4 into the 8 x 32 temporary, whose rows are then scattered.
 // Either way every output element comes from one kernel call on one (group or pair, slab), so neither the tile count
 // nor the staging can change it
 bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
@@ -524,10 +513,9 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     const int64_t   tcm_lost   = tcm != nullptr ? (int64_t) (tcm - static_cast<uint8_t *>(tile.tcm)) : 0;
     const int64_t   tcm_size   = std::max<int64_t>(0, (int64_t) tile.tcm_size - tcm_lost);
     const bool      stage      = setting == mmid_setting::staged && tcm != nullptr && tcm_size >= slab_bytes;
-    const bool      pad8       = d.sgroups && spacemit_expert_q4_0() == 2;
     const int64_t   act_align  = d.sgroups ? (int64_t) d.f->group_align : 64;
     if (d.sgroups) {
-        sgroup_offsets(d, w, pad8);
+        sgroup_offsets(d, w);
     }
 
     // the expert at hand: its rows, read from the workspace or, once held, from TCM, and where its slabs are staged
@@ -539,11 +527,11 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
         e = expert;
         r = w.start[e + 1] - w.start[e];
         // the expert's quantized rows (or packed groups), consecutive in the workspace
-        rows_bytes = d.sgroups ? sexpert_bytes(r, pad8, d) : r * d.a_row_bytes;
+        rows_bytes = d.sgroups ? sexpert_bytes(r, d) : r * d.a_row_bytes;
         hold_act   = stage && pad_to(rows_bytes, act_align) + slab_bytes <= tcm_size;
         acts       = d.sgroups ? sgroup_base(tile.workspace, d) + w.offs[e] : qa + w.start[e] * d.a_row_bytes;
         slab_buf   = stage ? tcm + (hold_act ? pad_to(rows_bytes, act_align) : 0) : nullptr;
-        count      = d.sgroups ? sgroup_count(r, pad8) : group_count(r);
+        count      = d.sgroups ? sgroup_count(r) : group_count(r);
         held       = false;
     };
     // the unit (e, slab s): the slab staged, then every group of the expert
@@ -558,9 +546,9 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
             spacemit_ime::copy(slab_buf, b, (size_t) slab_bytes);
             b = slab_buf;
         }
-        // sgroups: a group of 8 or 4 into the g_rows x 32 scratch, its real rows scattered; a single straight out
+        // sgroups: a group of 8 or 4 into the g_rows x 32 temporary, its rows scattered; a single straight out
         for (int64_t g = 0; g < count && d.sgroups; g++) {
-            const sgroup sg = sgroup_at(g, r, pad8, d);
+            const sgroup sg = sgroup_at(g, r, d);
             if (sg.size == 1) {
                 d.f->gemm_group(acts + sg.off, b, out_row(node, w.rows[w.start[e] + sg.start], s * nb_cols), 1,
                                 (size_t) nb_cols, (size_t) d.k_blocks, (size_t) d.n, reference);
@@ -568,7 +556,7 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
             }
             d.f->gemm_group(acts + sg.off, b, w.result, (size_t) sg.size, (size_t) nb_cols, (size_t) d.k_blocks,
                             (size_t) nb_cols, reference);
-            for (int64_t t = 0; t < sg.real; t++) {
+            for (int64_t t = 0; t < sg.size; t++) {
                 std::memcpy(out_row(node, w.rows[w.start[e] + sg.start + t], s * nb_cols), w.result + t * nb_cols,
                             (size_t) nb_cols * sizeof(float));
             }

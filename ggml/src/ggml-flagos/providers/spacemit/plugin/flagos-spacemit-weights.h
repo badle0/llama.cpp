@@ -20,7 +20,7 @@ enum class spacemit_layout {
     q4_1_min_32x256,  // 3-D Q4_1 MUL_MAT_ID weights (unless FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu): each 32-row tile in the
                       // q4_0 32x256 form (Q4_1's d and nibbles), then the tile's fp16 minimums; d q + m = d (q - 8) +
                       // (m + 8 d), the q4_0 kernels and a correction (lossless, same size; reads restore the GGUF bytes)
-    q4_0s_32x256,     // 3-D Q4_0 MUL_MAT_ID weights under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8: the q4_0 32x256 bytes
+    q4_0s_32x256,     // 3-D Q4_0 MUL_MAT_ID weights (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain): the q4_0 32x256 bytes
                       // with every nibble byte ^ 0x88, signed nibbles q - 8 for SpacemiT's fork's kernels (lossless,
                       // same size; reads restore the GGUF bytes)
 };
@@ -30,7 +30,7 @@ enum class spacemit_layout {
 // A 3-D tensor (MUL_MAT_ID's experts) takes the layout of its type under the same rule, its ggml_nrows rows stored as
 // one 2-D weight's are, so each expert's rows start at a 32-row group; a 3-D Q4_1 tensor takes the q4_1 min layout,
 // and is plain under FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu (2-D Q4_1 keeps the Q8_0 route either way); a 3-D Q4_0 tensor
-// takes the q4_0s layout under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8 (2-D Q4_0 keeps q4_0 32x256). A 4-D tensor
+// takes the q4_0s layout unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain (2-D Q4_0 keeps q4_0 32x256). A 4-D tensor
 // never has a layout.
 // A view is stored the way its view_src is; it never has a layout of its own. llama.cpp's cache tensors (named
 // cache_k_, cache_v_, cache_r_ and cache_s_ before allocation) always keep ggml's layout, whatever their type and shape,
@@ -58,15 +58,10 @@ void spacemit_tensor_fill(ggml_tensor * t, uint8_t value, size_t offset, size_t 
 // bad value's warning shows
 uint32_t spacemit_expert_q4_1();
 
-// FLAGOS_SPACEMIT_EXPERT_Q4_0 as parsed: 0 plain (unset, empty or plain, the default: a 3-D Q4_0 weight in q4_0 32x256
-// and today's kernels), 1 m8 and 2 pad8 (the q4_0s layout and the fork's kernels; MUL_MAT_ID's arm for an expert's
-// rows past its groups of 8: one group of 4 and single rows, or one more group of 8 padded with zero rows). Read at
-// registration too, so a bad value's warning shows
+// FLAGOS_SPACEMIT_EXPERT_Q4_0 as parsed: 1 m8 (unset, empty or m8, the default: a 3-D Q4_0 weight in the q4_0s layout,
+// MUL_MAT_ID with the fork's kernels on an expert's rows in groups of 8, then one of 4 and single rows), 0 plain (q4_0
+// 32x256 and the kernels before it, the fallback). Read at registration too, so a bad value's warning shows
 uint32_t spacemit_expert_q4_0();
-
-// test-only FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE as parsed: the stable factor of the q4_0s layout's 8-row and 4-row
-// packs, 0.1f (unset, empty or 0.1: the fork's) or 1.0f (1). Read by those packs only; read at registration too
-float spacemit_expert_q4_0_stable_factor();
 
 // FLAGOS_SPACEMIT_REPACK_THREADS as parsed (1 to 16): the threads a whole-weight repack may use. Read at registration
 // too, as spacemit_embd_read_switch, so a bad value's warning shows
