@@ -516,10 +516,11 @@ def case_grid(ctx):
 
 
 def case_chat(ctx):
-    turns = CHAT_TURNS[:3] if ctx.quick else CHAT_TURNS
-    max_tokens = 128 if ctx.quick else 512
-    for mode, thinking in (("off", False), ("on", True)):
-        failed, answered, proc = None, 0, None
+    turns = CHAT_TURNS[:ctx.chat_turns] if ctx.chat_turns else CHAT_TURNS[:3] if ctx.quick else CHAT_TURNS
+    max_tokens = ctx.chat_max_tokens or (128 if ctx.quick else 512)
+    modes = [(m, t) for m, t in (("off", False), ("on", True)) if ctx.chat_thinking in (m, "both")]
+    for mode, thinking in modes:
+        failed, answered, hits, proc = None, 0, 0, None
         try:
             proc, url, secs, why = start_server(ctx, f"chat-{mode}", CHAT_FLAGS)
             if secs is None:
@@ -532,34 +533,42 @@ def case_chat(ctx):
                             "chat_template_kwargs": {"enable_thinking": thinking}}
                     status, first, events, t, err = stream(url, "/v1/chat/completions", body, 900)
                     reasoning_ms = content_ms = finish = None
-                    content = []
+                    content, reasoning_parts = [], []
                     for ms, ev in events:
                         for choice in (ev.get("choices") or []) if isinstance(ev, dict) else []:
                             delta = choice.get("delta") or {}
-                            if delta.get("reasoning_content") and reasoning_ms is None:
-                                reasoning_ms = ms
+                            if delta.get("reasoning_content"):
+                                reasoning_parts.append(delta["reasoning_content"])
+                                if reasoning_ms is None:
+                                    reasoning_ms = ms
                             if delta.get("content"):
                                 content.append(delta["content"])
                                 if content_ms is None:
                                     content_ms = ms
                             if choice.get("finish_reason"):
                                 finish = choice["finish_reason"]
-                    text = "".join(content)
+                    text, reasoning = "".join(content), "".join(reasoning_parts)
                     err = no_timings(err, t)
                     row("chat", mode=mode, turn=i, status=status, first_event_ms=first, first_reasoning_ms=reasoning_ms,
                         first_content_ms=content_ms, cache_n=t.get("cache_n"), prompt_n=t.get("prompt_n"),
                         prompt_ms=t.get("prompt_ms"), predicted_n=t.get("predicted_n"),
                         predicted_per_second=t.get("predicted_per_second"), finish_reason=finish,
-                        hit_max_tokens=finish == "length", content_chars=len(text), error=err)
+                        hit_max_tokens=finish == "length", content_chars=len(text), reasoning_chars=len(reasoning),
+                        error=err)
+                    hits += finish == "length"
                     if err:
                         failed = f"turn {i}: {err}"
                         break
                     answered += 1
-                    messages.append({"role": "assistant", "content": text})
+                    # the server can keep an earlier turn's reasoning in the prompt (--reasoning-preserve) only if
+                    # the client sends it back
+                    messages.append({"role": "assistant", "content": text, "reasoning_content": reasoning} if reasoning
+                                    else {"role": "assistant", "content": text})
         finally:
             stop_server(proc)
         sc.report(f"chat, thinking {mode}: every turn answered ({len(turns)})", failed is None,
                   f"{answered} of {len(turns)} answered" + (f"; stopped at {failed}" if failed else ""))
+        sc.info(f"chat, thinking {mode}", f"{hits} of {answered} answers hit max_tokens ({max_tokens})")
 
 
 def cancel_request(url, body, wait_s):
@@ -998,7 +1007,8 @@ def summary(ctx):
                    f"reasoning {fmt(r['first_reasoning_ms'])} ms, first content {fmt(r['first_content_ms'])} ms, "
                    f"cache_n {r['cache_n']}, prompt_n {r['prompt_n']}, prompt_ms {fmt(r['prompt_ms'])}, predicted_n "
                    f"{r['predicted_n']} at {fmt(r['predicted_per_second'], 2)} t/s, finish {r['finish_reason']}"
-                   f"{' (max_tokens)' if r['hit_max_tokens'] else ''}, {r['content_chars']} characters" +
+                   f"{' (max_tokens)' if r['hit_max_tokens'] else ''}, {r['content_chars']} characters, "
+                   f"{r['reasoning_chars']} of reasoning" +
                    (f"; {r['error']}" if r["error"] else ""))
     cancelled = {r["repeat"]: r for r in case_rows["cancel"] if r.get("kind") == "cancelled"}
     if cancelled:
@@ -1114,6 +1124,12 @@ def main():
                     help=f"comma list from {','.join(CASES)} (default: all; always run in that order)")
     ap.add_argument("--repeats", type=int, default=None, help="the grid's repeats (default: 5, 2 with --quick)")
     ap.add_argument("--quick", action="store_true", help="every case cut down to minutes")
+    ap.add_argument("--chat-thinking", choices=["off", "on", "both"], default="both",
+                    help="which of the chat case's thinking modes run (default: %(default)s)")
+    ap.add_argument("--chat-turns", type=int, default=None,
+                    help=f"how many of the chat case's {len(CHAT_TURNS)} turns run (default: all, 3 with --quick)")
+    ap.add_argument("--chat-max-tokens", type=int, default=None,
+                    help="max_tokens of each chat turn (default: 512, 128 with --quick)")
     ap.add_argument("--ime-build", default=str(sc.REPO / "build-ime"),
                     help="upstream IME build for the control and alongside (skipped if absent)")
     ap.add_argument("--tcm-dir", default=os.path.expanduser("~/tcmtest"), help="directory with tcmtest and tcmrelease")
@@ -1127,6 +1143,10 @@ def main():
     args = ap.parse_args()
     if args.repeats is not None and args.repeats < 1:
         ap.error("--repeats must be at least 1")
+    if args.chat_turns is not None and not 1 <= args.chat_turns <= len(CHAT_TURNS):
+        ap.error(f"--chat-turns must be from 1 to {len(CHAT_TURNS)}")
+    if args.chat_max_tokens is not None and args.chat_max_tokens < 1:
+        ap.error("--chat-max-tokens must be at least 1")
     if args.segv:
         if not Path(args.segv).is_file():
             sys.exit(f"--segv: not found: {args.segv}")
@@ -1137,7 +1157,8 @@ def main():
                           repeats=args.repeats if args.repeats is not None else (2 if args.quick else 5),
                           ime_bench=Path(args.ime_build) / "bin" / "llama-bench", tcm_dir=args.tcm_dir,
                           allow_cpu=args.allow_cpu, alongside_no_tcm=args.alongside_no_tcm, base=None,
-                          logs=bdir / f"logs-ttft-{Path(args.model).stem}")
+                          chat_thinking=args.chat_thinking, chat_turns=args.chat_turns,
+                          chat_max_tokens=args.chat_max_tokens, logs=bdir / f"logs-ttft-{Path(args.model).stem}")
     problem = (f"model not found: {args.model}" if not Path(args.model).is_file() else
                f"not found: {ctx.server}" if not ctx.server.is_file() else "")
     if problem:
@@ -1154,10 +1175,12 @@ def main():
     u = os.uname()
     uname = f"{u.sysname} {u.release} {u.machine}"
     start = time.strftime("%Y-%m-%d %H:%M:%S")
+    env = {k: os.environ[k] for k in sorted(os.environ) if k.startswith(("LLAMA_ARG_", "GGML_FLAGOS_", "FLAGOS_"))}
     sc.say(f"repo {sc.REPO}\nbuild {bdir}\nlogs {ctx.logs}\nmodel {args.model}\ncommit {commit}\nhost {uname}\n"
-           f"start {start}" + (f"\ncrash reporter {sc.preload['LD_PRELOAD']}" if sc.preload else "") + "\n")
+           f"start {start}" + (f"\ncrash reporter {sc.preload['LD_PRELOAD']}" if sc.preload else "") +
+           ("\nenv " + " ".join(f"{k}={v}" for k, v in env.items()) if env else "") + "\n")
     row("meta", repo=str(sc.REPO), build_dir=str(bdir), logs=str(ctx.logs), model=args.model, commit=commit,
-        uname=uname, start=start, crash_reporter=sc.preload.get("LD_PRELOAD"),
+        uname=uname, start=start, crash_reporter=sc.preload.get("LD_PRELOAD"), env=env,
         args={**vars(args), "repeats": ctx.repeats}, measure_flags=MEASURE_FLAGS, chat_flags=CHAT_FLAGS)
 
     fns = {"grid": case_grid, "chat": case_chat, "cancel": case_cancel, "tg512": case_tg512, "restart": case_restart,
