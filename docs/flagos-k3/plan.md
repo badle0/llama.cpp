@@ -3728,6 +3728,102 @@ The node is the largest step of every prompt graph (45.5% at 32 tokens, 32.2% at
 
 **`static` and the two switches removed (2026-11-21 on the Mac, by the coder subagent, the diff read and the checks rerun by me; confirmed on the K3 2026-11-22 at `afd896979`, logs `~/k3-logs/qr`: all checks passed, the queue line 6/6, 18/18, 0/0, 2/2, 2/2, the f32 run's text, the KLD's figures unchanged; pp32 59.26, pp128 78.61, pp501 82.99, pp2048 75.90, tg512 9.48 t/s).** `FLAGOS_SPACEMIT_MMID_DEAL`, `FLAGOS_SPACEMIT_MMID_CHUNKS`, the static deal's loop and the read at registration are gone; the chunk count is the constant `mmid_chunks` (16). The queue's loop is untouched. The check's reference is now the first default run through the backend: grouped, without TCM, a second compute in a row and (on the Mac) the tiles on threads 20 times must give its bytes, as must the steps called directly; the CPU on one thread bounds it (NMSE 1.37e-05 on the Mac, the figure `static` gave before). On the Mac: the 6 known `conv pair` failures and no other under the default, `GGML_FLAGOS_KERNEL_VARIANTS=0` and `FLAGOS_SPACEMIT_TEST_THREADS=1`; the queue line 6/6 cases, 24/24, 42/42, 2/2, 2/2 (on the K3 it will read 18/18 and 0/0 for the two middle counts); the four other check programs pass; `test-backend-ops -o MUL_MAT_ID` 227/227; the riscv64 syntax check 0 errors. Mutations caught: no reset (4 failures, then the time limit), a chunk's first slab off by one (157 failures more; the coder's two), every second chunk skipped (199 more, mine). A weakness the coder's second mutation showed: with `static` gone every byte comparison runs the same chunk code, so a wrong chunk is caught by the bound against the CPU only (it was: the skipped slabs stay NaN). That the queue's bytes are the static deal's on the real kernels is what the K3 run above recorded (36/36).
 
+### The Q4_0 experts: the fork's signed layout and 8-row kernel (spec, 2026-11-22)
+
+**Status:** written 2026-11-22 on the user's word ("write the spec for testing q4_0 expert path"). Not approved, nothing built.
+
+**What it is about.** `MUL_MAT_ID` on the 3-D Q4_0 expert tensors of Qwen3.6-35B-A3B: 115 of its 120 expert tensors (the other 5 are Q4_1, `blk.{0..4}.ffn_down_exps`), most of the file's bytes. The provider stores them in the dense matmul's layout (`q4_0_32x256`) and multiplies an expert's rows with the dense matmul's 4-row and 1-row kernels (`q4_0_gemm`). SpacemiT's fork has had a path of its own for these tensors since its PR #53 (2026-11-09, `3dea41375`; read at `mtmd-backend` `b847bf396`, item 102). The provider has never run it. This step builds it beside today's path and measures it.
+
+**What the node costs today (build `afd896979`, ms a graph; logs `~/k3-logs/qr` and, for 1 and 4 tokens, `~/k3-logs/tr`).**
+
+| a graph of | pairs a node | the graph | `MUL_MAT_ID.gemm` | of it kernel | `MUL_MAT_ID.quantize` | the two steps' share |
+|---|---|---|---|---|---|---|
+| 1 token | 8 | 105.5 | 24.4 | 23.2 | 0.5 | 23.6% |
+| 4 tokens | 32 | 164.7 | 55.9 | 55.1 | 4.5 | 36.7% |
+| 32 tokens | 256 | 537.5 | 215.5 | 210.5 | 26.5 | 45.0% |
+| 128 tokens | 1,024 | 1,625.2 | 479.4 | 469.5 | 95.3 | 35.4% |
+| 501 tokens | 4,008 | 6,030.3 | 1,509.9 | 1,482.2 | 337.5 | 30.6% |
+
+With 256 experts a layer, an expert has 1 pair on average at 32 tokens, 4 at 128 and 15.7 at 501 (the mean over all experts; the draw is uneven, not counted here).
+
+**What the fork does differently (read in its code, not run by us).**
+1. *Signed nibbles in the weights.* Its 3-D Q4_0 layout is the `32x256` layout with every nibble byte `^ 0x88` (`repack.cpp:1761-1779`): a nibble then holds `q - 8` as a signed 4-bit value. The kernel's dot product is `d (q - 8) a` directly. Today's kernels compute `d q a` and take off `8 d sum(a)`, with `sum(a)` kept in fp16 in the activation pack.
+2. *The activations split into nibbles once.* Its 8-row pack stores each int8 activation as a low and a high nibble lane (`quantize_a_i8_r8_hp`, `rvv_kernels.cpp:5542`), 2,176 bytes a group of 8 rows and 256 values, aligned to 128 bytes. Today's kernels split the activations inside the kernel, once for every weight slab the rows meet (my reading of their assembly).
+3. *8 rows a kernel call* (`gemm_kernel_i8i4_hp_al_m8`, `ime2_kernels.cpp:2598`), with aligned 4-row and 1-row kernels beside it (`_hp_al_m4`, `_hp_al_m1`). Today: 4 rows a call at most.
+4. *Tails padded.* With several tokens it puts an expert's last rows, fewer than 8, in a group of 8 with zero rows (`pad8_all`, `ime.cpp:830-833`, `:936-943`), so every row goes through the 8-row kernel.
+
+**What changes in the arithmetic.** A group shares one activation scale per 32 values: the largest magnitude over the group's rows sets it. Today's 4-row pack already does this for its 4 rows (`quantize_a_4row_i8_hp`), so a token's result already depends on which tokens share its group. The fork's path widens the group to 8 rows, which can only make a small row's quantization coarser; it also drops the fp16 `sum(a)` term, which can only make the result more exact (both by inference). Which of the two weighs more is not known: the K3's KLD decides. The weights stay lossless (a byte permutation and one XOR; a read restores the GGUF bytes).
+
+**The change.**
+
+0. *A layout* (`plugin/flagos-spacemit-weights.{h,cpp}`, `plugin/flagos-spacemit-ime-kernels.{h,cpp}`): `q4_0s_32x256`, the `q4_0_32x256` bytes with the nibble bytes `^ 0x88`; repack and unpack as `q4_0_32x256`'s plus the XOR. Chosen at load for a 3-D Q4_0 `MUL_MAT_ID` weight by the switch of part 3, never for a 2-D weight. The tensor is stored in one layout only, so the provider's memory does not change.
+
+1. *The kernels and packers, copied from the fork at `b847bf396`* (`plugin/flagos-spacemit-ime-kernels.cpp`, origin and changes noted as for the other copies): `gemm_kernel_i8i4_hp_al_m8`, `gemm_kernel_i8i4_hp_al_m4`, `gemm_kernel_i8i4_hp_al_m1`, `quantize_a_i8_r8_hp`, `quantize_a_i8_r4_hp_al`. The 1-row pack is to be today's `quantize_a_row_i8_hp` if the fork's `quantize_a_i8_r1_hp` writes the same bytes (the coder compares the two; if not, the fork's is copied too). Each kernel and packer gets a scalar reference beside it (`GGML_FLAGOS_KERNEL_VARIANTS=0`), which the Mac runs. To check while copying: every asm block's clobber list names what it writes ("memory" where it stores; the dense 1-row kernel's declares none, which the Q4_1 correction had to work around), and the 8-row kernel's copy of its accumulators after the asm stays the fork's scalar one (its vector state is left at e32, m2; the fork's own note).
+
+2. *The expert multiply on a signed tensor* (`plugin/flagos-spacemit-ime-id.cpp`). The node keeps its two steps, the grouping by expert, the 32-column slabs, the TCM staging and the claim queue. What differs is how an expert's rows are packed and which kernel a (group, slab) calls:
+   - **Several tokens, arm `m8`:** an expert's rows in order as groups of 8, then one group of 4 if 4 or more remain, then single rows. The kernels are the 8-row, the aligned 4-row and the aligned 1-row one.
+   - **Several tokens, arm `pad8`:** groups of 8, and the remaining rows as one more group of 8 filled with zero rows (the fork's form). The padded rows' outputs go to a scratch slab and are not stored.
+   - **One token:** the 1-row pack and the aligned 1-row kernel, one call per (pair, slab) as today.
+   - **The workspace:** the groups' strides are the fork's (2,176 bytes a group of 8 and a 256-value block, 1,216 a group of 4, each group aligned to 128 bytes); the node's workspace size is computed for the worst case of the arm, and the launch fails with a message if it is short, as today. The rows held in TCM beside a slab are the packed groups, where they fit.
+   - **The chunks' weights** (`slab_weight`, the rows of an expert) stay as they are; a retune is not in this step.
+
+3. *The switch, for the comparison only.* `FLAGOS_SPACEMIT_EXPERT_Q4_0=plain|m8|pad8`: unset, empty or `plain` is today's path and layout, the default until the K3 run has decided; `m8` and `pad8` store the 3-D Q4_0 weights signed and run the arm; another value warns once and keeps the default. Parsed once and read where a layout is decided, as `FLAGOS_SPACEMIT_EXPERT_Q4_1` is. The 5 Q4_1 expert tensors keep `q4_1_min_32x256` and today's kernels under every value: their correction reads the `sum(a)` the new packs do not have.
+
+**Files.** `plugin/flagos-spacemit-weights.{h,cpp}` (the layout, the switch, repack and unpack), `plugin/flagos-spacemit-ime-kernels.{h,cpp}` (the copies and their references), `plugin/flagos-spacemit-ime.cpp` (the format's row in the table; it gains the 8-row packer and the group strides), `plugin/flagos-spacemit-ime-id.cpp` (the groups, the workspace, the kernel calls), `tests/check_spacemit.cpp`, `build.md` (the switch's row). The contract's names, the core's steps and the plugin interface do not change. Nothing outside `providers/spacemit/` and `docs/flagos-k3/`.
+
+**References.**
+- The fork, `spacemit-com/llama.cpp` `mtmd-backend` `b847bf396`: `ime.cpp:145-232` (which kernel a type gets, `resolve_gemm_i8`), `:783-1260` (`forward_mul_mat_id`: the groups, `pad8_all`, its TCM use), `ime2_kernels.cpp:2438-2876` (the three kernels), `:4654-4688` (`gemm_i8i4_k256`), `rvv_kernels.cpp:5462-5600` (the two packers), `rvv_kernels.h:42-52` (the group sizes), `repack.cpp:1761-1779` (the XOR).
+- The fork's commit message for PR #53: the 8-row and 4-row groups, the padded tails and the signed nibbles are its production defaults; it gives no speed or accuracy figure for them.
+- Not read: the fork's per-tile split of the experts, and its own measurements, if any exist outside the repository.
+
+**Alternatives, and why they lose.**
+- *An 8-row kernel on today's unsigned layout:* the fork's kernel is written for signed nibbles and pre-split activations; a kernel of our own in IME assembly is more risk than a copy, with no reference to compare against.
+- *Only `pad8`, the fork's form as it is:* at 32 tokens most active experts have 1 or 2 rows, and each would run an 8-row call. Both arms are measured; the cost is two loads.
+- *An 8-row kernel with a scale per row:* it would keep a row's result independent of its group, but it is again a kernel of our own.
+- *The fork's quantized router* (item 102, b): it changes which experts are chosen. Not here.
+- *The Q4_1 experts on the signed path:* 5 tensors of 120, and their exact correction would need the activations' sums from a pack that no longer holds them.
+
+**Tests on the Mac (reference kernels; the IME assembly cannot run there).**
+- The layout: repack then unpack restores the GGUF bytes, 3-D shapes of the model's two forms ([2048, 512, n] and [512, 2048, n]) and small ones; a 2-D Q4_0 weight never gets the layout under any switch value.
+- Each new reference kernel against the CPU's result on the dequantized weights, by NMSE, at the bound today's Q4_0 expert check uses; the 8-row, 4-row and 1-row references against each other on rows of equal magnitude (the shared scale then changes nothing but rounding).
+- The cost of the shared scale, reported and not bounded: the NMSE of a small-magnitude row grouped with 3 and with 7 rows a hundred times larger, under `plain`, `m8` and `pad8`.
+- The groups: an expert with 1 to 17 rows, and 24, 31, 32, under both arms; every output row written once; a padded group's zero rows leave no trace in the output; experts of 0 rows between active ones; every pair on one expert.
+- What the claim queue's check holds today, under each arm: 1 tile against 8, with and without the test TCM, the tiles on threads 20 times, two computes in a row, the steps called directly (Mac only): the same bytes within an arm.
+- One token: `m8` and `pad8` give the same bytes (the same path), and stay within the bound against `plain`.
+- The switch: unset, `plain`, `m8`, `pad8`, an unknown value warning once.
+- `test-backend-ops -o MUL_MAT_ID` under each value; the five check programs; the riscv64 syntax check of the three plugin files touched, 0 errors.
+- Mutations that must fail: the XOR left out of the repack; the XOR left out of the unpack; a padded row's output stored; the group of 4 packed with the 8-row stride; the 1-row kernel fed today's unsigned weights.
+- Every run of a check program or test under `timeout`.
+- Not testable on the Mac: the three assembly kernels and the two RVV packers (never executed before the K3), any timing, any model (no small model there has experts).
+
+**The K3 run (one), and the rule set before it.** The usual block (the TCM guard, the dates, the build with its rc and a marker that the new binary ran, the check program with the device). Then:
+- `plain`, `m8` and `pad8` in turn, twice each: `llama-bench -p 4,32,128,501 -n 0 -r 3 -t 8` with the op tables (six loads);
+- one completion of the 501-token prompt with 32 generated tokens under each value (three loads), for the one-token graph and the text;
+- the KLD of 2 chunks against the float base under `m8` and under `pad8` (two loads; `plain`'s is known: 0.005482 +- 0.000680, maximum 0.219900, the same top token 94.706 +- 0.992%).
+
+About 25 minutes after the build, my estimate. An arm replaces `plain` as the default if all four hold for it:
+1. the check program passes with the real kernels, its new lines included;
+2. its mean KLD is at most 0.006162 (`plain`'s plus one of its error bars) and its same-top-token share at least 93.714% (`plain`'s less one); the maximum is reported, not judged;
+3. at 128 and at 501 tokens its graph, the mean of its two runs, is below `plain`'s by more than the two runs of an arm differ, and by at least 2% at 501;
+4. at 4 and at 32 tokens its graph, and in the completion its time per generated token, are not above `plain`'s by more than the runs differ, and no llama-bench figure is lower by more than that.
+
+If both arms pass, the one with the shorter 501-token graph wins, unless the other is shorter at 4 and 32 tokens by more than the runs differ; then the choice is the user's. If neither passes, the switch, the layout and the kernels are removed again, as the `zp4` arm was. The completion's text is reported against the f32 run's and is not a rule: the arithmetic differs, so the text may.
+
+**Estimates.** None that I can stand behind: the fork publishes no figure for this path and the kernels have never run here. What bounds it: the multiply's kernel time is 1,482 ms of the 6,030 ms graph at 501 tokens, so a kernel twice as fast (a guess at the upper end, not a prediction) would give about 94.6 t/s for today's 82.99. At 32 tokens few experts have 8 rows, so the 8-row kernel can do little there; what the signed 4-row and 1-row kernels do alone is unknown. One token is bound by memory (item 78), so no gain is expected there.
+
+**Risks.**
+- The accuracy may fall (the 8-row shared scale). The rule's second point decides; the Mac's reported NMSE gives a first sign.
+- Copied assembly that has never run here: a wrong clobber list or a wrong stride shows only on the K3. The check program's lines run there through the backend only (a test thread must not call an IME kernel).
+- The 128-byte group alignment and the larger packs change what fits in a tile's TCM beside a slab; the code must fall back to the workspace as today, not fail.
+
+**Not in this step.** The Q4_1 experts. The fork's quantized router, its Q8_0 layout in load order, its 2-row kernels and 5-bit kernels (item 102, b to d). The Q4_K and Q5_K expert layouts. The dense FP16 matmul. A retune of the chunks' weights. The removal of whichever path loses (a step of its own, confirmed on the K3, as before).
+
+**For the user's word.**
+1. *The accuracy rule.* Point 2 accepts a change inside one error bar of today's KLD on 2 chunks. I recommend it: a tighter rule needs more chunks than the runs so far have used, and the base file's chunk count is not known to me.
+2. *Two arms.* `pad8` beside `m8` costs two llama-bench loads and one KLD run, about 6 minutes. I recommend it: it is the fork's own form, and the two differ exactly where the 35B's short turns are.
+3. *The default stays `plain` until the run.* The claim queue became the default when built; here the arithmetic changes, so I propose the opposite.
+4. *The Q4_1 experts stay as they are.* I recommend it for this step.
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
