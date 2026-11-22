@@ -11,7 +11,8 @@
 // Several tokens: step 1 quantizes one row per pair, at the pair's place in that order, the 4 rows of a group
 // interleaved for the 4-row kernel; step 2's tiles claim chunks of (expert, 32-column slab) units, so an expert's
 // weights are read once per node, and multiply a slab by every group of its expert, staged through TCM by default. The
-// output rows are ggml-cpu's.
+// output rows are ggml-cpu's. A weight in the q4_0s layout (FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8) packs an expert's
+// rows in groups of 8 (then 4 and singles, or one zero-padded group of 8) for SpacemiT's fork's signed kernels.
 
 // the shared workspace: the quantized activations, then one id grouping, one gathered group of 4 rows and one 4 x 32
 // result per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line, then the cache line of step 2's claim

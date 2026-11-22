@@ -18,6 +18,18 @@ struct mm_format {
     void (*quantize_4rows)(const float * a, size_t count_k, uint8_t * qa, bool reference);
     size_t (*gemm)(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n, size_t k_blocks,
                    size_t ldc, bool reference);
+    // the signed layout's groups (q4_0s 32x256; null and 0 in the other formats, whose gemm takes rows as above): the
+    // packers of 8 and of 4 rows (row stride count_k; one row is quantize_row's pack), the bytes per K block of a
+    // group of 8, 4 and 1 rows, the alignment of a group's start, and the kernel of one group (rows 8, 4 or 1, the
+    // pack's size; count_n a multiple of 32). Here gemm and quantize_4rows are null: every call goes by group
+    void (*quantize_8rows)(const float * a, size_t count_k, uint8_t * qa, bool reference);
+    void (*quantize_4rows_al)(const float * a, size_t count_k, uint8_t * qa, bool reference);
+    size_t group8_blk_bytes;
+    size_t group4_blk_bytes;
+    size_t group1_blk_bytes;
+    size_t group_align;
+    size_t (*gemm_group)(const uint8_t * qa, const uint8_t * qb, float * c, size_t rows, size_t count_n,
+                         size_t k_blocks, size_t ldc, bool reference);
 };
 
 // the format of a weight's layout; aborts for a weight without one (spacemit_find_op admits only weights with one)

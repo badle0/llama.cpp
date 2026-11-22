@@ -17,19 +17,65 @@ namespace {
 constexpr int64_t nb_cols   = spacemit_ime::row_tile;  // weight rows per IME tile
 constexpr int64_t row_align = 4;                       // rows of the 4-row kernel
 
-const mm_format k_q4_0_32x256     = { (int64_t) spacemit_ime::q4_0_k_block, spacemit_ime::q4_0_act_row_bytes,
-                                      spacemit_ime::q4_0_weight_row_bytes,  spacemit_ime::q4_0_quantize_row,
-                                      spacemit_ime::q4_0_quantize_4rows,    spacemit_ime::q4_0_gemm };
+const mm_format k_q4_0_32x256     = { (int64_t) spacemit_ime::q4_0_k_block,
+                                      spacemit_ime::q4_0_act_row_bytes,
+                                      spacemit_ime::q4_0_weight_row_bytes,
+                                      spacemit_ime::q4_0_quantize_row,
+                                      spacemit_ime::q4_0_quantize_4rows,
+                                      spacemit_ime::q4_0_gemm,
+                                      nullptr,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      0,
+                                      0,
+                                      nullptr };
 // Q8_0 weights, Q4_1 and Q6_K weights requantized to Q8_0 at load, and Q5_0 weights stored as Q8_0 exactly: the same
 // layout and kernels
-const mm_format k_q8_0_32x32      = { (int64_t) spacemit_ime::q8_0_k_block, spacemit_ime::i8_act_row_bytes,
-                                      spacemit_ime::q8_0_weight_row_bytes,  spacemit_ime::i8_quantize_row,
-                                      spacemit_ime::i8_quantize_4rows,      spacemit_ime::q8_0_gemm };
+const mm_format k_q8_0_32x32      = { (int64_t) spacemit_ime::q8_0_k_block,
+                                      spacemit_ime::i8_act_row_bytes,
+                                      spacemit_ime::q8_0_weight_row_bytes,
+                                      spacemit_ime::i8_quantize_row,
+                                      spacemit_ime::i8_quantize_4rows,
+                                      spacemit_ime::q8_0_gemm,
+                                      nullptr,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      0,
+                                      0,
+                                      nullptr };
 // 3-D Q4_1 experts (the default): the q4_0 activations and kernels on the tile's q4_0 part, plus the minimum's
 // correction (q4_1_min_gemm); only MUL_MAT_ID reaches this layout
-const mm_format k_q4_1_min_32x256 = { (int64_t) spacemit_ime::q4_0_k_block,    spacemit_ime::q4_0_act_row_bytes,
-                                      spacemit_ime::q4_1_min_weight_row_bytes, spacemit_ime::q4_0_quantize_row,
-                                      spacemit_ime::q4_0_quantize_4rows,       spacemit_ime::q4_1_min_gemm };
+const mm_format k_q4_1_min_32x256 = { (int64_t) spacemit_ime::q4_0_k_block,
+                                      spacemit_ime::q4_0_act_row_bytes,
+                                      spacemit_ime::q4_1_min_weight_row_bytes,
+                                      spacemit_ime::q4_0_quantize_row,
+                                      spacemit_ime::q4_0_quantize_4rows,
+                                      spacemit_ime::q4_1_min_gemm,
+                                      nullptr,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      0,
+                                      0,
+                                      nullptr };
+// 3-D Q4_0 experts under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8: SpacemiT's fork's signed kernels on groups of 8, 4 or
+// 1 rows; one row is the q4_0 1-row pack (the fork's quantize_a_i8_r1_hp writes the same bytes). Only MUL_MAT_ID
+// reaches this layout, and every one of its multiplies goes by group
+const mm_format k_q4_0s_32x256    = { (int64_t) spacemit_ime::q4_0_k_block,
+                                      spacemit_ime::q4_0_act_row_bytes,
+                                      spacemit_ime::q4_0_weight_row_bytes,
+                                      spacemit_ime::q4_0_quantize_row,
+                                      nullptr,
+                                      nullptr,
+                                      spacemit_ime::q4_0s_quantize_8rows,
+                                      spacemit_ime::q4_0s_quantize_4rows,
+                                      spacemit_ime::q4_0s_group_blk_bytes(8),
+                                      spacemit_ime::q4_0s_group_blk_bytes(4),
+                                      spacemit_ime::q4_0s_group_blk_bytes(1),
+                                      spacemit_ime::q8_hp_al_align,
+                                      spacemit_ime::q4_0s_gemm };
 
 }  // namespace
 
@@ -37,6 +83,8 @@ const mm_format & mm_format_of(const ggml_tensor * w) {
     switch (spacemit_weight_layout(w)) {
         case spacemit_layout::q4_0_32x256:
             return k_q4_0_32x256;
+        case spacemit_layout::q4_0s_32x256:
+            return k_q4_0s_32x256;
         case spacemit_layout::q4_1_min_32x256:
             return k_q4_1_min_32x256;
         case spacemit_layout::q4_1_q8_0_32x32:

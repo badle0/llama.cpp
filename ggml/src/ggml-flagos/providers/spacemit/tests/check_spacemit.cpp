@@ -1325,6 +1325,9 @@ static int check_weight_round_trip(ggml_backend_dev_t dev) {
         ggml_backend_buffer_free(buf1);
         ggml_free(ctx1);
     }
+    // the default FLAGOS_SPACEMIT_EXPERT_Q4_0: under m8 and pad8 a 3-D Q4_0 weight has a layout of its own (q4_0s, its
+    // round trip in check_mul_mat_id_q4_0s)
+    env_override q4_0_default("FLAGOS_SPACEMIT_EXPERT_Q4_0", nullptr);
     for (const ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K }) {
         const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
         ggml_init_params                 p3   = { ggml_tensor_overhead() * 2, nullptr, true };
@@ -8166,6 +8169,619 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
     return 0;
 }
 
+// the q4_0s kernels against each other on rows of equal magnitude, where a group's shared scale is each row's own and
+// only the fp16 rounding differs (the references 7e-7 apart on the Mac; a wrong lane or scale gives about 1e-1), with
+// room for the IME's own fp16 order; one output row against the CPU, which a padded row's zeros (NMSE 1) exceed
+constexpr double k_q4_0s_kernels_max_nmse = 5e-5;
+constexpr double k_q4_0s_row_max_nmse     = 1e-2;
+
+// one MUL_MAT_ID node on 3-D Q4_0 experts for check_mul_mat_id_q4_0s: the weight in our buffer (its layout is decided
+// by the FLAGOS_SPACEMIT_EXPERT_Q4_0 in force when it is made, so it is made inside the setting's scope) and the CPU
+// backend's result on the dequantized weights in F32, computed once
+struct q40s_node {
+    ggml_context *        ctx_w = nullptr, * ctx_h = nullptr, * ctx_d = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr, buf_h = nullptr, buf_d = nullptr;
+    ggml_tensor *         w = nullptr, * y = nullptr, * y_ref = nullptr;
+    ggml_cgraph *         g_dev = nullptr;
+    int64_t               n_out = 0;
+    bool                  ok    = false;  // claimed, and the CPU's result computed
+
+    q40s_node(ggml_backend_dev_t dev, ggml_backend_t cpu, const std::vector<uint8_t> & q, int64_t k, int64_t n,
+              int64_t n_mats, int64_t n_used, int64_t ne11, int64_t n_tok, const std::vector<int32_t> & id_values,
+              const std::vector<float> & xv) {
+        ggml_init_params pw = { ggml_tensor_overhead() * 2, nullptr, true };
+        ggml_init_params p  = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 2, nullptr, true };
+        ctx_w               = ggml_init(pw);
+        ctx_h               = ggml_init(p);
+        ctx_d               = ggml_init(p);
+        if (ctx_w == nullptr || ctx_h == nullptr || ctx_d == nullptr) {
+            return;
+        }
+        w = ggml_new_tensor_3d(ctx_w, GGML_TYPE_Q4_0, k, n, n_mats);
+        ggml_set_name(w, "blk.0.ffn_gate_exps.weight");
+        ggml_tensor * w_f32 = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, k, n, n_mats);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, k, ne11, n_tok);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx_h, GGML_TYPE_I32, n_used, n_tok);
+        y_ref               = ggml_mul_mat_id(ctx_h, w_f32, x, ids);
+        y                   = ggml_mul_mat_id(ctx_d, w, x, ids);
+        buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, ggml_backend_dev_buffer_type(dev));
+        buf_h = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+        buf_d = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, ggml_backend_dev_buffer_type(dev));
+        if (buf_w == nullptr || buf_h == nullptr || buf_d == nullptr || q.size() != ggml_nbytes(w) ||
+            (int64_t) xv.size() != ggml_nelements(x) || (int64_t) id_values.size() != n_used * n_tok) {
+            return;
+        }
+        ggml_backend_tensor_set(w, q.data(), 0, q.size());
+        const std::vector<float> wf = dequantize(GGML_TYPE_Q4_0, q);
+        ggml_backend_tensor_set(w_f32, wf.data(), 0, ggml_nbytes(w_f32));
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(ids, id_values.data(), 0, ggml_nbytes(ids));
+        n_out               = ggml_nelements(y);
+        ggml_cgraph * g_cpu = ggml_new_graph(ctx_h);
+        ggml_build_forward_expand(g_cpu, y_ref);
+        g_dev = ggml_new_graph(ctx_d);
+        ggml_build_forward_expand(g_dev, y);
+        ok = ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(cpu, g_cpu) == GGML_STATUS_SUCCESS;
+    }
+
+    ~q40s_node() {
+        ggml_backend_buffer_free(buf_d);
+        ggml_backend_buffer_free(buf_h);
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx_d);
+        ggml_free(ctx_h);
+        ggml_free(ctx_w);
+    }
+
+    q40s_node(const q40s_node &)             = delete;
+    q40s_node & operator=(const q40s_node &) = delete;
+
+    // through the backend under FLAGOS_SPACEMIT_MMID (nullptr: staged), the output filled with NaN first so an element
+    // no tile writes shows; ok turns false when the compute fails
+    std::vector<float> run(ggml_backend_t backend, const char * mmid) {
+        const std::vector<float> junk((size_t) n_out, NAN);
+        set_env("FLAGOS_SPACEMIT_MMID", mmid);
+        ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
+        ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
+        std::vector<float> out((size_t) n_out, NAN);
+        ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
+        set_env("FLAGOS_SPACEMIT_MMID", nullptr);
+        return out;
+    }
+
+    const float * ref() const { return static_cast<const float *>(y_ref->data); }
+};
+
+// the q4_0s layout (FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 and pad8; plan.md "The Q4_0 experts: the fork's signed layout and
+// 8-row kernel", its tests on the Mac). Checked: the switch's values (the layouts of 3-D and 2-D Q4_0 and of 3-D Q4_1,
+// the claims, an unknown value warning once); repack and unpack restore the GGUF bytes at the model's two shapes and
+// small ones; each group kernel (8, 4 and 1 rows, pad8's padded group of 8) against the CPU on the dequantized weights;
+// the test-only FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE and factor 1's kernels; the 8-, 4- and 1-row kernels against each other on rows of equal magnitude; the groups under both arms (1 to 17, 24,
+// 31 and 32 rows an expert, experts of 0 rows between active ones, every pair on one expert) against the CPU, each
+// output row on its own, and the claim queue check's forms the same bytes within an arm; one token, m8 and pad8 the
+// same bytes and within the bound of plain. Reported, not bounded: the NMSE of a small row grouped with 3 and with 7
+// rows a hundred times larger. The direct calls run on the calling core, so on the K3 only with the reference kernels
+static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
+    const bool     direct = host || *reference_label() != '\0';
+    ggml_backend_t cpu    = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    REQUIRE(kernels != nullptr);
+    const spacemit_plugin_kernel * step_q = nullptr, * step_g = nullptr;
+    for (uint32_t i = 0; i < n_kernels; i++) {
+        if (kernels[i].name != nullptr && std::strcmp(kernels[i].name, "mul_mat_id.quantize") == 0) {
+            step_q = &kernels[i];
+        }
+        if (kernels[i].name != nullptr && std::strcmp(kernels[i].name, "mul_mat_id.gemm") == 0) {
+            step_g = &kernels[i];
+        }
+    }
+    REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
+    env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
+    env_override q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
+    env_override stable_default("FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE", nullptr);  // the fork's 0.1 but where set below
+
+    const char * const arms[2] = { "m8", "pad8" };
+    const auto         fail    = [](bool good, const std::string & what) {
+        if (!good) {
+            std::fprintf(stderr, "FAIL: MUL_MAT_ID q4_0s, %s\n", what.c_str());
+            g_failures++;
+        }
+        return good;
+    };
+    // expert e repeated counts[e] times, filling the tokens' slots in order
+    const auto id_list = [](const std::vector<int64_t> & counts) {
+        std::vector<int32_t> list;
+        for (size_t e = 0; e < counts.size(); e++) {
+            list.insert(list.end(), (size_t) counts[e], (int32_t) e);
+        }
+        return list;
+    };
+    // the NMSE of rows [r0, r1) of n columns of a against b
+    const auto rows_nmse = [](const std::vector<float> & a, const float * b, int64_t n, int64_t r0, int64_t r1) {
+        return nmse(a.data() + r0 * n, b + r0 * n, (r1 - r0) * n);
+    };
+    const auto sci = [](double v) {
+        char text[32];
+        std::snprintf(text, sizeof(text), "%.3e", v);
+        return std::string(text);
+    };
+    uint32_t seed = 5200;
+
+    // the switch: the layouts the default gives, then each value
+    uint32_t plain2 = 0, plain3 = 0, q41 = 0;
+    {
+        env_override     sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", nullptr);
+        ggml_init_params p   = { ggml_tensor_overhead() * 4, nullptr, true };
+        ggml_context *   ctx = ggml_init(p);
+        REQUIRE(ctx != nullptr);
+        plain2 = table->tensor_layout(ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64));
+        plain3 = table->tensor_layout(ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 64, 4));
+        q41    = table->tensor_layout(ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 64, 4));
+        ggml_free(ctx);
+        REQUIRE(plain2 != 0 && plain3 == plain2 && q41 != 0);
+    }
+    int n_switch = 0, n_switch_ok = 0;
+    for (const char * setting : { (const char *) nullptr, "", "plain", "m8", "pad8", "bogus" }) {
+        env_override     sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", setting);
+        log_capture      log;
+        const bool       bogus = setting != nullptr && std::strcmp(setting, "bogus") == 0;
+        const bool       m8    = setting != nullptr && std::strcmp(setting, "m8") == 0;
+        const bool       want  = m8 || (setting != nullptr && std::strcmp(setting, "pad8") == 0);
+        ggml_init_params p     = { ggml_tensor_overhead() * 16, nullptr, true };
+        ggml_context *   ctx   = ggml_init(p);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor *  w3 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 64, 4);
+        ggml_tensor *  w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
+        ggml_tensor *  wg = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2048, 512);  // the model's gate shape in 2-D
+        const uint32_t l3 = table->tensor_layout(w3);
+        const uint32_t l2 = table->tensor_layout(w2);
+        const uint32_t lg = table->tensor_layout(wg);
+        const uint32_t l1 = table->tensor_layout(ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 64, 4));
+        const bool     layouts =
+            l2 == plain2 && lg == plain2 && l1 == q41 && (want ? l3 != plain3 && l3 != 0 : l3 == plain3);
+        ggml_tensor * x1     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 512);
+        ggml_tensor * ids2   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 512);
+        ggml_tensor * x7     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 7);
+        const bool    claims = ggml_backend_dev_supports_op(dev, ggml_mul_mat_id(ctx, w3, x1, ids2)) &&
+                            ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w2, x7));
+        const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_EXPERT_Q4_0=");
+        n_switch++;
+        n_switch_ok += fail(layouts && claims && warnings == (bogus ? 1 : 0),
+                            std::string("EXPERT_Q4_0=") + (setting != nullptr ? setting : "unset") +
+                                ": layouts 3-D " + std::to_string(l3) + ", 2-D " + std::to_string(l2) + " and " +
+                                std::to_string(lg) + ", 3-D Q4_1 " + std::to_string(l1) + " (default 3-D and 2-D " +
+                                std::to_string(plain2) + ", 3-D Q4_1 " + std::to_string(q41) + "); claims " +
+                                (claims ? "taken" : "refused") + "; " + std::to_string(warnings) + " warnings");
+        ggml_free(ctx);
+    }
+
+    // repack and unpack restore the GGUF bytes, and a second repack keeps them; the model's two shapes repack on
+    // several threads (over 1 MiB)
+    int n_trip = 0, n_trip_ok = 0;
+    for (const char * arm : arms) {
+        env_override sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", arm);
+        for (const std::array<int64_t, 3> & s : std::vector<std::array<int64_t, 3>>{
+                 { 2048, 512, 4 }, { 512, 2048, 4 }, { 256, 32, 2 }, { 512, 64, 3 } }) {
+            ggml_init_params p   = { ggml_tensor_overhead() * 2, nullptr, true };
+            ggml_context *   ctx = ggml_init(p);
+            REQUIRE(ctx != nullptr);
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, s[0], s[1], s[2]);
+            ggml_set_name(w, "blk.0.ffn_up_exps.weight");
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            REQUIRE(buf != nullptr);
+            const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q4_0, s[0], s[1] * s[2], seed++);
+            std::vector<uint8_t>       read(q.size()), read2(q.size());
+            ggml_backend_tensor_set(w, q.data(), 0, q.size());
+            ggml_backend_tensor_get(w, read.data(), 0, read.size());
+            ggml_backend_tensor_set(w, read.data(), 0, read.size());
+            ggml_backend_tensor_get(w, read2.data(), 0, read2.size());
+            const bool signed_layout = table->tensor_layout(w) != plain3;
+            n_trip++;
+            n_trip_ok += fail(signed_layout && read == q && read2 == q,
+                              std::string(arm) + ": [" + std::to_string(s[0]) + ", " + std::to_string(s[1]) + ", " +
+                                  std::to_string(s[2]) + "]: " + (signed_layout ? "" : "not the q4_0s layout, ") +
+                                  "the read-back " + (read == q ? "is" : "is not") + " the GGUF bytes, after a second " +
+                                  "repack " + (read2 == q ? "is" : "is not"));
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+        }
+    }
+
+    // each group kernel against the CPU on the dequantized weights: 16 tokens of one id, experts of 8, 4, 1 and 3 rows.
+    // m8: tokens 0-7 the 8-row kernel, 8-11 the 4-row one, 12-15 the 1-row one; pad8: 0-7 the 8-row kernel, 8-15 in
+    // groups of 8 padded with zero rows
+    double e_k8 = 0.0, e_k4 = 0.0, e_k1 = 0.0, e_kpad = 0.0;
+    bool   kernels_ok = true;
+    {
+        const int64_t              k = 2048, n = 64;
+        const std::vector<int64_t> counts = { 8, 4, 1, 3 };
+        const std::vector<uint8_t> q      = quantize_weights(GGML_TYPE_Q4_0, k, n * 4, seed++);
+        const std::vector<float>   xv     = random_values(k * 16, seed++, 2.0f);
+        for (int a = 0; a < 2; a++) {
+            env_override       sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", arms[a]);
+            q40s_node          nd(dev, cpu, q, k, n, 4, 1, 1, 16, id_list(counts), xv);
+            ggml_backend_t     backend = tcm_backend(dev, nullptr);
+            REQUIRE(backend != nullptr);
+            const std::vector<float> out = nd.run(backend, nullptr);
+            ggml_backend_free(backend);
+            kernels_ok = kernels_ok && nd.ok;
+            const double e8 = nd.ok ? rows_nmse(out, nd.ref(), n, 0, 8) : HUGE_VAL;
+            e_k8            = std::max(e_k8, e8);
+            if (a == 0) {
+                e_k4 = nd.ok ? rows_nmse(out, nd.ref(), n, 8, 12) : HUGE_VAL;
+                e_k1 = nd.ok ? rows_nmse(out, nd.ref(), n, 12, 16) : HUGE_VAL;
+            } else {
+                e_kpad = nd.ok ? rows_nmse(out, nd.ref(), n, 8, 16) : HUGE_VAL;
+            }
+        }
+        kernels_ok = fail(kernels_ok && e_k8 <= k_mul_mat_max_nmse && e_k4 <= k_mul_mat_max_nmse &&
+                              e_k1 <= k_mul_mat_max_nmse && e_kpad <= k_mul_mat_max_nmse,
+                          "the kernels against the CPU: 8 rows " + sci(e_k8) + ", 4 rows " +
+                              sci(e_k4) + ", 1 row " + sci(e_k1) + ", padded 8 " +
+                              sci(e_kpad));
+    }
+
+    // the stable factor of the 8-row and 4-row packs (FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE, test-only), on the node
+    // above under m8: unset, 0.1 and an unknown value (warning once) the same bytes, 1 other bytes; at factor 1 the
+    // 8-row and 4-row kernels against the CPU within the bound, and its 8-row group against factor 0.1's by NMSE
+    int    n_stable = 0, n_stable_ok = 0;
+    double e_s8 = HUGE_VAL, e_s4 = HUGE_VAL, e_s81 = HUGE_VAL;
+    {
+        const int64_t              k = 2048, n = 64;
+        const std::vector<uint8_t> q  = quantize_weights(GGML_TYPE_Q4_0, k, n * 4, seed++);
+        const std::vector<float>   xv = random_values(k * 16, seed++, 2.0f);
+        env_override               sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", "m8");
+        const char * const         values[4] = { nullptr, "0.1", "1", "bogus" };
+        std::vector<float>         out[4];
+        bool                       ran = true;
+        for (int v = 0; v < 4; v++) {
+            env_override   st("FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE", values[v]);
+            log_capture    log;
+            q40s_node      nd(dev, cpu, q, k, n, 4, 1, 1, 16, id_list({ 8, 4, 1, 3 }), xv);
+            ggml_backend_t backend = tcm_backend(dev, nullptr);
+            REQUIRE(backend != nullptr);
+            out[v] = nd.run(backend, nullptr);
+            ggml_backend_free(backend);
+            ran = ran && nd.ok;
+            if (v == 2 && nd.ok) {
+                e_s8 = rows_nmse(out[v], nd.ref(), n, 0, 8);
+                e_s4 = rows_nmse(out[v], nd.ref(), n, 8, 12);
+            }
+            const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE=");
+            n_stable++;
+            n_stable_ok += fail(nd.ok && warnings == (v == 3 ? 1 : 0),
+                                std::string("EXPERT_Q4_0_STABLE=") + (values[v] != nullptr ? values[v] : "unset") +
+                                    ": " + (nd.ok ? "ran" : "failed") + ", " + std::to_string(warnings) + " warnings");
+        }
+        const auto same = [&](int a, int b) {
+            return out[a].size() == out[b].size() &&
+                   std::memcmp(out[a].data(), out[b].data(), out[a].size() * sizeof(float)) == 0;
+        };
+        if (ran) {
+            e_s81 = nmse(out[2].data(), out[0].data(), 8 * n);
+        }
+        n_stable++;
+        n_stable_ok += fail(ran && same(0, 1) && same(0, 3) && !same(0, 2),
+                            std::string("EXPERT_Q4_0_STABLE: unset and 0.1 ") + (same(0, 1) ? "equal" : "differ") +
+                                ", unset and an unknown value " + (same(0, 3) ? "equal" : "differ") + ", unset and 1 " +
+                                (same(0, 2) ? "equal" : "differ"));
+        n_stable++;
+        n_stable_ok += fail(e_s8 <= k_mul_mat_max_nmse && e_s4 <= k_mul_mat_max_nmse && e_s81 <= k_q4_0s_kernels_max_nmse,
+                            "factor 1: against the CPU 8 rows " + sci(e_s8) + ", 4 rows " + sci(e_s4) +
+                                "; its 8-row group against factor 0.1 " + sci(e_s81));
+    }
+
+    // the kernels against each other on rows of equal magnitude: every row's largest value of a subblock the same, so
+    // a group's shared scale is each row's own. All experts hold the same weights; 8 tokens of 2 ids: slot 0 on expert
+    // 0 (a group of 8 under m8), slot 1 on expert 1 for tokens 0-3 (a group of 4), 2 for 4-6 and 3 for 7 (single rows);
+    // FLAGOS_SPACEMIT_MMID=rows multiplies every pair with the 1-row kernel
+    double e_84 = HUGE_VAL, e_81 = HUGE_VAL, e_41 = HUGE_VAL;
+    {
+        const int64_t        k = 512, n = 64, n_tok = 8;
+        std::vector<uint8_t> one = quantize_weights(GGML_TYPE_Q4_0, k, n, seed++), q;
+        for (int e = 0; e < 4; e++) {
+            q.insert(q.end(), one.begin(), one.end());
+        }
+        std::vector<float> xv = random_values(k * n_tok, seed++, 0.9f);
+        for (int64_t t = 0; t < n_tok; t++) {
+            for (int64_t b = 0; b < k / 32; b++) {
+                const float m = 0.5f + 0.25f * (float) (b % 8);
+                for (int64_t i = 0; i < 32; i++) {
+                    xv[(size_t) (t * k + b * 32 + i)] *= m;
+                }
+                xv[(size_t) (t * k + b * 32 + (t + b) % 32)] = t % 2 == 0 ? m : -m;
+            }
+        }
+        std::vector<int32_t> ids;
+        for (int64_t t = 0; t < n_tok; t++) {
+            ids.push_back(0);
+            ids.push_back(t < 4 ? 1 : t < 7 ? 2 : 3);
+        }
+        env_override   sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", "m8");
+        q40s_node      nd(dev, cpu, q, k, n, 4, 2, 1, n_tok, ids, xv);
+        ggml_backend_t backend = tcm_backend(dev, nullptr);
+        REQUIRE(backend != nullptr);
+        const std::vector<float> staged = nd.run(backend, nullptr);
+        const std::vector<float> rows   = nd.run(backend, "rows");
+        ggml_backend_free(backend);
+        if (nd.ok) {
+            // the output row of (token t, slot s) is t * 2 + s
+            std::vector<float> s8, s4, r8, r4;
+            for (int64_t t = 0; t < n_tok; t++) {
+                const auto at = [&](const std::vector<float> & v, int64_t s) { return v.begin() + (t * 2 + s) * n; };
+                s8.insert(s8.end(), at(staged, 0), at(staged, 0) + n);
+                r8.insert(r8.end(), at(rows, 0), at(rows, 0) + n);
+                if (t < 4) {
+                    s4.insert(s4.end(), at(staged, 1), at(staged, 1) + n);
+                    r4.insert(r4.end(), at(rows, 1), at(rows, 1) + n);
+                }
+            }
+            e_84 = nmse(s8.data(), s4.data(), (int64_t) s4.size());
+            e_81 = nmse(s8.data(), r8.data(), (int64_t) s8.size());
+            e_41 = nmse(s4.data(), r4.data(), (int64_t) s4.size());
+        }
+    }
+    const bool equal_ok = fail(e_84 <= k_q4_0s_kernels_max_nmse && e_81 <= k_q4_0s_kernels_max_nmse &&
+                                   e_41 <= k_q4_0s_kernels_max_nmse,
+                               "the kernels against each other on rows of equal magnitude: 8 vs 4 rows " +
+                                   sci(e_84) + ", 8 vs 1 " + sci(e_81) + ", 4 vs 1 " +
+                                   sci(e_41));
+
+    // the cost of the shared scale, reported: token 0 and token 4 a hundred times smaller than the others; tokens 0-3
+    // on expert 0 (token 0 with 3 others), 4-11 on expert 1 (token 4 with 7 others; plain: in two groups of 4)
+    double e_small[3][3] = {};  // [plain, m8, pad8][with 3, with 7, alone (FLAGOS_SPACEMIT_MMID=rows)]
+    {
+        const int64_t              k = 512, n = 64, n_tok = 12;
+        const std::vector<uint8_t> q  = quantize_weights(GGML_TYPE_Q4_0, k, n * 2, seed++);
+        std::vector<float>         xv = random_values(k * n_tok, seed++, 1.0f);
+        for (const int64_t t : { 0, 4 }) {
+            for (int64_t i = 0; i < k; i++) {
+                xv[(size_t) (t * k + i)] *= 0.01f;
+            }
+        }
+        const char * const settings[3] = { "plain", "m8", "pad8" };
+        for (int a = 0; a < 3; a++) {
+            env_override   sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", settings[a]);
+            q40s_node      nd(dev, cpu, q, k, n, 2, 1, 1, n_tok, id_list({ 4, 8 }), xv);
+            ggml_backend_t backend = tcm_backend(dev, nullptr);
+            REQUIRE(backend != nullptr);
+            const std::vector<float> staged = nd.run(backend, nullptr);
+            const std::vector<float> rows   = nd.run(backend, "rows");
+            ggml_backend_free(backend);
+            e_small[a][0] = nd.ok ? rows_nmse(staged, nd.ref(), n, 0, 1) : HUGE_VAL;
+            e_small[a][1] = nd.ok ? rows_nmse(staged, nd.ref(), n, 4, 5) : HUGE_VAL;
+            e_small[a][2] = nd.ok ? rows_nmse(rows, nd.ref(), n, 0, 1) : HUGE_VAL;
+            fail(nd.ok, std::string("the shared scale's cost under ") + settings[a] + ": the node failed");
+        }
+    }
+
+    // the groups under both arms. Each case against the CPU (the whole output, and its worst row: a row overwritten by
+    // a padded row's zeros has NMSE 1), and the first backend run's bytes (with TCM) for grouped, without TCM, twice
+    // in a row, on threads 20 times, and the steps directly on 1 tile and 8 (in reverse, one tile first, without TCM,
+    // on threads 20 times)
+    struct shape_case {
+        const char *         what;
+        int64_t              n_used, ne11;
+        std::vector<int64_t> counts;  // the rows per expert; its size is the expert count
+    };
+    std::vector<int64_t> one_to_17;
+    for (int64_t r = 1; r <= 17; r++) {
+        one_to_17.push_back(r);
+    }
+    const std::vector<shape_case> shapes = {
+        { "1 to 17 rows an expert", 1, 1, one_to_17 },
+        { "24, 31 and 32 rows an expert", 1, 1, { 24, 31, 32 } },
+        { "experts of 0 rows between active ones", 1, 1, { 0, 3, 0, 0, 9, 0, 0, 0, 2, 0, 13, 0 } },
+        { "every pair on one expert, a row per id", 4, 4, { 0, 0, 40, 0 } },
+    };
+    struct direct_form {
+        const char * what;
+        uint32_t     nth;
+        int          order;  // 0 the tiles in turn, 1 in reverse, 2 tile nth / 2 first, 3 on threads
+        bool         staged;
+        uint32_t     runs;
+    };
+    const std::vector<direct_form> forms = {
+        { "1 tile", 1, 0, true, 1 },
+        { "8 tiles", 8, 0, true, 1 },
+        { "8 tiles in reverse", 8, 1, true, 1 },
+        { "8 tiles, one first", 8, 2, true, 1 },
+        { "8 tiles without TCM", 8, 0, false, 1 },
+        { "8 tiles on threads", 8, 3, true, 20 },
+        { "8 tiles on threads without TCM", 8, 3, false, 20 },
+    };
+    const size_t        tcm_size = 393216;  // the K3's 384 KiB
+    std::vector<uint8_t> tcm(8 * tcm_size);
+    // the two steps directly on nth tiles, the workspace aligned to 64 as the core's
+    const auto direct_run = [&](q40s_node & nd, uint32_t nth, int order, bool staged) {
+        const size_t         ws = step_q->workspace_size(nd.y);
+        std::vector<uint8_t> raw(ws + 64);
+        uint8_t * const      wsp = raw.data() + (64 - reinterpret_cast<uintptr_t>(raw.data()) % 64) % 64;
+        const std::vector<float> junk((size_t) nd.n_out, NAN);
+        ggml_backend_tensor_set(nd.y, junk.data(), 0, ggml_nbytes(nd.y));
+        std::atomic<bool> failed{ false };
+        const auto        call = [&](const spacemit_plugin_kernel * step, uint32_t ith) {
+            uint8_t * const     own  = tcm.data() + (order == 3 ? ith * tcm_size : 0);
+            const spacemit_tile tile = { ith, nth, staged ? own : nullptr, staged ? tcm_size : 0, wsp, ws, nullptr };
+            if (!step->fn(&tile, nd.y)) {
+                failed = true;
+            }
+        };
+        for (const spacemit_plugin_kernel * step : { step_q, step_g }) {
+            if (order == 3) {
+                std::vector<std::thread> threads;
+                for (uint32_t ith = 0; ith < nth; ith++) {
+                    threads.emplace_back([&, ith] { call(step, ith); });
+                }
+                for (std::thread & t : threads) {
+                    t.join();
+                }
+                continue;
+            }
+            for (uint32_t i = 0; i < nth; i++) {
+                const uint32_t half = nth / 2;
+                call(step, order == 1 ? nth - 1 - i : order == 2 ? (i == 0 ? half : i <= half ? i - 1 : i) : i);
+            }
+        }
+        nd.ok = nd.ok && !failed;
+        std::vector<float> out((size_t) nd.n_out, NAN);
+        ggml_backend_tensor_get(nd.y, out.data(), 0, ggml_nbytes(nd.y));
+        return out;
+    };
+    int    n_shapes = 0, n_shapes_ok = 0, n_same = 0, n_same_ok = 0;
+    double worst_shape = 0.0, worst_row = 0.0, worst_rows = 0.0;
+    for (const shape_case & c : shapes) {
+        const int64_t              k = 256, n = 96, n_mats = (int64_t) c.counts.size();
+        const std::vector<int32_t> ids   = id_list(c.counts);
+        const int64_t              n_tok = (int64_t) ids.size() / c.n_used;
+        const std::vector<uint8_t> q     = quantize_weights(GGML_TYPE_Q4_0, k, n * n_mats, seed++);
+        const std::vector<float>   xv    = random_values(k * c.ne11 * n_tok, seed++, 2.0f);
+        for (const char * arm : arms) {
+            env_override       sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", arm);
+            q40s_node          nd(dev, cpu, q, k, n, n_mats, c.n_used, c.ne11, n_tok, ids, xv);
+            const size_t       bytes = (size_t) nd.n_out * sizeof(float);
+            std::string        differ;
+            const auto same = [&](const std::vector<float> & a, const std::vector<float> & b, const char * what) {
+                n_same++;
+                const bool good = a.size() == b.size() && std::memcmp(a.data(), b.data(), bytes) == 0;
+                n_same_ok += good;
+                if (!good) {
+                    differ += differ.empty() ? what : std::string(", ") + what;
+                }
+            };
+            if (!nd.ok) {
+                n_shapes++;
+                fail(false, std::string(arm) + ", " + c.what + ": not claimed, or the CPU failed");
+                continue;
+            }
+            std::vector<float> ref, rows;
+            {
+                ggml_backend_t backend = tcm_backend(dev, nullptr);
+                REQUIRE(backend != nullptr);
+                ref = nd.run(backend, nullptr);
+                same(nd.run(backend, "grouped"), ref, "grouped");
+                rows = nd.run(backend, "rows");
+                ggml_backend_free(backend);
+            }
+            {
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                REQUIRE(backend != nullptr);
+                same(nd.run(backend, nullptr), ref, "without TCM");
+                same(nd.run(backend, nullptr), ref, "the second compute in a row");
+                ggml_backend_free(backend);
+            }
+            if (host) {
+                ggml_backend_t backend = tcm_backend(dev, "1");
+                REQUIRE(backend != nullptr);
+                bool all = true;
+                for (int i = 0; i < 20; i++) {
+                    const std::vector<float> out = nd.run(backend, nullptr);
+                    all = all && std::memcmp(out.data(), ref.data(), bytes) == 0;
+                }
+                same(all ? ref : std::vector<float>(), ref, "on threads");
+                ggml_backend_free(backend);
+            }
+            for (size_t f = 0; f < forms.size() && direct; f++) {
+                bool all = true;
+                for (uint32_t i = 0; i < forms[f].runs; i++) {
+                    const std::vector<float> out = direct_run(nd, forms[f].nth, forms[f].order, forms[f].staged);
+                    all = all && std::memcmp(out.data(), ref.data(), bytes) == 0;
+                }
+                same(all ? ref : std::vector<float>(), ref, forms[f].what);
+            }
+            const int64_t n_rows = nd.n_out / n;
+            double        e = HUGE_VAL, e_row = HUGE_VAL, e_rows = HUGE_VAL;
+            if (nd.ok) {
+                e      = nmse(ref.data(), nd.ref(), nd.n_out);
+                e_rows = nmse(rows.data(), nd.ref(), nd.n_out);
+                e_row  = 0.0;
+                for (int64_t r = 0; r < n_rows; r++) {
+                    e_row = std::max(e_row, rows_nmse(ref, nd.ref(), n, r, r + 1));
+                }
+            }
+            worst_shape = std::max(worst_shape, e);
+            worst_row   = std::max(worst_row, e_row);
+            worst_rows  = std::max(worst_rows, e_rows);
+            n_shapes++;
+            n_shapes_ok += fail(nd.ok && differ.empty() && e <= k_mul_mat_max_nmse && e_row <= k_q4_0s_row_max_nmse &&
+                                    e_rows <= k_mul_mat_max_nmse,
+                                std::string(arm) + ", " + c.what + ": " + (nd.ok ? "ran" : "failed") +
+                                    "; not the first run's bytes: " + (differ.empty() ? "none" : differ) +
+                                    "; NMSE " + sci(e) + ", worst row " + sci(e_row) +
+                                    ", rows " + sci(e_rows));
+        }
+    }
+
+    // one token: both arms the 1-row pack and kernel, so the same bytes; against plain within the bound
+    int    n_one = 0, n_one_ok = 0;
+    double worst_one = 0.0;
+    {
+        const int64_t              k = 2048, n = 512, n_mats = 16;
+        const std::vector<uint8_t> q   = quantize_weights(GGML_TYPE_Q4_0, k, n * n_mats, seed++);
+        const std::vector<float>   xv  = random_values(k, seed++, 2.0f);
+        const std::vector<int32_t> ids = { 3, 14, 0, 7, 9, 1, 12, 5 };
+        const char * const         settings[3] = { "plain", "m8", "pad8" };
+        std::vector<float>         out[3];
+        bool                       ran = true;
+        double                     e_cpu = 0.0;
+        for (int a = 0; a < 3; a++) {
+            env_override   sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", settings[a]);
+            q40s_node      nd(dev, cpu, q, k, n, n_mats, 8, 1, 1, ids, xv);
+            ggml_backend_t backend = tcm_backend(dev, nullptr);
+            REQUIRE(backend != nullptr);
+            out[a] = nd.run(backend, nullptr);
+            ggml_backend_free(backend);
+            ran   = ran && nd.ok;
+            e_cpu = std::max(e_cpu, nd.ok ? nmse(out[a].data(), nd.ref(), nd.n_out) : HUGE_VAL);
+        }
+        const bool bits = ran && out[1].size() == out[2].size() &&
+                          std::memcmp(out[1].data(), out[2].data(), out[1].size() * sizeof(float)) == 0;
+        worst_one       = ran ? std::max(nmse(out[1].data(), out[0].data(), (int64_t) out[0].size()),
+                                         nmse(out[2].data(), out[0].data(), (int64_t) out[0].size())) :
+                                HUGE_VAL;
+        n_one++;
+        n_one_ok += fail(bits && worst_one <= k_mul_mat_max_nmse && e_cpu <= k_mul_mat_max_nmse,
+                         std::string("one token: m8 and pad8 ") + (bits ? "bit for bit" : "differ") +
+                             ", against plain NMSE " + sci(worst_one) + ", against the CPU " +
+                             sci(e_cpu));
+    }
+
+    ggml_backend_free(cpu);
+    std::printf("mmid     3-D Q4_0 experts in the q4_0s layout (FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 and pad8): the switch "
+                "(unset, empty, plain, m8, pad8 and an unknown value warning once; 2-D Q4_0 and 3-D Q4_1 keep their "
+                "layouts) %d/%d; repack and unpack the GGUF bytes at [2048, 512, 4], [512, 2048, 4] and two small "
+                "shapes %d/%d; against the CPU on the dequantized weights max NMSE the 8-row kernel %.2e, 4-row %.2e, "
+                "1-row %.2e, pad8's padded 8 %.2e (bound %.0e)%s; FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE (unset, 0.1, 1 and "
+                "an unknown value warning once; unset, 0.1 and the unknown value the same bytes, 1 others) %d/%d, at "
+                "factor 1 max NMSE the 8-row kernel %.2e, 4-row %.2e (bound %.0e), its 8-row group against factor "
+                "0.1 %.2e (bound %.0e); on rows of equal magnitude 8 vs 4 rows %.2e, 8 vs 1 "
+                "%.2e, 4 vs 1 %.2e (bound %.0e)%s; the groups (1 to 17, 24, 31 and 32 rows an expert, experts of 0 "
+                "rows between active ones, every pair on one expert) under both arms %d/%d cases, max NMSE %.2e, "
+                "worst row %.2e (bound %.0e), rows %.2e; within an arm the first run's bytes (grouped, without TCM, "
+                "twice in a row%s%s) in %d/%d; one token m8 and pad8 bit for bit and against plain within the bound "
+                "%d/%d (NMSE %.2e)%s\n",
+                n_switch_ok, n_switch, n_trip_ok, n_trip, e_k8, e_k4, e_k1, e_kpad, k_mul_mat_max_nmse,
+                kernels_ok ? "" : " FAILED", n_stable_ok, n_stable, e_s8, e_s4, k_mul_mat_max_nmse, e_s81,
+                k_q4_0s_kernels_max_nmse, e_84, e_81, e_41, k_q4_0s_kernels_max_nmse, equal_ok ? "" : " FAILED",
+                n_shapes_ok, n_shapes, worst_shape, worst_row, k_q4_0s_row_max_nmse, worst_rows,
+                host ? ", on threads 20 times" : "",
+                direct ? ", the steps directly on 1 and 8 tiles, in reverse, one first, without TCM, on threads" : "",
+                n_same_ok, n_same, n_one_ok, n_one, worst_one, reference_label());
+    std::printf("info     MUL_MAT_ID q4_0s, the cost of the shared activation scale (reported, not bounded): NMSE of a "
+                "row a hundred times smaller than the rows it is grouped with, with 3 / with 7 / alone (rows): plain "
+                "%.2e / %.2e / %.2e, m8 %.2e / %.2e / %.2e, pad8 %.2e / %.2e / %.2e%s\n",
+                e_small[0][0], e_small[0][1], e_small[0][2], e_small[1][0], e_small[1][1], e_small[1][2],
+                e_small[2][0], e_small[2][1], e_small[2][2], reference_label());
+    return 0;
+}
+
 // MUL_MAT_ID, the experts' matmuls (Qwen3.6-35B-A3B): the claims and the refused forms, then the provider against the
 // CPU backend on one thread, for the IME layouts' types at the model's shapes (gate and up [2048, 512, 256] with one
 // activation row per token, down [512, 2048, 256] with one per id, 8 ids per token) and at small ones, 1 to 512
@@ -8570,7 +9186,7 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
                 "shapes quantized with an imatrix %.2e (bound %.0e)\n",
                 worst_readback[0], worst_readback[1], k_mul_mat_max_nmse);
     return check_mul_mat_id_groups(dev, host) != 0 || check_mul_mat_id_queue(dev, host) != 0 ||
-                   check_mul_mat_id_q4_1(dev, host) != 0 ?
+                   check_mul_mat_id_q4_1(dev, host) != 0 || check_mul_mat_id_q4_0s(dev, host) != 0 ?
                1 :
                0;
 }

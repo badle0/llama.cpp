@@ -13,6 +13,9 @@
 //   form of the Q4_1 d and nibbles, then the tile's fp16 minimums, [K/32 block][32 rows]. A weight d q + m is
 //   d (q - 8) + (m + 8 d): the q4_0 kernels give the first part, q4_1_min_gemm adds the second. Lossless, 20 bytes per
 //   32 weights as Q4_1; the activations are the q4_0 layout's.
+// - "q4_0s 32x256" (3-D Q4_0 experts under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8): the q4_0 32x256 bytes with every
+//   nibble byte ^ 0x88, so a nibble holds q - 8 as a signed 4-bit value (SpacemiT's fork). Lossless, same size. Its
+//   kernels take the activations in groups of 8, 4 or 1 rows (the fork's packs) and need no sum(a) correction.
 // A 3-D weight (MUL_MAT_ID's experts) is stored as the 2-D weight of its ggml_nrows rows in any layout.
 // Without GGML_FLAGOS_SPACEMIT_IME2 only the scalar references exist and are used.
 
@@ -49,6 +52,16 @@ constexpr size_t q8_hp_blk_size(size_t blk_len, bool with_blk_sum = false, bool 
                             (with_blk_scale ? sizeof(_Float16) : 0);
     return blk_size;
 }
+
+// copied from rvv_kernels.h (SpacemiT's fork, mtmd-backend b847bf396, 43-52): bytes per 256 values of the q4_0s
+// layout's 4-row and 8-row activation groups (payload, shared scales, sums and average scale, padded), and the
+// alignment of a group's start
+constexpr size_t q8_hp_m4al_blk_size =
+    (8 * 4 * 32 + 8 * 4 * sizeof(_Float16) + 4 * 8 * sizeof(_Float16) + 4 * sizeof(_Float16) + 63) / 64 * 64;
+constexpr size_t q8_hp_m8_blk_size = (8 * 8 * 32 + 8 * sizeof(_Float16) + sizeof(_Float16) + 127) / 128 * 128;
+static_assert(q8_hp_m4al_blk_size == 1216, "m4al group layout");
+static_assert(q8_hp_m8_blk_size == 2176, "m8 group layout");
+constexpr size_t q8_hp_al_align = 128;
 
 // bytes of one quantized activation row and of one repacked weight row of length k (a multiple of the layout's K
 // block). Q4_0 keeps its size (18 bytes per 32 values); Q8_0 keeps its 34, which a Q4_1 (20) or Q6_K weight (26.25)
@@ -89,6 +102,17 @@ size_t q8_0_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count
 // a multiple of row_tile
 size_t q4_1_min_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t count_m, size_t count_n,
                      size_t k_blocks, size_t ldc, bool reference);
+// the q4_0s layout: 8 or 4 rows (row stride count_k) packed as one group, q8_hp_m8_blk_size or q8_hp_m4al_blk_size
+// bytes per 256 values; one row is q4_0_quantize_row's pack. q4_0s_gemm multiplies one group of rows (8, 4 or 1, the
+// pack it was given) by count_n columns (a multiple of row_tile) into c (row stride ldc) and returns rows
+void   q4_0s_quantize_8rows(const float * a, size_t count_k, uint8_t * qa, bool reference);
+void   q4_0s_quantize_4rows(const float * a, size_t count_k, uint8_t * qa, bool reference);
+size_t q4_0s_gemm(const uint8_t * qa, const uint8_t * qb, float * c, size_t rows, size_t count_n, size_t k_blocks,
+                  size_t ldc, bool reference);
+// bytes per 256 values of a group of rows (8, 4 or 1) in the q4_0s layout's packs
+constexpr size_t q4_0s_group_blk_bytes(size_t rows) {
+    return rows == 8 ? q8_hp_m8_blk_size : rows == 4 ? q8_hp_m4al_blk_size : q8_hp_blk_size(q4_0_k_block, true, true);
+}
 
 // copy into or out of TCM
 void copy(void * dst, const void * src, size_t size);
@@ -111,5 +135,8 @@ void unpack_q5_0_q8_0(const ggml_tensor * t, void * data);
 // Q4_1 in the q4_1 min layout, exactly both ways: repack writes ggml_nbytes(t) bytes; unpack restores the GGUF bytes
 int  repack_q4_1_min(ggml_tensor * t, const void * data, size_t size);
 void unpack_q4_1_min(const ggml_tensor * t, void * data);
+// Q4_0 in the q4_0s layout, exactly both ways: repack_q4_0 and the nibble bytes ^ 0x88; unpack restores the GGUF bytes
+int  repack_q4_0s(ggml_tensor * t, const void * data, size_t size);
+void unpack_q4_0s(const ggml_tensor * t, void * data);
 
 }  // namespace spacemit_ime

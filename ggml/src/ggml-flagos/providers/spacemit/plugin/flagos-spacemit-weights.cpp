@@ -56,24 +56,91 @@ int expert_q4_1_from_env() {
     return spacemit_cached_switch(value, seen, parse_expert_q4_1);
 }
 
+enum expert_q4_0 : int { expert_q4_0_plain = 0, expert_q4_0_m8 = 1, expert_q4_0_pad8 = 2 };
+
+// FLAGOS_SPACEMIT_EXPERT_Q4_0 (plan.md "The Q4_0 experts: the fork's signed layout and 8-row kernel"): how a 3-D Q4_0
+// weight is stored and multiplied. plain, unset or empty (the default): q4_0 32x256 and today's kernels. m8, pad8:
+// the q4_0s layout and the fork's kernels, MUL_MAT_ID's arm by name. Parsed once (spacemit_cached_switch); anything
+// else warns once per parse generation and keeps the default. Decided at a weight's load, as FLAGOS_SPACEMIT_EXPERT_Q4_1
+int parse_expert_q4_0() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_EXPERT_Q4_0");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "plain") == 0) {
+        return expert_q4_0_plain;
+    }
+    if (std::strcmp(v, "m8") == 0) {
+        return expert_q4_0_m8;
+    }
+    if (std::strcmp(v, "pad8") == 0) {
+        return expert_q4_0_pad8;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_EXPERT_Q4_0=%s: not plain, m8 or pad8, the default (plain) kept\n", __func__,
+                      v);
+    }
+    return expert_q4_0_plain;
+}
+
+int expert_q4_0_from_env() {
+    static std::atomic<int>      value{ expert_q4_0_plain };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_expert_q4_0);
+}
+
+// FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE (test-only, for the K3 comparison run): the stable factor of the q4_0s layout's
+// 8-row and 4-row packs. 0.1, unset or empty: the fork's 0.1 (0); 1: factor 1 (1). Parsed once
+// (spacemit_cached_switch); anything else warns once per parse generation and keeps 0.1
+int parse_expert_q4_0_stable() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "0.1") == 0) {
+        return 0;
+    }
+    if (std::strcmp(v, "1") == 0) {
+        return 1;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_EXPERT_Q4_0_STABLE=%s: not 0.1 or 1, the default (0.1) kept\n", __func__, v);
+    }
+    return 0;
+}
+
+int expert_q4_0_stable_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_expert_q4_0_stable);
+}
+
 }  // namespace
 
 uint32_t spacemit_expert_q4_1() {
     return (uint32_t) expert_q4_1_from_env();
 }
 
+uint32_t spacemit_expert_q4_0() {
+    return (uint32_t) expert_q4_0_from_env();
+}
+
+float spacemit_expert_q4_0_stable_factor() {
+    return expert_q4_0_stable_from_env() == 1 ? 1.0f : 0.1f;
+}
+
 // a 3-D tensor (MUL_MAT_ID's experts, [K, N, n_expert]) is stored as its ggml_nrows rows in 32-row groups, each
 // expert's N rows whole groups (N % 32 == 0), so expert e's rows start at row e * N. Q4_1 takes the Q8_0 route in 2-D
 // only: the requantization's read-back is the nearest Q4_1, on which test-backend-ops' MUL_MAT_ID cases fail under
 // imatrix quantization (NMSE about 6e-4 against 5e-4). A 3-D Q4_1 weight takes the q4_1 min layout (lossless); under
-// FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu it stays plain and MUL_MAT_ID refuses it
+// FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu it stays plain and MUL_MAT_ID refuses it. A 3-D Q4_0 weight takes the q4_0s layout
+// under FLAGOS_SPACEMIT_EXPERT_Q4_0=m8 or pad8, a 2-D one never
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[3] != 1 ||
         !ggml_is_contiguous(t) || spacemit_is_cache_name(t->name)) {
         return spacemit_layout::plain;
     }
     if (t->type == GGML_TYPE_Q4_0 && t->ne[0] % spacemit_ime::q4_0_k_block == 0) {
-        return spacemit_layout::q4_0_32x256;
+        return t->ne[2] > 1 && expert_q4_0_from_env() != expert_q4_0_plain ? spacemit_layout::q4_0s_32x256 :
+                                                                               spacemit_layout::q4_0_32x256;
     }
     if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q8_0_k_block == 0 && t->ne[2] == 1) {
         return spacemit_layout::q4_1_q8_0_32x32;
@@ -219,6 +286,8 @@ int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, 
             return spacemit_ime::repack_q5_0_q8_0(t, data, size);
         case spacemit_layout::q4_1_min_32x256:
             return spacemit_ime::repack_q4_1_min(t, data, size);
+        case spacemit_layout::q4_0s_32x256:
+            return spacemit_ime::repack_q4_0s(t, data, size);
         case spacemit_layout::plain:
             break;
     }
@@ -294,9 +363,10 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
     }
 
     // a weight layout has ne[1] % 32 == 0, ne[3] == 1 and no view; each range's stand-in is a 2-D tensor of its rows.
-    // The Q8_0 layouts store 34 bytes per 32 weights, Q4_0's and the q4_1 min layout their own row size
+    // The Q8_0 layouts store 34 bytes per 32 weights, Q4_0's (both) and the q4_1 min layout their own row size
     const size_t src_row = ggml_row_size(t->type, t->ne[0]);
-    const size_t dst_row = layout == spacemit_layout::q4_0_32x256 || layout == spacemit_layout::q4_1_min_32x256 ?
+    const size_t dst_row = layout == spacemit_layout::q4_0_32x256 || layout == spacemit_layout::q4_0s_32x256 ||
+                                   layout == spacemit_layout::q4_1_min_32x256 ?
                                src_row :
                                spacemit_ime::q8_0_weight_row_bytes((size_t) t->ne[0]);
     std::vector<ggml_tensor>  parts((size_t) n);
@@ -370,6 +440,9 @@ static void spacemit_unpack(const ggml_tensor * t, void * data) {
             return;
         case spacemit_layout::q4_1_min_32x256:
             spacemit_ime::unpack_q4_1_min(t, data);
+            return;
+        case spacemit_layout::q4_0s_32x256:
+            spacemit_ime::unpack_q4_0s(t, data);
             return;
         case spacemit_layout::plain:
             break;
