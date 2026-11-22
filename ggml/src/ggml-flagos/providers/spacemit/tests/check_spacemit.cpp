@@ -1,7 +1,7 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
 //                              [--bench | --bench-attn | --bench-mm | --bench-f32 | --bench-embd | --bench-repack |
-//                               --bench-x100]
+//                               --bench-x100 | --bench-mmid]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -32,6 +32,10 @@
 //                    between the provider and the CPU backend on 8 or 4 threads; lines "x100bench ...", then
 //                    "x100bench: checks n/n PASS|FAIL". X100BENCH_REPS (5), X100BENCH_SMALL=1 (small shapes) (not run
 //                    by --bench)
+//   --bench-mmid     of the benchmarks only one MUL_MAT_ID node of Q4_0 experts at Qwen3.6-35B-A3B's two shapes
+//                    ([2048, 512, 256] and [512, 2048, 256], 8 ids a token): 1 token, 4 tokens of 32 experts, 4 and 8
+//                    tokens of the same 8 experts, 32 tokens of random ids, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against
+//                    the default taking turns twice; median and minimum of 60 computes (not run by --bench)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
 // them: requantized to Q8_0.
 
@@ -12800,6 +12804,161 @@ static int bench_x100(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// --bench-mmid only (plan.md "The Q4_0 experts: the fork's signed layout and 8-row kernel"): one MUL_MAT_ID node of
+// Q4_0 experts through the backend at Qwen3.6-35B-A3B's two shapes (gate and up [2048, 512, 256], one activation row a
+// token; down [512, 2048, 256], one a slot), 8 ids a token, for five row patterns: 1 token (the 1-row path), 4 tokens
+// of 32 different experts (single rows), 4 and 8 tokens of the same 8 experts (groups of 4 and of 8), 32 tokens drawn
+// at random (seed fixed). FLAGOS_SPACEMIT_EXPERT_Q4_0=plain and the default (m8) take turns twice, the weight written
+// again at each turn (its layout is decided at load); per cell 5 warm-up computes and 60 timed, the median and the
+// minimum in us a node, then per shape and pattern the default's median over plain's (all of a setting's timed
+// computes). The host executor runs the reference kernels: there the numbers mean nothing
+static int bench_mmid(ggml_backend_dev_t dev) {
+    env_override mmid("FLAGOS_SPACEMIT_MMID", nullptr);
+    env_override q4_1("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
+    ggml_backend_t backend = nullptr;
+    {
+        env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM, as bench_mm
+        backend = ggml_backend_dev_init(dev, nullptr);
+    }
+    REQUIRE(backend != nullptr);
+    const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    constexpr int64_t n_as = 256, n_used = 8;
+    constexpr int     n_warm = 5, n_timed = 60;
+    struct mmid_shape {
+        const char * what;
+        int64_t      k, n, ne11;
+    };
+    const mmid_shape shapes[] = { { "gate, up", 2048, 512, 1 }, { "down", 512, 2048, n_used } };
+    struct mmid_pattern {
+        const char *         what;
+        int64_t              n_tok;
+        std::vector<int32_t> ids;
+    };
+    std::vector<mmid_pattern> patterns;
+    {
+        mmid_pattern a = { "1 token", 1, {} }, b = { "4 tokens, 32 experts", 4, {} };
+        mmid_pattern c = { "4 tokens, the same 8 experts", 4, {} }, e = { "8 tokens, the same 8 experts", 8, {} };
+        mmid_pattern r = { "32 tokens, random ids", 32, {} };
+        for (int64_t s = 0; s < n_used; s++) {
+            a.ids.push_back((int32_t) (s * 37 % n_as));
+        }
+        for (int64_t j = 0; j < 4 * n_used; j++) {
+            b.ids.push_back((int32_t) (j * 7 % n_as));  // 7 is prime to 256: 32 different experts
+        }
+        for (int64_t t = 0; t < 8; t++) {
+            for (int64_t s = 0; s < n_used; s++) {
+                if (t < 4) {
+                    c.ids.push_back((int32_t) (s * 31 % n_as));
+                }
+                e.ids.push_back((int32_t) (s * 31 % n_as));
+            }
+        }
+        uint32_t             seed = 4711;
+        std::vector<int32_t> perm((size_t) n_as);
+        for (int64_t t = 0; t < 32; t++) {  // distinct experts within a token, as ARGSORT gives them
+            for (int64_t x = 0; x < n_as; x++) {
+                perm[(size_t) x] = (int32_t) x;
+            }
+            for (int64_t s = 0; s < n_used; s++) {
+                seed = seed * 1664525u + 1013904223u;
+                std::swap(perm[(size_t) s], perm[(size_t) (s + (seed >> 8) % (uint32_t) (n_as - s))]);
+                r.ids.push_back(perm[(size_t) s]);
+            }
+        }
+        patterns = { a, b, c, e, r };
+    }
+
+    const char * const settings[2] = { "plain", nullptr };  // nullptr: unset, the default (m8)
+    for (const mmid_shape & sh : shapes) {
+        const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q4_0, sh.k, sh.n * n_as, 1);
+        ggml_init_params           pw    = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context *             ctx_w = ggml_init(pw);
+        REQUIRE(ctx_w != nullptr);
+        ggml_tensor * w = ggml_new_tensor_3d(ctx_w, GGML_TYPE_Q4_0, sh.k, sh.n, n_as);
+        ggml_set_name(w, "blk.0.ffn_gate_exps.weight");
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
+        REQUIRE(buf_w != nullptr);
+
+        // the patterns' nodes, built once: activations and ids on the host, the output in our buffer
+        std::vector<ggml_context *>         ctxs;
+        std::vector<ggml_backend_buffer_t>  bufs;
+        std::vector<ggml_cgraph *>          graphs;
+        for (const mmid_pattern & pt : patterns) {
+            ggml_init_params p     = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
+            ggml_context *   ctx_h = ggml_init(p);
+            ggml_context *   ctx_d = ggml_init(p);
+            REQUIRE(ctx_h != nullptr && ctx_d != nullptr);
+            ggml_tensor * x   = ggml_new_tensor_3d(ctx_h, GGML_TYPE_F32, sh.k, sh.ne11, pt.n_tok);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx_h, GGML_TYPE_I32, n_used, pt.n_tok);
+            ggml_tensor * y   = ggml_mul_mat_id(ctx_d, w, x, ids);
+            ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+            ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, buft);
+            REQUIRE(bh != nullptr && bd != nullptr);
+            REQUIRE((int64_t) pt.ids.size() == n_used * pt.n_tok);
+            const std::vector<float> xv = random_values(ggml_nelements(x), 2, 1.0f);
+            ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+            ggml_backend_tensor_set(ids, pt.ids.data(), 0, ggml_nbytes(ids));
+            ggml_cgraph * g = ggml_new_graph(ctx_d);
+            ggml_build_forward_expand(g, y);
+            ctxs.insert(ctxs.end(), { ctx_h, ctx_d });
+            bufs.insert(bufs.end(), { bh, bd });
+            graphs.push_back(g);
+        }
+
+        std::vector<std::vector<double>> all(patterns.size() * 2);  // [pattern][setting]: every timed compute, us
+        for (int turn = 0; turn < 4; turn++) {
+            const int    k = turn % 2;
+            env_override sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", settings[k]);
+            ggml_backend_tensor_set(w, q.data(), 0, q.size());  // the repack in this setting's layout
+            for (size_t pi = 0; pi < patterns.size(); pi++) {
+                bool ok = ggml_backend_dev_supports_op(dev, ggml_graph_node(graphs[pi], -1));
+                for (int i = 0; i < n_warm && ok; i++) {
+                    ok = ggml_backend_graph_compute(backend, graphs[pi]) == GGML_STATUS_SUCCESS;
+                }
+                std::vector<double> t;
+                for (int i = 0; i < n_timed && ok; i++) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    ok            = ggml_backend_graph_compute(backend, graphs[pi]) == GGML_STATUS_SUCCESS;
+                    const auto t1 = std::chrono::steady_clock::now();
+                    t.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                }
+                CHECK(ok && !t.empty());
+                std::vector<double> sorted = t;
+                std::sort(sorted.begin(), sorted.end());
+                all[pi * 2 + k].insert(all[pi * 2 + k].end(), t.begin(), t.end());
+                std::printf("bench    mmid %-8s [%lld, %lld, %lld] %-28s %-7s turn %d: median %9.1f us, min %9.1f us a "
+                            "node\n",
+                            sh.what, (long long) sh.k, (long long) sh.n, (long long) n_as, patterns[pi].what,
+                            settings[k] != nullptr ? settings[k] : "default", turn + 1, sorted[sorted.size() / 2],
+                            sorted.front());
+            }
+        }
+        for (size_t pi = 0; pi < patterns.size(); pi++) {
+            double med[2];
+            for (int k = 0; k < 2; k++) {
+                std::vector<double> & v = all[pi * 2 + k];
+                std::sort(v.begin(), v.end());
+                med[k] = v[v.size() / 2];
+            }
+            std::printf("bench    mmid %-8s [%lld, %lld, %lld] %-28s default over plain: %.3f (medians %.1f and %.1f "
+                        "us, %d computes each)\n",
+                        sh.what, (long long) sh.k, (long long) sh.n, (long long) n_as, patterns[pi].what,
+                        med[1] / med[0], med[1], med[0], 2 * n_timed);
+        }
+        for (ggml_backend_buffer_t b : bufs) {
+            ggml_backend_buffer_free(b);
+        }
+        for (ggml_context * c : ctxs) {
+            ggml_free(c);
+        }
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx_w);
+    }
+    ggml_backend_free(backend);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     bool expect_device = false;
     bool expect_none   = false;
@@ -12811,6 +12970,7 @@ int main(int argc, char ** argv) {
     bool run_embd      = false;
     bool run_repack    = false;
     bool run_x100      = false;
+    bool run_mmid      = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -12832,10 +12992,12 @@ int main(int argc, char ** argv) {
             run_repack = true;
         } else if (std::strcmp(argv[i], "--bench-x100") == 0) {
             run_x100 = true;
+        } else if (std::strcmp(argv[i], "--bench-mmid") == 0) {
+            run_mmid = true;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
-                         "--bench-f32 | --bench-embd | --bench-repack | --bench-x100]\n"
+                         "--bench-f32 | --bench-embd | --bench-repack | --bench-x100 | --bench-mmid]\n"
                          "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
                          "tokens\n"
                          "  --bench-f32: the F32 matmul only\n"
@@ -12844,7 +13006,9 @@ int main(int argc, char ** argv) {
                          "  --bench-repack: the weights' repack at load only, FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 "
                          "and 8, and FLAGOS_SPACEMIT_REPACK_VIA=x100\n"
                          "  --bench-x100: the 1-row matmul beside readers on the X100 cores, and split between the "
-                         "provider and the CPU backend\n",
+                         "provider and the CPU backend\n"
+                         "  --bench-mmid: one MUL_MAT_ID node of Q4_0 experts, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against "
+                         "the default\n",
                          argv[0]);
             return 2;
         }
@@ -12905,7 +13069,8 @@ int main(int argc, char ** argv) {
                     (run_attn && (bench_attn(dev) != 0 || bench_attn_tiled(dev) != 0)) ||
                         (run_mm && bench_mm(dev) != 0) || (run_f32 && bench_mm_f32(dev) != 0) ||
                         (run_embd && bench_embd(dev) != 0) ||
-                        (run_repack && bench_repack(dev, !host) != 0) || (run_x100 && bench_x100(dev) != 0)) {
+                        (run_repack && bench_repack(dev, !host) != 0) || (run_x100 && bench_x100(dev) != 0) ||
+                        (run_mmid && bench_mmid(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

@@ -239,14 +239,11 @@ sgroup sgroup_at(int64_t g, int64_t r, const mmid_dims & d) {
     return { 8 * n8 + row_align * has4 + j, 1, n8 * d.g8_bytes + has4 * d.g4_bytes + j * d.g1_bytes };
 }
 
-// the bytes of an expert's packed groups
+// the bytes of an expert's packed groups: its groups of 8, its group of 4 if any, its single rows
 int64_t sexpert_bytes(int64_t r, const mmid_dims & d) {
-    const int64_t count = sgroup_count(r);
-    if (count == 0) {
-        return 0;
-    }
-    const sgroup last = sgroup_at(count - 1, r, d);
-    return last.off + (last.size == 8 ? d.g8_bytes : last.size == row_align ? d.g4_bytes : d.g1_bytes);
+    const int64_t n8   = r / 8;
+    const int64_t has4 = r - 8 * n8 >= row_align ? 1 : 0;
+    return n8 * d.g8_bytes + has4 * d.g4_bytes + (r - 8 * n8 - row_align * has4) * d.g1_bytes;
 }
 
 // one tile's part of the workspace, after the activations
@@ -269,12 +266,20 @@ mmid_work mmid_work_of(const spacemit_tile & tile, const mmid_dims & d) {
     return w;
 }
 
-// sgroups: every expert's byte offset in the packed groups, from the grouping's starts (every tile alike)
-void sgroup_offsets(const mmid_dims & d, const mmid_work & w) {
-    w.offs[0] = 0;
+// sgroups: every expert's byte offset in the packed groups, from the grouping's starts (every tile alike); returns
+// the groups of all experts. An expert without rows costs one compare
+int64_t sgroup_offsets(const mmid_dims & d, const mmid_work & w) {
+    int64_t groups = 0;
+    w.offs[0]      = 0;
     for (int64_t e = 0; e < d.n_as; e++) {
-        w.offs[e + 1] = w.offs[e] + sexpert_bytes(w.start[e + 1] - w.start[e], d);
+        const int64_t r = w.start[e + 1] - w.start[e];
+        w.offs[e + 1]   = w.offs[e];
+        if (r > 0) {
+            w.offs[e + 1] += sexpert_bytes(r, d);
+            groups += sgroup_count(r);
+        }
     }
+    return groups;
 }
 
 // sgroups: the packed groups' base, the workspace's activation part aligned to group_align (act_bytes has the slack)
@@ -348,17 +353,16 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
             return (const float *) ((const char *) x->data + (r.i1 % d.ne11) * x->nb[1] + r.i2 * x->nb[2]);
         };
         if (d.sgroups) {
-            sgroup_offsets(d, w);
+            const int64_t   n_groups = sgroup_offsets(d, w);
             uint8_t * const base     = sgroup_base(tile.workspace, d);
-            int64_t         n_groups = 0;
-            for (int64_t e = 0; e < d.n_as; e++) {
-                n_groups += sgroup_count(w.start[e + 1] - w.start[e]);
-            }
             const int64_t g0 = n_groups * tile.ith / tile.nth;
             const int64_t g1 = n_groups * (tile.ith + 1) / tile.nth;
             int64_t       g  = 0;
             for (int64_t e = 0; e < d.n_as && g < g1; e++) {
-                const int64_t r     = w.start[e + 1] - w.start[e];
+                const int64_t r = w.start[e + 1] - w.start[e];
+                if (r == 0) {
+                    continue;
+                }
                 const int64_t count = sgroup_count(r);
                 for (int64_t i = std::max<int64_t>(0, g0 - g); i < count && g + i < g1; i++) {
                     const sgroup    s   = sgroup_at(i, r, d);
@@ -452,7 +456,8 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
 // its output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per run
 // of the expert's units where they fit beside it; a slab is copied whatever the group count, since staging a slab is
 // also faster for one kernel call (plan.md "1-row matmul bandwidth"). The q4_0s layout: the expert's packed groups
-// (sgroup_at), a group of 8 or 4 into the 8 x 32 temporary, whose rows are then scattered.
+// (groups of 8, a group of 4, single rows, walked in order), a group of 8 or 4 into the 8 x 32 temporary, whose rows
+// are then scattered.
 // Either way every output element comes from one kernel call on one (group or pair, slab), so neither the tile count
 // nor the staging can change it
 bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
@@ -518,8 +523,9 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
         sgroup_offsets(d, w);
     }
 
-    // the expert at hand: its rows, read from the workspace or, once held, from TCM, and where its slabs are staged
-    int64_t         e = -1, r = 0, rows_bytes = 0, count = 0;
+    // the expert at hand: its rows, read from the workspace or, once held, from TCM, and where its slabs are staged;
+    // sgroups: its groups of 8, whether it has a group of 4, its single rows
+    int64_t         e = -1, r = 0, rows_bytes = 0, count = 0, n8 = 0, n4 = 0, n1 = 0;
     bool            hold_act = false, held = false;
     const uint8_t * acts     = nullptr;
     uint8_t *       slab_buf = nullptr;
@@ -531,7 +537,10 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
         hold_act   = stage && pad_to(rows_bytes, act_align) + slab_bytes <= tcm_size;
         acts       = d.sgroups ? sgroup_base(tile.workspace, d) + w.offs[e] : qa + w.start[e] * d.a_row_bytes;
         slab_buf   = stage ? tcm + (hold_act ? pad_to(rows_bytes, act_align) : 0) : nullptr;
-        count      = d.sgroups ? sgroup_count(r) : group_count(r);
+        count      = d.sgroups ? 0 : group_count(r);
+        n8         = r / 8;
+        n4         = r - 8 * n8 >= row_align ? 1 : 0;
+        n1         = r - 8 * n8 - row_align * n4;
         held       = false;
     };
     // the unit (e, slab s): the slab staged, then every group of the expert
@@ -546,19 +555,30 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
             spacemit_ime::copy(slab_buf, b, (size_t) slab_bytes);
             b = slab_buf;
         }
-        // sgroups: a group of 8 or 4 into the g_rows x 32 temporary, its rows scattered; a single straight out
-        for (int64_t g = 0; g < count && d.sgroups; g++) {
-            const sgroup sg = sgroup_at(g, r, d);
-            if (sg.size == 1) {
-                d.f->gemm_group(acts + sg.off, b, out_row(node, w.rows[w.start[e] + sg.start], s * nb_cols), 1,
-                                (size_t) nb_cols, (size_t) d.k_blocks, (size_t) d.n, reference);
-                continue;
+        // sgroups: the groups in order with a running pair and byte offset, a group of 8 or 4 into the g_rows x 32
+        // temporary and its rows scattered, a single straight out
+        if (d.sgroups) {
+            const int64_t    col  = s * nb_cols;
+            const mmid_row * pair = w.rows + w.start[e];
+            const uint8_t *  a    = acts;
+            const auto       many = [&](int64_t rows, int64_t bytes) {
+                d.f->gemm_group(a, b, w.result, (size_t) rows, (size_t) nb_cols, (size_t) d.k_blocks, (size_t) nb_cols,
+                                reference);
+                for (int64_t t = 0; t < rows; t++) {
+                    std::memcpy(out_row(node, pair[t], col), w.result + t * nb_cols, (size_t) nb_cols * sizeof(float));
+                }
+                pair += rows;
+                a += bytes;
+            };
+            for (int64_t g = 0; g < n8; g++) {
+                many(8, d.g8_bytes);
             }
-            d.f->gemm_group(acts + sg.off, b, w.result, (size_t) sg.size, (size_t) nb_cols, (size_t) d.k_blocks,
-                            (size_t) nb_cols, reference);
-            for (int64_t t = 0; t < sg.size; t++) {
-                std::memcpy(out_row(node, w.rows[w.start[e] + sg.start + t], s * nb_cols), w.result + t * nb_cols,
-                            (size_t) nb_cols * sizeof(float));
+            if (n4 != 0) {
+                many(row_align, d.g4_bytes);
+            }
+            for (int64_t g = 0; g < n1; g++, pair++, a += d.g1_bytes) {
+                d.f->gemm_group(a, b, out_row(node, *pair, col), 1, (size_t) nb_cols, (size_t) d.k_blocks,
+                                (size_t) d.n, reference);
             }
         }
         for (int64_t g = 0; g < count && !d.sgroups; g++) {
