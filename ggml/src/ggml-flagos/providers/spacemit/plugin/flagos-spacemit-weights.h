@@ -17,7 +17,7 @@ enum class spacemit_layout {
                       // 34 bytes per 32 weights, not 26.25; reads are approximate)
     q5_0_q8_0_32x32,  // Q5_0 matmul weights as Q8_0 in the q8_0 32x32 layout, exactly (d (q - 16) is Q8_0's d qs with
                       // qs = q - 16); 34 bytes per 32 weights, not 22; reads restore the GGUF bytes
-    q4_1_min_32x256,  // 3-D Q4_1 MUL_MAT_ID weights (unless FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu): each 32-row tile in the
+    q4_1_min_32x256,  // 3-D Q4_1 MUL_MAT_ID weights: each 32-row tile in the
                       // q4_0 32x256 form (Q4_1's d and nibbles), then the tile's fp16 minimums; d q + m = d (q - 8) +
                       // (m + 8 d), the q4_0 kernels and a correction (lossless, same size; reads restore the GGUF bytes)
     q4_0s_32x256,     // 3-D Q4_0 MUL_MAT_ID weights (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain): the q4_0 32x256 bytes
@@ -28,8 +28,8 @@ enum class spacemit_layout {
 // decided from the tensor's type, shape and name alone, never from how the buffer is used: test-backend-ops places
 // weights in ordinary buffers. supports_op, the buffer functions and the kernels all ask this one function.
 // A 3-D tensor (MUL_MAT_ID's experts) takes the layout of its type under the same rule, its ggml_nrows rows stored as
-// one 2-D weight's are, so each expert's rows start at a 32-row group; a 3-D Q4_1 tensor takes the q4_1 min layout,
-// and is plain under FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu (2-D Q4_1 keeps the Q8_0 route either way); a 3-D Q4_0 tensor
+// one 2-D weight's are, so each expert's rows start at a 32-row group; a 3-D Q4_1 tensor takes the q4_1 min layout
+// (2-D Q4_1 keeps the Q8_0 route); a 3-D Q4_0 tensor
 // takes the q4_0s layout unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain (2-D Q4_0 keeps q4_0 32x256). A 4-D tensor
 // never has a layout.
 // A view is stored the way its view_src is; it never has a layout of its own. llama.cpp's cache tensors (named
@@ -53,25 +53,15 @@ void spacemit_tensor_write(ggml_tensor * t, const void * data, size_t offset, si
 void spacemit_tensor_read(const ggml_tensor * t, void * data, size_t offset, size_t size);
 void spacemit_tensor_fill(ggml_tensor * t, uint8_t value, size_t offset, size_t size);
 
-// FLAGOS_SPACEMIT_EXPERT_Q4_1 as parsed: 0 cpu (a 3-D Q4_1 weight has no layout, so MUL_MAT_ID refuses it and the
-// node stays on the CPU), 1 exact (unset or empty, the default: the q4_1 min layout). Read at registration too, so a
-// bad value's warning shows
-uint32_t spacemit_expert_q4_1();
-
 // FLAGOS_SPACEMIT_EXPERT_Q4_0 as parsed: 1 m8 (unset, empty or m8, the default: a 3-D Q4_0 weight in the q4_0s layout,
 // MUL_MAT_ID with the fork's kernels on an expert's rows in groups of 8, then one of 4 and single rows), 0 plain (q4_0
 // 32x256 and the kernels before it, the fallback). Read at registration too, so a bad value's warning shows
 uint32_t spacemit_expert_q4_0();
 
-// FLAGOS_SPACEMIT_REPACK_THREADS as parsed (1 to 16): the threads a whole-weight repack may use. Read at registration
-// too, as spacemit_embd_read_switch, so a bad value's warning shows
-uint32_t spacemit_repack_threads();
 // test-only: the repacks since the last call that ran on several threads (on either route), and the most ranges one of
-// them used. flagos-check-spacemit checks FLAGOS_SPACEMIT_REPACK_THREADS by it
+// them used. flagos-check-spacemit checks the repack's ranges by it
 void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges);
-// FLAGOS_SPACEMIT_REPACK_VIA as parsed: 0 threads, 1 x100 (only in a build with spine-runtime, where it is the
-// default). Read at registration too, so a bad value's warning shows
-uint32_t spacemit_repack_via();
-// test-only: under x100 since the last call, the weights repacked through an admitted launch, those that fell back to
-// the calling thread (no cores, no stream, launch refused), and the ranges run again on the calling thread
+// test-only: with spine-runtime (the X100 route) since the last call, the weights repacked through an admitted launch,
+// those that fell back to the calling thread (no cores, no stream, launch refused), and the ranges run again on the
+// calling thread
 void spacemit_repack_x100_take(uint64_t * through_stream, uint64_t * not_through, uint64_t * reran);

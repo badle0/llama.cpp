@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // spine-runtime's X100 backend ("spacemit-k3-x100", tiles on the X100 cores) for load-time work, the weight repack
-// under FLAGOS_SPACEMIT_REPACK_VIA=x100, its default here (plan.md "Repack on spert's X100 backend"). Without
+// (plan.md "Repack on spert's X100 backend"). Without
 // spine-runtime in the build both are trivial: no cores, and every index on the calling thread.
 
 // the backend's cores (backend_info num_cores), looked up once per process; 0 when the backend is invalid or the build

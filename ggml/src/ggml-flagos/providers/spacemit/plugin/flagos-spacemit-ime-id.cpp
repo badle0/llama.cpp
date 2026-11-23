@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -92,8 +91,7 @@ mmid_dims mmid_dims_of(const ggml_tensor * node) {
     d.b_row_bytes = (int64_t) d.f->weight_row_bytes((size_t) d.k);
     d.sgroups     = d.f->gemm_group != nullptr;
     d.g_rows      = d.sgroups ? 8 : row_align;
-    // a row per activation row (one token, or rows) or a row per pair, whichever is larger: the size must not depend on
-    // the setting
+    // a row per activation row (one token) or a row per pair, whichever is larger
     size_t act = (size_t) (std::max(d.ne11, d.n_ids) * d.ne12 * d.a_row_bytes);
     d.g8_bytes = d.g4_bytes = d.g1_bytes = 0;
     if (d.sgroups) {
@@ -114,41 +112,6 @@ mmid_dims mmid_dims_of(const ggml_tensor * node) {
     d.gather_bytes = GGML_PAD((size_t) (d.g_rows * d.k) * sizeof(float), 64);
     d.tile_bytes   = d.group_bytes + d.gather_bytes + GGML_PAD((size_t) (d.g_rows * nb_cols) * sizeof(float), 64);
     return d;
-}
-
-// FLAGOS_SPACEMIT_MMID: staged (unset or empty, the default): several tokens group the pairs by expert and stage each
-// 32-column weight slab through TCM, with the expert's quantized rows beside it where they fit; grouped: the same
-// grouping and the same kernel calls with the slabs read from DRAM, so the same bytes; rows: one 1-row kernel call per
-// (pair, slab) from DRAM, the path before the grouping, for any token count. Parsed once (spacemit_cached_switch; the
-// check program resets between its settings); anything else warns once per parse generation and keeps the default.
-// Both steps read it, so a change between them (not something llama.cpp does) would leave the activations in a layout
-// the multiply does not expect
-enum class mmid_setting { staged, grouped, rows };
-
-int parse_mmid_setting() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_MMID");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "staged") == 0) {
-        return (int) mmid_setting::staged;
-    }
-    if (std::strcmp(v, "grouped") == 0) {
-        return (int) mmid_setting::grouped;
-    }
-    if (std::strcmp(v, "rows") == 0) {
-        return (int) mmid_setting::rows;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_MMID=%s: not staged, grouped or rows, the default (staged) kept\n", __func__,
-                      v);
-    }
-    return (int) mmid_setting::staged;
-}
-
-mmid_setting mmid_setting_from_env() {
-    static std::atomic<int>      value{ 0 };
-    static std::atomic<uint32_t> seen{ 0 };
-    return static_cast<mmid_setting>(spacemit_cached_switch(value, seen, parse_mmid_setting));
 }
 
 // the queue's counter: after the tiles' parts, at the workspace's end, on a cache line of its own when the workspace is
@@ -307,14 +270,14 @@ float * out_row(const ggml_tensor * node, const mmid_row & r, int64_t n0) {
 
 // the activations (one row per activation row, or one per pair, whichever is larger), then one grouping, one gathered
 // group and one result slab per tile for SPACEMIT_MAX_TILES tiles, each padded to a cache line, then a cache line for
-// the queue's counter. It must not depend on the setting: the steps of one node may not all see the same value. The
-// q4_0s layout's packed groups take the activations' part at the worst of both arms (mmid_dims_of)
+// the queue's counter. The q4_0s layout's packed groups take the activations' part at the worst of both arms
+// (mmid_dims_of)
 size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
     const mmid_dims d = mmid_dims_of(node);
     return d.act_bytes + SPACEMIT_MAX_TILES * d.tile_bytes + 64;
 }
 
-// step 1: quantize the activations into the workspace's first part. One token (or rows): every activation row (ne11 per
+// step 1: quantize the activations into the workspace's first part. One token: every activation row (ne11 per
 // token) once, in the 1-row form, at row i11 + i12 * ne11; one row: the tiles split its K blocks, as mul_mat.quantize
 // does. Several tokens: one row per (token, slot) pair, at the pair's place in the grouping's order, so that an
 // expert's rows are consecutive; the 4 rows of a group are stored interleaved for the 4-row kernel, which wants them
@@ -327,7 +290,7 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
     const bool            reference = mm_use_reference();
     const ggml_tensor *   x         = node->src[1];
     uint8_t *             qa        = static_cast<uint8_t *>(tile.workspace);
-    const bool            by_pair   = d.ne12 > 1 && mmid_setting_from_env() != mmid_setting::rows;
+    const bool            by_pair   = d.ne12 > 1;
 
     if (by_pair) {
         const size_t needed = spacemit_mul_mat_id_workspace(node);
@@ -446,25 +409,24 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
 
 // step 2: multiply. Every tile groups the pairs by expert (group_rows) in its own part of the workspace, from the ids
 // alone, so all tiles hold the same lists.
-// One token (or rows): the units are (pair j, 32 columns c), numbered j * (N / 32) + c in the grouping's order and
+// One token: the units are (pair j, 32 columns c), numbered j * (N / 32) + c in the grouping's order and
 // dealt as contiguous ranges; each run of one pair's columns is one 1-row kernel call on the expert's rows.
 // Several tokens: the units are (active expert e, 32-column slab s), expert-major, each weighted by the expert's rows
 // plus the slab (slab_weight). An expert's slabs are cut into chunks of about a 16th of a tile's share of the weight
 // (mmid_chunks), which the tiles claim in order from the counter that tile 0 of step 1 reset. A slab belongs to one
 // tile, so an expert's weights are read once per node. For a unit the tile multiplies the slab by every group of the
 // expert: a group of 4 into a 4 x 32 temporary whose rows are then scattered to their output rows, a single straight to
-// its output row. With TCM (staged) the slab is copied there once per unit and the expert's quantized rows once per run
+// its output row. With TCM the slab is copied there once per unit and the expert's quantized rows once per run
 // of the expert's units where they fit beside it; a slab is copied whatever the group count, since staging a slab is
 // also faster for one kernel call (plan.md "1-row matmul bandwidth"). The q4_0s layout: the expert's packed groups
 // (groups of 8, a group of 4, single rows, walked in order), a group of 8 or 4 into the 8 x 32 temporary, whose rows
 // are then scattered.
 // Either way every output element comes from one kernel call on one (group or pair, slab), so neither the tile count
-// nor the staging can change it
+// nor the staging can change it; without TCM (or too little of it) the slabs are read from DRAM
 bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) {
     const spacemit_tile & tile      = *tile_p;
     const mmid_dims       d         = mmid_dims_of(node);
     const bool            reference = mm_use_reference();
-    const mmid_setting    setting   = mmid_setting_from_env();
     const size_t          needed    = spacemit_mul_mat_id_workspace(node);
     if (tile.nth == 0 || tile.nth > SPACEMIT_MAX_TILES || tile.workspace == nullptr || tile.workspace_size < needed) {
         GGML_LOG_ERROR("FlagOS SpacemiT: mul_mat_id.gemm needs %zu workspace bytes for %u tiles, has %zu\n", needed,
@@ -485,7 +447,7 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     const int64_t         nth     = tile.nth;
     const int64_t         per     = d.n / nb_cols;  // 32-column slabs of an expert
 
-    if (d.ne12 == 1 || setting == mmid_setting::rows) {
+    if (d.ne12 == 1) {
         const int64_t n_pairs = d.n_ids * d.ne12;
         const int64_t units   = n_pairs * per;
         const int64_t u_end   = units * (tile.ith + 1) / nth;
@@ -517,7 +479,7 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
         d.sgroups && tile.tcm != nullptr ? sgroup_base(tile.tcm, d) : static_cast<uint8_t *>(tile.tcm);
     const int64_t   tcm_lost   = tcm != nullptr ? (int64_t) (tcm - static_cast<uint8_t *>(tile.tcm)) : 0;
     const int64_t   tcm_size   = std::max<int64_t>(0, (int64_t) tile.tcm_size - tcm_lost);
-    const bool      stage      = setting == mmid_setting::staged && tcm != nullptr && tcm_size >= slab_bytes;
+    const bool      stage      = tcm != nullptr && tcm_size >= slab_bytes;
     const int64_t   act_align  = d.sgroups ? (int64_t) d.f->group_align : 64;
     if (d.sgroups) {
         sgroup_offsets(d, w);

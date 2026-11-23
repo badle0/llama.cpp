@@ -3,7 +3,7 @@
 # toolchain. Apple clang parses for riscv64 with RVV, using rvv-syntax/riscv_vector.h (Apple clang ships without it)
 # and the macOS SDK headers presented as Apple's. It checks types, intrinsic names and signatures and template
 # instantiations; nothing is assembled or linked, so the K3 build (GCC 15) is still the real test.
-# Usage (any directory): docs/flagos-k3/scripts/rvv-syntax-check.sh [file.cpp ...]   (default: the kernel files)
+# Usage (any directory): docs/flagos-k3/scripts/rvv-syntax-check.sh [file.cpp ...]   (default: the plugin's .cpp files)
 # File names are relative to the provider directory, as plugin/flagos-spacemit-exec.cpp.
 # SPERT_INCLUDE=<dir with spert.hpp> also checks the spine-runtime code (-DGGML_FLAGOS_SPACEMIT_SPERT -I<dir>), as
 # plugin/flagos-spacemit-exec.cpp, -weights.cpp and -x100.cpp have it on the K3.
@@ -15,7 +15,7 @@ if [ -n "${SPERT_INCLUDE:-}" ] && [ ! -f "$SPERT_INCLUDE/spert.hpp" ]; then
   echo "SPERT_INCLUDE=$SPERT_INCLUDE: no spert.hpp there" >&2
   exit 1
 fi
-[ $# -gt 0 ] || set -- plugin/flagos-spacemit-rvv-kernels.cpp plugin/flagos-spacemit-kernels.cpp plugin/flagos-spacemit-ime-kernels.cpp plugin/flagos-spacemit-ime.cpp plugin/flagos-spacemit-rvv-attn.cpp plugin/flagos-spacemit-attn.cpp
+[ $# -gt 0 ] || set -- plugin/flagos-spacemit-rvv-kernels.cpp plugin/flagos-spacemit-kernels.cpp plugin/flagos-spacemit-ime-kernels.cpp plugin/flagos-spacemit-ime.cpp plugin/flagos-spacemit-rvv-attn.cpp plugin/flagos-spacemit-attn.cpp plugin/flagos-spacemit-gdn.cpp plugin/flagos-spacemit-seq.cpp plugin/flagos-spacemit-moe.cpp plugin/flagos-spacemit-ime-id.cpp plugin/flagos-spacemit-weights.cpp plugin/flagos-spacemit-plugin.cpp plugin/flagos-spacemit-exec.cpp plugin/flagos-spacemit-x100.cpp
 status=0
 for f in "$@"; do
   log="$LOGS/rvv-syntax-$(basename "$f").log"

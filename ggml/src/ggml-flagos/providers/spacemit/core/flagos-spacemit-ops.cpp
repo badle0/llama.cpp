@@ -378,12 +378,9 @@ static bool spacemit_get_rows_block_type(ggml_type type) {
 // GET_ROWS of quantized rows by I32 indices into F32 rows (the token embedding, src/llama-graph.cpp build_inp_embd):
 // contiguous rows of whole blocks, shaped as ggml-cpu's get_rows_q asserts, stored as ggml's blocks. A host buffer
 // holds them so; the layout rule answers for our buffer (and for a weight not allocated yet), where an IME layout is
-// refused. FLAGOS_SPACEMIT_EMBD=cpu refuses every such lookup (spacemit_embd_on_cpu)
+// refused
 static bool spacemit_get_rows_quant_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
                                               ggml_backend_buffer_type_t) {
-    if (spacemit_embd_on_cpu()) {
-        return false;
-    }
     const ggml_tensor *         src    = op->src[0];
     const ggml_tensor *         idx    = op->src[1];
     const ggml_backend_buffer_t buffer = src->view_src != nullptr ? src->view_src->buffer : src->buffer;
@@ -430,7 +427,7 @@ static bool spacemit_mul_mat_ime_supported(const ggml_tensor * op, const spacemi
 
 // MUL_MAT_ID (the experts' matmuls, src/llama-graph.cpp build_moe_ffn): the experts' weight [K, N, n_expert] in an IME
 // layout, so in our buffer, never a view (the layout rule gives a 3-D weight one when each expert's N rows are whole
-// 32-row groups, but to no 3-D Q4_1 weight under FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu); F32 activations [K, ne11,
+// 32-row groups); F32 activations [K, ne11,
 // n_tokens] (ne11 1, broadcast, or n_used) and the F32 output contiguous; I32 ids [n_used, n_tokens] with any strides
 // (build_moe_ffn's are a view of ARGSORT's output, ggml_argsort_top_k). ggml_mul_mat_id asserts the shapes. As for
 // MUL_MAT the answer does not depend on the token count: llama.cpp asks once per weight, at load, with 512 tokens

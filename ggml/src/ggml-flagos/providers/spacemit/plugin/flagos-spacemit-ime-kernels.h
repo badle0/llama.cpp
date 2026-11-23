@@ -9,7 +9,7 @@
 //   Q8_0 lossless (a byte permutation); from Q4_1 and Q6_K requantized at load, per 32 values scale = max|w| / 127
 //   (stored in fp16), so each weight moves by about half a Q8_0 step at most (20 and 26.25 bytes per 32 weights become
 //   34); from Q5_0 exactly, its scale kept and qs = q - 16 (22 bytes per 32 weights become 34).
-// - "q4_1 min 32x256" (3-D Q4_1 experts, unless FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu): each 32-row tile is the q4_0 32x256
+// - "q4_1 min 32x256" (3-D Q4_1 experts): each 32-row tile is the q4_0 32x256
 //   form of the Q4_1 d and nibbles, then the tile's fp16 minimums, [K/32 block][32 rows]. A weight d q + m is
 //   d (q - 8) + (m + 8 d): the q4_0 kernels give the first part, q4_1_min_gemm adds the second. Lossless, 20 bytes per
 //   32 weights as Q4_1; the activations are the q4_0 layout's.

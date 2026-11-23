@@ -27,45 +27,11 @@ namespace {
 // ROPE's table). The RVV kernels take the same (spacemit_rvv_attn::supported_shape; above 128 in segments)
 constexpr int64_t max_head_size = 256;
 
-// ggml-cpu's tile size (ggml_fa_tile_config::Q, as in ime.cpp): its tiled kernel from this many tokens per head, and
-// the largest value of FLAGOS_SPACEMIT_ATTN_TILED
-constexpr int64_t tiled_min_rows = 64;
-
+#if defined(GGML_FLAGOS_SPACEMIT_RVV)
 // the tiled kernel from this many tokens per call, the default since T1 step 2 (measured on the K3 2026-11-11, plan.md
 // "T1 spec"); 2-8 tokens go to the KV-head split before this kernel is reached
-constexpr int64_t tiled_default_rows = 9;
-
-// FLAGOS_SPACEMIT_ATTN_TILED=<n> (plan.md "T1 spec"), for comparisons: the tiled kernel from n tokens per call, n
-// decimal digits only, 1 to 64 (64: the kernels before T1); unset or empty: tiled_default_rows. Parsed once
-// (spacemit_cached_switch); anything else keeps the default with a warning, once per parse generation rather than per
-// process, so that the check program sees each bad value's, and once only when two tiles parse in the same generation
-int parse_tiled_setting() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_ATTN_TILED");
-    if (v == nullptr || *v == '\0') {
-        return (int) tiled_default_rows;
-    }
-    int64_t      n = 0;
-    const char * c = v;
-    for (; *c >= '0' && *c <= '9' && n <= tiled_min_rows; ++c) {  // stops past 64, so no overflow
-        n = n * 10 + (*c - '0');
-    }
-    if (*c == '\0' && n >= 1 && n <= tiled_min_rows) {
-        return (int) n;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };  // the generation last warned in; generations start at 1
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ATTN_TILED=%s: not a token count from 1 to 64, the default %lld kept\n",
-                      __func__, v, (long long) tiled_default_rows);
-    }
-    return (int) tiled_default_rows;
-}
-
-int tiled_setting_from_env() {
-    static std::atomic<int>      value{ 0 };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_tiled_setting);
-}
+constexpr int64_t tiled_rows = 9;
+#endif
 
 // test-only (spacemit_attn_paths_take): the calls of spacemit_kernel_flash_attn by the kernel its tile 0 ran
 std::atomic<uint64_t> g_attn_tiled{ 0 }, g_attn_one_chunk{ 0 }, g_attn_reference{ 0 };
@@ -620,15 +586,13 @@ bool spacemit_kernel_flash_attn(const spacemit_tile * tile_p, ggml_tensor * dst)
     if (ir0 >= ir1) {
         return true;
     }
-    // read on the reference path too, so that a bad value is reported there (the check program's values on the Mac)
-    const int64_t tiled_from = tiled_setting_from_env();
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     // the copied kernels need VLEN 1024, read on the core that runs them (ime.cpp checks the same); the tiled kernel
     // keeps its scratch in TCM, the one-chunk kernels use TCM when there is some and otherwise go row by row
     const int64_t DK = dst->src[1]->ne[0];
     const int64_t DV = dst->src[2]->ne[0];
     if (!spacemit_use_reference() && __riscv_vlenb() == 128 && spacemit_rvv_attn::supported_shape(DK, DV)) {
-        if (q->ne[1] >= tiled_from && tile.tcm != nullptr &&
+        if (q->ne[1] >= tiled_rows && tile.tcm != nullptr &&
             tile.tcm_size >= spacemit_rvv_attn::tiled_scratch_bytes(DK, DV)) {
             if (tile.ith == 0) {
                 g_attn_tiled.fetch_add(1, std::memory_order_relaxed);
@@ -642,8 +606,6 @@ bool spacemit_kernel_flash_attn(const spacemit_tile * tile_p, ggml_tensor * dst)
         }
         return true;
     }
-#else
-    (void) tiled_from;
 #endif
     if (tile.ith == 0) {
         g_attn_reference.fetch_add(1, std::memory_order_relaxed);
@@ -660,7 +622,6 @@ int spacemit_flash_attn_split(const ggml_tensor * op) {
 void spacemit_flash_attn_read_switch() {
     (void) split_setting_from_env();
     (void) kvh_setting_from_env();
-    (void) tiled_setting_from_env();
 }
 
 void spacemit_attn_paths_take(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference) {

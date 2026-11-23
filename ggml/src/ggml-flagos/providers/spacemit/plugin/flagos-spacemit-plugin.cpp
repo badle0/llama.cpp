@@ -104,7 +104,7 @@ bool spacemit_ai_gate_available() {
 
 //
 // memory: host memory on huge pages where the system has them, else 64-byte aligned; Q4_0, Q4_1, Q8_0, Q6_K and Q5_0
-// matmul weights (2-D, and 3-D experts; a 3-D Q4_1 one not under FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu) are stored in IME
+// matmul weights (2-D, and 3-D experts) are stored in IME
 // layouts (flagos-spacemit-weights.h), a Q4_1, Q6_K or Q5_0 weight in more than ggml_nbytes
 // (tensor_alloc_size). set, get and fill work in ggml's layout within ggml_nbytes; only the repack and its inverse
 // touch the stored bytes beyond it.
@@ -170,12 +170,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     *dev = d;
     // the plugin's own switch, read at registration: first read in llama.cpp's trial load, its warning would be hidden
     spacemit_flash_attn_read_switch();
-    spacemit_embd_read_switch();
-    (void) spacemit_repack_threads();
-    (void) spacemit_repack_via();
-    (void) spacemit_expert_q4_1();
     (void) spacemit_expert_q4_0();
-    spacemit_gdn_read_switch();
     return SPACEMIT_STATUS_SUCCESS;
 }
 
@@ -472,14 +467,8 @@ void * plugin_get_proc_address(const char * name) {
     if (std::strcmp(name, "spacemit_gdn_paths_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_gdn_paths_take_fn>(spacemit_gdn_paths_take));
     }
-    if (std::strcmp(name, "spacemit_repack_threads") == 0) {
-        return reinterpret_cast<void *>(static_cast<spacemit_repack_threads_fn>(spacemit_repack_threads));
-    }
     if (std::strcmp(name, "spacemit_repack_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_repack_take_fn>(spacemit_repack_take));
-    }
-    if (std::strcmp(name, "spacemit_repack_via") == 0) {
-        return reinterpret_cast<void *>(static_cast<spacemit_repack_via_fn>(spacemit_repack_via));
     }
     if (std::strcmp(name, "spacemit_repack_x100_take") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_repack_x100_take_fn>(spacemit_repack_x100_take));

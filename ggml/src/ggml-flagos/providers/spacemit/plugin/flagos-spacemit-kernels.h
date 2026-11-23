@@ -13,9 +13,10 @@
 // cores, to tell a ported-kernel error from an orchestration error; hosts without the K3 kernels always use them
 bool spacemit_use_reference();
 
-// test-only: the kernels' environment switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD, GDN_PREFILL; the repack's REPACK_THREADS and REPACK_VIA) are parsed once and cached, not
-// read at every call on every tile (S1 step 2b, 2026-10-30). The check program, which flips them inside one process
-// (env_override), calls spacemit_switches_reset, by name through get_proc_address, so the next read parses again
+// test-only: the plugin's environment switches (FLAGOS_SPACEMIT_MM, ATTN, ATTN_KVH, EXPERT_Q4_0) are parsed once and
+// cached, not read at every call on every tile (S1 step 2b, 2026-10-30). The check program, which flips them inside
+// one process (env_override), calls spacemit_switches_reset, by name through get_proc_address, so the next read parses
+// again
 uint32_t spacemit_switches_generation();
 void     spacemit_switches_reset();
 
@@ -42,11 +43,8 @@ bool spacemit_kernel_cpy_f32(const spacemit_tile * tile, ggml_tensor * dst);    
 bool spacemit_kernel_scale_f32(const spacemit_tile * tile, ggml_tensor * dst);  // F32 rows, bias 0
 bool spacemit_kernel_get_rows_f32(const spacemit_tile * tile, ggml_tensor * dst);
 bool spacemit_kernel_get_rows_quant(const spacemit_tile * tile, ggml_tensor * dst);  // quantized rows into F32
-// reads FLAGOS_SPACEMIT_EMBD (rvv or ggml's dequantizers) at registration, as spacemit_flash_attn_read_switch
-void spacemit_embd_read_switch();
-// test-only: the calls of spacemit_kernel_get_rows_quant since the last call by the kernel that ran (counted by tile
-// 0): the RVV Q6_K kernel, ggml's dequantizers. flagos-check-spacemit checks FLAGOS_SPACEMIT_EMBD by it
-void spacemit_embd_paths_take(uint64_t * rvv, uint64_t * ggml);
+// test-only: the calls of spacemit_kernel_get_rows_quant since the last call (counted by tile 0)
+void spacemit_embd_paths_take(uint64_t * calls);
 bool spacemit_kernel_swiglu_f32(const spacemit_tile * tile, ggml_tensor * dst);
 
 // ROPE keeps one row of cos/sin values per tile in the workspace

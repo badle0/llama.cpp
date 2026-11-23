@@ -27,35 +27,6 @@ static bool spacemit_is_cache_name(const char * name) {
 
 namespace {
 
-enum expert_q4_1 : int { expert_q4_1_cpu = 0, expert_q4_1_exact = 1 };
-
-// FLAGOS_SPACEMIT_EXPERT_Q4_1: how a 3-D Q4_1 weight (the MoE experts) is stored. exact, unset or empty (the default):
-// the q4_1 min layout (lossless). cpu: no layout, so MUL_MAT_ID refuses the node and the CPU runs it.
-// Parsed once (spacemit_cached_switch); anything else warns once per parse generation and keeps the default.
-// A weight's layout is decided at its load, so a process is assumed not to change this switch after its first weight:
-// every reader (the allocation size, the repack, the read-back, the claims) must see one value
-int parse_expert_q4_1() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_EXPERT_Q4_1");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "exact") == 0) {
-        return expert_q4_1_exact;
-    }
-    if (std::strcmp(v, "cpu") == 0) {
-        return expert_q4_1_cpu;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_EXPERT_Q4_1=%s: not exact or cpu, the default (exact) kept\n", __func__, v);
-    }
-    return expert_q4_1_exact;
-}
-
-int expert_q4_1_from_env() {
-    static std::atomic<int>      value{ expert_q4_1_exact };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_expert_q4_1);
-}
-
 enum expert_q4_0 : int { expert_q4_0_plain = 0, expert_q4_0_m8 = 1 };
 
 // FLAGOS_SPACEMIT_EXPERT_Q4_0 (plan.md "The Q4_0 experts: the fork's signed layout and 8-row kernel"): how a 3-D Q4_0
@@ -63,7 +34,8 @@ enum expert_q4_0 : int { expert_q4_0_plain = 0, expert_q4_0_m8 = 1 };
 // and the fork's kernels, an expert's rows in groups of 8, then one of 4 and single rows. plain: q4_0 32x256 and the
 // 4-row and 1-row kernels before it, the fallback until the K3 has confirmed the default. Parsed once
 // (spacemit_cached_switch); anything else, pad8 (a removed arm) included, warns once per parse generation and keeps
-// the default. Decided at a weight's load, as FLAGOS_SPACEMIT_EXPERT_Q4_1
+// the default. A weight's layout is decided at its load, so a process is assumed not to change this switch after its
+// first weight: every reader (the allocation size, the repack, the read-back, the claims) must see one value
 int parse_expert_q4_0() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_EXPERT_Q4_0");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "m8") == 0) {
@@ -88,10 +60,6 @@ int expert_q4_0_from_env() {
 
 }  // namespace
 
-uint32_t spacemit_expert_q4_1() {
-    return (uint32_t) expert_q4_1_from_env();
-}
-
 uint32_t spacemit_expert_q4_0() {
     return (uint32_t) expert_q4_0_from_env();
 }
@@ -99,8 +67,8 @@ uint32_t spacemit_expert_q4_0() {
 // a 3-D tensor (MUL_MAT_ID's experts, [K, N, n_expert]) is stored as its ggml_nrows rows in 32-row groups, each
 // expert's N rows whole groups (N % 32 == 0), so expert e's rows start at row e * N. Q4_1 takes the Q8_0 route in 2-D
 // only: the requantization's read-back is the nearest Q4_1, on which test-backend-ops' MUL_MAT_ID cases fail under
-// imatrix quantization (NMSE about 6e-4 against 5e-4). A 3-D Q4_1 weight takes the q4_1 min layout (lossless); under
-// FLAGOS_SPACEMIT_EXPERT_Q4_1=cpu it stays plain and MUL_MAT_ID refuses it. A 3-D Q4_0 weight takes the q4_0s layout
+// imatrix quantization (NMSE about 6e-4 against 5e-4). A 3-D Q4_1 weight takes the q4_1 min layout (lossless). A 3-D
+// Q4_0 weight takes the q4_0s layout
 // (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain), a 2-D one never
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[3] != 1 ||
@@ -114,8 +82,7 @@ spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_Q4_1 && t->ne[0] % spacemit_ime::q8_0_k_block == 0 && t->ne[2] == 1) {
         return spacemit_layout::q4_1_q8_0_32x32;
     }
-    if (t->type == GGML_TYPE_Q4_1 && t->ne[2] > 1 && t->ne[0] % spacemit_ime::q4_0_k_block == 0 &&
-        expert_q4_1_from_env() == expert_q4_1_exact) {
+    if (t->type == GGML_TYPE_Q4_1 && t->ne[2] > 1 && t->ne[0] % spacemit_ime::q4_0_k_block == 0) {
         return spacemit_layout::q4_1_min_32x256;
     }
     if (t->type == GGML_TYPE_Q8_0 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {
@@ -157,88 +124,22 @@ static ggml_tensor * spacemit_storage(const ggml_tensor * t, size_t & offset) {
 
 namespace {
 
-constexpr int    repack_max_threads     = 16;
-constexpr int    repack_default_threads = 8;  // T6's rule passed on the K3, 2026-11-12
-constexpr size_t repack_min_bytes       = size_t(1) << 20;  // a smaller weight repacks on the calling thread
+// the ranges (threads) that repack one weight (plan.md "T6 spec"; T6's rule passed on the K3, 2026-11-12)
+constexpr int    repack_threads   = 8;
+constexpr size_t repack_min_bytes = size_t(1) << 20;  // a smaller weight repacks on the calling thread
 
-// FLAGOS_SPACEMIT_REPACK_THREADS=<n> (plan.md "T6 spec"): the host threads that repack one weight, n decimal digits
-// only, 1 to 16; unset or empty: 8. Parsed once (spacemit_cached_switch); anything else keeps the default with a
-// warning, once per parse generation
-int parse_repack_threads() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_REPACK_THREADS");
-    if (v == nullptr || *v == '\0') {
-        return repack_default_threads;
-    }
-    int          n = 0;
-    const char * c = v;
-    for (; *c >= '0' && *c <= '9' && n <= repack_max_threads; ++c) {  // stops past 16, so no overflow
-        n = n * 10 + (*c - '0');
-    }
-    if (*c == '\0' && n >= 1 && n <= repack_max_threads) {
-        return n;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };  // the generation last warned in; generations start at 1
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_THREADS=%s: not a thread count from 1 to 16, the default %d kept\n",
-                      __func__, v, repack_default_threads);
-    }
-    return repack_default_threads;
-}
-
-int repack_threads_from_env() {
-    static std::atomic<int>      value{ repack_default_threads };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_repack_threads);
-}
-
-enum repack_via : int { repack_via_threads = 0, repack_via_x100 = 1 };
-
+// who runs the ranges of a split weight: with spine-runtime in the build the tiles of its X100 backend (plan.md
+// "Repack on spert's X100 backend"; user, 2026-11-14), else std::thread (T6)
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
-constexpr int repack_via_default = repack_via_x100;  // user, 2026-11-14
+constexpr bool repack_on_x100 = true;
 #else
-constexpr int repack_via_default = repack_via_threads;
+constexpr bool repack_on_x100 = false;
 #endif
-
-// FLAGOS_SPACEMIT_REPACK_VIA (plan.md "Repack on spert's X100 backend"): threads: std::thread (T6); x100: the tiles of
-// spine-runtime's X100 backend. Unset or empty: x100 with spine-runtime in the build, threads without. Parsed once
-// (spacemit_cached_switch); x100 without spine-runtime and any other value warn once per parse generation
-int parse_repack_via() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_REPACK_VIA");
-    if (v == nullptr || *v == '\0') {
-        return repack_via_default;
-    }
-    if (std::strcmp(v, "threads") == 0) {
-        return repack_via_threads;
-    }
-#if defined(GGML_FLAGOS_SPACEMIT_SPERT)
-    if (std::strcmp(v, "x100") == 0) {
-        return repack_via_x100;
-    }
-#endif
-    static std::atomic<uint32_t> warned_in{ 0 };
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        if (std::strcmp(v, "x100") == 0) {
-            GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=x100: no spine-runtime in this build, threads kept\n",
-                          __func__);
-        } else {
-            GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_REPACK_VIA=%s: not threads or x100, the default kept\n", __func__, v);
-        }
-    }
-    return repack_via_default;
-}
-
-int repack_via_from_env() {
-    static std::atomic<int>      value{ repack_via_default };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_repack_via);
-}
 
 // test-only (spacemit_repack_take): the repacks that ran on several threads, and the most ranges one of them used
 std::atomic<uint64_t> g_repack_threaded{ 0 }, g_repack_max_ranges{ 0 };
-// test-only (spacemit_repack_x100_take): under x100 the weights repacked through an admitted launch, those that fell
-// back to the calling thread, and the ranges run again on the calling thread
+// test-only (spacemit_repack_x100_take): on the X100 route the weights repacked through an admitted launch, those that
+// fell back to the calling thread, and the ranges run again on the calling thread
 std::atomic<uint64_t> g_repack_x100_through{ 0 }, g_repack_x100_not_through{ 0 }, g_repack_x100_reran{ 0 };
 
 int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, size_t size) {
@@ -279,14 +180,6 @@ void pack_range(void * arg, uint32_t i) {
 
 }  // namespace
 
-uint32_t spacemit_repack_threads() {
-    return (uint32_t) repack_threads_from_env();
-}
-
-uint32_t spacemit_repack_via() {
-    return (uint32_t) repack_via_from_env();
-}
-
 void spacemit_repack_take(uint64_t * threaded, uint64_t * max_ranges) {
     *threaded   = g_repack_threaded.exchange(0);
     *max_ranges = g_repack_max_ranges.exchange(0);
@@ -298,27 +191,27 @@ void spacemit_repack_x100_take(uint64_t * through_stream, uint64_t * not_through
     *reran          = g_repack_x100_reran.exchange(0);
 }
 
-// A weight of several 32-row groups and at least repack_min_bytes is cut into up to FLAGOS_SPACEMIT_REPACK_THREADS
+// A weight of several 32-row groups and at least repack_min_bytes is cut into up to repack_threads
 // ranges of whole groups, each repacked by the same routine on a stand-in tensor of its rows (plan.md "T6 spec"): every
 // routine works group by group, so the bytes are the one-thread bytes. A 3-D weight is cut the same way, on its
 // ggml_nrows rows: a range may span experts, as its rows are one flat list of groups. The first range runs on the
-// calling thread. Under FLAGOS_SPACEMIT_REPACK_VIA=x100 the other ranges are tiles on the X100 backend, at most its
-// cores + 1 ranges, and no thread is started
+// calling thread. With spine-runtime the other ranges are tiles on the X100 backend, at most its cores + 1 ranges,
+// and no thread is started
 static void spacemit_pack(ggml_tensor * t, const void * data) {
     const spacemit_layout layout = spacemit_weight_layout(t);
     const size_t          size   = ggml_nbytes(t);
     const int64_t         nrows  = ggml_nrows(t);
     const int64_t         groups = nrows / (int64_t) spacemit_ime::row_tile;
     const bool            split  = !(layout == spacemit_layout::plain || size < repack_min_bytes || groups <= 1);
-    int64_t               n      = split ? std::min<int64_t>(repack_threads_from_env(), groups) : 1;
-    const bool            x100   = n > 1 && repack_via_from_env() == repack_via_x100;
+    int64_t               n      = split ? std::min<int64_t>(repack_threads, groups) : 1;
+    const bool            x100   = n > 1 && repack_on_x100;
     if (x100) {  // the backend starts (workers, /dev/tcm) at the first such weight
         const uint32_t cores = spacemit_x100_cores();
         if (cores == 0) {
             static std::atomic<bool> warned{ false };
             if (!warned.exchange(true)) {
-                GGML_LOG_WARN("FlagOS SpacemiT: FLAGOS_SPACEMIT_REPACK_VIA=x100: the X100 backend has no cores; "
-                              "weights repack on the calling thread\n");
+                GGML_LOG_WARN("FlagOS SpacemiT: the X100 backend has no cores; weights repack on the calling "
+                              "thread\n");
             }
             g_repack_x100_not_through.fetch_add(1, std::memory_order_relaxed);
             n = 1;

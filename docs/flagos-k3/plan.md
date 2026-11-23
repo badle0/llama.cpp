@@ -3919,7 +3919,7 @@ At 4 tokens the default's three runs spread over 3.8 ms and `plain`'s over 0.9; 
 
 ### The server's checkpoints in a chat turn (spec, 2026-11-23)
 
-**Status:** written 2026-11-23 on the user's word ("start writing spec as your recommended order"; first of three). Not approved. Its run has probably happened already: the blocks of items 104 and 106 skipped their chat stage, which they do only if `~/ck/chat.out` exists on the board; the logs are not on the Mac.
+**Status:** written 2026-11-23 on the user's word ("start writing spec as your recommended order"; first of three). Not approved. Its run has happened: on 2026-11-23 the board's block found `~/ck/chat.out` and skipped the stage. The logs are still not on the Mac (the board left for an upgrade the same day).
 
 **What it is about.** No provider code. For a model with recurrent state llama-server writes context checkpoints and cuts a prompt so that it can write them (item 99; `tools/server/server-context.cpp`, `do_checkpoint`, `checkpoint_offsets`). With `--reasoning-preserve` a chat turn processes only the new question (item 101), and then the checkpoints are most of what is left to save.
 
@@ -3943,7 +3943,7 @@ The price above goes into the same `build.md` paragraph. Whether to adopt is the
 
 ### The dense Q4_0 matmuls: the fork's FP16 path, a reference run first (spec, 2026-11-23)
 
-**Status:** written 2026-11-23 on the user's word (second of three). Part A approved the same day ("agreed to partA"); its run is prepared, the fork's source going to the board as an archive from the Mac (the board's clock is in April, so it is not asked to fetch over TLS). Part B not specified.
+**Status:** written 2026-11-23 on the user's word (second of three). Part A approved the same day ("agreed to partA"). The fork builds on the board; its first measurement ran the fork's plain CPU, because at this commit its backend is off unless `GGML_SPACEMIT_BACKEND=1` is set ("Part A on the board, first attempts" below). The corrected run was started and the board then left for an upgrade; its outcome is not known. Part B not specified.
 
 **What it is about.** The 2-D Q4_0 weights of Qwen3.6-35B-A3B (`attn_qkv`, `attn_gate`, `ssm_out`, `attn_q`, `attn_output`): 1,171 ms of a 5,437 ms graph at 501 tokens (21.5%, item 109), more than the expert multiply. The provider multiplies them with int8 activations, 4 rows a kernel call. SpacemiT's fork multiplies them in FP16, 16 rows a call (its PR #53, read at `mtmd-backend` `b847bf396`; the provider has never run it).
 
@@ -3967,6 +3967,14 @@ The price above goes into the same `build.md` paragraph. Whether to adopt is the
 - The first decision: the fork's layout (one layout for both paths, 5.6% more bytes on the one-row path, which is bound by memory, for the weights concerned) or today's layout with a dequantization of our own (no second layout, one routine not copied).
 - The kernels copied with scalar references beside them; a driver of our own for the K slices, on the provider's executor and its TCM.
 - The rule as for the experts: the check program, the KLD within one error bar, a prompt graph shorter by a set share, nothing slower at one token.
+
+**Part A on the board, first attempts (2026-11-23; from the terminal output the user pasted, the logs not copied to the Mac).**
+- *The source* went as an archive made on the Mac from the commit fetched for item 102 (the download from GitHub broke off); unpacked with every file touched, since the board's clock is in April.
+- *The build:* 173 steps with spine-runtime 0.6.3, the four programs present. The first block's terminal was lost during it; a build under `timeout` is in a process group of its own, which neither a closed terminal nor Ctrl-C reaches.
+- *The fork's backend is off by default at `b847bf396`:* `ggml_backend_spacemit_reg_get_device_count` returns 0 unless the environment has `GGML_SPACEMIT_BACKEND=1` (`ggml-spacemit.cpp:951-962`; not in its build notes, not so at `4e782bc`). Without it `test-backend-ops -b SPACEMIT0` ends with "no device named 'SPACEMIT0' (devices: CPU)", and llama-bench runs the CPU backend while its table still says `SPACEMIT` in the backend column.
+- *What that run measured.* The provider, valid: the dense Q4_0 `MUL_MAT` perf case (4,096 weight rows, K 14,336) 1.14 to 1.17 ms at 1 row and 64.6 to 64.7 ms at 512; pp4 23.21 and 23.44, pp32 59.45 and 60.60, pp128 81.51 and 81.77, pp501 92.14 and 92.35, tg64 9.78 and 9.81 t/s. The fork's CPU backend on 8 threads, not a reference by the project's rule: pp501 5.38 and 5.37, tg64 3.13 and 3.00 t/s; the completion's text the f32 run's.
+- *Seen beside, on accuracy:* that CPU run's KLD against the base is 0.004140 +- 0.000484, maximum 0.140666, the same top token 94.314 +- 1.026%. The base is the one-thread CPU of our build on the same file, so two CPU implementations of this model differ by 0.0041 where the provider differs by 0.0051. By inference most of the provider's KLD on this model is its sensitivity to the order of the arithmetic, not the 8-bit activations; what in the fork's CPU build differs was not isolated (its own comment on Gated DeltaNet reports 0.004 to 0.005 between two orders).
+- *Left on the board:* `~/llama.cpp-smt-b847` (the build that is complete), `~/smt-b847-2` (a second build, stopped), `~/pa`, `~/pa2`, `~/fork-reference` (the CPU run), `~/fork-reference-retry` (the corrected run, state unknown), `~/ck` (the chat run without checkpoints, never copied).
 
 **Risks.** The fork may not build or run on the board at this commit (its dependencies may have moved past 0.6.3 in fact though not in its notes); then Part A is the perf test's cases only if that much builds, or the decision is taken without it. A gain on K 14,336 may not carry to K 2,048 (fewer values a slice); (b) covers that.
 
@@ -4006,6 +4014,43 @@ Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 t
 **Not in this step.** Packing a token's row once for its 8 experts, or once for the gate and up nodes together (item 110's list): a design of its own.
 
 **For the user's word.** (1) Without a switch, compared across sessions, or with a test switch and one more removal: I recommend without, the bytes being unchanged and the op table's waiting column the measure. (2) Its place in the order: it is small, and can run while Part A of the dense spec is on the board.
+
+### The third cleanup: decided switches removed, the conv pair bound (2026-11-23)
+
+**Status:** done on the Mac 2026-11-23 while the board is away for an upgrade (the user: "resume the task of remove redundancy in our code base"; the scope by the user's answers the same day; by the coder subagent in three rounds, the diff read and the checks below rerun by me unless said). Not run on the K3.
+
+**Removed, the winner left as the only behaviour.**
+- `FLAGOS_SPACEMIT_REPACK_THREADS` (8 ranges stay) and `FLAGOS_SPACEMIT_REPACK_VIA` (the X100 route with spine-runtime in the build, threads without; both paths stay).
+- `FLAGOS_SPACEMIT_MMID` (`staged` stays, with its fall-back to the same grouping without TCM; the several-token `rows` form is gone, one token keeps its 1-row path).
+- `FLAGOS_SPACEMIT_ATTN_TILED` (9 stays), `FLAGOS_SPACEMIT_GDN_PREFILL` (`auto` stays: the TCM form, else the chunkwise one, else the recurrence), `FLAGOS_SPACEMIT_SSM_CONV` (the fused pair stays), `FLAGOS_SPACEMIT_STATE` (`direct` stays).
+- `FLAGOS_SPACEMIT_EMBD`: `cpu` and, by the user's word, `rvv` with its code (the RVV Q6_K lookup, 98 lines, and its counter); ggml's dequantizers on the provider stay.
+- `FLAGOS_SPACEMIT_EXPERT_Q4_1`: `cpu` by the user's word; a 3-D Q4_1 weight always takes the `q4_1_min` layout.
+- The plan cache's timing counters on the default path (two or three clock reads a graph); `GGML_FLAGOS_STATS` still reports `plan_lookup_us` and `plan_key_us`, clocked only when it or `GGML_FLAGOS_OP_STATS` is on.
+- In the plugin header's test-only part: two typedefs nothing backs any more, and the lookup counter's second slot.
+- `scripts/embd-experiments.sh`, which existed for the lookup experiment only.
+
+**Kept.** `FLAGOS_SPACEMIT_ATTN`, `ATTN_KVH`, `MM`, `PLAN`, `QUANTIZE`, `EXPERT_Q4_0` (`plain`, the 4-token question), `DISABLE`, the test hooks; the plugin table and its members nothing calls (the user did not take that item); the copied kernels' unreachable branches.
+
+**The conv pair bound (the user: "add item 4").** The fused CONCAT + SSM_CONV pair's convolution output is compared with the CPU within `seq_bound{ 1e-12, 1e-6 }`, the bound the plain SSM_CONV check has had for the RVV kernel since 2026-11-14, for the reference kernels too: a compiler may contract the multiply and add (Apple clang 21 since 2026-11-18, NMSE 3e-15; by inference GCC on the K3 with the reference kernels). The copied state and the other output stay bit for bit against the CPU, and our own paths bit for bit against each other. The check program says "all checks passed" on the Mac again; the six known failures are gone.
+
+**Fixes beside.** `scripts/rvv-syntax-check.sh` checks all 14 plugin files by default (it had left out the files of the Gated DeltaNet, the sequence ops, the router and the expert multiply). `build.md`: the nine switch rows gone, two command blocks with the runner's removed `--milestone` marked historical, and the K3 build's two standing steps written down (`build-dates.sh check`, `STEPS=build` of `t1-experiments.sh`).
+
+**Size.** `core/` and `plugin/`: 110 lines added, 599 removed. The check program: 560 added, 1,257 removed.
+
+**Checks on the Mac.**
+- The check program under the default, `FLAGOS_SPACEMIT_EXPERT_Q4_0=plain`, `GGML_FLAGOS_KERNEL_VARIANTS=0` and `FLAGOS_SPACEMIT_TEST_THREADS=1`: rc 0, "all checks passed". Before the bound's change, 35 of the 58 output lines were today's baseline to the figure and the other 23 were the lines about removed switches or reworded comparisons.
+- The whole `test-backend-ops` sweep 3745/3745 (mine, before the last two small rounds; after them `MUL_MAT_ID` 227/227, `GET_ROWS` 43/43, `SSM_CONV` 45/45, `GATED_DELTA_NET` 36/36, `FLASH_ATTN_EXT` 1794/1794, `MUL_MAT` 32/32); the four other check programs pass.
+- Three models through `llama-completion` (401 prompt tokens, 24 generated; Qwen3.5-0.8B Q4_0 and Q4_K_M, Qwen3-0.6B Q4_0): the text of a build of the unchanged tree, byte for byte, and for Qwen3.5-0.8B the same step list in the op tables.
+- The riscv64 syntax check with its new default list: 14 files, 0 errors.
+- Mutations caught: the repack constant 1 (29 failures), the state step writing to a copy (35), the pair's result times 1 + 1e-4 (6), a tap from the neighbouring channel (6), one element of the copied state a unit in the last place off (11; the coder's five), a 3-D Q4_1 weight left plain (10, then an abort), the pairs never fused (11; mine).
+- Mutations the Mac cannot catch, since the code is RVV-only there: the tiled threshold 64 for 9, the Gated DeltaNet's TCM form forced off. They need the K3.
+
+**What no check reaches any more.** The tiled attention kernel at 1 to 8 tokens; the Gated DeltaNet recurrence at prefill shapes on the K3; the `std::thread` repack in a build with spine-runtime; a repack of 16 ranges. All four are code that only a removed switch value selected, or a fall-back.
+
+**Left knowingly.**
+- `scripts/t1-experiments.sh` is not edited, because every K3 build goes through its `STEPS=build` and it cannot be tried without the board: its other steps still name `FLAGOS_SPACEMIT_ATTN_TILED` and a benchmark that is gone, and would run the default silently. A build script of its own is the clean fix, once the board is back.
+- `scripts/structural-experiments.sh` (its two lookup modes) and `scripts/mem-probe.sh` (one `unset`) still name removed switches.
+- Not tested: anything the K3 alone compiles or runs (the X100 repack route's expectations in the check, the Gated DeltaNet's expected forms on RVV with one new case, the tiled counts at 9 to 63 tokens, `gdn_rvv` after its condition lost the switch).
 
 ### Not planned
 

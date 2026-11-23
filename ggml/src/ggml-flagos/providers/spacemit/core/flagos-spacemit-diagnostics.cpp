@@ -257,54 +257,6 @@ bool spacemit_quantize_shared() {
     return false;
 }
 
-bool spacemit_ssm_conv_fused() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_SSM_CONV");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "fused") == 0) {
-        return true;
-    }
-    if (std::strcmp(v, "split") == 0) {
-        return false;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_SSM_CONV=%s: unknown setting ignored (fused)\n", __func__, v);
-    }
-    return true;
-}
-
-spacemit_state_kind spacemit_state_mode() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_STATE");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "direct") == 0) {
-        return spacemit_state_kind::direct;
-    }
-    if (std::strcmp(v, "copy") == 0) {
-        return spacemit_state_kind::copy;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_STATE=%s: unknown setting ignored (direct)\n", __func__, v);
-    }
-    return spacemit_state_kind::direct;
-}
-
-bool spacemit_embd_on_cpu() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_EMBD");
-    if (v == nullptr || *v == '\0') {
-        return false;
-    }
-    if (std::strcmp(v, "cpu") == 0) {
-        return true;
-    }
-    if (std::strcmp(v, "ggml") == 0 || std::strcmp(v, "rvv") == 0) {  // the plugin's kernel choice
-        return false;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_EMBD=%s: unknown setting ignored\n", __func__, v);
-    }
-    return false;
-}
-
 bool spacemit_op_disabled(enum ggml_op op) {
     if (!g_ops_parsed.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_diag_mutex);

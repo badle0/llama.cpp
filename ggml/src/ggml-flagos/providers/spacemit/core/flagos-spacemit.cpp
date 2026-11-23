@@ -252,9 +252,8 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     // graph is rebuilt). The check still runs at every store, that is on every miss, and on every graph the scheduler
     // did not stamp (uid 0, a miss). The test-only none checks and expands every graph, nothing cached
     const spacemit_plan_mode                    plan_mode = spacemit_plan_mode_get();
-    const bool                                  clocked   = timed || plan_mode != spacemit_plan_mode::none;
     const std::chrono::steady_clock::time_point start =
-        clocked ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     int64_t rows = -1, n_kv = -1;  // the counters' kind of graph: its first matmul's rows, its first attention's KV length
 
     // a MUL_MAT quantizes its activations in step 0 and multiplies them in step 1 (spacemit_find_op). They have their
@@ -269,11 +268,6 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         }
         share = false;
     }
-    // FLAGOS_SPACEMIT_SSM_CONV and FLAGOS_SPACEMIT_STATE: the convolution pairs (spacemit_conv_pair) expanded into
-    // their stashed steps and the state passes (spacemit_state_pass) into their one step, structural decisions, so the
-    // plan cache keeps them under the uid's trust
-    const bool                fuse_conv  = spacemit_ssm_conv_fused();
-    const spacemit_state_kind state_mode = spacemit_state_mode();
     // no plan cache under FLAGOS_SPACEMIT_QUANTIZE=shared (test-only): its sharing decisions read data addresses
     // (spacemit_overlaps), which the key does not cover
     const bool          cached = plan_mode == spacemit_plan_mode::uid_trust && !share;
@@ -281,15 +275,14 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     size_t              scratch_size = 0, act_size = 0;
     ctx->steps.clear();
     ctx->step_names.clear();
-    // the configuration word is the activation-sharing fact (bit 0), FLAGOS_SPACEMIT_SSM_CONV=split (bit 1),
-    // FLAGOS_SPACEMIT_STATE=copy (bit 2) and, above them, the plugin's switch generation, which moves whenever a
-    // kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a plugin switch); a
-    // different word is a miss
+    // the configuration word is the activation-sharing fact (bit 0) and, above it, the plugin's switch generation,
+    // which moves whenever a kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a
+    // plugin switch); a different word is a miss. The convolution pairs (spacemit_conv_pair) and the state passes
+    // (spacemit_state_pass) below are structural decisions, so the plan cache keeps them under the uid's trust
     uint64_t word = 0;
     if (cached) {
         const uint64_t generation = ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
-        word = (generation << 3) | (state_mode == spacemit_state_kind::copy ? 4 : 0) | (fuse_conv ? 0 : 2) |
-               (share ? 1 : 0);
+        word = (generation << 1) | (share ? 1 : 0);
     }
     // the key alone, before the contract check
     spacemit_plan_result plan = spacemit_plan_result::off;
@@ -351,7 +344,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         };
         uint64_t n_pairs = 0, n_passes = 0;
         ctx->conv_role.clear();
-        for (int i = 0; fuse_conv && i < n_nodes; i++) {
+        for (int i = 0; i < n_nodes; i++) {
             if (ggml_graph_node(cgraph, i)->op == GGML_OP_SSM_CONV) {
                 ctx->conv_role.assign((size_t) n_nodes, 0);
                 break;
@@ -372,7 +365,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         // clearing SCALE in, that node gets none either
         ctx->state_role.clear();
         ctx->state_cleared.clear();
-        for (int i = 0; state_mode != spacemit_state_kind::copy && i < n_nodes; i++) {
+        for (int i = 0; i < n_nodes; i++) {
             if (ggml_graph_node(cgraph, i)->op == GGML_OP_GATED_DELTA_NET) {
                 ctx->state_role.assign((size_t) n_nodes, SPACEMIT_STATE_NONE);
                 ctx->state_cleared.assign((size_t) n_nodes, 0);
@@ -439,17 +432,18 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
     // after the contract check; start when a trusted hit skipped it
     const std::chrono::steady_clock::time_point checked =
-        clocked && !trusted ? std::chrono::steady_clock::now() : start;
+        timed && !trusted ? std::chrono::steady_clock::now() : start;
     if (cached && !trusted) {
         // the probe missed: the checked graph's expansion stored, without a second lookup
         ctx->plan.store(cgraph, word, ctx->steps, ctx->step_names, scratch_size, act_size);
     }
     const std::chrono::steady_clock::time_point in_hand =
-        clocked ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // the counters' plan_lookup_us and plan_key_us (GGML_FLAGOS_STATS), clocked only when counted
     const double lookup_us = std::chrono::duration<double, std::micro>(in_hand - start).count();
     const double key_us    = std::chrono::duration<double, std::micro>(in_hand - checked).count();
     if (cached) {
-        spacemit_plan_counters_add(plan, lookup_us, key_us);
+        spacemit_plan_counters_add(plan);
     }
     if (ctx->steps.empty()) {
         return GGML_STATUS_SUCCESS;

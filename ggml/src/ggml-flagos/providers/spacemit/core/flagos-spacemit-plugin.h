@@ -106,8 +106,8 @@ typedef uint64_t (*spacemit_executors_take_fn)(void);
 typedef void (*spacemit_mm_paths_take_fn)(uint64_t * path_a, uint64_t * path_b, uint64_t * path_c);
 // test-only: the one-step attention calls since the last call by the kernel that ran (tiled, one-chunk, reference)
 typedef void (*spacemit_attn_paths_take_fn)(uint64_t * tiled, uint64_t * one_chunk, uint64_t * reference);
-// test-only: the quantized lookups (get_rows.quant) since the last call by the kernel that ran (RVV Q6_K, ggml's)
-typedef void (*spacemit_embd_paths_take_fn)(uint64_t * rvv, uint64_t * ggml);
+// test-only: the quantized lookups (get_rows.quant) since the last call
+typedef void (*spacemit_embd_paths_take_fn)(uint64_t * calls);
 // test-only: the gdn.f32 tile calls that had rows since the last call by the form they ran (reference, RVV fused
 // recurrence, RVV two-pass recurrence, chunkwise prefill, TCM prefill)
 typedef void (*spacemit_gdn_paths_take_fn)(uint64_t * reference, uint64_t * fused, uint64_t * two_pass, uint64_t * chunk,
@@ -117,17 +117,14 @@ typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, st
 // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
 // as MUL_MAT a, so that b can multiply what a's quantize step wrote
 typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
-// test-only: FLAGOS_SPACEMIT_REPACK_THREADS as parsed (1 to 16), and the weight repacks since the last take that ran on
-// several threads with the most ranges one of them used
-typedef uint32_t (*spacemit_repack_threads_fn)(void);
+// test-only: the weight repacks since the last take that ran on several ranges (threads or X100 tiles), and the most
+// ranges one of them used
 typedef void (*spacemit_repack_take_fn)(uint64_t * threaded, uint64_t * max_ranges);
-// test-only: FLAGOS_SPACEMIT_REPACK_VIA as parsed (0 threads, 1 x100; x100 is the default in a build with
-// spine-runtime), and under x100 the weights repacked through an admitted X100 launch, those that fell back to the
-// calling thread and the ranges rerun there since the last take
-typedef uint32_t (*spacemit_repack_via_fn)(void);
+// test-only: with spine-runtime (the X100 route), the weights repacked through an admitted X100 launch, those that
+// fell back to the calling thread and the ranges rerun there since the last take
 typedef void (*spacemit_repack_x100_take_fn)(uint64_t * through_stream, uint64_t * not_through, uint64_t * reran);
-// test-only: the plugin parses its switches (FLAGOS_SPACEMIT_MM, ATTN, EMBD, REPACK_THREADS, REPACK_VIA, GDN_PREFILL) once; a test
-// that changes them inside one process calls this so the next read parses again
+// test-only: the plugin parses its switches (FLAGOS_SPACEMIT_MM, ATTN, ATTN_KVH, EXPERT_Q4_0) once; a test that
+// changes them inside one process calls this so the next read parses again
 typedef void (*spacemit_switches_reset_fn)(void);
 // test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its
 // configuration word, plan.md "S1 step 3 spec"), so a switch that changes the step list cannot reuse a cached plan

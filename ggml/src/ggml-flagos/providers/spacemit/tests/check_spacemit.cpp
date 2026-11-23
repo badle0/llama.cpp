@@ -14,19 +14,17 @@
 //                    (--bench-f32)
 //   --bench-attn     of the benchmarks only flash attention (at one token also FLAGOS_SPACEMIT_ATTN=split and
 //                    one-chunk, against the default; at 2, 3, 4 and 8 tokens FLAGOS_SPACEMIT_ATTN_KVH=off
-//                    against the default), then at 9-64 tokens FLAGOS_SPACEMIT_ATTN_TILED=64 (the kernels before
-//                    T1) against 9, the default (not run by --bench)
+//                    against the default) (not run by --bench)
 //   --bench-mm       of the benchmarks only the matmuls of a Qwen3-4B batch of 2-512 rows under the default
 //                    (fit,staged) against FLAGOS_SPACEMIT_MM=split (the default until 2026-10-25)
 //   --bench-f32      of the benchmarks only the F32 matmul (the router's [2048, 256] at 1, 32, 128 and 501 token rows
 //                    and [2048, 32] at 1 and 501)
 //   --bench-embd     of the benchmarks only the token embedding lookup: one call of 1-512 rows of 1024 and 2560
-//                    columns from 32768, Q6_K by FLAGOS_SPACEMIT_EMBD=ggml against rvv, and the same values as F32
+//                    columns from 32768, Q6_K by ggml's dequantizers, and the same values as F32
 //                    copied by get_rows.f32 (not run by --bench)
 //   --bench-repack   of the benchmarks only the weights' repack at load: one tensor of 2560 columns per layout (Q4_0,
-//                    Q4_1 and Q6_K to Q8_0, Q8_0) with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 and 8, and with
-//                    FLAGOS_SPACEMIT_REPACK_VIA=x100 (its ranges printed; "-" without spine-runtime) (not run by
-//                    --bench)
+//                    Q4_1 and Q6_K to Q8_0, Q8_0) on the build's route (8 threads; with spine-runtime the X100
+//                    stream, its ranges printed) (not run by --bench)
 //   --bench-x100     of the benchmarks only the 1-row matmul beside the X100 cores (head Q6_K 2560x151936, ffn_up
 //                    and ffn_down Q4_0): timed while 4 or 8 threads read another 1 GiB buffer, and split by rows
 //                    between the provider and the CPU backend on 8 or 4 threads; lines "x100bench ...", then
@@ -46,7 +44,7 @@
 #include "ggml.h"
 #include "../ggml-impl.h"  // ggml_cgraph's uid and ggml_graph_view (the plan cache's probes)
 #define GGML_COMMON_DECL_CPP
-#include "../ggml-common.h"  // block_q6_K (the lane model of the RVV lookup and its edge blocks)
+#include "../ggml-common.h"  // block_q6_K (the edge blocks of the Q6_K lookup)
 #include "providers/spacemit/core/flagos-spacemit-diagnostics.h"  // the diagnostics under the deck's names (S1 step 5)
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
 #include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
@@ -110,9 +108,7 @@ static spacemit_switches_reset_fn  g_switches_reset  = nullptr;
 static spacemit_attn_paths_take_fn g_attn_paths_take = nullptr;
 static spacemit_embd_paths_take_fn g_embd_paths_take = nullptr;
 static spacemit_gdn_paths_take_fn  g_gdn_paths_take  = nullptr;
-static spacemit_repack_threads_fn  g_repack_threads  = nullptr;
 static spacemit_repack_take_fn     g_repack_take     = nullptr;
-static spacemit_repack_via_fn      g_repack_via      = nullptr;
 static spacemit_repack_x100_take_fn g_repack_x100_take = nullptr;
 
 static int bind_plugin_names(ggml_backend_dev_t dev) {
@@ -129,16 +125,13 @@ static int bind_plugin_names(ggml_backend_dev_t dev) {
         reinterpret_cast<spacemit_embd_paths_take_fn>(table->get_proc_address("spacemit_embd_paths_take"));
     g_gdn_paths_take =
         reinterpret_cast<spacemit_gdn_paths_take_fn>(table->get_proc_address("spacemit_gdn_paths_take"));
-    g_repack_threads =
-        reinterpret_cast<spacemit_repack_threads_fn>(table->get_proc_address("spacemit_repack_threads"));
     g_repack_take = reinterpret_cast<spacemit_repack_take_fn>(table->get_proc_address("spacemit_repack_take"));
-    g_repack_via  = reinterpret_cast<spacemit_repack_via_fn>(table->get_proc_address("spacemit_repack_via"));
     g_repack_x100_take =
         reinterpret_cast<spacemit_repack_x100_take_fn>(table->get_proc_address("spacemit_repack_x100_take"));
     REQUIRE(g_steps_take != nullptr && g_executors_take != nullptr && g_mm_paths_take != nullptr &&
             g_mm_tail_take != nullptr && g_switches_reset != nullptr && g_attn_paths_take != nullptr &&
-            g_embd_paths_take != nullptr && g_gdn_paths_take != nullptr && g_repack_threads != nullptr && g_repack_take != nullptr &&
-            g_repack_via != nullptr && g_repack_x100_take != nullptr);
+            g_embd_paths_take != nullptr && g_gdn_paths_take != nullptr && g_repack_take != nullptr &&
+            g_repack_x100_take != nullptr);
     return 0;
 }
 
@@ -290,8 +283,7 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
                              "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
                              "spacemit_switches_reset", "spacemit_switches_generation",
                              "spacemit_attn_paths_take", "spacemit_embd_paths_take", "spacemit_gdn_paths_take",
-                             "spacemit_repack_threads", "spacemit_repack_take",
-                             "spacemit_repack_via", "spacemit_repack_x100_take" };
+                             "spacemit_repack_take", "spacemit_repack_x100_take" };
     size_t       n_names = 0;
     for (const char * name : names) {
         n_names += table->get_proc_address(name) != nullptr ? 1 : 0;
@@ -1031,9 +1023,6 @@ constexpr double k_requant_max_nmse = 5e-6;
 // which tensors the provider claims for MUL_MAT: exactly Q4_0, Q4_1, Q8_0 and Q6_K weights in their IME layouts, in its
 // buffer; and what its buffer type allocates for them (Q4_1 and Q6_K are stored as Q8_0)
 static int check_mul_mat_claims(ggml_backend_dev_t dev) {
-    // the default: a 3-D Q4_1 weight takes the q4_1 min layout, so this check's claims and sizes do not depend on the
-    // caller's FLAGOS_SPACEMIT_EXPERT_Q4_1
-    env_override               q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_buffer_type_t buft   = ggml_backend_dev_buffer_type(dev);
     ggml_init_params           params = { ggml_tensor_overhead() * 128, nullptr, true };
     ggml_context *             ctx    = ggml_init(params);
@@ -1161,9 +1150,6 @@ constexpr double k_q4_1_read_max_nmse = 5e-5;
 // set_tensor repacks; get_tensor restores the GGUF bytes (Q4_0, Q8_0) or returns the nearest Q4_1 or Q6_K to the
 // stored Q8_0 values (Q4_1, Q6_K); partial access works (whole writes only for the weights stored as Q8_0)
 static int check_weight_round_trip(ggml_backend_dev_t dev) {
-    // the layouts of the default: a 3-D Q4_1 weight takes the q4_1 min layout, whatever the caller's
-    // FLAGOS_SPACEMIT_EXPERT_Q4_1
-    env_override     q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_init_params params = { ggml_tensor_overhead() * 4, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
     REQUIRE(ctx != nullptr);
@@ -1957,7 +1943,7 @@ constexpr double k_attn_max_row_nmse = 5e-3;
 // when the scores are flat (q's values scaled by 1, as in the case at depth), and by a median 1.3e-3 at 512
 // (simulated); the general bound lets those pass. The other cases' peaked scores (q scaled by 4) can hide one position
 // in a long row even from this bound (median 5e-6 at 4096), not in rows of up to a few hundred. From 64 tokens per
-// call, with TCM, the provider runs the tiled kernel
+// call the CPU runs its tiled kernel too (the provider, with TCM, from 9)
 constexpr double  k_attn_max_row_nmse_tiled = 1e-5;
 constexpr int64_t k_attn_tiled_tokens       = 64;
 
@@ -2109,9 +2095,6 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     // (checked below, where each run sets FLAGOS_SPACEMIT_ATTN_KVH itself)
     env_override one_chunk_switch("FLAGOS_SPACEMIT_ATTN", "one-chunk");
     env_override kvh_off_switch("FLAGOS_SPACEMIT_ATTN_KVH", "off");
-    // and the tiled kernel from 64 tokens, so that the cases keep their kernels and the row bounds by token count
-    // (k_attn_tiled_tokens) stay right under any default of FLAGOS_SPACEMIT_ATTN_TILED (plan.md "T1 spec")
-    env_override tiled_switch("FLAGOS_SPACEMIT_ATTN_TILED", "64");
     double       worst = 0.0;
     uint32_t     seed  = 40;
     for (const attn_case & c : cases) {
@@ -2339,16 +2322,15 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
         n_kvh_direct_same += same;
     }
 
-    // T1 (plan.md "T1 spec"): the tiled kernel below 64 tokens, under FLAGOS_SPACEMIT_ATTN_TILED=1 and the pins above
-    // (KVH off, so 1 to 8 tokens reach the one-step kernel too). Against two references: the CPU on the same call,
-    // within the general bounds (below 64 tokens the CPU runs its one-chunk kernel, which sums V in F16), and the CPU's
-    // tiled kernel on the same call made 64 tokens long, whose first rows are this call's (attn_run draws K and V cell
-    // by cell and q token by token from the seed; the mask hides the added cells from these rows), within the tiled
-    // bound, which catches a missed visible position. The kernel by the counter: the tiled one on the K3, the reference
-    // on the host or under GGML_FLAGOS_KERNEL_VARIANTS=0. A second run must repeat bit for bit; that the output differs
-    // from the one under 64 is counted only. The cases take its edges: 108 rows over 8 tiles (tiles start inside a
-    // head), rows 0-13 of 26 after 50 seeing none of the second KV tile (one mixed group of 4), 1 to 7 tokens (no group
-    // of 4, or one and 1 to 3 rows alone)
+    // T1 (plan.md "T1 spec"): the tiled kernel below 64 tokens, from 9 (the pins above, KVH off, change nothing at
+    // these token counts). Against two references: the CPU on the same call, within the general bounds (below 64 tokens
+    // the CPU runs its one-chunk kernel, which sums V in F16), and the CPU's tiled kernel on the same call made 64
+    // tokens long, whose first rows are this call's (attn_run draws K and V cell by cell and q token by token from the
+    // seed; the mask hides the added cells from these rows), within the tiled bound, which catches a missed visible
+    // position. The kernel by the counter: the tiled one on the K3, the reference on the host or under
+    // GGML_FLAGOS_KERNEL_VARIANTS=0. A second run must repeat bit for bit. The cases take its edges: 108 rows over 8
+    // tiles (tiles start inside a head), rows 0-13 of 26 after 50 seeing none of the second KV tile (one mixed group of
+    // 4)
     const bool         expect_reference = host || reference_label()[0] != '\0';
     const char * const kernel_names[3]  = { "tiled", "one-chunk", "reference" };
     const int          expected_kernel  = expect_reference ? 2 : 0;
@@ -2382,10 +2364,7 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     tiled_cases.push_back({ "every cell hidden, sinks", { 32, 8, 128, 1024, 26, 998 }, attn_mask::causal, 0.0f, 4.0f,
                             0.0f, true, -INFINITY });
     tiled_cases.push_back({ "flat scores at depth", { 32, 8, 128, 4096, 26, 4070 }, attn_mask::causal, 0.0f, 1.0f });
-    for (int64_t n_tokens : { 1, 2, 3, 5, 7 }) {
-        tiled_cases.push_back({ "Qwen3-4B", { 32, 8, 128, 256, n_tokens, 256 - n_tokens } });
-    }
-    int    n_tiled_ran = 0, n_tiled_repeat = 0, n_tiled_differ = 0;
+    int    n_tiled_ran = 0, n_tiled_repeat = 0;
     double e_tiled = 0.0, e_tiled_row = 0.0, e_tiled_row64 = 0.0;
     for (const tiled_case & c : tiled_cases) {
         const uint32_t case_seed = seed++;
@@ -2400,19 +2379,12 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
         REQUIRE(run64.init(dev, s64, c.mode, c.visible, c.max_bias, case_seed, c.q_scale, c.softcap, c.sinks));
         REQUIRE(ggml_backend_graph_compute(cpu, run64.g_cpu) == GGML_STATUS_SUCCESS);
         const int64_t      n = ggml_nelements(run.out);
-        std::vector<float> tiled[2], at64;
+        std::vector<float> tiled[2];
         uint64_t           count[3];
-        {
-            env_override tiled_one("FLAGOS_SPACEMIT_ATTN_TILED", "1");
-            g_attn_paths_take(&count[0], &count[1], &count[2]);
-            REQUIRE(run.dev_output(backend, tiled[0]));
-            g_attn_paths_take(&count[0], &count[1], &count[2]);
-            REQUIRE(run.dev_output(backend, tiled[1]));
-        }
-        {
-            env_override tiled_64("FLAGOS_SPACEMIT_ATTN_TILED", "64");
-            REQUIRE(run.dev_output(backend, at64));
-        }
+        g_attn_paths_take(&count[0], &count[1], &count[2]);
+        REQUIRE(run.dev_output(backend, tiled[0]));
+        g_attn_paths_take(&count[0], &count[1], &count[2]);
+        REQUIRE(run.dev_output(backend, tiled[1]));
         const std::string what = std::string("tiled below 64 tokens, ") + c.what;
         const attn_error  e    = attn_errors(tiled[0].data(), static_cast<const float *>(run.out_ref->data), n,
                                              run.out->ne[0]);
@@ -2445,58 +2417,6 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
             g_failures++;
         }
         n_tiled_repeat += repeat;
-        n_tiled_differ += std::memcmp(tiled[0].data(), at64.data(), n * sizeof(float)) != 0;
-    }
-
-    // the switch's values on one 26-token call (KVH off by the pin): a bad value is warned once and keeps the default;
-    // the kernel by the counter (on the host and under GGML_FLAGOS_KERNEL_VARIANTS=0 the reference for all)
-    const struct {
-        const char * value;
-        bool         tiled, warned;
-    } tiled_values[] = {
-        { nullptr, true, false }, { "", true, false },  { "9", true, false },   { "64", false, false },
-        { "26", true, false },    { "1", true, false }, { "27", false, false }, { "0", true, true },
-        { "65", true, true },     { "9x", true, true }, { "x", true, true },
-    };
-    const auto lines_with = [](const std::string & text, const char * what) {
-        int n = 0;
-        for (size_t at = 0; at < text.size();) {
-            const size_t end = std::min(text.find('\n', at), text.size());
-            n += text.substr(at, end - at).find(what) != std::string::npos;
-            at = end + 1;
-        }
-        return n;
-    };
-    int n_values_ok = 0;
-    {
-        const attn_shape s = { 32, 8, 128, 1024, 26, 998 };
-        attn_run         run;
-        REQUIRE(run.init(dev, s, attn_mask::causal, 0.0f, 0.0f, seed++));
-        for (const auto & v : tiled_values) {
-            env_override       tiled_value("FLAGOS_SPACEMIT_ATTN_TILED", v.value);
-            log_capture        log;
-            std::vector<float> o;
-            uint64_t           count[3];
-            g_attn_paths_take(&count[0], &count[1], &count[2]);
-            REQUIRE(run.dev_output(backend, o));
-            g_attn_paths_take(&count[0], &count[1], &count[2]);
-            const int warnings = lines_with(log.take(), "FLAGOS_SPACEMIT_ATTN_TILED=");
-            const int kernel   = expect_reference ? 2 : v.tiled ? 0 : 1;
-            bool      ok       = warnings == (v.warned ? 1 : 0);
-            for (int k = 0; k < 3; k++) {
-                ok = ok && count[k] == (k == kernel ? 1u : 0u);
-            }
-            if (!ok) {
-                std::fprintf(stderr,
-                             "FAIL: attention FLAGOS_SPACEMIT_ATTN_TILED=%s: %d warning lines (expected %d), counted "
-                             "tiled %llu, one-chunk %llu, reference %llu (expected one %s)\n",
-                             v.value != nullptr ? v.value : "(unset)", warnings, v.warned ? 1 : 0,
-                             (unsigned long long) count[0], (unsigned long long) count[1],
-                             (unsigned long long) count[2], kernel_names[kernel]);
-                g_failures++;
-            }
-            n_values_ok += ok;
-        }
     }
 
     // head sizes above 128 (plan.md "Step 2 spec", B: Qwen3.5's 256; 129 and 192 for the edges). On the K3 the backend
@@ -2521,9 +2441,8 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
         float        max_bias = 0.0f;
         float        softcap  = 0.0f;
         bool         sinks    = false;
-        const char * attn     = nullptr;  // FLAGOS_SPACEMIT_ATTN, FLAGOS_SPACEMIT_ATTN_KVH, FLAGOS_SPACEMIT_ATTN_TILED
-        const char * kvh      = nullptr;  // (nullptr: the default)
-        const char * tiled    = nullptr;
+        const char * attn     = nullptr;  // FLAGOS_SPACEMIT_ATTN, FLAGOS_SPACEMIT_ATTN_KVH (nullptr: the default)
+        const char * kvh      = nullptr;
     };
     const char * const     one_step = "flash_attn";
     const char * const     split_p  = "flash_attn.split.partial_paired";
@@ -2546,10 +2465,10 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
                                attn_mask::none, 0.0f, 0.0f, false, "one-chunk" });
         wide_cases.push_back({ "1 token, ALiBi (max_bias 8) with GQA 4", { 16, 4, d, 256, 1, 255 }, one_step, 1,
                                attn_mask::alibi, 8.0f });
-        wide_cases.push_back({ "7 tokens, KV-head split off, tiled from 64", { 16, 4, d, 256, 7, 249 }, one_step, 1,
-                               causal, 0.0f, 0.0f, false, nullptr, "off", "64" });
-        wide_cases.push_back({ "7 tokens, softcap 2, sinks, KV-head split off, tiled from 64", { 16, 4, d, 256, 7, 249 },
-                               one_step, 1, causal, 0.0f, 2.0f, true, nullptr, "off", "64" });
+        wide_cases.push_back({ "7 tokens, KV-head split off", { 16, 4, d, 256, 7, 249 }, one_step, 1, causal, 0.0f,
+                               0.0f, false, nullptr, "off" });
+        wide_cases.push_back({ "7 tokens, softcap 2, sinks, KV-head split off", { 16, 4, d, 256, 7, 249 }, one_step, 1,
+                               causal, 0.0f, 2.0f, true, nullptr, "off" });
         wide_cases.push_back({ "batch of 26, softcap 2, sinks", { 16, 4, d, 256, 26, 100 }, one_step, 0, causal, 0.0f,
                                2.0f, true });
         wide_cases.push_back({ "batch of 26, no mask", { 16, 4, d, 256, 26, 100 }, one_step, 0, attn_mask::none });
@@ -2577,7 +2496,6 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     for (const wide_case & c : wide_cases) {
         env_override attn_default("FLAGOS_SPACEMIT_ATTN", c.attn);
         env_override kvh_default("FLAGOS_SPACEMIT_ATTN_KVH", c.kvh);
-        env_override tiled_default("FLAGOS_SPACEMIT_ATTN_TILED", c.tiled);
         attn_run     run;
         REQUIRE(run.init(dev, c.s, c.mode, 0.0f, c.max_bias, seed++, 4.0f, c.softcap, c.sinks));
         REQUIRE(ggml_backend_graph_compute(cpu, run.g_cpu) == GGML_STATUS_SUCCESS);
@@ -2685,23 +2603,14 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
                 kvh_cases.size(), e_kvh, k_attn_max_nmse, e_kvh_row, k_attn_max_row_nmse, n_kvh_taken,
                 kvh_cases.size(), n_kvh_differ, kvh_cases.size(), n_kvh_repeat, kvh_cases.size(), n_kvh_direct_same,
                 n_kvh_direct, reference_label());
-    std::printf("attn     tiled kernel below 64 tokens (FLAGOS_SPACEMIT_ATTN_TILED=1, KVH off) on %zu cases (Qwen3-4B "
-                "9-63 tokens at n_kv 256-4096, Qwen3-0.6B, GQA 8 and 1, tiles starting inside a head, a mixed group "
-                "of 4, head size 64, no mask, sinks, softcap, ALiBi with GQA 4, every cell hidden, flat scores at "
-                "depth, 1-7 tokens): vs CPU max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); vs the CPU's "
-                "tiled kernel on 64 tokens worst row %.2e (bound %.0e); the %s ran in %d/%zu; two runs identical in "
-                "%d/%zu; %d/%zu outputs differ from those under 64%s\n",
+    std::printf("attn     tiled kernel below 64 tokens (9-63 tokens, the default) on %zu cases (Qwen3-4B 9-63 tokens "
+                "at n_kv 256-4096, Qwen3-0.6B, GQA 8 and 1, tiles starting inside a head, a mixed group of 4, head "
+                "size 64, no mask, sinks, softcap, ALiBi with GQA 4, every cell hidden, flat scores at depth): vs CPU "
+                "max NMSE %.2e (bound %.0e), worst row %.2e (bound %.0e); vs the CPU's tiled kernel on 64 tokens worst "
+                "row %.2e (bound %.0e); the %s ran in %d/%zu; two runs identical in %d/%zu%s\n",
                 tiled_cases.size(), e_tiled, k_attn_max_nmse, e_tiled_row, k_attn_max_row_nmse, e_tiled_row64,
                 k_attn_max_row_nmse_tiled, expect_reference ? "reference" : "tiled kernel", n_tiled_ran,
-                tiled_cases.size(), n_tiled_repeat, tiled_cases.size(), n_tiled_differ, tiled_cases.size(),
-                reference_label());
-    std::printf("attn     FLAGOS_SPACEMIT_ATTN_TILED values (unset, empty, 9, 64, 26, 1, 27, 0, 65, 9x, x) on a "
-                "26-token call at n_kv 1024: one warning for each of 0, 65, 9x and x and none for the others, the "
-                "kernel by the counter %s, as expected in %d/%zu%s\n",
-                expect_reference ? "the reference for all" :
-                                   "tiled for unset, empty, 9, 26, 1 and the bad values (the default 9 kept), "
-                                   "one-chunk for 64 and 27",
-                n_values_ok, sizeof(tiled_values) / sizeof(tiled_values[0]), reference_label());
+                tiled_cases.size(), n_tiled_repeat, tiled_cases.size(), reference_label());
     std::printf("attn     head sizes 129, 192 and 256 (16 or 32 query and 4 or 8 KV heads; 8 and 2 at 256) on %zu "
                 "cases, the backend on the %s (1 token at n_kv 256-4096: one-chunk 4- and 2-row, ALiBi 1-row, split; "
                 "2-7 tokens: KV-head split 2-16 rows a pass, 1-row with it off; batches of 26, 99 and 128; softcap, "
@@ -2731,116 +2640,114 @@ static int count_lines_with(const std::string & text, const char * what) {
     return n;
 }
 
-// per layout, weights of 32, 64, 96 and 4096 rows of 2560 columns, one group of 65536 columns (over 1 MiB in one
-// group) and three 3-D weights (3 experts of 32 rows of 2560, 8 of 64 and 4 of 512 rows of 2048; Q4_1's in the q4_1
-// min layout, FLAGOS_SPACEMIT_EXPERT_Q4_1 unset), written with FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 3, 8 and 16: the
-// stored bytes (the whole alloc size, past ggml_nbytes for the layouts requantized to Q8_0) and the read-back are the
-// one-thread ones, and by the counter the threads ran, with min(n, groups) ranges, exactly for the weights of at least
-// 1 MiB and several groups. Then a partial
-// write (Q4_0, Q8_0, Q5_0) on 8 threads, and the switch's values. All of it under FLAGOS_SPACEMIT_REPACK_VIA=threads; with
-// spine-runtime (spert) also each weight under x100 against the one-thread bytes. Then FLAGOS_SPACEMIT_REPACK_VIA's
-// values
+// per layout, weights of 32, 64, 96, 1056 and 4096 rows of 2560 columns, 64 and 96 rows of 32768, one group of 65536
+// columns (over 1 MiB in one group) and three 3-D weights (3 experts of 32 rows of 2560, 8 of 64 and 4 of 512 rows of
+// 2048; Q4_1's in the q4_1 min layout), each written whole: by the counters the
+// ranges ran, exactly for the weights of at least 1 MiB and several groups, on min(8, groups) threads without
+// spine-runtime (spert) and through the X100 stream with it (at most its cores + 1 ranges), and for those the stored
+// bytes (the whole alloc size, past ggml_nbytes for the layouts requantized to Q8_0) and the read-back are the
+// one-thread ones: the same rows written piece by piece as weights of one group (3-D: of 2 experts of 32 rows), which
+// repack on the calling thread. Then a partial write (Q4_0, Q8_0, Q5_0) on the same route against the whole write of
+// the patched bytes
 static int check_repack_threads(ggml_backend_dev_t dev, bool spert) {
-    env_override               via_threads("FLAGOS_SPACEMIT_REPACK_VIA", "threads");
-    env_override               q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_buffer_type_t buft    = ggml_backend_dev_buffer_type(dev);
     const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_0 };
     // mats > 1: a 3-D weight of mats experts (MUL_MAT_ID's), cut on its ggml_nrows rows
     const struct {
         int64_t rows, cols, mats;
-    } shapes[] = { { 32, 2560, 1 }, { 64, 2560, 1 },  { 96, 2560, 1 },  { 4096, 2560, 1 },
-                   { 32, 65536, 1 }, { 32, 2560, 3 }, { 64, 2048, 8 }, { 512, 2048, 4 } };
-    const char * values[]  = { "1", "2", "3", "8", "16" };
-    const size_t min_bytes = size_t(1) << 20;
-    int          n_cmp = 0, n_raw_same = 0, n_read_same = 0, n_path = 0, n_path_ok = 0, n_threaded = 0;
-    int          n_x100 = 0, n_x100_same = 0, n_x100_path_ok = 0, n_x100_through = 0;
-    uint64_t     x100_ranges = 0;
-    uint32_t     seed = 71;
+    } shapes[] = { { 32, 2560, 1 },  { 64, 2560, 1 },  { 96, 2560, 1 },  { 1056, 2560, 1 }, { 4096, 2560, 1 },
+                   { 64, 32768, 1 }, { 96, 32768, 1 }, { 32, 65536, 1 }, { 32, 2560, 3 },   { 64, 2048, 8 },
+                   { 512, 2048, 4 } };
+    const size_t  min_bytes = size_t(1) << 20;
+    const int64_t n_threads = 8;
+    int           n_cmp = 0, n_raw_same = 0, n_read_same = 0, n_path = 0, n_path_ok = 0, n_threaded = 0;
+    bool          seen_ranges[9] = {};
+    uint32_t      seed           = 71;
+    // the route of a write: with spert through the X100 stream, 2 to want ranges; else on want threads
+    const auto route_ok = [&](bool split, uint64_t want, uint64_t threaded, uint64_t ranges, uint64_t through,
+                              uint64_t not_through, uint64_t reran) {
+        if (not_through != 0 || reran != 0) {
+            return false;
+        }
+        if (!split) {
+            return threaded == 0 && ranges == 0 && through == 0;
+        }
+        return threaded == 1 &&
+               (spert ? through == 1 && ranges >= 2 && ranges <= want : through == 0 && ranges == want);
+    };
     for (const ggml_type type : types) {
         for (const auto & s : shapes) {
-            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+            ggml_init_params params = { 2 * ggml_tensor_overhead(), nullptr, true };
             ggml_context *   ctx    = ggml_init(params);
             REQUIRE(ctx != nullptr);
-            ggml_tensor * w = ggml_new_tensor_3d(ctx, type, s.cols, s.rows, s.mats);
+            const int64_t piece_mats = s.mats > 1 ? 2 : 1;
+            ggml_tensor * w          = ggml_new_tensor_3d(ctx, type, s.cols, s.rows, s.mats);
+            ggml_tensor * piece      = ggml_new_tensor_3d(ctx, type, s.cols, 32, piece_mats);
             ggml_set_name(w, s.mats > 1 ? "blk.0.ffn_up_exps.weight" : "blk.0.ffn_up.weight");
+            ggml_set_name(piece, ggml_get_name(w));
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
             REQUIRE(buf != nullptr);
             const std::vector<uint8_t> q      = quantize_weights(type, s.cols, s.rows * s.mats, seed++);
             const size_t               alloc  = ggml_backend_buft_get_alloc_size(buft, w);
             const int64_t              groups = s.rows * s.mats / 32;
             const bool                 big    = ggml_nbytes(w) >= min_bytes && groups > 1;
-            std::vector<uint8_t>       raw_ref, read_ref, read(q.size());
-            for (const char * v : values) {
-                env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", v);
-                ggml_backend_buffer_clear(buf, 0xa5);  // a range left out shows
-                uint64_t threaded = 0, ranges = 0;
+            const uint8_t *            raw    = static_cast<const uint8_t *>(w->data);  // host memory underneath
+            std::vector<uint8_t>       read(q.size());
+
+            ggml_backend_buffer_clear(buf, 0xa5);  // a range left out shows
+            uint64_t threaded = 0, ranges = 0, through = 0, not_through = 0, reran = 0;
+            g_repack_take(&threaded, &ranges);
+            g_repack_x100_take(&through, &not_through, &reran);
+            ggml_backend_tensor_set(w, q.data(), 0, q.size());
+            g_repack_take(&threaded, &ranges);
+            g_repack_x100_take(&through, &not_through, &reran);
+            ggml_backend_tensor_get(w, read.data(), 0, read.size());
+            const uint64_t want    = big ? (uint64_t) std::min(n_threads, groups) : 0;
+            const bool     path_ok = route_ok(big, want, threaded, ranges, through, not_through, reran);
+            n_path++;
+            n_path_ok += path_ok;
+            n_threaded += threaded != 0;
+            if (path_ok && big) {
+                seen_ranges[ranges] = true;
+            }
+            if (!path_ok) {
+                std::fprintf(stderr,
+                             "FAIL: repack %s %lldx%lld: %llu threaded with %llu ranges, %llu through the X100 stream, "
+                             "%llu not, %llu rerun (expected %s)\n",
+                             ggml_type_name(type), (long long) (s.rows * s.mats), (long long) s.cols,
+                             (unsigned long long) threaded, (unsigned long long) ranges, (unsigned long long) through,
+                             (unsigned long long) not_through, (unsigned long long) reran,
+                             !big ? "none" : spert ? "1 through the stream" : "1 threaded");
+                g_failures++;
+            }
+            CHECK(std::memcmp(raw, q.data(), q.size()) != 0);  // stored repacked
+            if (big) {
+                // the one-thread bytes: the same rows, one piece after another
+                const size_t  piece_alloc = ggml_backend_buft_get_alloc_size(buft, piece);
+                const size_t  piece_bytes = ggml_nbytes(piece);
+                const int64_t n_pieces    = groups / piece_mats;
+                REQUIRE(groups % piece_mats == 0 && piece_alloc * (size_t) n_pieces == alloc &&
+                        piece_bytes * (size_t) n_pieces == q.size());
+                const std::vector<uint8_t> write_raw(raw, raw + alloc);
+                std::vector<uint8_t>       raw_ref(alloc), read_ref(q.size());
                 g_repack_take(&threaded, &ranges);
-                ggml_backend_tensor_set(w, q.data(), 0, q.size());
+                for (int64_t p = 0; p < n_pieces; p++) {
+                    ggml_backend_tensor_set(piece, q.data() + (size_t) p * piece_bytes, 0, piece_bytes);
+                    std::memcpy(raw_ref.data() + (size_t) p * piece_alloc, piece->data, piece_alloc);
+                    ggml_backend_tensor_get(piece, read_ref.data() + (size_t) p * piece_bytes, 0, piece_bytes);
+                }
                 g_repack_take(&threaded, &ranges);
-                ggml_backend_tensor_get(w, read.data(), 0, read.size());
-                const uint8_t * raw     = static_cast<const uint8_t *>(w->data);  // host memory underneath
-                const int64_t   n       = std::atoi(v);
-                const bool      path_ok = big && n > 1 ? threaded == 1 && ranges == (uint64_t) std::min(n, groups) :
-                                                         threaded == 0 && ranges == 0;
-                n_path++;
-                n_path_ok += path_ok;
-                n_threaded += threaded != 0;
-                if (!path_ok) {
-                    std::fprintf(stderr,
-                                 "FAIL: repack %s %lldx%lld with %s threads: %llu threaded with %llu ranges (expected "
-                                 "%s)\n",
-                                 ggml_type_name(type), (long long) (s.rows * s.mats), (long long) s.cols, v,
-                                 (unsigned long long) threaded, (unsigned long long) ranges,
-                                 big && n > 1 ? "1 threaded" : "none");
-                    g_failures++;
-                }
-                if (raw_ref.empty()) {
-                    raw_ref.assign(raw, raw + alloc);
-                    read_ref = read;
-                    CHECK(std::memcmp(raw, q.data(), q.size()) != 0);  // stored repacked
-                    continue;
-                }
-                const bool raw_same  = std::memcmp(raw, raw_ref.data(), alloc) == 0;
+                CHECK(threaded == 0);  // every piece on the calling thread
+                const bool raw_same  = write_raw == raw_ref;
                 const bool read_same = read == read_ref;
                 n_cmp++;
                 n_raw_same += raw_same;
                 n_read_same += read_same;
                 if (!raw_same || !read_same) {
-                    std::fprintf(stderr, "FAIL: repack %s %lldx%lld with %s threads: stored bytes %s, read-back %s\n",
-                                 ggml_type_name(type), (long long) (s.rows * s.mats), (long long) s.cols, v,
-                                 raw_same ? "same" : "differ", read_same ? "same" : "differs");
-                    g_failures++;
-                }
-            }
-            // the same weight through the X100 backend, the threads at their default (8)
-            if (spert) {
-                env_override via("FLAGOS_SPACEMIT_REPACK_VIA", "x100");
-                env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", nullptr);
-                ggml_backend_buffer_clear(buf, 0xa5);
-                uint64_t threaded = 0, ranges = 0, through = 0, not_through = 0, reran = 0;
-                g_repack_take(&threaded, &ranges);
-                g_repack_x100_take(&through, &not_through, &reran);
-                ggml_backend_tensor_set(w, q.data(), 0, q.size());
-                g_repack_take(&threaded, &ranges);
-                g_repack_x100_take(&through, &not_through, &reran);
-                ggml_backend_tensor_get(w, read.data(), 0, read.size());
-                const bool same    = std::memcmp(w->data, raw_ref.data(), alloc) == 0 && read == read_ref;
-                const bool path_ok = not_through == 0 && reran == 0 &&
-                                     (big ? threaded == 1 && through == 1 && ranges >= 2 && ranges <= 8 :
-                                            threaded == 0 && through == 0);
-                n_x100++;
-                n_x100_same += same;
-                n_x100_path_ok += path_ok;
-                n_x100_through += through != 0;
-                x100_ranges = std::max(x100_ranges, ranges);
-                if (!same || !path_ok) {
-                    std::fprintf(stderr,
-                                 "FAIL: repack %s %lldx%lld via x100: bytes %s; %llu threaded with %llu ranges, %llu "
-                                 "through the stream, %llu not, %llu rerun\n",
+                    std::fprintf(stderr, "FAIL: repack %s %lldx%lld in %llu ranges: stored bytes %s, read-back %s\n",
                                  ggml_type_name(type), (long long) (s.rows * s.mats), (long long) s.cols,
-                                 same ? "same" : "differ", (unsigned long long) threaded, (unsigned long long) ranges,
-                                 (unsigned long long) through, (unsigned long long) not_through,
-                                 (unsigned long long) reran);
+                                 (unsigned long long) want, raw_same ? "same" : "differ",
+                                 read_same ? "same" : "differs");
                     g_failures++;
                 }
             }
@@ -2849,7 +2756,8 @@ static int check_repack_threads(ggml_backend_dev_t dev, bool spert) {
         }
     }
 
-    // a partial write repacks the whole weight again (unpack, patch, pack), so on the same threads
+    // a partial write repacks the whole weight again (unpack, patch, pack) on the same route: the bytes of a whole
+    // write of the patched bytes (these layouts read back the GGUF bytes)
     int n_partial = 0, n_partial_same = 0;
     for (const ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0 }) {
         ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
@@ -2861,151 +2769,46 @@ static int check_repack_threads(ggml_backend_dev_t dev, bool spert) {
         REQUIRE(buf != nullptr);
         const std::vector<uint8_t> q = quantize_weights(type, 2560, 4096, seed++);
         const std::vector<uint8_t> patch(100000, 0x3c);
-        const size_t               alloc = ggml_backend_buft_get_alloc_size(buft, w);
-        std::vector<uint8_t>       raw_ref;
-        for (const char * v : { "1", "8" }) {
-            env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", v);
-            ggml_backend_buffer_clear(buf, 0xa5);
-            ggml_backend_tensor_set(w, q.data(), 0, q.size());
-            uint64_t threaded = 0, ranges = 0;
-            g_repack_take(&threaded, &ranges);
-            ggml_backend_tensor_set(w, patch.data(), 12345, patch.size());
-            g_repack_take(&threaded, &ranges);
-            const uint8_t * raw = static_cast<const uint8_t *>(w->data);
-            if (raw_ref.empty()) {
-                raw_ref.assign(raw, raw + alloc);
-                CHECK(threaded == 0);
-                continue;
-            }
-            const bool same = std::memcmp(raw, raw_ref.data(), alloc) == 0 && threaded == 1 && ranges == 8;
-            n_partial++;
-            n_partial_same += same;
-            CHECK(same);
-        }
+        std::vector<uint8_t>       patched = q;
+        std::memcpy(patched.data() + 12345, patch.data(), patch.size());
+        const size_t    alloc    = ggml_backend_buft_get_alloc_size(buft, w);
+        const uint8_t * raw      = static_cast<const uint8_t *>(w->data);
+        uint64_t        threaded = 0, ranges = 0, through = 0, not_through = 0, reran = 0;
+        ggml_backend_buffer_clear(buf, 0xa5);
+        ggml_backend_tensor_set(w, patched.data(), 0, patched.size());
+        const std::vector<uint8_t> raw_ref(raw, raw + alloc);
+        ggml_backend_buffer_clear(buf, 0xa5);
+        ggml_backend_tensor_set(w, q.data(), 0, q.size());
+        g_repack_take(&threaded, &ranges);
+        g_repack_x100_take(&through, &not_through, &reran);
+        ggml_backend_tensor_set(w, patch.data(), 12345, patch.size());
+        g_repack_take(&threaded, &ranges);
+        g_repack_x100_take(&through, &not_through, &reran);
+        const bool same = std::memcmp(raw, raw_ref.data(), alloc) == 0 &&
+                          route_ok(true, (uint64_t) n_threads, threaded, ranges, through, not_through, reran);
+        n_partial++;
+        n_partial_same += same;
+        CHECK(same);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
     }
 
-    // the switch's values on a 4096-row Q8_0 weight: a bad value is warned once and keeps the default, 8
-    const struct {
-        const char * value;
-        uint32_t     n;
-        bool         warned;
-    } switch_values[] = {
-        { nullptr, 8, false }, { "", 8, false }, { "1", 1, false }, { "8", 8, false },
-        { "16", 16, false },   { "0", 8, true }, { "17", 8, true }, { "abc", 8, true },
-    };
-    int n_values_ok = 0;
-    {
-        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
-        ggml_context *   ctx    = ggml_init(params);
-        REQUIRE(ctx != nullptr);
-        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 4096);
-        ggml_set_name(w, "blk.0.ffn_up.weight");
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        REQUIRE(buf != nullptr);
-        const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q8_0, 2560, 4096, seed++);
-        for (const auto & v : switch_values) {
-            env_override   threads("FLAGOS_SPACEMIT_REPACK_THREADS", v.value);
-            log_capture    log;
-            const uint32_t first = g_repack_threads(), second = g_repack_threads();
-            uint64_t       threaded = 0, ranges = 0;
-            g_repack_take(&threaded, &ranges);
-            ggml_backend_tensor_set(w, q.data(), 0, q.size());
-            g_repack_take(&threaded, &ranges);
-            const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_REPACK_THREADS=");
-            const bool ok       = first == v.n && second == v.n && warnings == (v.warned ? 1 : 0) &&
-                            (v.n > 1 ? threaded == 1 && ranges == v.n : threaded == 0 && ranges == 0);
-            if (!ok) {
-                std::fprintf(stderr,
-                             "FAIL: FLAGOS_SPACEMIT_REPACK_THREADS=%s: read %u and %u (expected %u), %d warning lines "
-                             "(expected %d), %llu threaded with %llu ranges\n",
-                             v.value != nullptr ? v.value : "(unset)", first, second, v.n, warnings, v.warned ? 1 : 0,
-                             (unsigned long long) threaded, (unsigned long long) ranges);
-                g_failures++;
-            }
-            n_values_ok += ok;
+    std::string range_list;
+    for (int r = 8; r >= 2; r--) {
+        if (seen_ranges[r]) {
+            const char * sep = range_list.empty() ? "" : range_list.find(" and ") == std::string::npos ? " and " : ", ";
+            range_list       = std::to_string(r) + sep + range_list;
         }
-        ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
     }
-
-    // FLAGOS_SPACEMIT_REPACK_VIA's values on the same weight, the threads at their default (8): the default route is
-    // x100 with spine-runtime and threads without, and unset, empty and abc take it (abc with one warning); x100 is
-    // x100 only with spine-runtime, else threads with one warning
-    const struct {
-        const char * value;
-        uint32_t     via;
-        bool         warned;
-    } via_values[] = {
-        { nullptr, spert ? 1u : 0u, false }, { "", spert ? 1u : 0u, false }, { "threads", 0, false },
-        { "x100", spert ? 1u : 0u, !spert }, { "abc", spert ? 1u : 0u, true },
-    };
-    int n_via_ok = 0;
-    {
-        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
-        ggml_context *   ctx    = ggml_init(params);
-        REQUIRE(ctx != nullptr);
-        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 4096);
-        ggml_set_name(w, "blk.0.ffn_up.weight");
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        REQUIRE(buf != nullptr);
-        const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q8_0, 2560, 4096, seed++);
-        env_override               threads("FLAGOS_SPACEMIT_REPACK_THREADS", nullptr);
-        for (const auto & v : via_values) {
-            env_override   via("FLAGOS_SPACEMIT_REPACK_VIA", v.value);
-            log_capture    log;
-            const uint32_t first = g_repack_via(), second = g_repack_via();
-            uint64_t       threaded = 0, ranges = 0, through = 0, not_through = 0, reran = 0;
-            g_repack_take(&threaded, &ranges);
-            g_repack_x100_take(&through, &not_through, &reran);
-            ggml_backend_tensor_set(w, q.data(), 0, q.size());
-            g_repack_take(&threaded, &ranges);
-            g_repack_x100_take(&through, &not_through, &reran);
-            const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_REPACK_VIA=");
-            const bool ok       = first == v.via && second == v.via && warnings == (v.warned ? 1 : 0) &&
-                            threaded == 1 && not_through == 0 && reran == 0 &&
-                            (v.via == 1 ? through == 1 && ranges >= 2 && ranges <= 8 : through == 0 && ranges == 8);
-            if (!ok) {
-                std::fprintf(stderr,
-                             "FAIL: FLAGOS_SPACEMIT_REPACK_VIA=%s: read %u and %u (expected %u), %d warning lines "
-                             "(expected %d), %llu threaded with %llu ranges, %llu through the stream, %llu not, %llu "
-                             "rerun\n",
-                             v.value != nullptr ? v.value : "(unset)", first, second, v.via, warnings, v.warned ? 1 : 0,
-                             (unsigned long long) threaded, (unsigned long long) ranges, (unsigned long long) through,
-                             (unsigned long long) not_through, (unsigned long long) reran);
-                g_failures++;
-            }
-            n_via_ok += ok;
-        }
-        ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
-    }
-
-    std::printf("repack   FLAGOS_SPACEMIT_REPACK_THREADS 2, 3, 8 and 16 against 1 (Q4_0, Q4_1 and Q6_K to Q8_0, Q8_0, "
-                "Q5_0 as Q8_0; "
-                "32, 64, 96 and 4096 rows of 2560, 32 of 65536; 3-D, Q4_1 in the q4_1 min layout: 3 x 32 of 2560, "
-                "8 x 64 and 4 x 512 of 2048): "
-                "stored bytes identical in %d/%d, read-back identical "
-                "in %d/%d; the threads by the counter as expected in %d/%d (%d threaded: at least 1 MiB and several "
-                "groups only); a partial write on 8 threads identical in %d/%d\n",
-                n_raw_same, n_cmp, n_read_same, n_cmp, n_path_ok, n_path, n_threaded, n_partial_same, n_partial);
-    std::printf("repack   FLAGOS_SPACEMIT_REPACK_THREADS values (unset, empty, 1, 8, 16, 0, 17, abc) on a 4096-row "
-                "Q8_0 weight: one warning for each of 0, 17 and abc and none for the others, the default 8 for all but 1, 8 "
-                "and 16, as expected in %d/%zu\n",
-                n_values_ok, sizeof(switch_values) / sizeof(switch_values[0]));
-    if (spert) {
-        std::printf("repack   FLAGOS_SPACEMIT_REPACK_VIA=x100 against one thread (the layouts and shapes above, the "
-                    "threads at 8): stored bytes and read-back identical in %d/%d; the route by the counters as "
-                    "expected in %d/%d (%d through the X100 stream, at most %llu ranges; none fell back or reran)\n",
-                    n_x100_same, n_x100, n_x100_path_ok, n_x100, n_x100_through, (unsigned long long) x100_ranges);
-    } else {
-        std::printf("repack   FLAGOS_SPACEMIT_REPACK_VIA=x100 comparisons skipped (no spine-runtime in this build)\n");
-    }
-    std::printf("repack   FLAGOS_SPACEMIT_REPACK_VIA values (unset, empty, threads, x100, abc) on a 4096-row Q8_0 "
-                "weight: one warning for abc%s and none for the others, the default %s, as expected in %d/%zu\n",
-                spert ? "" : " and x100 (no spine-runtime)", spert ? "x100 (the X100 stream)" : "threads", n_via_ok,
-                sizeof(via_values) / sizeof(via_values[0]));
+    std::printf("repack   whole writes (Q4_0, Q4_1 and Q6_K to Q8_0, Q8_0, Q5_0 as Q8_0; 32, 64, 96, 1056 and 4096 "
+                "rows of 2560, 64 and 96 of 32768, 32 of 65536; 3-D, Q4_1 in the q4_1 min layout: 3 x 32 of 2560, 8 x "
+                "64 and 4 x 512 of 2048): the route by the counters as expected in %d/%d (%d split, %s, with %s "
+                "ranges: at least 1 MiB and several groups only); of those the stored bytes identical to the "
+                "one-thread ones (the rows written as weights of one group, 3-D of 2 experts of 32 rows) in %d/%d, "
+                "read-back identical in %d/%d; a partial write on the same route identical to the whole write of the "
+                "patched bytes in %d/%d\n",
+                n_path_ok, n_path, n_threaded, spert ? "through the X100 stream" : "on threads", range_list.c_str(),
+                n_raw_same, n_cmp, n_read_same, n_cmp, n_partial_same, n_partial);
     return 0;
 }
 
@@ -3741,64 +3544,12 @@ bool embd_table::init(ggml_type type, int64_t nc, uint32_t seed, bool edges) {
     return true;
 }
 
-// test-only: the RVV lookup's arithmetic (flagos-spacemit-rvv-kernels.cpp dequantize_q6_K_blocks) lane by lane in
-// scalar C++, the same grouping and operand order: per half of 128 values the 8 products d * scale in F32; per group
-// g of 32 lanes (y[32 g + l]) the scale 2 g + l / 16, the 6-bit value from ql[l], ql[l + 32] and qh[l] by the same
-// and, shift and or in uint8, minus 32 in int8, widened to int32 and converted to F32, and one multiply (scale, q) per
-// lane. Checked against ggml's to_float by memcmp, it proves the plan's arithmetic on any host, not the intrinsics
-static void q6_K_lane_model(const block_q6_K * x, int64_t nb, float * y) {
-    for (int64_t b = 0; b < nb; b++) {
-        const float     d  = GGML_FP16_TO_FP32(x[b].d);
-        const uint8_t * ql = x[b].ql;
-        const uint8_t * qh = x[b].qh;
-        const int8_t *  sc = x[b].scales;
-        float *         yb = y + b * QK_K;
-        for (int n = 0; n < QK_K; n += 128) {
-            float s[8];
-            for (int j = 0; j < 8; j++) {
-                s[j] = d * (float) sc[j];
-            }
-            for (int g = 0; g < 4; g++) {
-                for (int l = 0; l < 32; l++) {
-                    const uint8_t l0 = ql[l], l1 = ql[l + 32], h = qh[l];
-                    const uint8_t hb = g == 0 ? (uint8_t) ((uint8_t) (h << 4) & 0x30) :
-                                       g == 1 ? (uint8_t) ((uint8_t) (h << 2) & 0x30) :
-                                       g == 2 ? (uint8_t) (h & 0x30) : (uint8_t) ((h >> 2) & 0x30);
-                    const uint8_t lb = g == 0 ? (uint8_t) (l0 & 0xf) : g == 1 ? (uint8_t) (l1 & 0xf) :
-                                       g == 2 ? (uint8_t) (l0 >> 4) : (uint8_t) (l1 >> 4);
-                    const int8_t  q  = (int8_t) ((int8_t) (lb | hb) - 32);
-                    const float   qf = (float) (int32_t) q;
-                    const float   sv = l < 16 ? s[2 * g] : s[2 * g + 1];
-                    yb[32 * g + l]   = sv * qf;
-                }
-            }
-            yb += 128;
-            ql += 64;
-            qh += 32;
-            sc += 8;
-        }
-    }
-}
-
-// the lane model against ggml's to_float on rows of bytes: the blocks whose values are identical (memcmp)
-static int64_t q6_K_lane_model_same(const std::vector<uint8_t> & bytes) {
-    const int64_t      nb = (int64_t) (bytes.size() / sizeof(block_q6_K));
-    std::vector<float> ref(nb * QK_K), got(nb * QK_K);
-    ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(bytes.data(), ref.data(), nb * QK_K);
-    q6_K_lane_model((const block_q6_K *) bytes.data(), nb, got.data());
-    int64_t same = 0;
-    for (int64_t b = 0; b < nb; b++) {
-        same += std::memcmp(ref.data() + b * QK_K, got.data() + b * QK_K, QK_K * sizeof(float)) == 0;
-    }
-    return same;
-}
-
-// the kernel the quantized lookups since the last call ran, by the counter (spacemit_embd_paths_take): rvv, ggml,
-// none or mixed
+// the kernel the quantized lookups since the last call ran, by the counter (spacemit_embd_paths_take): ggml's
+// dequantizers, or none
 static const char * embd_kernel_taken() {
-    uint64_t rvv = 0, ggml = 0;
-    g_embd_paths_take(&rvv, &ggml);
-    return rvv != 0 && ggml != 0 ? "mixed" : rvv != 0 ? "rvv" : ggml != 0 ? "ggml" : "none";
+    uint64_t calls = 0;
+    g_embd_paths_take(&calls);
+    return calls != 0 ? "ggml" : "none";
 }
 
 // n token ids, unordered, every fifth a repeat of an earlier one; from 7 on also the first and the last row
@@ -3852,8 +3603,7 @@ static int lookup_identical(ggml_backend_dev_t dev, ggml_backend_t backend, ggml
 // which GET_ROWS the provider claims, and by which contract: F32 rows by get_rows.f32 as before; Q4_0, Q4_1, Q5_0,
 // Q5_1, Q8_0, Q4_K, Q5_K and Q6_K rows by get_rows.quant from a CPU buffer whatever the layout rule says, from our buffer
 // (or not allocated, as test-backend-ops asks) only where the rule gives ggml's layout; no other type, no I64 indices,
-// no strided rows, no partial block; FLAGOS_SPACEMIT_EMBD=cpu refuses the lookup, ggml, rvv and an unknown value keep it
-// (lookup_switch_values counts the warnings). Returns the number of nodes checked
+// no strided rows, no partial block. Returns the number of nodes checked
 static int lookup_claims(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     spacemit_ops               ops;
@@ -3936,21 +3686,6 @@ static int lookup_claims(ggml_backend_dev_t dev) {
                 w->buffer = nullptr;
             }
         }
-    }
-
-    // FLAGOS_SPACEMIT_EMBD=cpu: the lookup refused, the F32 rows still taken; ggml, rvv (the plugin's kernel choice)
-    // and an unknown value: the provider kept
-    {
-        env_override embd("FLAGOS_SPACEMIT_EMBD", "cpu");
-        expect("Q6_K in a CPU buffer, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, q6_cpu, idx), "");
-        expect("Q6_K of 5 rows not allocated, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, q6_few, idx), "");
-        expect("F32 in a CPU buffer, FLAGOS_SPACEMIT_EMBD=cpu", ggml_get_rows(ctx, f32_cpu, idx), "get_rows.f32");
-    }
-    for (const char * value : { "ggml", "rvv", "x" }) {
-        env_override      embd("FLAGOS_SPACEMIT_EMBD", value);
-        const std::string what = std::string(", FLAGOS_SPACEMIT_EMBD=") + value;
-        expect("Q6_K in a CPU buffer" + what, ggml_get_rows(ctx, q6_cpu, idx), "get_rows.quant");
-        expect("Q4_0 in a CPU buffer" + what, ggml_get_rows(ctx, q4_cpu, idx), "get_rows.quant");
     }
 
     // every type, 5 rows not allocated (ggml's layout): exactly the listed block types and F32
@@ -4079,91 +3814,15 @@ struct lookup_graph {
     }
 };
 
-// FLAGOS_SPACEMIT_EMBD's values (plan.md "Embedding lookup spec", step 2) on a lookup of 7 Q6_K rows: the claim (the
-// core's), the bytes, the kernel by the counter (the plugin's: the RVV kernel under rvv where it can run, else ggml's)
-// and the warnings, one from the core for x and none from the plugin. Returns the values that behaved, of 6, and in
-// x_core and x_plugin the warnings of x
-static int lookup_switch_values(ggml_backend_dev_t dev, ggml_backend_t backend, ggml_backend_t cpu,
-                                const embd_table & t, bool expect_rvv, int & x_core, int & x_plugin) {
-    const struct {
-        const char * value;  // nullptr: unset
-        bool         claimed;
-        const char * kernel;
-        int          warnings;
-    } values[] = {
-        { nullptr, true, "ggml", 0 }, { "", true, "ggml", 0 },     { "ggml", true, "ggml", 0 },
-        { "rvv", true, expect_rvv ? "rvv" : "ggml", 0 },          { "cpu", false, "none", 0 },
-        { "x", true, "ggml", 1 },
-    };
-    int ok = 0;
-    for (const auto & v : values) {
-        (void) embd_kernel_taken();
-        env_override      embd("FLAGOS_SPACEMIT_EMBD", v.value);
-        log_capture       log;
-        const int         same   = lookup_identical(dev, backend, cpu, t, 7, 31);
-        const char *      kernel = embd_kernel_taken();
-        const std::string text   = log.take();
-        int               all = 0, core = 0;
-        for (size_t at = text.find("FLAGOS_SPACEMIT_EMBD"); at != std::string::npos;
-             at        = text.find("FLAGOS_SPACEMIT_EMBD", at + 1)) {
-            all++;
-        }
-        for (size_t at = text.find("spacemit_embd_on_cpu: FLAGOS_SPACEMIT_EMBD="); at != std::string::npos;
-             at        = text.find("spacemit_embd_on_cpu: FLAGOS_SPACEMIT_EMBD=", at + 1)) {
-            core++;
-        }
-        if (v.value != nullptr && std::strcmp(v.value, "x") == 0) {
-            x_core   = core;
-            x_plugin = all - core;
-        }
-        const bool good = same == (v.claimed ? 1 : -1) && std::strcmp(kernel, v.kernel) == 0 && all == v.warnings &&
-                          core == v.warnings;
-        if (!good) {
-            std::fprintf(stderr,
-                         "FAIL: FLAGOS_SPACEMIT_EMBD=%s: lookup %s, kernel %s (expected %s), %d warnings, %d from the "
-                         "core (expected %d)\n",
-                         v.value != nullptr ? v.value : "(unset)",
-                         same == 1 ? "identical" : same == 0 ? "differs" : "refused or failed", kernel, v.kernel, all,
-                         core, v.warnings);
-            g_failures++;
-        }
-        ok += good;
-    }
-    return ok;
-}
-
-static int check_embedding(ggml_backend_dev_t dev, bool host) {
+static int check_embedding(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
     REQUIRE(g_embd_paths_take != nullptr);
 
-    // the RVV kernel runs under FLAGOS_SPACEMIT_EMBD=rvv on the AI cores only (as the T1 block decides its kernel):
-    // not on the host executor, not under GGML_FLAGOS_KERNEL_VARIANTS=0
-    const bool expect_rvv = !host && reference_label()[0] == '\0';
-
-    // the lane model of the RVV kernel against ggml's to_float, on any host: random Q6_K rows of 256, 1024 and 2560
-    // values and the edge blocks
-    int64_t lane_blocks = 0, lane_same = 0;
-    for (const int64_t nc : { 256, 1024, 2560 }) {
-        for (const bool edges : { false, true }) {
-            const std::vector<uint8_t> q =
-                edges ? q6_K_edge_rows(nc, k_vocab, 23) : quantize_weights(GGML_TYPE_Q6_K, nc, k_vocab, 23);
-            const int64_t same = q6_K_lane_model_same(q);
-            const int64_t nb   = (int64_t) (q.size() / sizeof(block_q6_K));
-            if (same != nb) {
-                std::fprintf(stderr, "FAIL: Q6_K lane model, %s rows of %lld: %lld of %lld blocks identical to ggml's\n",
-                             edges ? "edge" : "random", (long long) nc, (long long) same, (long long) nb);
-                g_failures++;
-            }
-            lane_blocks += nb;
-            lane_same += same;
-        }
-    }
-
     // Q6_K as Qwen3's token_embd (1024 and 2560 columns), one type each of the legacy and the K family; Q6_K of one
     // block per row and with the edge blocks (q6_K_edge_rows), at 1-3 ids (a row's blocks over the tiles, or a few rows)
-    // and from 9. Each under FLAGOS_SPACEMIT_EMBD unset (ggml's dequantizers) and rvv, the kernel by the counter
+    // and from 9; ggml's dequantizers by the counter
     const std::vector<int64_t> ids_first = { 1, 7, 64, 512 };
     const std::vector<int64_t> ids_few   = { 1, 2, 3, 9, 64, 512 };
     const struct {
@@ -4177,25 +3836,22 @@ static int check_embedding(ggml_backend_dev_t dev, bool host) {
         { GGML_TYPE_Q6_K, 256, false, ids_few },    { GGML_TYPE_Q6_K, 2560, false, ids_few },
         { GGML_TYPE_Q6_K, 2560, true, ids_few },
     };
-    const char * const settings[2] = { nullptr, "rvv" };
-    int                n_cases = 0, n_same = 0, n_kernel = 0, bad_ok = 0, n_bad = 0;
+    int n_cases = 0, n_same = 0, n_kernel = 0, bad_ok = 0, n_bad = 0;
     for (const auto & tb : tables) {
         embd_table t;
         REQUIRE(t.init(tb.type, tb.nc, 21, tb.edges));
-        for (const char * setting : settings) {
-            env_override embd("FLAGOS_SPACEMIT_EMBD", setting);
-            log_capture  log;  // neither setting is reported (the core's one warning is x's, lookup_switch_values)
-            const char * want = setting != nullptr && expect_rvv && tb.type == GGML_TYPE_Q6_K ? "rvv" : "ggml";
+        {
+            const char * want = "ggml";
             for (int64_t n : tb.ids) {
                 (void) embd_kernel_taken();
                 const int    same   = lookup_identical(dev, backend, cpu, t, n, (uint32_t) (n + tb.nc));
                 const char * kernel = embd_kernel_taken();
                 if (same != 1 || std::strcmp(kernel, want) != 0) {
                     std::fprintf(stderr,
-                                 "FAIL: GET_ROWS of %lld %s rows of %lld%s from a CPU buffer, FLAGOS_SPACEMIT_EMBD=%s: "
-                                 "%s, kernel %s (expected %s)\n",
+                                 "FAIL: GET_ROWS of %lld %s rows of %lld%s from a CPU buffer: %s, kernel %s (expected "
+                                 "%s)\n",
                                  (long long) n, ggml_type_name(tb.type), (long long) tb.nc,
-                                 tb.edges ? " (edge blocks)" : "", setting != nullptr ? setting : "(unset)",
+                                 tb.edges ? " (edge blocks)" : "",
                                  same == 1 ? "identical" : same < 0 ? "refused or failed" : "bytes differ from the CPU's",
                                  kernel, want);
                     g_failures++;
@@ -4210,43 +3866,30 @@ static int check_embedding(ggml_backend_dev_t dev, bool host) {
                 const char * kernel = embd_kernel_taken();  // a failed launch's tile 0 may skip the step: not "mixed"
                 if (bad != 4 || std::strcmp(kernel, want) != 0) {
                     std::fprintf(stderr,
-                                 "FAIL: GET_ROWS of Q6_K, index out of range, FLAGOS_SPACEMIT_EMBD=%s: %d of 4 launches "
-                                 "as expected, kernel %s (expected %s)\n",
-                                 setting != nullptr ? setting : "(unset)", bad, kernel, want);
+                                 "FAIL: GET_ROWS of Q6_K, index out of range: %d of 4 launches as expected, kernel %s "
+                                 "(expected %s)\n",
+                                 bad, kernel, want);
                     g_failures++;
                 }
                 bad_ok += std::strcmp(kernel, want) == 0 ? std::max(bad, 0) : 0;
                 n_bad += 4;
             }
-            if (log.take().find("FLAGOS_SPACEMIT_EMBD") != std::string::npos) {
-                std::fprintf(stderr, "FAIL: FLAGOS_SPACEMIT_EMBD=%s reported\n", setting != nullptr ? setting : "(unset)");
-                g_failures++;
-            }
         }
-    }
-
-    // the switch's values before lookup_claims, whose x would take the core's one warning
-    int value_x_core = -1, value_x_plugin = -1, n_values = 0;
-    {
-        embd_table t;
-        REQUIRE(t.init(GGML_TYPE_Q6_K, 1024, 24));
-        n_values = lookup_switch_values(dev, backend, cpu, t, expect_rvv, value_x_core, value_x_plugin);
     }
     const int n_claims = lookup_claims(dev);
 
-    // through the scheduler: 1 split with the lookup on the provider, 2 with it on the CPU (GGML_FLAGOS_DISABLE_OPS,
-    // FLAGOS_SPACEMIT_EMBD=cpu), the same bytes. Then, under uid-trust, new ids on the kept graph (a decode reusing its
+    // through the scheduler: 1 split with the lookup on the provider, 2 with it on the CPU (GGML_FLAGOS_DISABLE_OPS),
+    // the same bytes. Then, under uid-trust, new ids on the kept graph (a decode reusing its
     // graph): one hit by uid, and the rows of the new ids as the CPU's
     embd_table t;
     REQUIRE(t.init(GGML_TYPE_Q6_K, 1024, 22));
-    int                  splits[3] = { 0, 0, 0 };
-    bool                 placed[3] = { false, false, false };
-    std::vector<uint8_t> out[3];
+    int                  splits[2] = { 0, 0 };
+    bool                 placed[2] = { false, false };
+    std::vector<uint8_t> out[2];
     bool                 ran = true, reused = false;
     uint64_t             hits = 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         env_override         switch_off("GGML_FLAGOS_DISABLE_OPS", i == 1 ? "GET_ROWS" : nullptr);
-        env_override         embd_switch("FLAGOS_SPACEMIT_EMBD", i == 2 ? "cpu" : nullptr);
         env_override         plan_switch("FLAGOS_SPACEMIT_PLAN", "uid-trust");
         env_override         quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
         lookup_graph         l;
@@ -4287,16 +3930,15 @@ static int check_embedding(ggml_backend_dev_t dev, bool host) {
         }
         ggml_backend_sched_free(sched);
     }
-    const bool same     = out[0] == out[1] && out[0] == out[2];
-    const bool sched_ok = ran && splits[0] == 1 && splits[1] == 2 && splits[2] == 2 && placed[0] && placed[1] &&
-                          placed[2] && same && reused && hits == 1;
+    const bool same     = out[0] == out[1];
+    const bool sched_ok = ran && splits[0] == 1 && splits[1] == 2 && placed[0] && placed[1] && same && reused &&
+                          hits == 1;
     if (!sched_ok) {
         std::fprintf(stderr,
                      "FAIL: GET_ROWS of Q6_K through the scheduler: %s; splits %d (GGML_FLAGOS_DISABLE_OPS=GET_ROWS "
-                     "%d, FLAGOS_SPACEMIT_EMBD=cpu %d), placement as expected %d/%d/%d, outputs %s, new ids on the "
-                     "kept graph %s, %llu hits by uid\n",
-                     ran ? "ran" : "a graph failed", splits[0], splits[1], splits[2], placed[0] ? 1 : 0,
-                     placed[1] ? 1 : 0, placed[2] ? 1 : 0, same ? "identical" : "differ",
+                     "%d), placement as expected %d/%d, outputs %s, new ids on the kept graph %s, %llu hits by uid\n",
+                     ran ? "ran" : "a graph failed", splits[0], splits[1], placed[0] ? 1 : 0, placed[1] ? 1 : 0,
+                     same ? "identical" : "differ",
                      reused ? "as the CPU's" : "wrong", (unsigned long long) hits);
         g_failures++;
     }
@@ -4305,24 +3947,14 @@ static int check_embedding(ggml_backend_dev_t dev, bool host) {
     ggml_backend_free(cpu);
     std::printf("rows     GET_ROWS of a quantized token embedding in a CPU buffer vs CPU (Q6_K of 256, 1024 and 2560 "
                 "columns and of 2560 with edge blocks, Q4_0 and Q4_K of 1024, %lld rows; 1-512 ids, repeated and "
-                "unordered), FLAGOS_SPACEMIT_EMBD unset and rvv: %d/%d identical (bound 0, memcmp), kernels as "
-                "expected %d/%d (under rvv %s for Q6_K, ggml for Q4_0 and Q4_K; unset ggml); claims exact (%d nodes: "
-                "the eight block types, not other types, I64 indices, strided rows, a partial block or an IME layout; "
-                "F32 rows still get_rows.f32; FLAGOS_SPACEMIT_EMBD=cpu refuses the lookup and keeps the F32 rows, "
-                "ggml, rvv and x keep it); index out of range fails the launch and the next node is not run: %d/%d\n",
-                (long long) k_vocab, n_same, n_cases, n_kernel, n_cases, expect_rvv ? "rvv" : "ggml", n_claims, bad_ok,
-                n_bad);
-    std::printf("rows     FLAGOS_SPACEMIT_EMBD on 7 Q6_K rows: unset, empty and ggml ggml's kernel, rvv %s, cpu refused, x "
-                "ggml's with %d warning from the core and %d from the plugin: %d/6 as expected\n",
-                expect_rvv ? "the RVV kernel" : "ggml's (no RVV kernel here)", value_x_core, value_x_plugin, n_values);
-    std::printf("rows     Q6_K lane model of the RVV lookup vs ggml's to_float (random rows of 256, 1024 and 2560 values "
-                "and edge blocks: d 0, -0, negative, subnormal, +-65504; scales -128, 127, 0; q 0 and 63): %lld/%lld "
-                "blocks identical (memcmp; the arithmetic plan, not the intrinsics)\n",
-                (long long) lane_same, (long long) lane_blocks);
+                "unordered): %d/%d identical (bound 0, memcmp), ggml's kernel by the counter %d/%d; claims exact (%d "
+                "nodes: the eight block types, not other types, I64 indices, strided rows, a partial block or an IME "
+                "layout; F32 rows still get_rows.f32); index out of range fails the launch and the next node is not "
+                "run: %d/%d\n",
+                (long long) k_vocab, n_same, n_cases, n_kernel, n_cases, n_claims, bad_ok, n_bad);
     std::printf("rows     the lookup and RMS_NORM through the scheduler: %d split against %d with "
-                "GGML_FLAGOS_DISABLE_OPS=GET_ROWS and %d with FLAGOS_SPACEMIT_EMBD=cpu, outputs %s; new ids on the "
-                "kept graph %s, %llu hit by uid\n",
-                splits[0], splits[1], splits[2], same ? "identical" : "differ", reused ? "as the CPU's" : "wrong",
+                "GGML_FLAGOS_DISABLE_OPS=GET_ROWS, outputs %s; new ids on the kept graph %s, %llu hit by uid\n",
+                splits[0], splits[1], same ? "identical" : "differ", reused ? "as the CPU's" : "wrong",
                 (unsigned long long) hits);
     return 0;
 }
@@ -5258,7 +4890,9 @@ static ggml_tensor * gdn_raw(ggml_context * ctx, ggml_type dst_type, ggml_tensor
 //   tiles, or on the K3 their RVV ports: CONCAT's moves the same floats. SSM_CONV's RVV port adds the four taps with
 //   fused multiply-adds, which is not how GCC built ggml-cpu's loop on the K3, so with the RVV kernels it is held to a
 //   rounding bound instead (k_ssm_conv in check_seq_ops). Each output element comes from one row, so the split cannot
-//   change a result.
+//   change a result. The convolution pair's stashed SSM_CONV (check_conv_pair) is held to that bound against the CPU
+//   with the reference kernels too, as a compiler may contract its multiply and add (seen with Apple clang 21 on
+//   2026-11-18, NMSE 3e-15); its copies and its own paths stay bit for bit.
 // - SILU, SIGMOID, SOFTPLUS and L2_NORM: within an NMSE and a largest |difference| / max(1, |CPU's value|) (the
 //   absolute error up to 1, the relative one above). The references are bit for bit ggml-cpu's scalar code for
 //   SIGMOID, SOFTPLUS and L2_NORM, but on the K3 the RVV kernels use SpacemiT's vector exp (ARM's optimized routine,
@@ -6912,15 +6546,16 @@ static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
 // only consumers are one SSM_CONV and views of its last 3 columns runs concat.f32.tail and ssm_conv.f32.stashed. The
 // graphs as delta-net-base.cpp build_conv_state and qwen35.cpp build them: concat(state [3, C, n_s], transpose(x)),
 // the view of its last 3 columns copied into a state tensor, ssm_conv(concat, kernel). Through the device against
-// ggml-cpu on one thread: the convolution's output within check_seq_ops' SSM_CONV bound, the copied state (and a
-// case's other output) bit for bit, fused or not by the pair counter (spacemit_conv_pairs_take); a fused case again
-// under FLAGOS_SPACEMIT_SSM_CONV=split, unfused, with the same bytes. A fused case's two kernels also called directly
-// on 1, 3 and 8 tiles on a CPU-buffer copy (on the K3 the calling core, another vector length): the device's bytes,
-// since each element is one sum in one order whatever the split and the vector length. Then one fused graph through
-// the scheduler (its allocator reusing memory) under the plan cache: a miss, a trusted hit counting no pair,
-// FLAGOS_SPACEMIT_SSM_CONV=split a miss by the configuration word, the default a miss again, every output the same
-// bytes. GGML_FLAGOS_KERNEL_VARIANTS=0 is read once per process, so the program's reference pass covers the portable
-// kernels; the device always runs its 8 tiles
+// ggml-cpu on one thread: the convolution's output within the rounding bound of check_seq_ops' SSM_CONV on the K3
+// (NMSE 1e-12, |difference| / max(1, |y|) 1e-6), with the reference kernels too, as a compiler may contract the
+// multiply and add (seen with Apple clang 21 on 2026-11-18, NMSE 3e-15); the copied state (and a case's other output)
+// bit for bit, fused or not by the pair counter (spacemit_conv_pairs_take). A fused case's two
+// kernels also called directly on 1, 3 and 8 tiles on a CPU-buffer copy (on the K3 the calling core, another vector
+// length): the device's bytes, since each element is one sum in one order whatever the split and the vector length.
+// Then one fused graph through the scheduler (its allocator reusing memory) under the plan cache: a miss, then a
+// trusted hit counting no pair, both outputs the same bytes, within the bound of the CPU's and the copied state bit for
+// bit. GGML_FLAGOS_KERNEL_VARIANTS=0 is read once per process,
+// so the program's reference pass covers the portable kernels; the device always runs its 8 tiles
 //
 
 struct conv_pair_case {
@@ -7032,12 +6667,32 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
-    // check_seq_ops' SSM_CONV bound: ggml-cpu's bytes, but a rounding bound for the RVV kernels' fused taps
-#if defined(__riscv)
-    const seq_bound bound = *reference_label() != '\0' ? k_seq_exact : seq_bound{ 1e-12, 1e-6 };
-#else
-    const seq_bound bound = k_seq_exact;
-#endif
+    // check_seq_ops' SSM_CONV bound with the RVV kernels, for every kernel: a compiler may contract the stashed
+    // kernel's multiply and add, the RVV port fuses its taps
+    const seq_bound bound = { 1e-12, 1e-6 };
+    // the convolution's output against the CPU's: its NMSE and its largest |difference| / max(1, |y|); -1 if the sizes
+    // differ
+    const auto rounding = [](const std::vector<uint8_t> & got, const void * want, size_t want_bytes, double & e,
+                             double & a) {
+        e = a = -1.0;
+        if (got.size() != want_bytes) {
+            return;
+        }
+        const float * g = (const float *) got.data();
+        const float * r = (const float *) want;
+        const int64_t n = (int64_t) (got.size() / sizeof(float));
+        e               = nmse(g, r, n);
+        a               = 0.0;
+        for (int64_t i = 0; i < n; i++) {
+            double d = HUGE_VAL;
+            if (g[i] == r[i]) {
+                d = 0.0;
+            } else if (std::isfinite(g[i]) && std::isfinite(r[i])) {
+                d = std::fabs((double) g[i] - r[i]) / std::max(1.0, std::fabs((double) r[i]));
+            }
+            a = std::max(a, d);
+        }
+    };
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -7055,7 +6710,6 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
     const spacemit_plugin_kernel * k_stash = entry("ssm_conv.f32.stashed");
     REQUIRE(k_tail != nullptr && k_stash != nullptr && k_stash->workspace_size != nullptr);
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
-    env_override                     fused_default("FLAGOS_SPACEMIT_SSM_CONV", nullptr);
     env_override                     plan_default("FLAGOS_SPACEMIT_PLAN", nullptr);
     env_override                     quantize_default("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
 
@@ -7089,7 +6743,7 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
         const std::vector<uint8_t> want_out = conv_pair_graph::bytes(ref.out), want_state = conv_pair_graph::bytes(ref.state),
                                    want_extra = conv_pair_graph::bytes(ref.extra), want_tail = ref.tail();
 
-        // one device run under the current FLAGOS_SPACEMIT_SSM_CONV: ran, the pairs it fused, its outputs
+        // one device run: ran, the pairs it fused, its outputs
         const auto run = [&](uint64_t & pairs, std::vector<uint8_t> & out, std::vector<uint8_t> & state,
                              std::vector<uint8_t> & extra) {
             dv.junk();
@@ -7101,35 +6755,20 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
             extra         = conv_pair_graph::bytes(dv.extra);
             return ok;
         };
-        uint64_t             pairs = 0, pairs_split = 0;
-        std::vector<uint8_t> out, state, extra, out_split, state_split, extra_split;
+        uint64_t             pairs = 0;
+        std::vector<uint8_t> out, state, extra;
         const bool           dev_ok = ref_ok && run(pairs, out, state, extra);
         double               e = -1.0, a = -1.0;
         bool                 exact = false;
-        if (dev_ok && out.size() == want_out.size()) {
-            const float * g = (const float *) out.data();
-            const float * r = (const float *) want_out.data();
-            const int64_t n = (int64_t) (out.size() / sizeof(float));
-            e               = nmse(g, r, n);
-            a               = 0.0;
-            for (int64_t i = 0; i < n; i++) {
-                const double d = g[i] == r[i] ? 0.0 :
-                                 std::isfinite(g[i]) && std::isfinite(r[i]) ?
-                                                 std::fabs((double) g[i] - r[i]) / std::max(1.0, std::fabs((double) r[i])) :
-                                                 HUGE_VAL;
-                a = std::max(a, d);
-            }
+        if (dev_ok) {
+            rounding(out, want_out.data(), want_out.size(), e, a);
             exact = out == want_out;
         }
-        const bool in_bound = e >= 0.0 && e <= bound.nmse && a >= 0.0 && a <= bound.abs &&
-                              (bound.nmse > 0.0 || bound.abs > 0.0 || exact);
+        const bool in_bound = e >= 0.0 && e <= bound.nmse && a >= 0.0 && a <= bound.abs;
         worst_nmse          = std::max(worst_nmse, e);
         worst_abs           = std::max(worst_abs, a);
-        bool split_ok = true, direct_ok = true;
+        bool direct_ok = true;
         if (c.fused && dev_ok) {
-            env_override split("FLAGOS_SPACEMIT_SSM_CONV", "split");
-            split_ok = run(pairs_split, out_split, state_split, extra_split) && pairs_split == 0 && out_split == out &&
-                       state_split == want_state;
             // the two kernels directly, on a CPU-buffer copy
             conv_pair_graph dir;
             direct_ok = dir.init(c, ggml_backend_cpu_buffer_type(), seed);
@@ -7160,20 +6799,19 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
             }
         }
         const bool ok = ref_ok && dev_ok && pairs == (c.fused ? 1u : 0u) && in_bound && state == want_state &&
-                        extra == want_extra && split_ok && direct_ok;
+                        extra == want_extra && direct_ok;
         n_ok += ok;
         n_fused += pairs == 1;
         if (!ok) {
             std::fprintf(stderr,
                          "FAIL: conv pair %s (n %lld, C %lld, %lld sequences, kernel width %lld): the CPU reference %s, "
                          "the run %s, %llu pairs fused (expected %d); NMSE %.3e, |difference| / max(1, |y|) %.3e "
-                         "(bounds %.0e, %.0e), bytes as the CPU's %s; the copied state %s, the other output %s; split "
-                         "%s; the direct calls %s\n",
+                         "(bounds %.0e, %.0e), bytes as the CPU's %s; the copied state %s, the other output %s; the "
+                         "direct calls %s\n",
                          c.what, (long long) c.n, (long long) c.C, (long long) c.n_s, (long long) c.kw,
                          ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", (unsigned long long) pairs,
                          c.fused ? 1 : 0, e, a, bound.nmse, bound.abs, exact ? "yes" : "no",
                          state == want_state ? "as the CPU's" : "differs", extra == want_extra ? "as the CPU's" : "differs",
-                         split_ok ? "unfused, the same bytes" : "fused or other bytes",
                          direct_ok ? "as the device's" : "differ");
             g_failures++;
         }
@@ -7182,7 +6820,7 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
 
     // through the scheduler (inputs in our buffer, the rest in its compute buffer) under the plan cache's uid trust
     bool     sched_ok = false;
-    uint64_t sched_pairs[4] = {}, sched_hits[4] = {}, sched_misses[4] = {};
+    uint64_t sched_pairs[2] = {}, sched_hits[2] = {}, sched_misses[2] = {};
     {
         const conv_pair_case c = { "the scheduler", 100, 1000, 1, 4, 0, true };
         conv_pair_graph      sg, ref;
@@ -7192,22 +6830,7 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
             bool                 ok      = sched != nullptr && ggml_backend_graph_compute(cpu, ref.g) == GGML_STATUS_SUCCESS;
             const std::vector<uint8_t> want_state = conv_pair_graph::bytes(ref.state);
             std::vector<uint8_t>       first;
-            // the core reads FLAGOS_SPACEMIT_SSM_CONV at every graph, so it is set here without set_env's reset of the
-            // kernels' switches, which would move the plugin's generation and make every run a miss by that alone
-            const auto set_raw = [](const char * value) {
-#if defined(_WIN32)
-                _putenv_s("FLAGOS_SPACEMIT_SSM_CONV", value != nullptr ? value : "");
-#else
-                if (value != nullptr) {
-                    setenv("FLAGOS_SPACEMIT_SSM_CONV", value, 1);
-                } else {
-                    unsetenv("FLAGOS_SPACEMIT_SSM_CONV");
-                }
-#endif
-            };
-            const char * const settings[4] = { nullptr, nullptr, "split", nullptr };
-            for (int i = 0; i < 4 && ok; i++) {
-                set_raw(settings[i]);
+            for (int i = 0; i < 2 && ok; i++) {
                 spacemit_conv_pairs_take();
                 spacemit_plan_counters_take();
                 ok = ggml_backend_sched_graph_compute(sched, sg.g) == GGML_STATUS_SUCCESS;
@@ -7224,31 +6847,25 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
             const bool on_device = sched != nullptr && ggml_backend_sched_get_tensor_backend(sched, sg.cat) == backend &&
                                    ggml_backend_sched_get_tensor_backend(sched, sg.out) == backend;
             // the output within the bound of ggml-cpu's
-            double e = -1.0;
-            if (ok && first.size() == ggml_nbytes(ref.out)) {
-                e = nmse((const float *) first.data(), (const float *) ref.out->data,
-                         (int64_t) (first.size() / sizeof(float)));
+            double e = -1.0, a = -1.0;
+            if (ok) {
+                rounding(first, ref.out->data, ggml_nbytes(ref.out), e, a);
             }
-            const bool e_ok = e >= 0.0 && e <= bound.nmse &&
-                              (bound.nmse > 0.0 || std::memcmp(first.data(), ref.out->data, first.size()) == 0);
+            const bool e_ok = e >= 0.0 && e <= bound.nmse && a >= 0.0 && a <= bound.abs;
             sched_ok = ok && on_device && e_ok && sched_pairs[0] == 1 && sched_misses[0] == 1 && sched_hits[1] == 1 &&
-                       sched_pairs[1] == 0 && sched_misses[2] == 1 && sched_pairs[2] == 0 && sched_misses[3] == 1 &&
-                       sched_pairs[3] == 1;
+                       sched_pairs[1] == 0;
             if (sched != nullptr) {
                 ggml_backend_sched_free(sched);
             }
         }
         if (!sched_ok) {
             std::fprintf(stderr,
-                         "FAIL: conv pair through the scheduler: pairs %llu/%llu/%llu/%llu (expected 1/0/0/1), plan "
-                         "hits %llu/%llu/%llu/%llu (expected 0/1/0/0), misses %llu/%llu/%llu/%llu (expected 1/0/1/1), "
-                         "or the outputs, the placement or the bound failed\n",
+                         "FAIL: conv pair through the scheduler: pairs %llu/%llu (expected 1/0), plan hits %llu/%llu "
+                         "(expected 0/1), misses %llu/%llu (expected 1/0), or the outputs, the placement or the bound "
+                         "failed\n",
                          (unsigned long long) sched_pairs[0], (unsigned long long) sched_pairs[1],
-                         (unsigned long long) sched_pairs[2], (unsigned long long) sched_pairs[3],
                          (unsigned long long) sched_hits[0], (unsigned long long) sched_hits[1],
-                         (unsigned long long) sched_hits[2], (unsigned long long) sched_hits[3],
-                         (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1],
-                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3]);
+                         (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1]);
             g_failures++;
         }
     }
@@ -7256,29 +6873,27 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf("convpair CONCAT + SSM_CONV as the model builds them (n 32, 33, 100, 501, 64 tokens of 8, 96, 1000, "
-                "8192, 7 channels fused; 31 tokens, a second consumer, a view from column n - 1, 2 sequences, a "
-                "kernel of width 3, an output concat not)%s: %d/%d cases, %d fused by the counter; the output against "
-                "the CPU max NMSE %.2e, |difference| / max(1, |y|) %.2e (bounds %.0e, %.0e), the copied state and "
-                "other outputs bit for bit, FLAGOS_SPACEMIT_SSM_CONV=split unfused with the same bytes; the kernels "
-                "directly on 1, 3 and 8 tiles as the device %d/%d; through the scheduler a miss, a hit by uid (no "
-                "pair), split a miss by the configuration word, the default a miss again, the same bytes: %s\n",
+                "8192, 7 channels fused; 31 tokens, a second consumer, a view from column n - 1, 2 sequences, a kernel "
+                "of width 3, an output concat not)%s: %d/%d cases, %d fused by the counter; the output against the CPU "
+                "(a rounding bound) max NMSE %.2e, |difference| / max(1, |y|) %.2e (bounds %.0e, %.0e), the copied "
+                "state and other outputs bit for bit; the kernels directly on 1, 3 and 8 tiles as the device %d/%d; "
+                "through the scheduler a miss, a hit by uid (no pair), the same bytes, within the bound: %s\n",
                 reference_label(), n_ok, n_cases, n_fused, worst_nmse, worst_abs, bound.nmse, bound.abs, n_direct_ok,
                 n_direct, sched_ok ? "checked" : "FAILED");
     return 0;
 }
 
-// the many-row path of MUL_MAT_ID (FLAGOS_SPACEMIT_MMID): from 2 tokens the (token, slot) pairs are sorted by expert,
-// an expert's rows go in groups of 4 through the 4-row kernel (the rest one by one) and each 32-column weight slab is
-// multiplied by all of them, so that the expert's weights are read once per node. staged (the default) copies the slab
-// into TCM, with the expert's quantized rows beside it where they fit; grouped reads it where it lies, with the same
-// kernel calls on the same bytes; rows is the path before, one 1-row kernel call per (pair, slab) from DRAM.
+// the many-row path of MUL_MAT_ID: from 2 tokens the (token, slot) pairs are sorted by expert, an expert's rows go in
+// groups of 4 through the 4-row kernel (the rest one by one) and each 32-column weight slab is multiplied by all of
+// them, so that the expert's weights are read once per node. With TCM the slab is copied there, with the expert's
+// quantized rows beside it where they fit; without TCM it is read where it lies, with the same kernel calls on the same
+// bytes. One token (ne12 == 1) keeps the 1-row path.
 // The ids of a case are built from a wanted row count per expert, so one node has experts with 0, 1, 2, 3, 4, 5, 7, 8,
 // 9 and 40 rows (groups of 4 with and without a tail, and experts no token uses), in that order and shuffled. Per
-// case: staged with TCM, staged without TCM and grouped bit for bit, the two steps called directly on 1 and on 8 tiles
-// likewise, every output against the CPU backend on one thread within MUL_MAT's bound, and at one token (ne12 == 1,
-// which keeps the 1-row path) bit for bit with rows. The 4-row kernel is not bit-equal to the 1-row one, so rows is
-// compared by the bound, not by its bytes. TCM: a stand-in of the K3's 384 KiB, as check_gemv and check_mm_paths get
-// one; the direct calls get a buffer of their own, zeroed first, so that a staged call must leave bytes in it
+// case: with TCM and without bit for bit, the two steps called directly on 1 and on 8 tiles likewise, every output
+// against the CPU backend on one thread within MUL_MAT's bound. TCM: a stand-in of the K3's 384 KiB, as check_gemv and
+// check_mm_paths get one; the direct calls get a buffer of their own, zeroed first, so that a staged call must leave
+// bytes in it
 // weights quantized from random normal values, with the other checks' uniform generator through a Box-Muller
 // transform: a real weight's values are near normal
 static std::vector<uint8_t> quantize_normal_weights(ggml_type type, int64_t k, int64_t n, uint32_t seed) {
@@ -7300,11 +6915,10 @@ static std::vector<uint8_t> quantize_normal_weights(ggml_type type, int64_t k, i
     return q;
 }
 
-// MUL_MAT_ID with 3-D Q4_1 experts in the q4_1 min layout, FLAGOS_SPACEMIT_EXPERT_Q4_1 unset (the default; the
-// model's five blk.{0..4}.ffn_down_exps of Qwen3.6-35B-A3B). A weight's layout is decided at its load, so every weight
-// here is made, written and freed inside the setting's scope. The layout is lossless, so both comparisons carry the
+// MUL_MAT_ID with 3-D Q4_1 experts in the q4_1 min layout (the model's five blk.{0..4}.ffn_down_exps of
+// Qwen3.6-35B-A3B). The layout is lossless, so both comparisons carry the
 // bound: against the CPU on the weight's read-back (what the model and test-backend-ops see) and on the GGUF bytes.
-// Checked: the staged, grouped and rows settings against each other and the steps directly on 1 and on 8 tiles,
+// Checked: with TCM and without against each other and the steps directly on 1 and on 8 tiles,
 // experts of 0 to 40 rows, one token and ten, broadcast activations and a row per id, the model's down shape with 4
 // experts, repack-unpack-repack, and that the read-back is the GGUF bytes
 static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_backend_t cpu,
@@ -7341,10 +6955,9 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
     };
 
     int      n_cases = 0, n_ok = 0, n_same = 0, n_stable = 0, n_bits = 0;
-    double   worst = 0.0, worst_rows = 0.0, worst_gguf = 0.0;
+    double   worst = 0.0, worst_gguf = 0.0;
     uint32_t seed = 4100;
     for (const q41_case & c : cases) {
-        env_override               sw("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
         const int64_t              n_mats = (int64_t) c.counts.size();
         const std::vector<int32_t> ids_in = id_list(c);
         REQUIRE((int64_t) ids_in.size() == c.n_used * c.n_tok);
@@ -7395,33 +7008,28 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
         ggml_build_forward_expand(g_dev, y);
         bool ok = ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(cpu, g_cpu) == GGML_STATUS_SUCCESS;
 
-        const auto run = [&](ggml_backend_t backend, const char * setting) {
-            set_env("FLAGOS_SPACEMIT_MMID", setting);
+        const auto run = [&](ggml_backend_t backend) {
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
             std::vector<float> out((size_t) n_out, NAN);
             ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
             return out;
         };
-        const char * const settings[3] = { nullptr, "grouped", "rows" };  // unset: staged, the default
-        std::vector<float> out[3], staged_plain;
+        std::vector<float> out, staged_plain;
         {
             ggml_backend_t backend = tcm_backend(dev, nullptr);
             REQUIRE(backend != nullptr);
-            for (int s = 0; s < 3; s++) {
-                out[s] = run(backend, settings[s]);
-            }
+            out = run(backend);
             ggml_backend_free(backend);
         }
-        {  // without TCM the staged setting reads the slabs where they lie, as grouped does
+        {  // without TCM the slabs are read where they lie
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             REQUIRE(backend != nullptr);
-            staged_plain = run(backend, nullptr);
+            staged_plain = run(backend);
             ggml_backend_free(backend);
         }
 
-        // the two steps directly on 1 and on 8 tiles, staged with a TCM buffer of its own and grouped without
+        // the two steps directly on 1 and on 8 tiles, with a TCM buffer of their own and without
         const size_t         ws = step_q->workspace_size(y);
         std::vector<uint8_t> workspace(ws);
         std::vector<uint8_t> tcm(393216);
@@ -7429,7 +7037,6 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
         for (int r = 0; r < 4 && direct; r++) {
             const uint32_t nth    = (r % 2) == 0 ? 1u : 8u;
             const bool     staged = r < 2;
-            set_env("FLAGOS_SPACEMIT_MMID", staged ? nullptr : "grouped");
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             for (const spacemit_plugin_kernel * step : { step_q, step_g }) {
                 for (uint32_t ith = 0; ith < nth; ith++) {
@@ -7438,22 +7045,18 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
                     ok &= step->fn(&tile, y);
                 }
             }
-            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
             d_out[r].assign((size_t) n_out, NAN);
             ggml_backend_tensor_get(y, d_out[r].data(), 0, ggml_nbytes(y));
         }
 
         const size_t out_bytes = (size_t) n_out * sizeof(float);
-        bool         same      = ok && std::memcmp(out[0].data(), out[1].data(), out_bytes) == 0 &&
-                     std::memcmp(out[0].data(), staged_plain.data(), out_bytes) == 0;
+        bool         same      = ok && std::memcmp(out.data(), staged_plain.data(), out_bytes) == 0;
         for (int r = 0; r < 4 && direct && same; r++) {
-            same = std::memcmp(out[0].data(), d_out[r].data(), out_bytes) == 0;
+            same = std::memcmp(out.data(), d_out[r].data(), out_bytes) == 0;
         }
-        const double e      = ok ? nmse(out[0].data(), (const float *) y_ref->data, n_out) : -1.0;
-        const double e_rows = ok ? nmse(out[2].data(), (const float *) y_ref->data, n_out) : -1.0;
-        const double e_gguf = ok ? nmse(out[0].data(), (const float *) y_q41->data, n_out) : -1.0;
-        const bool   in_bound = e >= 0.0 && e_rows >= 0.0 && e_gguf >= 0.0 && e <= k_mul_mat_max_nmse &&
-                              e_rows <= k_mul_mat_max_nmse && e_gguf <= k_mul_mat_max_nmse;
+        const double e        = ok ? nmse(out.data(), (const float *) y_ref->data, n_out) : -1.0;
+        const double e_gguf   = ok ? nmse(out.data(), (const float *) y_q41->data, n_out) : -1.0;
+        const bool   in_bound = e >= 0.0 && e_gguf >= 0.0 && e <= k_mul_mat_max_nmse && e_gguf <= k_mul_mat_max_nmse;
         const bool   case_ok  = ok && same && in_bound && stable && bits;
         n_cases++;
         n_ok += case_ok;
@@ -7461,17 +7064,16 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
         n_stable += stable;
         n_bits += bits;
         worst      = std::max(worst, e);
-        worst_rows = std::max(worst_rows, e_rows);
         worst_gguf = std::max(worst_gguf, e_gguf);
         if (!case_ok) {
             std::fprintf(stderr,
                          "FAIL: MUL_MAT_ID Q4_1, %s, [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld "
-                         "tokens: %s; the settings and the tile counts %s; repack-unpack-repack %s; the read-back %s "
-                         "the GGUF bytes; NMSE against the read-back staged %.3e, rows %.3e, against the GGUF bytes "
-                         "%.3e (bound %.0e)\n",
+                         "tokens: %s; with TCM, without and the tile counts %s; repack-unpack-repack %s; the "
+                         "read-back %s the GGUF bytes; NMSE against the read-back %.3e, against the GGUF bytes %.3e "
+                         "(bound %.0e)\n",
                          c.what, (long long) c.k, (long long) c.n, (long long) n_mats, (long long) c.n_used,
                          (long long) c.ne11, (long long) c.n_tok, ok ? "ran" : "failed", same ? "equal" : "differ",
-                         stable ? "stable" : "changed the bytes", bits ? "is" : "is not", e, e_rows, e_gguf,
+                         stable ? "stable" : "changed the bytes", bits ? "is" : "is not", e, e_gguf,
                          k_mul_mat_max_nmse);
             g_failures++;
         }
@@ -7487,17 +7089,15 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
 
     std::printf("mmid     3-D Q4_1 experts (the q4_1 min layout, the default) at experts of 0, 1, 3, 4, 5, 8, 19 and "
                 "40 rows a node, 1 and 8 column slabs, broadcast and a row per id, 10 tokens and 1, the model's down "
-                "shape [512, 2048, 4]: %d/%d cases; staged, grouped, staged without TCM%s bit for bit in %d/%d; "
-                "repack-unpack-repack keeps the bytes in %d/%d; the read-back is the GGUF bytes in %d/%d; max NMSE "
-                "against the CPU on one thread computing on the read-back weights staged %.2e, rows %.2e, on the GGUF "
-                "bytes %.2e (bound %.0e)%s\n",
+                "shape [512, 2048, 4]: %d/%d cases; with TCM and without%s bit for bit in %d/%d; repack-unpack-repack "
+                "keeps the bytes in %d/%d; the read-back is the GGUF bytes in %d/%d; max NMSE against the CPU on one "
+                "thread computing on the read-back weights %.2e, on the GGUF bytes %.2e (bound %.0e)%s\n",
                 n_ok, n_cases, direct ? ", with the steps directly on 1 and on 8 tiles" : "", n_same, n_cases,
-                n_stable, n_cases, n_bits, n_cases, worst, worst_rows, worst_gguf, k_mul_mat_max_nmse,
-                reference_label());
+                n_stable, n_cases, n_bits, n_cases, worst, worst_gguf, k_mul_mat_max_nmse, reference_label());
     return 0;
 }
 
-// the claims under every value of FLAGOS_SPACEMIT_EXPERT_Q4_1, and the default's layout (check_mul_mat_id_q4_1_min)
+// the claims of 3-D Q4_1 weights, and their layout (check_mul_mat_id_q4_1_min)
 static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
     // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions
     const bool     direct = host || *reference_label() != '\0';
@@ -7520,27 +7120,20 @@ static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
         }
     }
     REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
-    env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
 
-    // what each value of the switch claims. Unset, exact and an unknown value (which warns and keeps the default) give
-    // a 3-D Q4_1 weight a layout, cpu none. 2-D Q4_1 keeps its Q8_0 route under every value. The row rule stays
-    // (N % 32), and K must be a multiple of 256 under every value
+    // a 3-D Q4_1 weight has a layout and MUL_MAT_ID takes it; 2-D Q4_1 keeps its Q8_0 route. The row rule stays
+    // (N % 32), and K must be a multiple of 256
     int n_claims = 0, n_claims_ok = 0;
-    for (const char * setting : { (const char *) nullptr, "exact", "cpu", "bogus" }) {
-        env_override     sw("FLAGOS_SPACEMIT_EXPERT_Q4_1", setting);
-        log_capture      log;
-        const bool       want  = setting == nullptr || std::strcmp(setting, "cpu") != 0;
-        const bool       bogus = setting != nullptr && std::strcmp(setting, "bogus") == 0;
-        const char *     name  = setting != nullptr ? setting : "unset";
-        ggml_init_params p    = { ggml_tensor_overhead() * 32, nullptr, true };
-        ggml_context *   ctx  = ggml_init(p);
+    {
+        ggml_init_params p   = { ggml_tensor_overhead() * 32, nullptr, true };
+        ggml_context *   ctx = ggml_init(p);
         REQUIRE(ctx != nullptr);
         const auto expect = [&](bool wanted, ggml_tensor * node, const char * what) {
             n_claims++;
             const bool got = ggml_backend_dev_supports_op(dev, node);
             n_claims_ok += got == wanted;
             if (got != wanted) {
-                std::fprintf(stderr, "FAIL: EXPERT_Q4_1=%s: %s: %s, expected %s\n", name, what,
+                std::fprintf(stderr, "FAIL: MUL_MAT_ID Q4_1 claims: %s: %s, expected %s\n", what,
                              got ? "claimed" : "refused", wanted ? "claimed" : "refused");
                 g_failures++;
             }
@@ -7549,14 +7142,14 @@ static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
         ggml_tensor * ids2 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 512);
         ggml_tensor * w    = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 64, 4);
         ggml_tensor * w2d  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_1, 256, 64);
-        expect(want, ggml_mul_mat_id(ctx, w, x1, ids2), "a 3-D Q4_1 weight");
+        expect(true, ggml_mul_mat_id(ctx, w, x1, ids2), "a 3-D Q4_1 weight");
         expect(true, ggml_mul_mat(ctx, w2d, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 7)), "MUL_MAT, 2-D Q4_1");
         n_claims += 2;
-        n_claims_ok += (table->tensor_layout(w) != 0) == want;
-        n_claims_ok += table->tensor_layout(w2d) != 0;  // 2-D Q4_1: the Q8_0 route, whatever the setting
-        if ((table->tensor_layout(w) != 0) != want || table->tensor_layout(w2d) == 0) {
-            std::fprintf(stderr, "FAIL: EXPERT_Q4_1=%s: the 3-D layout is %u (wanted %s), the 2-D layout %u\n", name,
-                         table->tensor_layout(w), want ? "a layout" : "none", table->tensor_layout(w2d));
+        n_claims_ok += table->tensor_layout(w) != 0;
+        n_claims_ok += table->tensor_layout(w2d) != 0;  // 2-D Q4_1: the Q8_0 route
+        if (table->tensor_layout(w) == 0 || table->tensor_layout(w2d) == 0) {
+            std::fprintf(stderr, "FAIL: MUL_MAT_ID Q4_1 claims: the 3-D layout is %u (wanted a layout), the 2-D layout "
+                         "%u\n", table->tensor_layout(w), table->tensor_layout(w2d));
             g_failures++;
         }
         expect(false,
@@ -7565,23 +7158,15 @@ static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
                "Q4_1 rows of 128 (not a multiple of 256)");
         expect(false, ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_1, 256, 48, 4), x1, ids2),
                "48 rows per expert (not a multiple of 32)");
-        const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_EXPERT_Q4_1=");
-        n_claims++;
-        n_claims_ok += warnings == (bogus ? 1 : 0);
-        if (warnings != (bogus ? 1 : 0)) {
-            std::fprintf(stderr, "FAIL: EXPERT_Q4_1=%s: %d warnings (wanted %d)\n", name, warnings, bogus ? 1 : 0);
-            g_failures++;
-        }
         ggml_free(ctx);
     }
 
     check_mul_mat_id_q4_1_min(dev, direct, cpu, step_q, step_g);
 
     ggml_backend_free(cpu);
-    std::printf("mmid     claims under FLAGOS_SPACEMIT_EXPERT_Q4_1 (unset, exact, cpu and an unknown value: a 3-D Q4_1 "
-                "weight has a layout and MUL_MAT_ID takes it under all but cpu, the unknown value warning once and "
-                "keeping the default; 2-D Q4_1 keeps its layout and MUL_MAT under every value; rows per expert not a "
-                "multiple of 32 and K not a multiple of 256 refused under every value) %d/%d\n",
+    std::printf("mmid     claims of 3-D Q4_1 (a 3-D Q4_1 weight has a layout and MUL_MAT_ID takes it; 2-D Q4_1 keeps "
+                "its layout and MUL_MAT; rows per expert not a multiple of 32 and K not a multiple of 256 refused) "
+                "%d/%d\n",
                 n_claims_ok, n_claims);
     return 0;
 }
@@ -7609,7 +7194,6 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
         }
     }
     REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
-    env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
 
     struct group_case {
         const char *         what;
@@ -7656,10 +7240,9 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
         return list;
     };
 
-    const char * const settings[3] = { nullptr, "grouped", "rows" };  // unset: staged, the default
-    int                n_cases = 0, n_ok = 0, n_same = 0, n_one = 0, n_one_ok = 0;
-    double             worst = 0.0, worst_rows = 0.0, worst_between = 0.0;
-    uint32_t           seed = 2600;
+    int      n_cases = 0, n_ok = 0, n_same = 0;
+    double   worst = 0.0;
+    uint32_t seed  = 2600;
     for (const group_case & c : cases) {
         const int64_t              n_mats = (int64_t) c.counts.size();
         const std::vector<int32_t> ids_in = id_list(c, seed);
@@ -7701,39 +7284,35 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
         ggml_build_forward_expand(g_dev, y);
         bool ok = ggml_backend_dev_supports_op(dev, y) && ggml_backend_graph_compute(cpu, g_cpu) == GGML_STATUS_SUCCESS;
 
-        // through the backend under each setting, the output filled with NaN first so an element no tile writes shows
-        const auto run = [&](ggml_backend_t backend, const char * setting) {
-            set_env("FLAGOS_SPACEMIT_MMID", setting);
+        // through the backend, the output filled with NaN first so an element no tile writes shows
+        const auto run = [&](ggml_backend_t backend) {
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
             std::vector<float> out((size_t) n_out, NAN);
             ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
             return out;
         };
-        std::vector<float> out[3], staged_plain, staged_threads;
+        std::vector<float> out, staged_plain, staged_threads;
         {
             ggml_backend_t backend = tcm_backend(dev, nullptr);
             REQUIRE(backend != nullptr);
-            for (int s = 0; s < 3; s++) {
-                out[s] = run(backend, settings[s]);
-            }
+            out = run(backend);
             ggml_backend_free(backend);
         }
         if (host) {  // the tiles on threads, each staging into a TCM stand-in of its own
             ggml_backend_t backend = tcm_backend(dev, "1");
             REQUIRE(backend != nullptr);
-            staged_threads = run(backend, nullptr);
+            staged_threads = run(backend);
             ggml_backend_free(backend);
         }
-        {  // without TCM the staged setting reads the slabs where they lie, as grouped does
+        {  // without TCM the slabs are read where they lie
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             REQUIRE(backend != nullptr);
-            staged_plain = run(backend, nullptr);
+            staged_plain = run(backend);
             ggml_backend_free(backend);
         }
 
-        // the two steps directly on 1 and on 8 tiles, staged with a TCM buffer of its own and grouped without
+        // the two steps directly on 1 and on 8 tiles, with a TCM buffer of their own and without
         const size_t         ws = step_q->workspace_size(y);
         std::vector<uint8_t> workspace(ws);
         std::vector<uint8_t> tcm(393216);
@@ -7742,7 +7321,6 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
         for (int r = 0; r < 4 && direct; r++) {
             const uint32_t nth    = (r % 2) == 0 ? 1u : 8u;
             const bool     staged = r < 2;
-            set_env("FLAGOS_SPACEMIT_MMID", staged ? nullptr : "grouped");
             std::fill(tcm.begin(), tcm.end(), uint8_t(0));
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             for (const spacemit_plugin_kernel * step : { step_q, step_g }) {
@@ -7752,7 +7330,6 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
                     ok &= step->fn(&tile, y);
                 }
             }
-            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
             d_out[r].assign((size_t) n_out, NAN);
             ggml_backend_tensor_get(y, d_out[r].data(), 0, ggml_nbytes(y));
             if (staged && c.n_tok > 1) {  // a staged call copies at least one slab into TCM
@@ -7760,40 +7337,27 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
             }
         }
 
-        // staged and grouped, with TCM and without, on 8 tiles and on 1: one kernel call per (group, slab) either way
+        // with TCM and without, on 8 tiles and on 1: one kernel call per (group, slab) either way
         const size_t out_bytes = (size_t) n_out * sizeof(float);
-        bool         same      = ok && std::memcmp(out[0].data(), out[1].data(), out_bytes) == 0 &&
-                     std::memcmp(out[0].data(), staged_plain.data(), out_bytes) == 0 && tcm_used &&
-                     (!host || std::memcmp(out[0].data(), staged_threads.data(), out_bytes) == 0);
+        bool         same      = ok && std::memcmp(out.data(), staged_plain.data(), out_bytes) == 0 && tcm_used &&
+                     (!host || std::memcmp(out.data(), staged_threads.data(), out_bytes) == 0);
         for (int r = 0; r < 4 && direct && same; r++) {
-            same = std::memcmp(out[0].data(), d_out[r].data(), out_bytes) == 0;
+            same = std::memcmp(out.data(), d_out[r].data(), out_bytes) == 0;
         }
-        const double e      = ok ? nmse(out[0].data(), (const float *) y_ref->data, n_out) : -1.0;
-        const double e_rows = ok ? nmse(out[2].data(), (const float *) y_ref->data, n_out) : -1.0;
-        const double e_both = ok ? nmse(out[0].data(), out[2].data(), n_out) : -1.0;
-        // one token keeps the 1-row path whatever the setting
-        const bool one_token = c.n_tok == 1;
-        const bool one_ok    = !one_token || (ok && std::memcmp(out[0].data(), out[2].data(), out_bytes) == 0);
-        const bool case_ok   = ok && same && one_ok && e >= 0.0 && e <= k_mul_mat_max_nmse && e_rows >= 0.0 &&
-                             e_rows <= k_mul_mat_max_nmse;
+        const double e       = ok ? nmse(out.data(), (const float *) y_ref->data, n_out) : -1.0;
+        const bool   case_ok = ok && same && e >= 0.0 && e <= k_mul_mat_max_nmse;
         n_cases++;
         n_ok += case_ok;
         n_same += same;
-        n_one += one_token;
-        n_one_ok += one_token && one_ok;
-        worst         = std::max(worst, e);
-        worst_rows    = std::max(worst_rows, e_rows);
-        worst_between = std::max(worst_between, e_both);
+        worst = std::max(worst, e);
         if (!case_ok) {
             std::fprintf(stderr,
                          "FAIL: MUL_MAT_ID many rows, %s, %s [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld "
-                         "tokens: %s; staged, grouped and the tile counts %s; NMSE staged %.3e, rows %.3e (bound "
-                         "%.0e)%s%s\n",
+                         "tokens: %s; with TCM, without and the tile counts %s; NMSE %.3e (bound %.0e)%s\n",
                          c.what, ggml_type_name(c.type), (long long) c.k, (long long) c.n, (long long) n_mats,
                          (long long) c.n_used, (long long) c.ne11, (long long) c.n_tok, ok ? "ran" : "failed",
-                         same ? "equal" : "differ", e, e_rows, k_mul_mat_max_nmse,
-                         tcm_used ? "" : ", a staged run left TCM untouched",
-                         one_ok ? "" : ", one token differs from rows");
+                         same ? "equal" : "differ", e, k_mul_mat_max_nmse,
+                         tcm_used ? "" : ", a staged run left TCM untouched");
             g_failures++;
         }
         ggml_backend_buffer_free(bh);
@@ -7807,21 +7371,20 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
     }
 
     ggml_backend_free(cpu);
-    std::printf("mmid     the many-row path (FLAGOS_SPACEMIT_MMID=staged, the default, against grouped and rows) at "
-                "experts of 0, 1, 2, 3, 4, 5, 7, 8, 9 and 40 rows a node, ids designed and shuffled with repeats "
-                "within a token, Q4_0 and Q8_0, 1 and 3 column slabs, broadcast and a row per id, 10 tokens and 1, a "
-                "long row whose rows do not fit beside the slab: %d/%d cases; staged with TCM%s, staged without TCM and "
-                "grouped bit for bit%s in %d/%d; one token bit for bit with rows %d/%d; against the CPU on one thread "
-                "max NMSE staged %.2e, rows %.2e, between them %.2e (bound %.0e)%s\n",
+    std::printf("mmid     the many-row path (the pairs grouped by expert, the slabs staged through TCM) at experts of "
+                "0, 1, 2, 3, 4, 5, 7, 8, 9 and 40 rows a node, ids designed and shuffled with repeats within a token, "
+                "Q4_0 and Q8_0, 1 and 3 column slabs, broadcast and a row per id, 10 tokens and 1, a long row whose "
+                "rows do not fit beside the slab: %d/%d cases; with TCM%s and without TCM bit for bit%s in %d/%d; "
+                "against the CPU on one thread max NMSE %.2e (bound %.0e)%s\n",
                 n_ok, n_cases, host ? " (tiles in turn and on threads)" : "",
-                direct ? ", with the steps directly on 1 and on 8 tiles" : "", n_same, n_cases, n_one_ok, n_one, worst,
-                worst_rows, worst_between, k_mul_mat_max_nmse, reference_label());
+                direct ? ", with the steps directly on 1 and on 8 tiles" : "", n_same, n_cases, worst,
+                k_mul_mat_max_nmse, reference_label());
     return 0;
 }
 
 // the many-row path's claim queue (plan.md "The expert matmul's claim queue"). Every output element comes from one
 // kernel call whoever claims its chunk, so the bytes are the first backend run's (with TCM) for any tile count, claim
-// order and staging. Through the backend: grouped, without TCM, twice in a row on one backend (the second compute
+// order and staging. Through the backend: without TCM, twice in a row on one backend (the second compute
 // needs step 1's reset), on threads 20 times. Directly: on 1 tile (it claims every chunk in order) and 8, in reverse,
 // one tile first, on threads 20 times; after each the counter (at the workspace's end, which the test aligns to 64)
 // holds the chunk count plus the tile count, each tile's last claim being past the end. The two steps' labels in the
@@ -7848,7 +7411,6 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         }
     }
     REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
-    env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
 
     struct queue_case {
         const char *         what;
@@ -7905,7 +7467,7 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
 
     int      n_cases = 0, n_ok = 0, n_backend = 0, n_backend_ok = 0, n_direct = 0, n_direct_ok = 0;
     int      n_design = 0, n_design_ok = 0;
-    double   worst = 0.0, worst_rows = 0.0;
+    double   worst = 0.0;
     uint32_t seed = 3100;
     for (size_t ci = 0; ci < cases.size(); ci++) {
         const queue_case &         c      = cases[ci];
@@ -7962,15 +7524,12 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         const auto same = [&](const std::vector<float> & a, const std::vector<float> & b) {
             return a.size() == b.size() && std::memcmp(a.data(), b.data(), bytes) == 0;
         };
-        // through the backend under the given FLAGOS_SPACEMIT_MMID, the output filled with NaN first so an element no
-        // tile writes shows
-        const auto run = [&](ggml_backend_t backend, const char * mmid) {
-            set_env("FLAGOS_SPACEMIT_MMID", mmid);
+        // through the backend, the output filled with NaN first so an element no tile writes shows
+        const auto run = [&](ggml_backend_t backend) {
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
             std::vector<float> out((size_t) n_out, NAN);
             ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-            set_env("FLAGOS_SPACEMIT_MMID", nullptr);
             return out;
         };
         const auto backend_same = [&](bool good, const char * what) {
@@ -7986,20 +7545,18 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
             n_design_ok += note(as, ci == 0 ? "not single-slab chunks" : "not fewer chunks than tiles");
         }
 
-        std::vector<float> ref, out_rows;
+        std::vector<float> ref;
         {
             ggml_backend_t backend = tcm_backend(dev, nullptr);
             REQUIRE(backend != nullptr);
-            ref = run(backend, nullptr);
-            backend_same(same(run(backend, "grouped"), ref), "grouped");
-            out_rows = run(backend, "rows");
+            ref = run(backend);
             ggml_backend_free(backend);
         }
         {  // without TCM, and the same graph twice on one backend: the second compute finds the first's counter
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             REQUIRE(backend != nullptr);
-            const std::vector<float> first  = run(backend, nullptr);
-            const std::vector<float> second = run(backend, nullptr);
+            const std::vector<float> first  = run(backend);
+            const std::vector<float> second = run(backend);
             backend_same(same(first, ref), "queue without TCM");
             backend_same(same(second, ref), "the second compute in a row");
             ggml_backend_free(backend);
@@ -8009,7 +7566,7 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
             REQUIRE(backend != nullptr);
             bool all = true;
             for (uint32_t i = 0; i < k_runs; i++) {
-                all = same(run(backend, nullptr), ref) && all;
+                all = same(run(backend), ref) && all;
             }
             backend_same(all, "queue on threads");
             ggml_backend_free(backend);
@@ -8087,22 +7644,18 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
             }
         }
 
-        const double e      = ok ? nmse(ref.data(), (const float *) y_ref->data, n_out) : -1.0;
-        const double e_rows = ok ? nmse(out_rows.data(), (const float *) y_ref->data, n_out) : -1.0;
-        const bool   case_ok =
-            ok && bad.empty() && e >= 0.0 && e <= k_mul_mat_max_nmse && e_rows >= 0.0 && e_rows <= k_mul_mat_max_nmse;
+        const double e       = ok ? nmse(ref.data(), (const float *) y_ref->data, n_out) : -1.0;
+        const bool   case_ok = ok && bad.empty() && e >= 0.0 && e <= k_mul_mat_max_nmse;
         n_cases++;
         n_ok += case_ok;
-        worst      = std::max(worst, e);
-        worst_rows = std::max(worst_rows, e_rows);
+        worst = std::max(worst, e);
         if (!case_ok) {
             std::fprintf(stderr,
                          "FAIL: MUL_MAT_ID queue, %s, %s [%lld, %lld, %lld], %lld ids, %lld rows per token, %lld tokens: "
-                         "%s; not the first run's bytes or not as designed: %s; NMSE queue %.3e, rows %.3e "
-                         "(bound %.0e)\n",
+                         "%s; not the first run's bytes or not as designed: %s; NMSE %.3e (bound %.0e)\n",
                          c.what, ggml_type_name(c.type), (long long) k, (long long) c.n, (long long) n_mats,
                          (long long) c.n_used, (long long) c.ne11, (long long) c.n_tok, ok ? "ran" : "failed",
-                         bad.empty() ? "none" : bad.c_str(), e, e_rows, k_mul_mat_max_nmse);
+                         bad.empty() ? "none" : bad.c_str(), e, k_mul_mat_max_nmse);
             g_failures++;
         }
         ggml_backend_buffer_free(bh);
@@ -8163,13 +7716,13 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
 
     std::printf("mmid     the claim queue (16 chunks a tile's share) at every pair on one expert, one row an expert, a "
                 "skewed draw (Q4_0, and Q8_0 with a row per id), fewer chunks than tiles, experts of 0 rows between "
-                "active ones: %d/%d cases; through the backend (grouped, without TCM, twice in a row%s) the first "
-                "run's bytes in %d/%d; directly (1 and 8 tiles, in reverse, one tile first, without TCM%s) the first "
-                "run's bytes and the counter at chunks + tiles in %d/%d; as designed %d/%d; the two steps' labels "
-                "%d/2; against the CPU on one thread max NMSE queue %.2e, rows %.2e (bound %.0e)%s\n",
+                "active ones: %d/%d cases; through the backend (without TCM, twice in a row%s) the first run's bytes "
+                "in %d/%d; directly (1 and 8 tiles, in reverse, one tile first, without TCM%s) the first run's bytes "
+                "and the counter at chunks + tiles in %d/%d; as designed %d/%d; the two steps' labels %d/2; against "
+                "the CPU on one thread max NMSE %.2e (bound %.0e)%s\n",
                 n_ok, n_cases, host ? ", on threads 20 times" : "", n_backend_ok, n_backend,
                 direct ? ", on threads 20 times" : "", n_direct_ok, n_direct, n_design_ok, n_design, n_labels, worst,
-                worst_rows, k_mul_mat_max_nmse, reference_label());
+                k_mul_mat_max_nmse, reference_label());
     return 0;
 }
 
@@ -8240,16 +7793,14 @@ struct q40s_node {
     q40s_node(const q40s_node &)             = delete;
     q40s_node & operator=(const q40s_node &) = delete;
 
-    // through the backend under FLAGOS_SPACEMIT_MMID (nullptr: staged), the output filled with NaN first so an element
-    // no tile writes shows; ok turns false when the compute fails
-    std::vector<float> run(ggml_backend_t backend, const char * mmid) {
+    // through the backend, the output filled with NaN first so an element no tile writes shows; ok turns false when
+    // the compute fails
+    std::vector<float> run(ggml_backend_t backend) {
         const std::vector<float> junk((size_t) n_out, NAN);
-        set_env("FLAGOS_SPACEMIT_MMID", mmid);
         ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
         ok = ok && ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
         std::vector<float> out((size_t) n_out, NAN);
         ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-        set_env("FLAGOS_SPACEMIT_MMID", nullptr);
         return out;
     }
 
@@ -8287,8 +7838,6 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
         }
     }
     REQUIRE(step_q != nullptr && step_g != nullptr && step_q->workspace_size != nullptr);
-    env_override mmid_default("FLAGOS_SPACEMIT_MMID", nullptr);
-    env_override q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
 
     const auto fail = [](bool good, const std::string & what) {
         if (!good) {
@@ -8409,7 +7958,7 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
         q40s_node                  nd(dev, cpu, q, k, n, 4, 1, 1, 16, id_list(counts), xv);
         ggml_backend_t             backend = tcm_backend(dev, nullptr);
         REQUIRE(backend != nullptr);
-        const std::vector<float> out = nd.run(backend, nullptr);
+        const std::vector<float> out = nd.run(backend);
         ggml_backend_free(backend);
         if (nd.ok) {
             e_k8 = rows_nmse(out, nd.ref(), n, 0, 8);
@@ -8424,7 +7973,7 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
     // the kernels against each other on rows of equal magnitude: every row's largest value of a subblock the same, so
     // a group's shared scale is each row's own. All experts hold the same weights; 8 tokens of 2 ids: slot 0 on expert
     // 0 (a group of 8 under m8), slot 1 on expert 1 for tokens 0-3 (a group of 4), 2 for 4-6 and 3 for 7 (single rows);
-    // FLAGOS_SPACEMIT_MMID=rows multiplies every pair with the 1-row kernel
+    // each token alone (one token: the 1-row path) multiplies its pairs with the 1-row kernel
     double e_84 = HUGE_VAL, e_81 = HUGE_VAL, e_41 = HUGE_VAL;
     {
         const int64_t        k = 512, n = 64, n_tok = 8;
@@ -8451,10 +8000,18 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
         q40s_node      nd(dev, cpu, q, k, n, 4, 2, 1, n_tok, ids, xv);
         ggml_backend_t backend = tcm_backend(dev, nullptr);
         REQUIRE(backend != nullptr);
-        const std::vector<float> staged = nd.run(backend, nullptr);
-        const std::vector<float> rows   = nd.run(backend, "rows");
+        const std::vector<float> staged = nd.run(backend);
+        std::vector<float>       rows;  // the tokens one by one, as the grouped node's output rows
+        bool                     alone_ok = true;
+        for (int64_t t = 0; t < n_tok; t++) {
+            const std::vector<float> xt(xv.begin() + t * k, xv.begin() + (t + 1) * k);
+            q40s_node                nt(dev, cpu, q, k, n, 4, 2, 1, 1, { ids[t * 2], ids[t * 2 + 1] }, xt);
+            const std::vector<float> out = nt.run(backend);
+            alone_ok                     = alone_ok && nt.ok;
+            rows.insert(rows.end(), out.begin(), out.end());
+        }
         ggml_backend_free(backend);
-        if (nd.ok) {
+        if (nd.ok && alone_ok) {
             // the output row of (token t, slot s) is t * 2 + s
             std::vector<float> s8, s4, r8, r4;
             for (int64_t t = 0; t < n_tok; t++) {
@@ -8479,7 +8036,7 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
 
     // the cost of the shared scale, reported: token 0 and token 4 a hundred times smaller than the others; tokens 0-3
     // on expert 0 (token 0 with 3 others), 4-11 on expert 1 (token 4 with 7 others; plain: in two groups of 4)
-    double e_small[2][3] = {};  // [plain, m8][with 3, with 7, alone (FLAGOS_SPACEMIT_MMID=rows)]
+    double e_small[2][3] = {};  // [plain, m8][with 3, with 7, alone (one token)]
     {
         const int64_t              k = 512, n = 64, n_tok = 12;
         const std::vector<uint8_t> q  = quantize_weights(GGML_TYPE_Q4_0, k, n * 2, seed++);
@@ -8493,22 +8050,22 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
         for (int a = 0; a < 2; a++) {
             env_override   sw("FLAGOS_SPACEMIT_EXPERT_Q4_0", settings[a]);
             q40s_node      nd(dev, cpu, q, k, n, 2, 1, 1, n_tok, id_list({ 4, 8 }), xv);
+            q40s_node      alone(dev, cpu, q, k, n, 2, 1, 1, 1, { 0 }, std::vector<float>(xv.begin(), xv.begin() + k));
             ggml_backend_t backend = tcm_backend(dev, nullptr);
             REQUIRE(backend != nullptr);
-            const std::vector<float> staged = nd.run(backend, nullptr);
-            const std::vector<float> rows   = nd.run(backend, "rows");
+            const std::vector<float> staged = nd.run(backend);
+            const std::vector<float> one    = alone.run(backend);
             ggml_backend_free(backend);
             e_small[a][0] = nd.ok ? rows_nmse(staged, nd.ref(), n, 0, 1) : HUGE_VAL;
             e_small[a][1] = nd.ok ? rows_nmse(staged, nd.ref(), n, 4, 5) : HUGE_VAL;
-            e_small[a][2] = nd.ok ? rows_nmse(rows, nd.ref(), n, 0, 1) : HUGE_VAL;
-            fail(nd.ok, std::string("the shared scale's cost under ") + settings[a] + ": the node failed");
+            e_small[a][2] = alone.ok ? rows_nmse(one, alone.ref(), n, 0, 1) : HUGE_VAL;
+            fail(nd.ok && alone.ok, std::string("the shared scale's cost under ") + settings[a] + ": the node failed");
         }
     }
 
     // the groups. Each case against the CPU (the whole output, and its worst row: a row written with another pair's
-    // output has NMSE about 1), and the first backend run's bytes (with TCM) for grouped, without TCM, twice
-    // in a row, on threads 20 times, and the steps directly on 1 tile and 8 (in reverse, one tile first, without TCM,
-    // on threads 20 times)
+    // output has NMSE about 1), and the first backend run's bytes (with TCM) without TCM, twice in a row, on threads 20
+    // times, and the steps directly on 1 tile and 8 (in reverse, one tile first, without TCM, on threads 20 times)
     struct shape_case {
         const char *         what;
         int64_t              n_used, ne11;
@@ -8579,7 +8136,7 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
         return out;
     };
     int    n_shapes = 0, n_shapes_ok = 0, n_same = 0, n_same_ok = 0;
-    double worst_shape = 0.0, worst_row = 0.0, worst_rows = 0.0;
+    double worst_shape = 0.0, worst_row = 0.0;
     for (const shape_case & c : shapes) {
         const int64_t              k = 256, n = 96, n_mats = (int64_t) c.counts.size();
         const std::vector<int32_t> ids   = id_list(c.counts);
@@ -8604,20 +8161,18 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
                 fail(false, std::string(arm) + ", " + c.what + ": not claimed, or the CPU failed");
                 continue;
             }
-            std::vector<float> ref, rows;
+            std::vector<float> ref;
             {
                 ggml_backend_t backend = tcm_backend(dev, nullptr);
                 REQUIRE(backend != nullptr);
-                ref = nd.run(backend, nullptr);
-                same(nd.run(backend, "grouped"), ref, "grouped");
-                rows = nd.run(backend, "rows");
+                ref = nd.run(backend);
                 ggml_backend_free(backend);
             }
             {
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 REQUIRE(backend != nullptr);
-                same(nd.run(backend, nullptr), ref, "without TCM");
-                same(nd.run(backend, nullptr), ref, "the second compute in a row");
+                same(nd.run(backend), ref, "without TCM");
+                same(nd.run(backend), ref, "the second compute in a row");
                 ggml_backend_free(backend);
             }
             if (host) {
@@ -8625,7 +8180,7 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
                 REQUIRE(backend != nullptr);
                 bool all = true;
                 for (int i = 0; i < 20; i++) {
-                    const std::vector<float> out = nd.run(backend, nullptr);
+                    const std::vector<float> out = nd.run(backend);
                     all = all && std::memcmp(out.data(), ref.data(), bytes) == 0;
                 }
                 same(all ? ref : std::vector<float>(), ref, "on threads");
@@ -8640,25 +8195,21 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
                 same(all ? ref : std::vector<float>(), ref, forms[f].what);
             }
             const int64_t n_rows = nd.n_out / n;
-            double        e = HUGE_VAL, e_row = HUGE_VAL, e_rows = HUGE_VAL;
+            double        e = HUGE_VAL, e_row = HUGE_VAL;
             if (nd.ok) {
-                e      = nmse(ref.data(), nd.ref(), nd.n_out);
-                e_rows = nmse(rows.data(), nd.ref(), nd.n_out);
-                e_row  = 0.0;
+                e     = nmse(ref.data(), nd.ref(), nd.n_out);
+                e_row = 0.0;
                 for (int64_t r = 0; r < n_rows; r++) {
                     e_row = std::max(e_row, rows_nmse(ref, nd.ref(), n, r, r + 1));
                 }
             }
             worst_shape = std::max(worst_shape, e);
             worst_row   = std::max(worst_row, e_row);
-            worst_rows  = std::max(worst_rows, e_rows);
             n_shapes++;
-            n_shapes_ok += fail(nd.ok && differ.empty() && e <= k_mul_mat_max_nmse && e_row <= k_q4_0s_row_max_nmse &&
-                                    e_rows <= k_mul_mat_max_nmse,
+            n_shapes_ok += fail(nd.ok && differ.empty() && e <= k_mul_mat_max_nmse && e_row <= k_q4_0s_row_max_nmse,
                                 std::string(arm) + ", " + c.what + ": " + (nd.ok ? "ran" : "failed") +
                                     "; not the first run's bytes: " + (differ.empty() ? "none" : differ) +
-                                    "; NMSE " + sci(e) + ", worst row " + sci(e_row) +
-                                    ", rows " + sci(e_rows));
+                                    "; NMSE " + sci(e) + ", worst row " + sci(e_row));
         }
     }
 
@@ -8679,7 +8230,7 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
             q40s_node      nd(dev, cpu, q, k, n, n_mats, 8, 1, 1, ids, xv);
             ggml_backend_t backend = tcm_backend(dev, nullptr);
             REQUIRE(backend != nullptr);
-            out[a] = nd.run(backend, nullptr);
+            out[a] = nd.run(backend);
             ggml_backend_free(backend);
             ran   = ran && nd.ok;
             e_cpu = std::max(e_cpu, nd.ok ? nmse(out[a].data(), nd.ref(), nd.n_out) : HUGE_VAL);
@@ -8698,17 +8249,17 @@ static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
                 "%.2e, 4-row %.2e, 1-row %.2e (bound %.0e)%s; on rows of equal magnitude 8 vs 4 rows %.2e, 8 vs 1 "
                 "%.2e, 4 vs 1 %.2e (bound %.0e)%s; the groups (1 to 17, 24, 31 and 32 rows an expert, experts of 0 "
                 "rows between active ones, every pair on one expert) %d/%d cases, max NMSE %.2e, worst row %.2e "
-                "(bound %.0e), rows %.2e; the first run's bytes (grouped, without TCM, twice in a row%s%s) in %d/%d; "
+                "(bound %.0e); the first run's bytes (without TCM, twice in a row%s%s) in %d/%d; "
                 "one token against plain within the bound %d/%d (NMSE %.2e)%s\n",
                 n_switch_ok, n_switch, n_trip_ok, n_trip, e_k8, e_k4, e_k1, k_mul_mat_max_nmse,
                 kernels_ok ? "" : " FAILED", e_84, e_81, e_41, k_q4_0s_kernels_max_nmse, equal_ok ? "" : " FAILED",
-                n_shapes_ok, n_shapes, worst_shape, worst_row, k_q4_0s_row_max_nmse, worst_rows,
+                n_shapes_ok, n_shapes, worst_shape, worst_row, k_q4_0s_row_max_nmse,
                 host ? ", on threads 20 times" : "",
                 direct ? ", the steps directly on 1 and 8 tiles, in reverse, one first, without TCM, on threads" : "",
                 n_same_ok, n_same, n_one_ok, n_one, worst_one, reference_label());
     std::printf("info     MUL_MAT_ID q4_0s, the cost of the shared activation scale (reported, not bounded): NMSE of a "
-                "row a hundred times smaller than the rows it is grouped with, with 3 / with 7 / alone (rows): plain "
-                "%.2e / %.2e / %.2e, m8 %.2e / %.2e / %.2e%s\n",
+                "row a hundred times smaller than the rows it is grouped with, with 3 / with 7 / alone (one token): "
+                "plain %.2e / %.2e / %.2e, m8 %.2e / %.2e / %.2e%s\n",
                 e_small[0][0], e_small[0][1], e_small[0][2], e_small[1][0], e_small[1][1], e_small[1][2],
                 reference_label());
     return 0;
@@ -8730,9 +8281,6 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
     // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions, so
     // they run there only with the reference kernels
     const bool direct = host || *reference_label() != '\0';
-    // the default: a 3-D Q4_1 weight takes the q4_1 min layout, so this check's claims do not depend on the caller's
-    // FLAGOS_SPACEMIT_EXPERT_Q4_1
-    env_override   q4_1_default("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -9271,16 +8819,13 @@ static int check_gdn(ggml_backend_dev_t dev) {
         seed += 8;
     }
 
-    // FLAGOS_SPACEMIT_GDN_PREFILL's values at Qwen3.5-4B's side (S_v 128, K 1, scalar gate, the model's inputs) from
-    // the chunk's 16 tokens, through the device only: a direct call runs on the calling thread, on the K3 an X100 core
-    // (VLEN 256, no TCM), where neither prefill form is taken. Against ggml-cpu, the scores and the final state apart:
-    // recurrence within the bound above over the whole output, tcm within a rounding bound, chunk (another order of
-    // operations) within a looser one, the default (auto, unset, empty and an unknown value, which warns once) within
-    // chunk's; each run repeated bit for bit. The tiles count the form they ran (spacemit_gdn_paths_take): with the RVV
-    // kernels chunk must take the chunkwise form, tcm the TCM form where a tile's TCM holds it, recurrence a recurrence
-    // form, and the default the TCM form where tcm's run of the same case took it, else the chunkwise form, with the
-    // bytes of the value whose form it took; without them (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) every value
-    // runs the reference, and the default gives the recurrence's bytes
+    // the prefill forms at Qwen3.5-4B's side (S_v 128, K 1, scalar gate, the model's inputs) from the chunk's 16
+    // tokens, through the device only: a direct call runs on the calling thread, on the K3 an X100 core (VLEN 256, no
+    // TCM), where neither prefill form is taken. Against ggml-cpu, the scores and the final state apart, within the
+    // chunkwise form's bound (another order of operations); each run repeated bit for bit. The tiles count the form
+    // they ran (spacemit_gdn_paths_take): with the RVV kernels the TCM form where its conditions hold (S_v % 4 == 0,
+    // vlmax(e32m2) <= S_v <= vlmax(e32m4) and a tile's TCM holds it), else the chunkwise form (S_v <= vlmax(e32m4)), so
+    // S_v 32 takes the chunkwise one; without them (another host, or GGML_FLAGOS_KERNEL_VARIANTS=0) the reference
     const gdn_case prefill_cases[] = {
   // what,                                                 S_v,   H, tok, seq, H_qk, seq_qk,   kda, K
         { "16 heads, 16 tokens (one chunk)",                128,  16,  16,   1,   16,      1, false, 1 },
@@ -9288,29 +8833,21 @@ static int check_gdn(ggml_backend_dev_t dev) {
         { "16 heads, 33 tokens",                            128,  16,  33,   1,   16,      1, false, 1 },
         { "16 heads, 100 tokens",                           128,  16, 100,   1,   16,      1, false, 1 },
         { "4 heads, q and k over 2, 33 tokens (idle tiles)", 128,  4,  33,   1,    2,      1, false, 1 },
+        { "S_v 32, 16 heads, 33 tokens",                     32,  16,  33,   1,   16,      1, false, 1 },
     };
-    const struct {
-        const char * value;
-        int          form;   // 0 recurrence, 1 chunk, 2 tcm, 3 the default (auto)
-        double       bound;  // on the scores and on the state; 0: k_gdn_max_nmse on the whole output
-        bool         warned;
-    } prefill_values[] = {
-        { "recurrence", 0, 0.0, false }, { "chunk", 1, 1e-6, false }, { "tcm", 2, 1e-10, false },
-        { "auto", 3, 1e-6, false },      { nullptr, 3, 1e-6, false }, { "", 3, 1e-6, false },
-        { "abc", 3, 1e-6, true },
-    };
-    int    n_prefill = 0, n_prefill_ok = 0, n_other[4] = { 0, 0, 0, 0 }, n_default_runs = 0;
-    double worst_prefill[4][2] = {};  // by form: the scores' NMSE, the state's
-    // the counters' forms, in spacemit_gdn_paths_take's order; per value, the cases in which the tiles took each
+    constexpr double k_gdn_prefill_max_nmse = 1e-6;  // on the scores and on the state
+    int              n_prefill = 0, n_prefill_ok = 0;
+    double           worst_prefill[2] = {};  // the scores' NMSE, the state's
+    // the counters' forms, in spacemit_gdn_paths_take's order; the cases in which the tiles took each
     const char * const form_names[5] = { "reference", "fused", "two-pass", "chunk", "tcm" };
-    constexpr size_t   n_values         = sizeof(prefill_values) / sizeof(prefill_values[0]);
-    int                n_took[n_values][5] = {};
+    int                n_took[5]     = {};
 #if defined(__riscv)
     const bool rvv = std::strlen(reference_label()) == 0;
 #else
     const bool rvv = false;
 #endif
-    size_t tcm_per_tile = 0;
+    size_t   tcm_per_tile = 0;
+    uint32_t vector_bits  = 0;
     {
         spacemit_plugin_device * pdev = nullptr;
         if (table->device_open(0, &pdev) == SPACEMIT_STATUS_SUCCESS && pdev != nullptr) {
@@ -9318,11 +8855,13 @@ static int check_gdn(ggml_backend_dev_t dev) {
             props.struct_size                  = sizeof(props);
             if (table->device_props(pdev, &props) == SPACEMIT_STATUS_SUCCESS) {
                 tcm_per_tile = props.tcm_bytes_per_tile;
+                vector_bits  = props.vector_bits;
             }
             table->device_close(pdev);
         }
     }
-    size_t tcm_needed = 0;  // the TCM form's state, k, q and v, and up to 128 bytes to align them
+    const int64_t vlmax_m2 = vector_bits / 32 * 2, vlmax_m4 = vector_bits / 32 * 4;  // e32 at the AI cores' VLEN
+    size_t        tcm_needed = 0;  // the TCM form's state, k, q and v, and up to 128 bytes to align them
     for (const gdn_case & c : prefill_cases) {
         gdn_run dv, ref;
         if (!dv.init(c, buft) || !ref.init(c, ggml_backend_cpu_buffer_type())) {
@@ -9349,86 +8888,52 @@ static int check_gdn(ggml_backend_dev_t dev) {
 
         ggml_cgraph * g_dev = ggml_new_graph(dv.ctx);
         ggml_build_forward_expand(g_dev, dv.node);
-        std::vector<float> by_form[3];  // the outputs of recurrence, chunk and tcm (the values before the default)
-        bool               tcm_ran = false;  // tcm's run of this case took the TCM form
-        const size_t       tcm_bytes = (size_t) (c.S_v * c.S_v + 3 * c.S_v) * sizeof(float) + 128;
-        tcm_needed                   = std::max(tcm_needed, tcm_bytes);
-        for (size_t vi = 0; vi < n_values; vi++) {
-            const auto & pv = prefill_values[vi];
-            n_prefill++;
-            env_override       mode("FLAGOS_SPACEMIT_GDN_PREFILL", pv.value);
-            log_capture        log;
-            std::vector<float> got[2];
-            bool               dev_ok = claimed && ref_ok;
-            uint64_t           taken[5];
-            g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);  // drops earlier calls
-            for (int r = 0; r < 2 && dev_ok; r++) {
-                const std::vector<float> junk((size_t) n, (float) (-r - 1));
-                ggml_backend_tensor_set(dv.node, junk.data(), 0, junk.size() * sizeof(float));
-                dev_ok = ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
-                if (dev_ok) {
-                    got[r].assign((size_t) n, NAN);
-                    ggml_backend_tensor_get(dv.node, got[r].data(), 0, (size_t) n * sizeof(float));
-                }
+        const size_t tcm_bytes = (size_t) (c.S_v * c.S_v + 3 * c.S_v) * sizeof(float) + 128;
+        tcm_needed             = std::max(tcm_needed, tcm_bytes);
+        n_prefill++;
+        std::vector<float> got[2];
+        bool               dev_ok = claimed && ref_ok;
+        uint64_t           taken[5];
+        g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);  // drops earlier calls
+        for (int r = 0; r < 2 && dev_ok; r++) {
+            const std::vector<float> junk((size_t) n, (float) (-r - 1));
+            ggml_backend_tensor_set(dv.node, junk.data(), 0, junk.size() * sizeof(float));
+            dev_ok = ggml_backend_graph_compute(backend, g_dev) == GGML_STATUS_SUCCESS;
+            if (dev_ok) {
+                got[r].assign((size_t) n, NAN);
+                ggml_backend_tensor_get(dv.node, got[r].data(), 0, (size_t) n * sizeof(float));
             }
-            g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);
-            // the form the tiles must take: chunk 3, tcm 4, -1 a recurrence form (fused or two-pass), 0 the reference;
-            // the default the TCM form where tcm's run took it (so a tile had TCM for it), else the chunkwise form
-            const int want_form = !rvv            ? 0 :
-                                  pv.form == 1    ? 3 :
-                                  pv.form == 2    ? (tcm_per_tile >= tcm_bytes ? 4 : -1) :
-                                  pv.form == 3    ? (tcm_ran ? 4 : 3) :
-                                                    -1;
-            bool forms_ok = want_form >= 0 ? taken[want_form] > 0 : taken[1] + taken[2] > 0;
-            for (int f = 0; f < 5; f++) {
-                forms_ok = forms_ok && (taken[f] == 0 || f == want_form || (want_form < 0 && (f == 1 || f == 2)));
-                n_took[vi][f] += dev_ok && taken[f] > 0;
-            }
-            const int  warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_GDN_PREFILL=");
-            const bool repeat   = dev_ok && std::memcmp(got[0].data(), got[1].data(), (size_t) n_cmp * sizeof(float)) == 0;
-            if (pv.form < 3 && dev_ok) {
-                by_form[pv.form] = got[0];
-                tcm_ran          = tcm_ran || (pv.form == 2 && taken[4] > 0);
-            }
-            const auto same_as = [&](const std::vector<float> & other) {
-                return dev_ok && other.size() == got[0].size() &&
-                       std::memcmp(got[0].data(), other.data(), (size_t) n_cmp * sizeof(float)) == 0;
-            };
-            const bool same = same_as(by_form[0]);
-            // the default's bytes are those of the value whose form it took (the recurrence's off the RVV kernels)
-            const bool as_its_form =
-                pv.form != 3 || same_as(by_form[want_form == 4 ? 2 : want_form == 3 ? 1 : 0]);
-            const double e_all   = dev_ok ? nmse(got[0].data(), want.data(), n_cmp) : -1.0;
-            const double e_out   = dev_ok ? nmse(got[0].data(), want.data(), n_attn) : -1.0;
-            const double e_state = dev_ok ? nmse(got[0].data() + n_attn, want.data() + n_attn, n_cmp - n_attn) : -1.0;
-            const bool   in_bound =
-                pv.bound > 0.0 ? e_out >= 0.0 && e_out <= pv.bound && e_state >= 0.0 && e_state <= pv.bound :
-                                 e_all >= 0.0 && e_all <= k_gdn_max_nmse;
-            const bool ok = claimed && ref_ok && dev_ok && repeat && in_bound && warnings == (pv.warned ? 1 : 0) &&
-                            (pv.form != 0 || same) && as_its_form && forms_ok;
-            n_prefill_ok += ok;
-            n_other[pv.form] += dev_ok && !same;
-            n_default_runs += pv.form == 3;
-            worst_prefill[pv.form][0] = std::max(worst_prefill[pv.form][0], e_out);
-            worst_prefill[pv.form][1] = std::max(worst_prefill[pv.form][1], e_state);
-            if (!ok) {
-                std::fprintf(stderr,
-                             "FAIL: GATED_DELTA_NET prefill %s, FLAGOS_SPACEMIT_GDN_PREFILL=%s: %s; the CPU reference "
-                             "%s, the run %s, its repeat %s, the recurrence's bytes %s, its form's %s; NMSE scores "
-                             "%.3e, state %.3e, all %.3e (bound %.0e); %d warning lines (expected %d); tile calls by "
-                             "form: reference "
-                             "%llu, fused %llu, two-pass %llu, chunk %llu, tcm %llu (expected %s; TCM %zu bytes per "
-                             "tile, the form needs %zu)\n",
-                             c.what, pv.value != nullptr ? pv.value : "(unset)", claimed ? "claimed" : "refused",
-                             ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", repeat ? "equal" : "differs",
-                             same ? "equal" : "differ", as_its_form ? "equal" : "differ", e_out, e_state, e_all,
-                             pv.bound > 0.0 ? pv.bound : k_gdn_max_nmse, warnings, pv.warned ? 1 : 0,
-                             (unsigned long long) taken[0], (unsigned long long) taken[1],
-                             (unsigned long long) taken[2], (unsigned long long) taken[3],
-                             (unsigned long long) taken[4], want_form >= 0 ? form_names[want_form] : "fused or two-pass",
-                             tcm_per_tile, tcm_bytes);
-                g_failures++;
-            }
+        }
+        g_gdn_paths_take(&taken[0], &taken[1], &taken[2], &taken[3], &taken[4]);
+        // the form the tiles must take: tcm 4, chunk 3, -1 a recurrence form (fused or two-pass), 0 the reference
+        const bool tcm_form  = c.S_v % 4 == 0 && c.S_v >= vlmax_m2 && c.S_v <= vlmax_m4 && tcm_per_tile >= tcm_bytes;
+        const int  want_form = !rvv ? 0 : tcm_form ? 4 : c.S_v <= vlmax_m4 ? 3 : -1;
+        bool       forms_ok  = want_form >= 0 ? taken[want_form] > 0 : taken[1] + taken[2] > 0;
+        for (int f = 0; f < 5; f++) {
+            forms_ok = forms_ok && (taken[f] == 0 || f == want_form || (want_form < 0 && (f == 1 || f == 2)));
+            n_took[f] += dev_ok && taken[f] > 0;
+        }
+        const bool   repeat  = dev_ok && std::memcmp(got[0].data(), got[1].data(), (size_t) n_cmp * sizeof(float)) == 0;
+        const double e_out   = dev_ok ? nmse(got[0].data(), want.data(), n_attn) : -1.0;
+        const double e_state = dev_ok ? nmse(got[0].data() + n_attn, want.data() + n_attn, n_cmp - n_attn) : -1.0;
+        const bool   in_bound = e_out >= 0.0 && e_out <= k_gdn_prefill_max_nmse && e_state >= 0.0 &&
+                              e_state <= k_gdn_prefill_max_nmse;
+        const bool ok = claimed && ref_ok && dev_ok && repeat && in_bound && forms_ok;
+        n_prefill_ok += ok;
+        worst_prefill[0] = std::max(worst_prefill[0], e_out);
+        worst_prefill[1] = std::max(worst_prefill[1], e_state);
+        if (!ok) {
+            std::fprintf(stderr,
+                         "FAIL: GATED_DELTA_NET prefill %s: %s; the CPU reference %s, the run %s, its repeat %s; NMSE "
+                         "scores %.3e, state %.3e (bound %.0e); tile calls by form: reference %llu, fused %llu, "
+                         "two-pass %llu, chunk %llu, tcm %llu (expected %s; TCM %zu bytes per tile, the form needs "
+                         "%zu)\n",
+                         c.what, claimed ? "claimed" : "refused", ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed",
+                         repeat ? "equal" : "differs", e_out, e_state, k_gdn_prefill_max_nmse,
+                         (unsigned long long) taken[0], (unsigned long long) taken[1], (unsigned long long) taken[2],
+                         (unsigned long long) taken[3], (unsigned long long) taken[4],
+                         want_form >= 0 ? form_names[want_form] : "fused or two-pass", tcm_per_tile, tcm_bytes);
+            g_failures++;
         }
     }
 
@@ -9478,20 +8983,14 @@ static int check_gdn(ggml_backend_dev_t dev) {
         ggml_free(ctx);
     }
 
-    std::string took;  // per value, the forms the tiles took and in how many cases
-    for (size_t vi = 0; vi < n_values; vi++) {
-        const char * v = prefill_values[vi].value;
-        took += std::string(vi > 0 ? "; " : "") + (v == nullptr ? "unset" : *v == '\0' ? "empty" : v) + ":";
-        bool any = false;
-        for (int f = 0; f < 5; f++) {
-            if (n_took[vi][f] > 0) {
-                took += std::string(any ? "," : "") + " " + form_names[f] + " form in " + std::to_string(n_took[vi][f]) +
-                        "/" + std::to_string(std::size(prefill_cases));
-                any = true;
-            }
+    std::string took;  // the forms the tiles took and in how many cases
+    for (int f = 0; f < 5; f++) {
+        if (n_took[f] > 0) {
+            took += std::string(took.empty() ? "" : ", ") + form_names[f] + " form in " + std::to_string(n_took[f]) +
+                    "/" + std::to_string(std::size(prefill_cases));
         }
-        took += any ? "" : " none";
     }
+    took = took.empty() ? "none" : took;
 
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
@@ -9505,18 +9004,13 @@ static int check_gdn(ggml_backend_dev_t dev) {
                 "do not divide v's, a gate of neither 1 nor S_v, a gate or beta of the wrong head count, a short "
                 "output refused: checked\n",
                 n_ok, n_cases, worst_nmse, k_gdn_max_nmse, worst_abs);
-    std::printf("gdn      FLAGOS_SPACEMIT_GDN_PREFILL (recurrence, chunk, tcm, and the default: auto, unset, empty, "
-                "abc) on the device, S_v 128, K 1, the model's inputs, 16, 17, 33 and 100 tokens of 16 heads and 33 "
-                "of 4 (idle tiles)%s: %d/%d; max NMSE against the CPU on one thread, scores / state: recurrence %.2e / "
-                "%.2e, chunk %.2e / %.2e (bound %.0e), tcm %.2e / %.2e (bound %.0e), the default %.2e / %.2e (bound "
-                "%.0e, its bytes those of the value whose form it took); bytes other than the recurrence's (the form "
-                "ran) for chunk in %d/%zu, tcm in %d/%zu, the default in %d/%d; one warning for abc; the tiles' forms "
-                "by the counters (TCM %zu bytes per tile, the tcm form needs %zu): %s\n",
-                reference_label(), n_prefill_ok, n_prefill, worst_prefill[0][0], worst_prefill[0][1],
-                worst_prefill[1][0], worst_prefill[1][1], prefill_values[1].bound, worst_prefill[2][0],
-                worst_prefill[2][1], prefill_values[2].bound, worst_prefill[3][0], worst_prefill[3][1],
-                prefill_values[3].bound, n_other[1], std::size(prefill_cases), n_other[2], std::size(prefill_cases),
-                n_other[3], n_default_runs, tcm_per_tile, tcm_needed, took.c_str());
+    std::printf("gdn      the prefill forms (the TCM form, else the chunkwise one, else the recurrence) on the device, "
+                "K 1, the model's inputs, S_v 128: 16, 17, 33 and 100 tokens of 16 heads and 33 of 4 (idle tiles), "
+                "S_v 32: 33 tokens of 16 heads%s: %d/%d; max NMSE against the CPU on one thread, scores / state %.2e / "
+                "%.2e (bound %.0e); each run's repeat bit for bit; the tiles' forms by the counters (TCM %zu bytes per "
+                "tile, the tcm form needs %zu): %s\n",
+                reference_label(), n_prefill_ok, n_prefill, worst_prefill[0], worst_prefill[1],
+                k_gdn_prefill_max_nmse, tcm_per_tile, tcm_needed, took.c_str());
     return 0;
 }
 
@@ -9530,15 +9024,14 @@ static int check_gdn(ggml_backend_dev_t dev) {
 // attention scores (the layer's next op) and the CPY of the new state into row head.
 //
 // Through the device against ggml-cpu on one thread: the scores and the written row of the states within check_gdn's
-// bound, the rows the CPY does not write bit for bit the inputs, the pass counted (spacemit_state_passes_take); then
-// the same graph under FLAGOS_SPACEMIT_STATE=copy, which counts no pass and must give the same bytes. A multi-token
-// case runs under every FLAGOS_SPACEMIT_GDN_PREFILL value, each with its own copy comparison. The step is also called
-// directly on 1, 3 and 8 tiles on a CPU-buffer copy: a row is one tile's whole work, so the three must agree bit for
-// bit and stay within the bound; they equal the device's bytes only where both run the same kernels (the reference
-// ones, or any host but the K3, whose calling core has another vector length - as check_gdn's direct calls).
-// Then one graph through the scheduler (its allocator reusing memory) under the plan cache: a miss, a trusted hit
-// counting no pass, FLAGOS_SPACEMIT_STATE=copy a miss by the configuration word, the default a miss again, the same
-// bytes; and two computes in a row with the state carried over, against the CPU doing the same.
+// bound, the rows the CPY does not write bit for bit the inputs, the pass counted (spacemit_state_passes_take). The
+// step is also called directly on 1, 3 and 8 tiles on a CPU-buffer copy: a row is one tile's whole work, so the three
+// must agree bit for bit and stay within the bound; they equal the device's bytes only where both run the same kernels
+// (the reference ones, or any host but the K3, whose calling core has another vector length - as check_gdn's direct
+// calls).
+// Then one graph through the scheduler (its allocator reusing memory) under the plan cache: a miss, then a trusted hit
+// counting no pass, the same bytes; and two computes in a row with the state carried over, against the CPU doing the
+// same.
 //
 // A case with zrow >= 0 is a sequence's first graph: build_rs' SCALE by 0 really clears row zrow there (clear says
 // how). Where it clears exactly the row the CPY writes, the pass folds it into its step
@@ -9795,8 +9288,6 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     REQUIRE(k_direct != nullptr && k_direct->fn != nullptr && k_direct->workspace_size != nullptr);
     REQUIRE(k_cleared != nullptr && k_cleared->fn != nullptr && k_cleared->workspace_size != nullptr);
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
-    env_override                     state_default("FLAGOS_SPACEMIT_STATE", nullptr);
-    env_override                     prefill_default("FLAGOS_SPACEMIT_GDN_PREFILL", nullptr);
     env_override                     plan_default("FLAGOS_SPACEMIT_PLAN", nullptr);
     env_override                     quantize_default("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
     // the direct calls run on the calling core: its bytes are the device's only where both run the same kernels
@@ -9845,9 +9336,6 @@ static int check_state_pass(ggml_backend_dev_t dev) {
   // refused: a write of the states between the two copies
         { "a write of the states between the copies",  16,  4,   2,   1, 1,     4,   1,    1,       0, false,   2, clear_late,   false },
     };
-    // the kernel choice must not change the pass: a multi-token case runs under every value
-    const char * const prefills[] = { nullptr, "recurrence", "chunk", "tcm" };
-
     int      n_cases = 0, n_ok = 0, n_passed = 0, n_direct = 0, n_direct_ok = 0;
     double   worst_nmse = 0.0;
     uint32_t seed       = 1500;
@@ -9866,7 +9354,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
         const std::vector<float> want_st   = state_graph::floats(ref.persist);
         const std::vector<float> want_more = state_graph::floats(ref.extra);
 
-        // one device run under the current switches: the passes it took and its outputs
+        // one device run: the passes it took and its outputs
         const auto run = [&](uint64_t & passes, std::vector<float> & out, std::vector<float> & st,
                              std::vector<float> & more) {
             dv.reset();
@@ -9878,22 +9366,13 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             more          = state_graph::floats(dv.extra);
             return ok;
         };
-        for (const char * prefill : prefills) {
-            if (prefill != nullptr && c.n_tokens == 1) {
-                continue;  // the prefill forms need 16 tokens; one value is enough for a one-token case
-            }
+        {
             n_cases++;
-            env_override       mode("FLAGOS_SPACEMIT_GDN_PREFILL", prefill);
-            uint64_t           passes = 0, passes_copy = 0;
-            std::vector<float> out, st, more, out_copy, st_copy, more_copy;
+            uint64_t           passes = 0;
+            std::vector<float> out, st, more;
             const bool         dev_ok = ref_ok && run(passes, out, st, more);
             std::vector<float> direct_out, direct_st;
-            bool               copy_ok = false, direct_ok = true;
-            if (dev_ok) {
-                env_override copy("FLAGOS_SPACEMIT_STATE", "copy");
-                copy_ok = run(passes_copy, out_copy, st_copy, more_copy) && passes_copy == 0 &&
-                          same_bytes(out_copy, out) && same_bytes(st_copy, st) && same_bytes(more_copy, more);
-            }
+            bool               direct_ok = true;
             // the scores and the state against ggml-cpu, and the rows the CPY does not write bit for bit the inputs
             const double e_out = dev_ok && out.size() == want.size() ? nmse(out.data(), want.data(), (int64_t) out.size()) : -1.0;
             const double e_st  = dev_ok && st.size() == want_st.size() ? nmse(st.data(), want_st.data(), (int64_t) st.size()) : -1.0;
@@ -9984,7 +9463,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             // the clearing node, the plain step and that node's own step otherwise
             bool names_ok = true;
             int  n_names[3] = {};
-            if (dev_ok && prefill == nullptr && c.zrow >= 0) {
+            if (dev_ok && c.zrow >= 0) {
                 env_override trace("GGML_FLAGOS_TRACE_LAUNCH", "1");
                 log_capture  log;
                 dv.reset();
@@ -9999,65 +9478,28 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             if (!c.wild) {
                 worst_nmse = std::max(worst_nmse, std::max(e_out, e_st));
             }
-            const bool ok = dev_ok && copy_ok && names_ok && kept && clear_ok && direct_ok &&
+            const bool ok = dev_ok && names_ok && kept && clear_ok && direct_ok &&
                             passes == (c.pass ? 1u : 0u) && close && wild_ok;
             n_ok += ok;
             n_passed += passes == 1;
             if (!ok) {
                 std::fprintf(stderr,
                              "FAIL: state pass %s (S_v %lld, %lld heads, %lld tokens, %lld sequences, K %lld, row "
-                             "%lld to row %lld of %lld, variant %d, clear %d of row %lld), "
-                             "FLAGOS_SPACEMIT_GDN_PREFILL=%s: the CPU reference %s, the run %s, %llu passes (expected "
+                             "%lld to row %lld of %lld, variant %d, clear %d of row %lld): the CPU reference %s, the "
+                             "run %s, %llu passes (expected "
                              "%d); NMSE scores %.3e, states %.3e, other output %.3e (bound %.0e), the bytes with a "
-                             "wild old state %s; the rows the CPY does not write %s, the cleared rows %s; copy %s; "
-                             "the direct calls %s; the step names %d cleared, %d direct, %d scale (expected %d/%d/%d)\n",
+                             "wild old state %s; the rows the CPY does not write %s, the cleared rows %s; the direct "
+                             "calls %s; the step names %d cleared, %d direct, %d scale (expected %d/%d/%d)\n",
                              c.what, (long long) c.S_v, (long long) c.H, (long long) c.n_tokens, (long long) c.n_seqs,
                              (long long) c.K, (long long) c.idx, (long long) c.head, (long long) c.slots, c.variant,
-                             c.clear, (long long) c.zrow, prefill != nullptr ? prefill : "(unset)",
-                             ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed", (unsigned long long) passes,
-                             c.pass ? 1 : 0, e_out, e_st, e_more, k_gdn_max_nmse, wild_ok ? "as the CPU's" : "other",
-                             kept ? "unchanged" : "changed", clear_ok ? "as the CPU's" : "other",
-                             copy_ok ? "no pass, the same bytes" : "a pass or other bytes",
-                             direct_ok ? "as expected" : "failed",
+                             c.clear, (long long) c.zrow, ref_ok ? "ran" : "failed", dev_ok ? "ran" : "failed",
+                             (unsigned long long) passes, c.pass ? 1 : 0, e_out, e_st, e_more, k_gdn_max_nmse,
+                             wild_ok ? "as the CPU's" : "other", kept ? "unchanged" : "changed",
+                             clear_ok ? "as the CPU's" : "other", direct_ok ? "as expected" : "failed",
                              n_names[0], n_names[1], n_names[2], c.cleared ? 1 : 0, c.pass && !c.cleared ? 1 : 0,
                              c.cleared ? 0 : 1);
                 g_failures++;
             }
-        }
-        seed += 8;
-    }
-
-    // FLAGOS_SPACEMIT_STATE=abc: reported once and taken as direct, so a sequence's first graph still folds its clear
-    bool unknown_ok = false;
-    {
-        const state_case c = { "an unknown setting", 16, 4, 2, 1, 1, 4, 1, 1, 0, true, 1, clear_whole, true };
-        state_graph      dv;
-        uint64_t         passes[2] = {};
-        int              warnings = 0, cleared = 0;
-        bool             ran = false;
-        if (dv.init(c, buft, buft)) {
-            dv.fill(c, seed);
-            env_override bogus("FLAGOS_SPACEMIT_STATE", "abc");
-            env_override trace("GGML_FLAGOS_TRACE_LAUNCH", "1");
-            log_capture  log;
-            ran = true;
-            for (int r = 0; r < 2; r++) {
-                dv.reset();
-                spacemit_state_passes_take();
-                ran       = ran && ggml_backend_graph_compute(backend, dv.g) == GGML_STATUS_SUCCESS;
-                passes[r] = spacemit_state_passes_take();
-            }
-            const std::string text = log.take();
-            warnings               = count_lines_with(text, "FLAGOS_SPACEMIT_STATE=abc");
-            cleared                = count_lines_with(text, " gated_delta_net.f32.direct.cleared ");
-        }
-        unknown_ok = ran && passes[0] == 1 && passes[1] == 1 && warnings == 1 && cleared == 2;
-        if (!unknown_ok) {
-            std::fprintf(stderr,
-                         "FAIL: state pass under FLAGOS_SPACEMIT_STATE=abc: %s, passes %llu and %llu (expected 1 and "
-                         "1), %d warning lines (expected 1), %d folding steps (expected 2)\n", ran ? "ran" : "failed",
-                         (unsigned long long) passes[0], (unsigned long long) passes[1], warnings, cleared);
-            g_failures++;
         }
         seed += 8;
     }
@@ -10105,7 +9547,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     // through the scheduler (the inputs and the states in our buffer, the rest in its compute buffer) under the plan
     // cache's uid trust
     bool     sched_ok = false;
-    uint64_t sched_passes[4] = {}, sched_hits[4] = {}, sched_misses[4] = {};
+    uint64_t sched_passes[2] = {}, sched_hits[2] = {}, sched_misses[2] = {};
     {
         const state_case c = { "the scheduler", 16, 4, 2, 1, 1, 4, 1, 1, 0, true };
         state_graph      sg, ref;
@@ -10119,22 +9561,7 @@ static int check_state_pass(ggml_backend_dev_t dev) {
             const std::vector<float> want    = state_graph::floats(ref.scores);
             const std::vector<float> want_st = state_graph::floats(ref.persist);
             std::vector<float>       first, first_st;
-            // the core reads FLAGOS_SPACEMIT_STATE at every graph, so it is set here without set_env's reset of the
-            // kernels' switches, which would move the plugin's generation and make every run a miss by that alone
-            const auto set_raw = [](const char * value) {
-#if defined(_WIN32)
-                _putenv_s("FLAGOS_SPACEMIT_STATE", value != nullptr ? value : "");
-#else
-                if (value != nullptr) {
-                    setenv("FLAGOS_SPACEMIT_STATE", value, 1);
-                } else {
-                    unsetenv("FLAGOS_SPACEMIT_STATE");
-                }
-#endif
-            };
-            const char * const settings[4] = { nullptr, nullptr, "copy", nullptr };
-            for (int i = 0; i < 4 && ok; i++) {
-                set_raw(settings[i]);
+            for (int i = 0; i < 2 && ok; i++) {
                 sg.reset();
                 spacemit_state_passes_take();
                 spacemit_plan_counters_take();
@@ -10151,7 +9578,6 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                 }
                 ok = ok && same_bytes(out, first) && same_bytes(out_st, first_st);
             }
-            set_raw(nullptr);
             const bool on_device = sched != nullptr && ggml_backend_sched_get_tensor_backend(sched, sg.gdn) == backend &&
                                    ggml_backend_sched_get_tensor_backend(sched, sg.cpy) == backend;
             const double e    = ok && first.size() == want.size() ?
@@ -10160,23 +9586,19 @@ static int check_state_pass(ggml_backend_dev_t dev) {
                                     nmse(first_st.data(), want_st.data(), (int64_t) first_st.size()) : -1.0;
             worst_nmse = std::max(worst_nmse, std::max(e, e_st));
             sched_ok   = ok && on_device && e >= 0.0 && e <= k_gdn_max_nmse && e_st >= 0.0 && e_st <= k_gdn_max_nmse &&
-                       sched_passes[0] == 1 && sched_misses[0] == 1 && sched_hits[1] == 1 && sched_passes[1] == 0 &&
-                       sched_misses[2] == 1 && sched_passes[2] == 0 && sched_misses[3] == 1 && sched_passes[3] == 1;
+                       sched_passes[0] == 1 && sched_misses[0] == 1 && sched_hits[1] == 1 && sched_passes[1] == 0;
             if (sched != nullptr) {
                 ggml_backend_sched_free(sched);
             }
         }
         if (!sched_ok) {
             std::fprintf(stderr,
-                         "FAIL: state pass through the scheduler: passes %llu/%llu/%llu/%llu (expected 1/0/0/1), plan "
-                         "hits %llu/%llu/%llu/%llu (expected 0/1/0/0), misses %llu/%llu/%llu/%llu (expected 1/0/1/1), "
-                         "or the outputs, the placement or the bound failed\n",
+                         "FAIL: state pass through the scheduler: passes %llu/%llu (expected 1/0), plan hits %llu/%llu "
+                         "(expected 0/1), misses %llu/%llu (expected 1/0), or the outputs, the placement or the bound "
+                         "failed\n",
                          (unsigned long long) sched_passes[0], (unsigned long long) sched_passes[1],
-                         (unsigned long long) sched_passes[2], (unsigned long long) sched_passes[3],
                          (unsigned long long) sched_hits[0], (unsigned long long) sched_hits[1],
-                         (unsigned long long) sched_hits[2], (unsigned long long) sched_hits[3],
-                         (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1],
-                         (unsigned long long) sched_misses[2], (unsigned long long) sched_misses[3]);
+                         (unsigned long long) sched_misses[0], (unsigned long long) sched_misses[1]);
             g_failures++;
         }
     }
@@ -10184,23 +9606,20 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     std::printf("statepass GATED_DELTA_NET + GET_ROWS + CPY as the model builds them (1, 2, 33 and 501 tokens of S_v "
-                "16, S_v 128 with 16 heads at 1 and 33 tokens, the row read in the row written or not, every "
-                "FLAGOS_SPACEMIT_GDN_PREFILL value above one token; refused: a second consumer of the row read in, "
-                "another view of the new state, 2 sequences, K 2, a read of the states between the copies, the CPY "
-                "into another tensor), and a sequence's first graph with build_rs' clear of a whole row (1, 2, 32 and "
-                "501 tokens of S_v 16, Qwen3.6-35B's S_v 128 with 32 heads at 1 and 32 tokens, 3 rows with the "
-                "cleared row read or not, a wild old state) folding it into the step, without the fold (a factor 0.5, "
-                "half a row, two rows, the cleared row not the written one, a read of the states before the GET_ROWS) "
-                "and refused (a write of the states between the copies)%s: %d/%d cases, %d passes by the counter; "
-                "against the CPU on one thread max NMSE %.2e (bound %.0e), the rows the CPY does not write bit for "
-                "bit and the cleared rows the CPU's bytes, the step names the fold's where it applies and no "
-                "scale.f32 there, FLAGOS_SPACEMIT_STATE=copy without a pass and with the same bytes, =abc reported "
-                "once and taken as direct: %s; the step directly on 1, 3 and 8 tiles %d/%d; two computes with the "
-                "state carried over: %s; through the scheduler a miss, a hit by uid (no pass), copy a miss by the "
-                "configuration word, the default a miss again, the same bytes: %s\n",
-                reference_label(), n_ok, n_cases, n_passed, worst_nmse, k_gdn_max_nmse,
-                unknown_ok ? "checked" : "FAILED", n_direct_ok, n_direct, carried_ok ? "checked" : "FAILED",
-                sched_ok ? "checked" : "FAILED");
+                "16, S_v 128 with 16 heads at 1 and 33 tokens, the row read in the row written or not; refused: a "
+                "second consumer of the row read in, another view of the new state, 2 sequences, K 2, a read of the "
+                "states between the copies, the CPY into another tensor), and a sequence's first graph with build_rs' "
+                "clear of a whole row (1, 2, 32 and 501 tokens of S_v 16, Qwen3.6-35B's S_v 128 with 32 heads at 1 "
+                "and 32 tokens, 3 rows with the cleared row read or not, a wild old state) folding it into the step, "
+                "without the fold (a factor 0.5, half a row, two rows, the cleared row not the written one, a read of "
+                "the states before the GET_ROWS) and refused (a write of the states between the copies)%s: %d/%d "
+                "cases, %d passes by the counter; against the CPU on one thread max NMSE %.2e (bound %.0e), the rows "
+                "the CPY does not write bit for bit and the cleared rows the CPU's bytes, the step names the fold's "
+                "where it applies and no scale.f32 there; the step directly on 1, 3 and 8 tiles %d/%d; two computes "
+                "with the state carried over: %s; through the scheduler a miss, a hit by uid (no pass), the same "
+                "bytes: %s\n",
+                reference_label(), n_ok, n_cases, n_passed, worst_nmse, k_gdn_max_nmse, n_direct_ok, n_direct,
+                carried_ok ? "checked" : "FAILED", sched_ok ? "checked" : "FAILED");
     return 0;
 }
 
@@ -10553,8 +9972,7 @@ static bool plan_key_probe(const ggml_cgraph * g) {
 // another uid, the entry its own: a miss by the uid alone; (k) under FLAGOS_SPACEMIT_QUANTIZE=shared no cache, so a
 // layer graph twice counts nothing; (i) under none every counter stays 0; (n), made once before the settings and
 // counted in each line: the switch unset gives uid-trust (the default), none gives none, and the old uid falls to
-// uid-trust with one warning. Under uid-trust every hit's key time equals its lookup time (the counters' definition: a
-// hit reads `checked` as `start`; that the hit skips the check is (o)). Every output against the CPU, the layers'
+// uid-trust with one warning. Every output against the CPU, the layers'
 // against each other byte for byte, and every output of uid-trust against none's byte for byte. 15 probes under none,
 // 14 under uid-trust
 static int check_plan(ggml_backend_dev_t dev) {
@@ -10616,8 +10034,6 @@ static int check_plan(ggml_backend_dev_t dev) {
             const spacemit_plan_counters d = spacemit_plan_counters_take();
             total.hits_uid += d.hits_uid;
             total.misses += d.misses;
-            total.lookup_us += d.lookup_us;
-            total.key_us += d.key_us;
             return d;
         };
         // one graph's counters against what the probe expects with the cache on (all 0 under none); ran: whether the
@@ -10628,20 +10044,12 @@ static int check_plan(ggml_backend_dev_t dev) {
             if (!on) {
                 uid_hits = misses = 0;
             }
-            bool ok = d.hits_uid == uid_hits && d.misses == misses;
+            const bool ok = d.hits_uid == uid_hits && d.misses == misses;
             if (!ok) {
                 std::fprintf(stderr, "FAIL: plan %s, probe %s: hits by uid %llu, misses %llu; expected %llu, %llu\n",
                              setting, probe, (unsigned long long) d.hits_uid, (unsigned long long) d.misses,
                              (unsigned long long) uid_hits, (unsigned long long) misses);
                 g_failures++;
-            }
-            // the counters' definition: on a hit graph_compute takes `checked` as `start`, so its key time is its
-            // lookup time, the same clock reads (that a hit really skips the contract check is probe (o))
-            if (on && uid_hits == 1 && d.hits_uid == 1 && d.lookup_us != d.key_us) {
-                std::fprintf(stderr, "FAIL: plan %s, probe %s: a trusted hit took %.1f us to the step list but %.1f us "
-                             "from after the check: the check ran\n", setting, probe, d.lookup_us, d.key_us);
-                g_failures++;
-                ok = false;
             }
             return ok;
         };
@@ -10888,8 +10296,7 @@ static int check_plan(ggml_backend_dev_t dev) {
 
         // (i) none: nothing counted
         if (!on) {
-            const bool zero =
-                total.hits_uid == 0 && total.misses == 0 && total.lookup_us == 0.0 && total.key_us == 0.0;
+            const bool zero = total.hits_uid == 0 && total.misses == 0;
             if (!zero) {
                 std::fprintf(stderr, "FAIL: plan none, probe (i): a counter moved\n");
                 g_failures++;
@@ -10902,13 +10309,11 @@ static int check_plan(ggml_backend_dev_t dev) {
                     "new objects, c RoPE base changed, d 7 tokens, e a stamped uid on other objects, f "
                     "FLAGOS_SPACEMIT_ATTN flipped, l the same value set again, g replay after a larger graph, h a graph "
                     "view, j a refusal%s, o a node unflagged after the store, m another uid on the same objects, k no "
-                    "cache under QUANTIZE=shared%s, n the default uid-trust); %d graphs: %llu "
-                    "hits by uid, %llu misses, lookup %.1f us and key %.1f us per graph; %s; layer NMSE %.2e (bound "
-                    "%.0e), attention NMSE %.2e (bound %.0e)\n",
+                    "cache under QUANTIZE=shared%s, n the default uid-trust); %d graphs: %llu hits by uid, %llu "
+                    "misses; %s; layer NMSE %.2e (bound %.0e), attention NMSE %.2e (bound %.0e)\n",
                     setting, n_passed, n_probes, on ? " after the entry and the key alone (seven cases)" : "",
                     on ? "" : ", i no counter moved", n_graphs, (unsigned long long) total.hits_uid,
-                    (unsigned long long) total.misses, n_graphs > 0 ? total.lookup_us / n_graphs : 0.0,
-                    n_graphs > 0 ? total.key_us / n_graphs : 0.0,
+                    (unsigned long long) total.misses,
                     on ? (std::to_string(n_compared) + " outputs identical to none's").c_str() :
                          (std::to_string(none_outputs.size()) + " outputs kept").c_str(),
                     worst_layer, k_layer_max_nmse, worst_attn, k_attn_max_nmse);
@@ -11842,7 +11247,7 @@ static int bench_mm_f32(ggml_backend_dev_t dev) {
 // bench_mm). GB/s counts the n_kv cells' K and V bytes once; a token (or batch) is 36 layers' calls, each its own
 // launch here. At one token the default (from n_kv 512 the split over the tiles with the turns; plan.md M2e.3, round 2)
 // also against FLAGOS_SPACEMIT_ATTN=split (the split without the turns) and one-chunk (the kernels before round 2); a
-// few tokens FLAGOS_SPACEMIT_ATTN_KVH=off against the default (below). --bench-attn also runs bench_attn_tiled after it
+// few tokens FLAGOS_SPACEMIT_ATTN_KVH=off against the default (below)
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -11946,84 +11351,12 @@ static int bench_attn(ggml_backend_dev_t dev) {
     return 0;
 }
 
-// T1 (plan.md "T1 spec"), --bench-attn only: the tiled kernel below 64 tokens at Qwen3-4B's heads, 9-64 tokens at n_kv
-// 256-8192, every cell valid, causal; FLAGOS_SPACEMIT_ATTN_TILED=64 (the kernels before T1) against 9, taking turns
-// twice (64, 9, then 9, 64), the faster turn of each kept, ATTN and ATTN_KVH unset; the copies and GB/s as bench_attn's
-// KV-head comparison. Each setting's kernel by the counter (spacemit_attn_paths_take): "mixed" if more than one ran. 64
-// tokens is the control, tiled under both
-static int bench_attn_tiled(ggml_backend_dev_t dev) {
-    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    REQUIRE(backend != nullptr);
-    for (const int64_t n_kv : { 256, 512, 1024, 2048, 4096, 8192 }) {
-        const int iterations = n_kv <= 256 ? 30 : n_kv <= 512 ? 25 : n_kv <= 1024 ? 20 : n_kv <= 4096 ? 10 : 5;
-        for (const int64_t n_tokens : { 9, 12, 16, 26, 32, 38, 48, 63, 64 }) {
-            const attn_shape s        = { 32, 8, 128, n_kv, n_tokens, n_kv - n_tokens };
-            const double     kv_bytes = 2.0 * (double) (s.n_kv * s.n_head_kv * s.d) * sizeof(ggml_fp16_t);
-            const size_t     copies   = (size_t) std::min(32.0, std::ceil(32e6 / kv_bytes));
-            std::vector<std::unique_ptr<attn_run>> runs;
-            for (size_t c = 0; c < copies; c++) {
-                runs.push_back(std::make_unique<attn_run>());
-                REQUIRE(runs.back()->init(dev, s, attn_mask::causal, 0.0f, 0.0f, (uint32_t) c));
-                CHECK(ggml_backend_graph_compute(backend, runs.back()->g_dev) == GGML_STATUS_SUCCESS);
-            }
-            uint64_t count[2][3] = {};  // per setting: tiled, one-chunk, reference
-            {
-                uint64_t ignored[3];
-                g_attn_paths_take(&ignored[0], &ignored[1], &ignored[2]);
-            }
-            bool       ok     = true;
-            size_t     next   = 0;
-            const auto dev_us = [&](int k) {
-                env_override attn_switch("FLAGOS_SPACEMIT_ATTN", nullptr);
-                env_override kvh_switch("FLAGOS_SPACEMIT_ATTN_KVH", nullptr);
-                env_override tiled_switch("FLAGOS_SPACEMIT_ATTN_TILED", k == 0 ? "64" : "9");
-                const double t = time_us(
-                    [&] {
-                        ok &= ggml_backend_graph_compute(backend, runs[next++ % copies]->g_dev) == GGML_STATUS_SUCCESS;
-                    },
-                    iterations);
-                uint64_t taken[3];
-                g_attn_paths_take(&taken[0], &taken[1], &taken[2]);
-                for (int i = 0; i < 3; i++) {
-                    count[k][i] += taken[i];
-                }
-                return t;
-            };
-            double t[2] = { HUGE_VAL, HUGE_VAL };
-            t[0]        = std::min(t[0], dev_us(0));
-            t[1]        = std::min(t[1], dev_us(1));
-            t[1]        = std::min(t[1], dev_us(1));
-            t[0]        = std::min(t[0], dev_us(0));
-            CHECK(ok);
-            const auto kernel = [&](int k) {
-                int n_ran = 0, last = 0;
-                for (int i = 0; i < 3; i++) {
-                    if (count[k][i] != 0) {
-                        n_ran++;
-                        last = i;
-                    }
-                }
-                static const char * const names[3] = { "tiled", "one-chunk", "reference" };
-                return n_ran == 1 ? names[last] : n_ran == 0 ? "none" : "mixed";
-            };
-            std::printf("bench    attn %lld tokens n_kv %4lld, FLAGOS_SPACEMIT_ATTN_TILED: 64 %8.0f us (%5.1f GB/s, "
-                        "%s); 9 %8.0f us (%+.1f%%, %5.1f GB/s, %s)\n",
-                        (long long) n_tokens, (long long) n_kv, t[0], kv_bytes / t[0] / 1e3, kernel(0), t[1],
-                        100.0 * (t[1] / t[0] - 1.0), kv_bytes / t[1] / 1e3, kernel(1));
-            std::fflush(stdout);
-        }
-    }
-    ggml_backend_free(backend);
-    return 0;
-}
-
 // plan.md "Embedding lookup spec", step 2, --bench-embd only: one lookup call (a graph of the one GET_ROWS node on the
 // provider, the output in our buffer) from a vocabulary of 32768 rows in a CPU buffer, at 1024 and 2560 columns and 1,
-// 8, 128 and 512 random ids (fixed seed): Q6_K rows by ggml's dequantizers (FLAGOS_SPACEMIT_EMBD=ggml) and by the RVV
-// kernel (rvv), and the same values as F32 rows (dequantized once by ggml's to_float) copied by get_rows.f32, the
-// ceiling of a table kept dequantized. The three take turns twice (in order, then reversed), the faster turn of each
-// kept; the two Q6_K settings' kernels by the counter (spacemit_embd_paths_take). The same ids every call: after the
-// warm-up their rows are in the caches
+// 8, 128 and 512 random ids (fixed seed): Q6_K rows by ggml's dequantizers, and the same values as F32 rows
+// (dequantized once by ggml's to_float) copied by get_rows.f32, the ceiling of a table kept dequantized. The two take
+// turns twice (in order, then reversed), the faster turn of each kept; the Q6_K lookup's kernel by the counter
+// (spacemit_embd_paths_take). The same ids every call: after the warm-up their rows are in the caches
 static int bench_embd(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     REQUIRE(backend != nullptr);
@@ -12067,33 +11400,26 @@ static int bench_embd(ggml_backend_dev_t dev) {
             CHECK(ggml_backend_dev_supports_op(dev, yq) && ggml_backend_dev_supports_op(dev, yf));
             const int     iterations = n <= 8 ? 200 : n <= 128 ? 50 : 20;
             bool          ok         = true;
-            double        t[3]       = { HUGE_VAL, HUGE_VAL, HUGE_VAL };
-            uint64_t      count[2][2] = {};  // per Q6_K setting: rvv, ggml
+            double        t[2]       = { HUGE_VAL, HUGE_VAL };
+            uint64_t      count      = 0;  // the Q6_K lookup's calls
             const auto    run = [&](int k) {
-                env_override  embd("FLAGOS_SPACEMIT_EMBD", k == 0 ? "ggml" : k == 1 ? "rvv" : nullptr);
-                ggml_cgraph * g = k == 2 ? gf : gq;
-                uint64_t      taken[2];
-                g_embd_paths_take(&taken[0], &taken[1]);
+                ggml_cgraph * g     = k == 1 ? gf : gq;
+                uint64_t      taken = 0;
+                g_embd_paths_take(&taken);
                 t[k] = std::min(
                     t[k], time_us([&] { ok &= ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS; }, iterations));
-                g_embd_paths_take(&taken[0], &taken[1]);
-                if (k < 2) {
-                    count[k][0] += taken[0];
-                    count[k][1] += taken[1];
+                g_embd_paths_take(&taken);
+                if (k == 0) {
+                    count += taken;
                 }
             };
-            for (const int k : { 0, 1, 2, 2, 1, 0 }) {
+            for (const int k : { 0, 1, 1, 0 }) {
                 run(k);
             }
             CHECK(ok);
-            const auto kernel = [&](int k) {
-                return count[k][0] != 0 && count[k][1] != 0 ? "mixed" : count[k][0] != 0 ? "rvv" :
-                       count[k][1] != 0                     ? "ggml" : "none";
-            };
-            std::printf("bench    embd %lld rows of %lld: ggml %.1f us, rvv %.1f us (%+.1f%%), f32 copy %.1f us; kernels %s "
-                        "%s\n",
-                        (long long) n, (long long) nc, t[0], t[1], 100.0 * (t[1] / t[0] - 1.0), t[2], kernel(0),
-                        kernel(1));
+            const char * kernel = count != 0 ? "ggml" : "none";
+            std::printf("bench    embd %lld rows of %lld: ggml %.1f us, f32 copy %.1f us; kernel %s\n", (long long) n,
+                        (long long) nc, t[0], t[1], kernel);
             std::fflush(stdout);
             ggml_backend_buffer_free(bh);
             ggml_backend_buffer_free(bd);
@@ -12108,9 +11434,9 @@ static int bench_embd(ggml_backend_dev_t dev) {
 }
 
 // plan.md "T6 spec", step 0, --bench-repack only: one whole-weight write (set_tensor, the repack at load) per layout of
-// 2560 columns, Qwen3-4B's width (Q4_0 and Q4_1 98304 rows, Q8_0 65536, Q6_K 32768: 65-150 MiB of GGUF bytes), with
-// FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 and 8 and FLAGOS_SPACEMIT_REPACK_VIA=x100 (threads at 8, so at most the X100
-// cores + 1 ranges; only with spine-runtime) taking turns, best of 3; MiB/s of the GGUF bytes
+// 2560 columns, Qwen3-4B's width (Q4_0 and Q4_1 98304 rows, Q8_0 65536, Q6_K 32768: 65-150 MiB of GGUF bytes), on the
+// build's route (8 threads; with spine-runtime the X100 stream, at most its cores + 1 ranges), best of 3; MiB/s of the
+// GGUF bytes
 static int bench_repack(ggml_backend_dev_t dev, bool spert) {
     const int64_t cols = 2560;
     const struct {
@@ -12123,7 +11449,6 @@ static int bench_repack(ggml_backend_dev_t dev, bool spert) {
         { GGML_TYPE_Q8_0, "Q8_0", 65536 },
         { GGML_TYPE_Q6_K, "Q6_K->Q8_0", 32768 },
     };
-    const char * values[] = { "1", "2", "4", "8" };
     for (const auto & s : shapes) {
         ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
         ggml_context *   ctx    = ggml_init(params);
@@ -12132,43 +11457,26 @@ static int bench_repack(ggml_backend_dev_t dev, bool spert) {
         ggml_set_name(w, "blk.0.ffn_up.weight");
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
         REQUIRE(buf != nullptr);
-        const std::vector<uint8_t> q = quantize_weights(s.type, cols, s.rows, 43);
-        double                     best[5]     = { HUGE_VAL, HUGE_VAL, HUGE_VAL, HUGE_VAL, HUGE_VAL };
-        uint64_t                   x100_ranges = 0;
+        const std::vector<uint8_t> q    = quantize_weights(s.type, cols, s.rows, 43);
+        double                     best = HUGE_VAL;
+        uint64_t                   used = 0;
         for (int round = 0; round < 3; round++) {
-            for (int k = 0; k < (spert ? 5 : 4); k++) {
-                const bool   x100 = k == 4;
-                env_override via("FLAGOS_SPACEMIT_REPACK_VIA", x100 ? "x100" : "threads");
-                env_override threads("FLAGOS_SPACEMIT_REPACK_THREADS", x100 ? "8" : values[k]);
-                uint64_t     threaded = 0, ranges = 0, through = 0, not_through = 0, reran = 0;
-                g_repack_take(&threaded, &ranges);
-                g_repack_x100_take(&through, &not_through, &reran);
-                const auto t0 = std::chrono::steady_clock::now();
-                ggml_backend_tensor_set(w, q.data(), 0, q.size());
-                const auto t1 = std::chrono::steady_clock::now();
-                g_repack_take(&threaded, &ranges);
-                g_repack_x100_take(&through, &not_through, &reran);
-                if (x100) {
-                    CHECK(threaded == 1 && through == 1 && not_through == 0 && reran == 0);
-                    x100_ranges = ranges;
-                } else {
-                    CHECK(k == 0 ? threaded == 0 : threaded == 1 && ranges == (uint64_t) std::atoi(values[k]));
-                }
-                best[k] = std::min(best[k], std::chrono::duration<double>(t1 - t0).count());
-            }
+            uint64_t threaded = 0, ranges = 0, through = 0, not_through = 0, reran = 0;
+            g_repack_take(&threaded, &ranges);
+            g_repack_x100_take(&through, &not_through, &reran);
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_backend_tensor_set(w, q.data(), 0, q.size());
+            const auto t1 = std::chrono::steady_clock::now();
+            g_repack_take(&threaded, &ranges);
+            g_repack_x100_take(&through, &not_through, &reran);
+            CHECK(threaded == 1 && not_through == 0 && reran == 0 && (spert ? through == 1 : ranges == 8));
+            used = ranges;
+            best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
         }
         const double mib = q.size() / 1048576.0;
-        char         x100_col[64];
-        if (spert) {
-            std::snprintf(x100_col, sizeof(x100_col), "x100 (%llu ranges) %.0f MiB/s", (unsigned long long) x100_ranges,
-                          mib / best[4]);
-        } else {
-            std::snprintf(x100_col, sizeof(x100_col), "x100 -");
-        }
-        std::printf("bench    repack %s %lldx%lld %.1f MiB: 1 thr %.0f MiB/s, 2 thr %.0f MiB/s, 4 thr %.0f MiB/s, 8 thr "
-                    "%.0f MiB/s, %s\n",
-                    s.name, (long long) s.rows, (long long) cols, mib, mib / best[0], mib / best[1], mib / best[2],
-                    mib / best[3], x100_col);
+        std::printf("bench    repack %s %lldx%lld %.1f MiB: %s, %llu ranges, %.0f MiB/s\n", s.name, (long long) s.rows,
+                    (long long) cols, mib, spert ? "the X100 stream" : "threads", (unsigned long long) used,
+                    mib / best);
         std::fflush(stdout);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
@@ -12813,8 +12121,6 @@ static int bench_x100(ggml_backend_dev_t dev) {
 // minimum in us a node, then per shape and pattern the default's median over plain's (all of a setting's timed
 // computes). The host executor runs the reference kernels: there the numbers mean nothing
 static int bench_mmid(ggml_backend_dev_t dev) {
-    env_override mmid("FLAGOS_SPACEMIT_MMID", nullptr);
-    env_override q4_1("FLAGOS_SPACEMIT_EXPERT_Q4_1", nullptr);
     ggml_backend_t backend = nullptr;
     {
         env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM, as bench_mm
@@ -12998,13 +12304,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr,
                          "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
                          "--bench-f32 | --bench-embd | --bench-repack | --bench-x100 | --bench-mmid]\n"
-                         "  --bench-attn: flash attention only, with FLAGOS_SPACEMIT_ATTN_TILED=64 against 9 at 9-64 "
-                         "tokens\n"
+                         "  --bench-attn: flash attention only\n"
                          "  --bench-f32: the F32 matmul only\n"
-                         "  --bench-embd: the token embedding lookup only, FLAGOS_SPACEMIT_EMBD=ggml against rvv and an "
-                         "F32 copy\n"
-                         "  --bench-repack: the weights' repack at load only, FLAGOS_SPACEMIT_REPACK_THREADS=1, 2, 4 "
-                         "and 8, and FLAGOS_SPACEMIT_REPACK_VIA=x100\n"
+                         "  --bench-embd: the token embedding lookup only, ggml's dequantizers against an F32 copy\n"
+                         "  --bench-repack: the weights' repack at load only, on the build's route\n"
                          "  --bench-x100: the 1-row matmul beside readers on the X100 cores, and split between the "
                          "provider and the CPU backend\n"
                          "  --bench-mmid: one MUL_MAT_ID node of Q4_0 experts, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against "
@@ -13056,7 +12359,7 @@ int main(int argc, char ** argv) {
     if (check_registry(dev, global_index) != 0 || check_loader(dev, global_index) != 0 || check_contracts(dev) != 0 ||
         check_buffer(dev) != 0 || check_ops(dev) != 0 ||
         check_mul_mat(dev, full) != 0 || check_repack_threads(dev, !host) != 0 || check_gemv(dev, host) != 0 || check_mm_paths(dev, host) != 0 ||
-        check_rows(dev) != 0 || check_embedding(dev, host) != 0 || check_cache_ops(dev) != 0 ||
+        check_rows(dev) != 0 || check_embedding(dev) != 0 || check_cache_ops(dev) != 0 ||
         check_state_ops(dev) != 0 || check_mul_mat_id(dev, host, full) != 0 || check_gdn(dev) != 0 ||
         check_state_pass(dev) != 0 || check_seq_ops(dev) != 0 || check_mul_mat_f32_split(dev) != 0 ||
         check_conv_pair(dev) != 0 || check_moe_ops(dev) != 0 ||
@@ -13066,7 +12369,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 :
-                    (run_attn && (bench_attn(dev) != 0 || bench_attn_tiled(dev) != 0)) ||
+                    (run_attn && bench_attn(dev) != 0) ||
                         (run_mm && bench_mm(dev) != 0) || (run_f32 && bench_mm_f32(dev) != 0) ||
                         (run_embd && bench_embd(dev) != 0) ||
                         (run_repack && bench_repack(dev, !host) != 0) || (run_x100 && bench_x100(dev) != 0) ||

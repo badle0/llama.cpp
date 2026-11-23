@@ -13,8 +13,6 @@ namespace {
 
 std::atomic<uint64_t> g_hits_uid{ 0 };
 std::atomic<uint64_t> g_misses{ 0 };
-std::atomic<uint64_t> g_lookup_ns{ 0 };
-std::atomic<uint64_t> g_key_ns{ 0 };
 
 }  // namespace
 
@@ -35,14 +33,12 @@ spacemit_plan_mode spacemit_plan_mode_get() {
 
 spacemit_plan_counters spacemit_plan_counters_take() {
     spacemit_plan_counters c;
-    c.hits_uid  = g_hits_uid.exchange(0);
-    c.misses    = g_misses.exchange(0);
-    c.lookup_us = static_cast<double>(g_lookup_ns.exchange(0)) / 1e3;
-    c.key_us    = static_cast<double>(g_key_ns.exchange(0)) / 1e3;
+    c.hits_uid = g_hits_uid.exchange(0);
+    c.misses   = g_misses.exchange(0);
     return c;
 }
 
-void spacemit_plan_counters_add(spacemit_plan_result result, double lookup_us, double key_us) {
+void spacemit_plan_counters_add(spacemit_plan_result result) {
     switch (result) {
         case spacemit_plan_result::off:
             return;
@@ -53,8 +49,6 @@ void spacemit_plan_counters_add(spacemit_plan_result result, double lookup_us, d
             g_misses++;
             break;
     }
-    g_lookup_ns += static_cast<uint64_t>(lookup_us * 1e3);
-    g_key_ns += static_cast<uint64_t>(key_us * 1e3);
 }
 
 bool spacemit_plan_cache::key_matches(const ggml_cgraph * cgraph, uint64_t word, bool want_names) const {

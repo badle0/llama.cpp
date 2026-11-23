@@ -16,10 +16,9 @@
 // tokens and a two-pass one beyond. Changes, each marked "flagos": the row range, the scratch and the TCM come from the
 // tile instead of the fork's context, std::vectors and thread_local buffer, the asserts are gone (the contract refuses
 // what they checked, core/flagos-spacemit-ops.cpp), and its two prefill forms (K 1, scalar gate, 16 tokens and up),
-// the chunkwise form and the TCM-transposed recurrence, run by default in the fork's order (FLAGOS_SPACEMIT_GDN_PREFILL
-// auto: the TCM form, else the chunkwise one, else the recurrence); recurrence, chunk or tcm pick one form. The
-// chunkwise form is not bit for bit the recurrence. It computes a row's attention score from the decayed row
-// (S q + delta k.q) and adds in vector reductions, a different rounding from the reference's, so
+// the chunkwise form and the TCM-transposed recurrence, run in the fork's order (the TCM form, else the chunkwise one,
+// else the recurrence). The chunkwise form is not bit for bit the recurrence. It computes a row's attention score from
+// the decayed row (S q + delta k.q) and adds in vector reductions, a different rounding from the reference's, so
 // GGML_FLAGOS_KERNEL_VARIANTS=0 keeps the reference.
 
 #include "flagos-spacemit-gdn.h"
@@ -35,45 +34,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 
 namespace {
-
-enum gdn_prefill : int { gdn_prefill_recurrence = 0, gdn_prefill_chunk = 1, gdn_prefill_tcm = 2, gdn_prefill_auto = 3 };
-
-// FLAGOS_SPACEMIT_GDN_PREFILL: auto (unset or empty, the default): the fork's order, the TCM-transposed recurrence
-// where its conditions hold, else the chunkwise form where its conditions hold, else the token recurrence; recurrence:
-// the token recurrence for every call; chunk or tcm: that form where its conditions hold, else the recurrence. Parsed
-// once (spacemit_cached_switch); any other value warns once per parse generation and keeps the default
-int parse_gdn_prefill() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_GDN_PREFILL");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "auto") == 0) {
-        return gdn_prefill_auto;
-    }
-    if (std::strcmp(v, "recurrence") == 0) {
-        return gdn_prefill_recurrence;
-    }
-    if (std::strcmp(v, "chunk") == 0) {
-        return gdn_prefill_chunk;
-    }
-    if (std::strcmp(v, "tcm") == 0) {
-        return gdn_prefill_tcm;
-    }
-    static std::atomic<uint32_t> warned_in{ 0 };
-    const uint32_t               generation = spacemit_switches_generation();
-    if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_GDN_PREFILL=%s: not auto, recurrence, chunk or tcm, the default (auto) kept\n",
-                      __func__, v);
-    }
-    return gdn_prefill_auto;
-}
-
-int gdn_prefill_from_env() {
-    static std::atomic<int>      value{ gdn_prefill_auto };
-    static std::atomic<uint32_t> seen{ 0 };
-    return spacemit_cached_switch(value, seen, parse_gdn_prefill);
-}
 
 // test-only (spacemit_gdn_paths_take): the tile calls that had rows, by the form they ran
 std::atomic<uint64_t> g_gdn_reference{ 0 }, g_gdn_fused{ 0 }, g_gdn_two_pass{ 0 }, g_gdn_chunk{ 0 }, g_gdn_tcm{ 0 };
@@ -117,9 +80,7 @@ gdn_shape gdn_shape_of(const ggml_tensor * node) {
 
 // the floats one tile takes of the workspace: three vectors of S_v (the RVV kernel's delta, decay and attention sums;
 // the reference's delta is the first), and the working state when K > 1, padded to a cache line so two tiles never
-// write one line. A node the chunkwise form could take (K 1, 16 tokens and up) gets its buffer in the same place,
-// whatever FLAGOS_SPACEMIT_GDN_PREFILL says (auto and chunk can take that form; the switch may change between the
-// workspace's sizing and the launch only in a test)
+// write one line. A node the chunkwise form could take (K 1, 16 tokens and up) gets its buffer in the same place
 int64_t gdn_tile_floats(const gdn_shape & sh) {
     int64_t floats = 3 * sh.S_v + (sh.K > 1 ? sh.S_v * sh.S_v : 0);
     if (sh.K == 1 && sh.n_tokens >= GDN_CHUNK_SIZE) {
@@ -696,11 +657,10 @@ __attribute__((noinline)) void gdn_recurrent_rows_lookahead(float *       dst,
 // gate and 16 tokens and up its chunkwise form or its recurrence on a transposed state in TCM.
 // flagos: the row range, the scratch and the TCM are the tile's (its kda_decay, delta, decay and state_q vectors are
 // the workspace slice's three S_v floats, its working state for K > 1 the slice's S_v * S_v, the chunkwise form's
-// buffer the slice's gdn_chunk_floats(S_v)); the asserts are the contract's; as the fork, auto (the default
-// FLAGOS_SPACEMIT_GDN_PREFILL, prefill) takes the TCM form where it can and else the chunkwise one; chunk and tcm take
-// only their form, recurrence neither, and a call outside a form's conditions, tcm without TCM too, takes the
-// recurrence. The state is read from state_in_base and written to state_out_base, which with K 1 may be the same row
-// (the state pass, core/flagos-spacemit-ops.h spacemit_state_pass): every form reads a row before it writes it
+// buffer the slice's gdn_chunk_floats(S_v)); the asserts are the contract's; as the fork, the TCM form where it can,
+// else the chunkwise one, and a call outside both forms' conditions takes the recurrence. The state is read from
+// state_in_base and written to state_out_base, which with K 1 may be the same row (the state pass,
+// core/flagos-spacemit-ops.h spacemit_state_pass): every form reads a row before it writes it
 void gdn_rvv(ggml_tensor * dst,
              const float * state_in_base,
              float *       state_out_base,
@@ -708,7 +668,6 @@ void gdn_rvv(ggml_tensor * dst,
              float *       state_work,
              void *        tcm,
              size_t        tcm_size,
-             int           prefill,
              int64_t       ir0,
              int64_t       ir1) {
     const ggml_tensor * src_q     = dst->src[0];
@@ -737,18 +696,16 @@ void gdn_rvv(ggml_tensor * dst,
     const uintptr_t shared_begin = reinterpret_cast<uintptr_t>(tcm);
     const size_t    tcm_offset   = GGML_PAD(shared_begin, GDN_TCM_ALIGNMENT) - shared_begin;
     const size_t    tcm_bytes    = (S_v * S_v + 3 * S_v) * sizeof(float);
-    const bool      transposed   = (prefill == gdn_prefill_tcm || prefill == gdn_prefill_auto) && K == 1 && !kda &&
-                            n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 && S_v >= (int64_t) __riscv_vsetvlmax_e32m2() &&
-                            S_v <= (int64_t) __riscv_vsetvlmax_e32m4() && tcm != nullptr && tcm_offset <= tcm_size &&
-                            tcm_bytes <= tcm_size - tcm_offset;
+    const bool      transposed   = K == 1 && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 &&
+                            S_v >= (int64_t) __riscv_vsetvlmax_e32m2() && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
+                            tcm != nullptr && tcm_offset <= tcm_size && tcm_bytes <= tcm_size - tcm_offset;
     float * tcm_state = transposed ? reinterpret_cast<float *>(shared_begin + tcm_offset) : nullptr;
     float * staged    = transposed ? tcm_state + S_v * S_v : nullptr;
 
     // prefill: chunkwise form (the token recurrence below handles the remaining cases)
-    if ((prefill == gdn_prefill_chunk || prefill == gdn_prefill_auto) && !transposed && K == 1 && !kda &&
-        n_tokens >= GDN_CHUNK_SIZE && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() && src_q->type == GGML_TYPE_F32 &&
-        src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32 && src_g->type == GGML_TYPE_F32 &&
-        src_beta->type == GGML_TYPE_F32 &&
+    if (!transposed && K == 1 && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
+        src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32 &&
+        src_g->type == GGML_TYPE_F32 && src_beta->type == GGML_TYPE_F32 &&
         ggml_is_contiguous_rows(src_q) && ggml_is_contiguous_rows(src_k) && ggml_is_contiguous_rows(src_v) &&
         ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta) && src_beta->ne[0] == 1) {
         g_gdn_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -910,8 +867,6 @@ bool gdn_tile_run(const spacemit_tile & tile, ggml_tensor * node, const float * 
 
     float * scratch    = (float *) tile.workspace + per_tile * tile.ith;
     float * state_work = sh.K > 1 ? scratch + 3 * sh.S_v : nullptr;
-    // read on every build, so that an unknown value warns where only the reference runs too
-    const int prefill  = gdn_prefill_from_env();
 
     int64_t ir0, ir1;
     tile_range(sh.H * sh.n_seqs, tile, ir0, ir1);
@@ -920,11 +875,10 @@ bool gdn_tile_run(const spacemit_tile & tile, ggml_tensor * node, const float * 
     }
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
     if (!spacemit_use_reference()) {
-        gdn_rvv(node, state_in_base, state_out_base, scratch, state_work, tile.tcm, tile.tcm_size, prefill, ir0, ir1);
+        gdn_rvv(node, state_in_base, state_out_base, scratch, state_work, tile.tcm, tile.tcm_size, ir0, ir1);
         return true;
     }
 #endif
-    GGML_UNUSED(prefill);
     g_gdn_reference.fetch_add(1, std::memory_order_relaxed);
     gdn_ref(node, state_in_base, state_out_base, scratch, state_work, ir0, ir1);
     return true;
@@ -934,10 +888,6 @@ bool gdn_tile_run(const spacemit_tile & tile, ggml_tensor * node, const float * 
 
 size_t spacemit_gdn_workspace(const ggml_tensor * node) {
     return (size_t) gdn_tile_floats(gdn_shape_of(node)) * SPACEMIT_MAX_TILES * sizeof(float);
-}
-
-void spacemit_gdn_read_switch() {
-    (void) gdn_prefill_from_env();
 }
 
 void spacemit_gdn_paths_take(uint64_t * reference, uint64_t * fused, uint64_t * two_pass, uint64_t * chunk,

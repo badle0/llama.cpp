@@ -39,28 +39,22 @@ enum class spacemit_plan_result {
     miss,     // expanded and stored
 };
 
-// read by tests only; added on every graph the cache serves or stores, the default path included (three clock reads
-// on a miss, two on a hit, and three atomic adds per graph); nothing under none or QUANTIZE=shared. What the lookups
-// did since the last take, over all backends. lookup_us: the time from the top of graph_compute to the step list in
-// hand, summed; key_us: from after the contract check (on a hit, which skips it, from the top of graph_compute) to the
-// step list in hand (on a miss the store; a miss's probe lies before the check and the expansion runs inside it, so
-// both are in lookup_us only), summed
+// read by tests only; added on every graph the cache serves or stores, the default path included (one atomic add per
+// graph); nothing under none or QUANTIZE=shared. What the lookups did since the last take, over all backends
 struct spacemit_plan_counters {
-    uint64_t hits_uid  = 0;
-    uint64_t misses    = 0;
-    double   lookup_us = 0.0;
-    double   key_us    = 0.0;
+    uint64_t hits_uid = 0;
+    uint64_t misses   = 0;
 };
 
 spacemit_plan_counters spacemit_plan_counters_take();
-void spacemit_plan_counters_add(spacemit_plan_result result, double lookup_us, double key_us);
+void spacemit_plan_counters_add(spacemit_plan_result result);
 
 // one backend context's cache: one entry, the last plan
 class spacemit_plan_cache {
   public:
     // the key: cgraph's uid not 0 and the entry's, word the entry's, and cgraph's nodes the very objects the entry
-    // recorded, all of them and in order. word: the configuration word (bit 0 the activation-sharing fact, bit 1
-    // FLAGOS_SPACEMIT_SSM_CONV=split, bit 2 FLAGOS_SPACEMIT_STATE=copy, above them the plugin's switch generation)
+    // recorded, all of them and in order. word: the configuration word (bit 0 the activation-sharing fact, above it the
+    // plugin's switch generation)
 
     // the key alone, before the contract check. On a hit fills steps (the entry's, whose nodes are this graph's;
     // workspace offsets 0, graph_compute sets them from the sizes), names when want_names, and the two workspace
