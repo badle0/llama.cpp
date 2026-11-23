@@ -3730,7 +3730,7 @@ The node is the largest step of every prompt graph (45.5% at 32 tokens, 32.2% at
 
 ### The Q4_0 experts: the fork's signed layout and 8-row kernel (spec, 2026-11-22)
 
-**Status:** written 2026-11-22 on the user's word ("write the spec for testing q4_0 expert path"), approved with its four points the same day ("agreed to all 4 rules, start building it"). Built and checked on the Mac the same day ("As built" below). Run on the K3 the same day ("On the K3" below): `m8` passes the rule at the stable factor 1 and fails its accuracy point at the fork's 0.1; `pad8` fails the speed point at 4 and 32 tokens. `m8` at factor 1 is the default since then, `pad8` and the factor's switch removed, confirmed on the K3 2026-11-22 (`e92642893`; "The default on the K3" below) but for one point left to the user: at 4 tokens the default's graph is 3 ms (1.8%) longer than `plain`'s.
+**Status:** written 2026-11-22 on the user's word ("write the spec for testing q4_0 expert path"), approved with its four points the same day ("agreed to all 4 rules, start building it"). Built and checked on the Mac the same day ("As built" below). Run on the K3 the same day ("On the K3" below): `m8` passes the rule at the stable factor 1 and fails its accuracy point at the fork's 0.1; `pad8` fails the speed point at 4 and 32 tokens. `m8` at factor 1 is the default since then, `pad8` and the factor's switch removed, confirmed on the K3 2026-11-22 (`e92642893`; "The default on the K3" below) but for one point: at 4 tokens the default's graph is 3 ms (1.8%) longer than `plain`'s, located in the signed kernels for single rows and groups of 4 ("The 4-token cost on the K3" below) and accepted by the user the same day ("accept 3ms for now"); `plain` stays as the switch's other value.
 
 **What it is about.** `MUL_MAT_ID` on the 3-D Q4_0 expert tensors of Qwen3.6-35B-A3B: 115 of its 120 expert tensors (the other 5 are Q4_1, `blk.{0..4}.ffn_down_exps`), most of the file's bytes. The provider stores them in the dense matmul's layout (`q4_0_32x256`) and multiplies an expert's rows with the dense matmul's 4-row and 1-row kernels (`q4_0_gemm`). SpacemiT's fork has had a path of its own for these tensors since its PR #53 (2026-11-09, `3dea41375`; read at `mtmd-backend` `b847bf396`, item 102). The provider has never run it. This step builds it beside today's path and measures it.
 
@@ -3889,6 +3889,123 @@ The KLD of 2 chunks against the float base (`plain`'s known figures: mean 0.0054
 - *Open, the user's word.* Keep `m8` as the default with its 3 ms at 4 tokens, and remove `plain`; or look for the 4-token cost first. The chat run without checkpoints again left no files: `~/ck/chat.out` exists on the board by the block's logic, its logs not on the Mac.
 
 **The 4-token cost, step 1: the driver's bookkeeping trimmed and a benchmark (2026-11-22, Mac only; the user: "look at the 4-token cost first"; by the coder subagent, the diff read and the checks rerun by me).** What the two K3 runs give without a new one: the quantize step is 0.5 ms a graph slower under the default (4.2 against 3.7 ms) although both arms pack a single row with the same packer, so that part is the driver's own work, by inference; the multiply is 1.3 ms slower (66.6 against 65.3 ms) over about 123,000 one-row kernel calls a graph, each on one 32-column slab staged in TCM, where one token (few calls, each over many columns from DRAM) is not slower. Read in the code: under the default every tile built the experts' byte offsets over all 256 experts in both steps of each of the 120 nodes, a call an expert, and worked out each group's place again for every slab. Changed (`plugin/flagos-spacemit-ime-id.cpp`, the signed path only, the bytes unchanged): an expert without rows costs one compare; the offsets' pass also counts the groups, so the quantize step's second pass over the experts is gone; the multiply works out an expert's shape once and walks its groups with a running offset. Left as they are: the 128-byte padding of a single row's pack (2,432 bytes against 2,320 at K 2048) and the assert in the signed multiply's wrapper. New, test code only: `flagos-check-spacemit --bench-mmid`, one `MUL_MAT_ID` node through the backend at the model's two shapes, at 1 token, 4 tokens on 32 experts (single rows), 4 and 8 tokens on the same 8 experts (groups of 4 and of 8) and 32 tokens of random ids, `plain` and the default taking turns twice, 60 timed computes a cell. Checks on the Mac: the check program's `mmid` lines are the build before's under the default and under `plain` (7 lines each); its 6 known `conv pair` failures and no other under the default, `plain`, `GGML_FLAGOS_KERNEL_VARIANTS=0` and `FLAGOS_SPACEMIT_TEST_THREADS=1`; `test-backend-ops -o MUL_MAT_ID` 227/227; the riscv64 syntax check 0 errors; the benchmark runs and prints its 50 lines (reference kernels, the figures mean nothing there). Mutations caught: the walk's first single row short by a group of 4 (29 failures more), an expert without rows adding bytes (a crash; the coder's two), the single rows counted over the group of 4 (a crash; mine). Not known: how much of the 3.1 ms this removes, and which signed kernel costs the rest; the K3 run says both, the benchmark by its three small patterns.
+
+**The 4-token cost on the K3 (2026-11-22, build `d5e9ae0e8`, logs `~/k3-logs/q6`; the benchmark, then `plain` and the default in turn three times, each a llama-bench of 3 repetitions).** The check program passes. The trimmed bookkeeping did not remove the cost: my inference that about 1 ms of it was bookkeeping was wrong, or its part is inside the runs' spread.
+
+| tokens | `plain`, the graph, three runs | the default, three runs | the difference of the means | llama-bench t/s, means |
+|---|---|---|---|---|
+| 4 | 170.5, 169.8, 170.7 | 175.3, 173.7, 171.5 | +3.2 ms (+1.9%) | 23.24 and 22.81 |
+| 8 | 257.6, 255.2, 260.2 | 258.4, 258.4, 258.0 | +0.6 ms | 30.82 and 30.75 |
+| 16 | 362.0, 361.9, 361.2 | 362.3, 360.8, 362.4 | +0.1 ms | 44.00 and 43.97 |
+| 32 | 543.7, 543.3, 543.3 | 535.1, 536.6, 537.5 | -7.0 ms (-1.3%) | 58.64 and 59.40 |
+
+At 4 tokens the default's three runs spread over 3.8 ms and `plain`'s over 0.9; the third pair is 0.8 ms apart. Of the 3.2 ms the multiply is 1.7 (66.9 against 65.3 ms) and the quantize step 0.3 (4.1 against 3.8; 0.5 before the trim).
+
+`--bench-mmid`, one node with the real kernels, the default's median over `plain`'s (120 computes each, the two settings in turn twice):
+
+| pattern | gate and up [2048, 512, 256] | down [512, 2048, 256] |
+|---|---|---|
+| 1 token (8 single rows, the one-token path) | 0.995 | 0.998 |
+| 4 tokens on 32 experts (32 single rows) | 1.021 | 1.055 |
+| 4 tokens on the same 8 experts (8 groups of 4) | 1.054 | 1.012 |
+| 8 tokens on the same 8 experts (8 groups of 8) | 0.873 | 0.927 |
+| 32 tokens, random ids | 1.058 | 1.039 |
+
+- *Where the cost is.* In the small groups when the weights sit in TCM: a single row is 2 to 5% slower with the signed kernel and a group of 4 is 1 to 5% slower, a group of 8 is 7 to 13% faster. One token, whose calls run over many columns from DRAM and are bound by memory, is equal. A node of 32 tokens with evenly drawn ids is slower too (few experts reach 8 rows there); the model's own 32-token graph is faster because its ids are not even.
+- *What it is not.* The two 1-row kernels read side by side differ in two things: the signed one has no `sum(a)` term (three instructions fewer a 32-value block) and uses `vmadot.hp` and `vmadotus.hp` where the other uses `vmadotsu.hp` and `vmadotu.hp`. So the signed kernel does less and is slower. A guess, not measured: the two signed dot instructions are slower on the A100 than the two unsigned ones. Not ruled out: the 128-byte padding of a single row's pack, the wrapper's assert.
+- *The break-even* is 8 tokens in the model: equal at 8 and 16, 1.3% faster at 32, 1.9% slower at 4.
+- *A way to remove it, not built:* an expert with fewer than 8 rows could have its slab turned back to unsigned nibbles as it is copied into TCM (one XOR in a copy that happens anyway) and run today's `plain` kernels, the signed path kept for experts of 8 rows and more. It would need the two packs side by side in one node and a KLD run, for about 3 ms of a 4-token graph and a few ms at 8 to 32 tokens (an estimate from the table above).
+- *Open, the user's word:* accept the 3 ms, or build that.
+
+### The server's checkpoints in a chat turn (spec, 2026-11-23)
+
+**Status:** written 2026-11-23 on the user's word ("start writing spec as your recommended order"; first of three). Not approved. Its run has probably happened already: the blocks of items 104 and 106 skipped their chat stage, which they do only if `~/ck/chat.out` exists on the board; the logs are not on the Mac.
+
+**What it is about.** No provider code. For a model with recurrent state llama-server writes context checkpoints and cuts a prompt so that it can write them (item 99; `tools/server/server-context.cpp`, `do_checkpoint`, `checkpoint_offsets`). With `--reasoning-preserve` a chat turn processes only the new question (item 101), and then the checkpoints are most of what is left to save.
+
+**What it costs (measured, item 100, the board's server log).** A turn of 21 tokens at depth 158: 822 ms to the first token, in which the server writes three checkpoints of 62.8 MiB (46 to 62 ms each, item 99) and runs the 21 tokens as three graphs of 3, 14 and 4 rows. One graph of 21 rows would take about 390 to 420 ms (an estimate between the 4-row graph's 173 ms and the 32-row graph's 533 ms), so about half of the turn is the server's policy.
+
+**The two forms.**
+- *A, a flag:* `--ctx-checkpoints 0` beside `--reasoning-preserve`. By the server's code no checkpoint is written and no prompt is cut; seen on the Mac with Qwen3.5-0.8B (one graph a prompt, 31 rows where it was 27 and 4).
+- *B, a server change:* keep the one checkpoint at the last user message's start and drop the two near the prompt's end. One write and two graphs a turn, and a regenerated answer still restores. It changes an upstream file (an `upstream-changes.md` entry, a pause by AGENTS.md); not proposed now, named so that A is not taken for the only way.
+
+**What A costs.** Whenever a prompt departs from the slot's cache, the whole conversation is processed again, since a recurrent state cannot be rolled back without a checkpoint: seen on the Mac (turn 3 processed 320 tokens where it had processed 148). At the board's 84.5 t/s (pp2048) a conversation of 4,096 tokens is about 48 s. A prompt departs when an answer is regenerated, when an earlier message is edited, and on every turn of a client that does not send an answer's reasoning back with thinking on (item 101, stage 2). So A is for clients that keep the history byte for byte.
+
+**The run (one, about 16 minutes; the stage that was in the blocks of items 104 and 106).** The chat case, thinking off, 20 turns of at most 512 tokens, `LLAMA_ARG_REASONING_PRESERVE=1 LLAMA_ARG_CTX_CHECKPOINTS=0`, with the op tables. Compared with item 101's stage 1, the same case with checkpoints on. A becomes the documented setting for chat (`build.md`, and the harness's chat flags behind an option) if all three hold:
+1. all 20 turns answer, and turns 2 to 20 process at most 30 tokens each;
+2. the first token of every turn from 2 to 20 comes at least 25% sooner than in item 101's stage 1 at the same turn;
+3. the op tables show one graph a turn.
+The price above goes into the same `build.md` paragraph. Whether to adopt is the user's word either way.
+
+**Estimate, not measured.** 0.84 s to about 0.45 s at turn 2, 1.25 s to about 0.85 s at depth 7,300 (the saving does not grow with depth, the attention's share does).
+
+**For the user's word.** (1) Is A wanted at all, given its price for regenerate and edit? (2) If the run has not happened, its block again.
+
+### The dense Q4_0 matmuls: the fork's FP16 path, a reference run first (spec, 2026-11-23)
+
+**Status:** written 2026-11-23 on the user's word (second of three). Part A approved the same day ("agreed to partA"); its run is prepared, the fork's source going to the board as an archive from the Mac (the board's clock is in April, so it is not asked to fetch over TLS). Part B not specified.
+
+**What it is about.** The 2-D Q4_0 weights of Qwen3.6-35B-A3B (`attn_qkv`, `attn_gate`, `ssm_out`, `attn_q`, `attn_output`): 1,171 ms of a 5,437 ms graph at 501 tokens (21.5%, item 109), more than the expert multiply. The provider multiplies them with int8 activations, 4 rows a kernel call. SpacemiT's fork multiplies them in FP16, 16 rows a call (its PR #53, read at `mtmd-backend` `b847bf396`; the provider has never run it).
+
+**What the fork does (read in `ime.cpp:1777-2470`, not run by us).**
+- *The weights* in a layout of its own, `Q41Block<32, 32, 2>` (`repack.h`): 19 bytes a row and 32 values (nibbles, a zero point byte, an fp16 scale), against Q4_0's 18. Lossless for Q4_0.
+- *Several rows:* the activations are cast to fp16 into TCM, a weight tile of 32 columns is dequantized to fp16 into TCM, and `gemm_kernel_f16f16f32_m16_vfwmadot` multiplies 16 rows by 32 columns. For K of 2,048 and more, which is every dense matmul of this model, K is cut into slices, one a worker or a core pair; a worker writes fp16 partial sums for its slice over all rows and columns, and a second pass adds the slices in f32. Five routes by shape, about 500 lines, tied to the fork's executor and its pairs of TCM blocks.
+- *One row:* an integer kernel on the same layout (`gemm_kernel_i8i4_m1_q41`), one byte in 19 more to read than today.
+- *The pieces:* two kernels in `ime2_kernels.cpp`, and the casts, the dequantization and the reduction from SpacemiT's generated kernel file `spe_kernels_core.h` (2,101 lines).
+- *Two refinements on branches not merged:* `pp512-opt` (which shapes split M and N; its commit gives pp512 697.94 to 738.37 t/s on Qwen3-0.6B Q4_0) and `fp32dotreduce-8x8opt` (the partial sums kept in 8 by 8 tiles; no figure).
+
+**Why not port it at once.** The port is the largest so far: a second weight layout or a dequantization of our own, about 2,500 lines of copied kernel code, a driver of our own for the K slices and their reduction, and a changed arithmetic (fp16 products and partial sums) that needs its KLD. And there is no figure for this model: the one sign is the fork's 698 to 738 t/s on Qwen3-0.6B against the provider's 530 on 2026-11-15, another stack and session. A reference run of the fork's own backend on the board costs one build and no provider code, and says whether the port is worth its size.
+
+**Part A, the reference run (no provider code).**
+- *The build:* the fork at `b847bf396` in a folder of its own on the board (`~/llama.cpp-smt-b847`), by `build.md` section 5's recipe (spine-runtime 0.6.3, which the board has and the fork's build notes still name). The board fetches it from GitHub, as it did on 2026-10-07; nothing of ours is touched. It uses `/dev/tcm`, so it runs under the TCM guard and never beside the provider.
+- *Measured, each backend in turn twice:* (a) `test-backend-ops perf -o MUL_MAT` on its dense Q4_0 cases (4,096 weight rows, K 14,336, 1 to 512 activation rows), the fork's device against the provider's: the kernel paths alone; (b) `llama-bench -p 4,32,128,501 -n 64 -r 3` on Qwen3.6-35B-A3B on both, the same flags; (c) on the fork's backend one completion and the KLD of 2 chunks against the float base, to know what its whole stack does to accuracy (its router is quantized, lossy by its own note).
+- *The rule for going on to Part B:* the fork's dense Q4_0 `MUL_MAT` is at least 15% faster than the provider's at 512 rows in (a), and its pp501 in (b) is not below the provider's. If only the first holds, the gain is in the kernel and something else of the fork costs it; Part B still stands. If the first fails, the port is dropped and recorded.
+- *What (b) cannot say:* which op a difference comes from; the fork's backend has no op counters.
+
+**Part B, the port, in outline (its own spec after Part A's figures).**
+- Behind a switch, as the expert path was: `plain` today's kernels, the new path for 2-D Q4_0 weights at 16 rows and more; one row and short batches keep today's path unless the figures say otherwise.
+- The first decision: the fork's layout (one layout for both paths, 5.6% more bytes on the one-row path, which is bound by memory, for the weights concerned) or today's layout with a dequantization of our own (no second layout, one routine not copied).
+- The kernels copied with scalar references beside them; a driver of our own for the K slices, on the provider's executor and its TCM.
+- The rule as for the experts: the check program, the KLD within one error bar, a prompt graph shorter by a set share, nothing slower at one token.
+
+**Risks.** The fork may not build or run on the board at this commit (its dependencies may have moved past 0.6.3 in fact though not in its notes); then Part A is the perf test's cases only if that much builds, or the decision is taken without it. A gain on K 14,336 may not carry to K 2,048 (fewer values a slice); (b) covers that.
+
+**For the user's word.** (1) Part A before any port: I recommend it. (2) The board fetching the fork from GitHub is the user's to run and allow.
+
+### The expert quantize step's deal (spec, 2026-11-23)
+
+**Status:** written 2026-11-23 on the user's word (third of three). Not approved, nothing built.
+
+**What it is about.** `MUL_MAT_ID`'s first step with several tokens (`plugin/flagos-spacemit-ime-id.cpp`, `spacemit_mul_mat_id_quantize`), which packs every expert's rows. It hands the groups to the tiles as contiguous ranges of equal count: tile *i* takes groups `n_groups * i / nth` up to `n_groups * (i + 1) / nth`. A group of 8 rows counts as much as a single row, so a tile whose range holds the large groups packs several times the rows of another, and the others wait at the step's end.
+
+**What it costs (the default, build `e92642893`, item 106; ms a graph).**
+
+| a graph of | the step | of it waiting | the graph | the waiting's share |
+|---|---|---|---|---|
+| 32 tokens | 26.8 | 7.0 | 533.5 | 1.3% |
+| 128 tokens | 92.3 | 22.1 | 1,545.1 | 1.4% |
+| 501 tokens | 335.6 | 45.2 | 5,413.0 | 0.8% |
+| 512 tokens, n_kv 512 to 2048 | 390 to 399 | 84 to 89 | 5,624 to 6,463 | 1.4 to 1.5% |
+
+Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 tokens (item 97): larger groups made the count a worse measure.
+
+**The change.** The ranges are cut by rows, not by groups: with the groups in their order and a running sum of their rows, tile *i* takes the groups whose first row falls in `[rows * i / nth, rows * (i + 1) / nth)`. A group is never divided, so a tile's share is off by less than one group (at most 8 rows). Each tile finds its range in the pass over the experts it makes already. A row costs the same wherever it is (one pass over K values), so rows are the right weight here, which they were not for the multiply (its units carry a slab's copy). Both layouts' paths get it (the default's groups of 8, 4 and 1; the others' groups of 4 and 1).
+
+**The bytes.** Every pack is written by one tile from the same inputs whichever tile that is, so the output is today's bit for bit for any tile count.
+
+**Why not the claim queue.** The multiply's queue takes its counter's reset from the step before it. The quantize step is the node's first, so a counter of its own would need a reset somewhere earlier or a marker per compute; a weighted fixed deal needs neither and should be near exact here. If the run shows waiting left, the queue is the next form.
+
+**Files.** `plugin/flagos-spacemit-ime-id.cpp`, `tests/check_spacemit.cpp`. No switch: the old deal stays reachable for the comparison run only as the previous build.
+
+**Tests on the Mac.** The check program's `MUL_MAT_ID` lines unchanged, figure for figure, under the default and under `plain` (the bytes cannot change); a new count in the claim queue's or the q4_0s line: for skewed draws the largest tile's rows over the mean at most 1 + 8 / (rows / tiles); 1 tile against 8 and the tiles on threads as now; mutations (a range starting one group late; the last tile's range ending one group early).
+
+**The K3 run (one), and the rule.** The build and the check program; then the build before against the new one cannot be compared in one session without a switch, so the comparison is against item 106's figures of the same day's session type: `llama-bench -p 32,128,501,2048 -n 512 -r 3` twice with the op tables. The change stays if the step's waiting falls by at least half at 128 and 501 tokens and no llama-bench figure is lower than item 106's by more than the runs differ. (If a same-session comparison is wanted, a test switch for the old deal is 5 lines and one more removal step.)
+
+**Estimate, not measured.** If two thirds of the waiting goes: 15 ms at 128 tokens, 30 at 501, 57 to 60 at 512; pp2048 84.5 to about 85.3 t/s.
+
+**Not in this step.** Packing a token's row once for its 8 experts, or once for the gate and up nodes together (item 110's list): a design of its own.
+
+**For the user's word.** (1) Without a switch, compared across sessions, or with a test switch and one more removal: I recommend without, the bytes being unchanged and the op table's waiting column the measure. (2) Its place in the order: it is small, and can run while Part A of the dense spec is on the board.
 
 ### Not planned
 
