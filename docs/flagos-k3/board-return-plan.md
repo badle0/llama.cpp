@@ -1,6 +1,6 @@
 # When the board is back: the revisit plan
 
-Written 2026-11-24, while the K3 is away for an upgrade. It holds what was found and decided on 2026-11-23 and 24 and the steps to take in order. Quote a step to start it. The detail behind each line is in `plan.md` ("The dense Q4_0 matmuls: the fork's FP16 path, a reference run first", "The third cleanup", "What came from the documents before the deck") and `progress.md` items 111 to 114.
+Written 2026-11-24, while the K3 is away for an upgrade. It holds what was found and decided on 2026-11-23 and 24 and the steps to take in order. Quote a step to start it. What each paste on the board runs, prints and decides is in `board-return-runs.md`. The detail behind each line is in `plan.md` ("The dense Q4_0 matmuls: the fork's FP16 path, a reference run first", "The third cleanup", "What came from the documents before the deck") and `progress.md` items 111 to 114.
 
 ## 1. Targets
 
@@ -52,8 +52,9 @@ Speed targets, agreed for Qwen3 on 2026-11-06 and not yet set for the 35B: a fre
 - On the fork: one completion and the KLD of 2 chunks.
 
 **Step 3. The fork against ours, op by op (about 1 hour; done whatever step 2 shows).**
-- The op test's timing mode on both backends: dense Q4_0 matmul at 1, 4, 32, 128 and 512 rows; the expert multiply at the same sizes; attention at 1, 26 and 128 tokens over a few depths; Gated DeltaNet.
-- A table of the two, with the ratio for each cell.
+- The op test's timing mode on both backends, on the cases the two trees share: dense Q4_0 matmul, the expert multiply, attention, Gated DeltaNet.
+- The whole model op by op: our op tables against the fork's own trace profiler (a second build of the fork with `GGML_BUILD_PROFILE`, run with `GGML_TRACE=1`), at 1, 4, 32, 128 and 501 tokens.
+- A table of the two by op family, with the ratio for each cell.
 
 **Step 4. Decide and port (one op at a time).**
 - For each op where the fork wins by more than the runs differ: a spec, then its driver behind a switch, then a run of the two in one session with the KLD.
