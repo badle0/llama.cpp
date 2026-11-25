@@ -133,3 +133,14 @@ Decides: a family is a candidate for step 4 when the fork is faster in D2 by mor
 | `~/cleanup-confirm` | the build log, the check program's output, our full table with op tables, the completion, the KLD |
 | `~/fork-overall` | the device and offload checks, three rounds of both backends' bench output, our op tables, the fork's completion and KLD, both builds' logs |
 | `~/fork-per-op` | the isolated op timings of both backends, our op tables, the fork's trace tables (not the traces), the comparison table |
+
+## 9. Round A's result (2026-11-25): the board came back empty
+
+- Kernel 6.18.3, 216 GB free, the clock is right. Nothing of ours is left: the repo and its build, the model, spine-runtime, `segv.so`, the KLD text and base, the float run's text, the fork's build, every run folder. `~/ck` and `~/fork-reference*` were never copied and are lost.
+- Round B becomes a setup round. First a probe of the tools, `/dev/tcm` and the network, which also fetches spine-runtime 0.6.3 and starts the model's download (ModelScope, 20,836,243,072 bytes, SHA-256 `52312daa5b2190c1f5723d33c3315c01c55af4206f6c6e6eb63f3d8dd52bb85e`). Then: the repo cloned from a bundle of the whole branch, `segv.so` built, ours configured and built from nothing, and the checks and the table as section 4 has them. The fork is built from its archive in round C.
+- spine-runtime stays at 0.6.3, the version behind every earlier figure, so that a change in speed is the system's and not the runtime's.
+- `build-dates.sh` is not needed while the clock is right; the blocks no longer call it.
+- `~/ppl.txt` cannot be restored: its source was never recorded. The KLD text from now on is wikitext-2's test file (`wiki.test.raw`, 1,290,590 bytes, SHA-256 `173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08`, copied from the Mac), and the base is remade from it with the CPU on one thread. The figures 0.005115, 0.089103 and 94.510% belonged to the old text and are no longer the expected values. The check is the deck's bound, a mean below 0.01, and the new figures become the reference.
+- The completion's text is still compared with the float run's (`~/k3-logs/f32/gen.out` on the Mac).
+- The speed table is compared with the old one knowing that the kernel changed. If it is outside 2%, the commit before the cleanup (`d5e9ae0e8`) is built in a second folder and the two run in turn, to tell the system's change from the cleanup's.
+- Round E (the chat run without checkpoints) is needed again.
