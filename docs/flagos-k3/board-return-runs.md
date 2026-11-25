@@ -142,5 +142,47 @@ Decides: a family is a candidate for step 4 when the fork is faster in D2 by mor
 - `build-dates.sh` is not needed while the clock is right; the blocks no longer call it.
 - `~/ppl.txt` cannot be restored: its source was never recorded. The KLD text from now on is wikitext-2's test file (`wiki.test.raw`, 1,290,590 bytes, SHA-256 `173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08`, copied from the Mac), and the base is remade from it with the CPU on one thread. The figures 0.005115, 0.089103 and 94.510% belonged to the old text and are no longer the expected values. The check is the deck's bound, a mean below 0.01, and the new figures become the reference.
 - The completion's text is still compared with the float run's (`~/k3-logs/f32/gen.out` on the Mac).
-- The speed table is compared with the old one knowing that the kernel changed. If it is outside 2%, the commit before the cleanup (`d5e9ae0e8`) is built in a second folder and the two run in turn, to tell the system's change from the cleanup's.
+- If the speed table is outside 2% of the old one, the commit before the cleanup (`d5e9ae0e8`) is built in a second folder and the two run in turn, to tell the system's change from the cleanup's.
 - Round E (the chat run without checkpoints) is needed again.
+
+**The probe, the same day.** Bianbu 4.0.5, gcc 15.2.0, git 2.53.0, Python 3.14.4, make; no cmake, no ninja, no tmux. `/dev/tcm` is there. `/usr/lib` now carries `libspert.so.0.6.3` and `libspine_tcm.so.3.0.1` of the system's own. The CPUs are as before (`k3-hardware.md`): 16 online, 8 X100 and 8 A100, a normal process allowed on 0 to 7, so `nproc` says 8. This kernel's `/proc/cpuinfo` lists no vendor extensions in its `isa` lines; whether the runtime still reaches the AI cores is settled by the check program with `--expect-device`. GitHub, ModelScope and Hugging Face all answer with the certificate check on. Correction (the same evening): the kernel and the compiler are not new. `PROJECT.md` records the old system as Bianbu 4.0, kernel 6.18.3, GCC 15.2 and CMake 4.2; the reinstall is Bianbu 4.0.5 with the same kernel and compiler versions, so at most patch levels of packages differ. The model came from ModelScope at about 450 KiB/s on one connection, which would take 12 hours, so the download continues with `aria2c` over several connections from ModelScope and Hugging Face together (the same file on both by SHA-256).
+
+**The setup, the same evening (`~/setup-build`).** cmake 4.2.3, ninja 1.13.2 and tmux installed from the board's archive; the repo cloned from the whole-branch bundle; the build from nothing: 388 steps, rc 0, 109 warning lines (80 in upstream's `ggml-cpu`, 29 in our provider, 25 of them in `plugin/flagos-spacemit-rvv-attn.cpp`, mostly narrowing conversions and sign comparisons; whether the old build printed the same ones was not recorded). The check program with `--expect-device` printed "all checks passed": the cleanup `fd757088f` holds on the real kernels, on the new kernel, with the runtime reaching the AI cores. The model finished downloading with `aria2c` on 16 connections. Next, one block: the model's SHA-256, the new KLD base, the table, the completion, the KLD, then the fork's two builds (plain and profiling) so that rounds C and D need no build.
+
+**The confirmation run, the same evening (`~/cleanup-confirm`, `~/fork-build`).**
+
+- The model's SHA-256 and the wiki text's are as recorded. The new KLD base (`~/kld-wiki/base.bin`, 2 chunks of 512 tokens, CPU, one thread): PPL 5.8619, 506 s a pass.
+- The provider against it: mean KLD 0.003381 +- 0.000361, median 0.001238, 99.9% 0.096165, maximum 0.108020, same top token 97.647 +- 0.672%. These are the reference for this text. The completion's text is the float run's; 1 graph split.
+- The prompt side is as before or slightly better: pp32 60.59, pp128 83.63, pp501 93.19, pp2048 85.97 t/s (59.85, 82.55, 92.04, 84.50 before the reinstall).
+- **Generation is 25% slower: tg512 7.18 t/s against 9.56.** A one-token graph takes 137.2 ms against 102.4. Two steps carry all of it: `CONCAT r8192` 25.3 ms for its 30 calls against 1.4, and `SSM_CONV r1` 14.4 ms against 2.5. Both are the convolution's one-token steps, both run the plain C loops of `plugin/flagos-spacemit-seq.cpp`, a file the cleanup did not touch, and every tile takes the same time. A few small one-row f32 matmuls are 1.3 to 1.9 times slower too; the quantized matmuls and the expert multiply are unchanged. Cause not known. Next: the commit before the cleanup built beside this one and the two run in turn (`~/tg-regression`), with the THP setting, the CPU governors and the two loops' machine code printed.
+- The fork built twice with no error line: 173 steps plain, 163 steps with `GGML_BUILD_PROFILE` (`llama-bench` only). Its configure took the system's `/usr/lib/libspert.so`, the same 0.6.3.
+
+**The cleanup cleared of the slow generation (`~/tg-regression`, the same night).** The commit before the cleanup (`d5e9ae0e8`, a second checkout and build) and HEAD, in turn, two rounds, `-p 32 -n 64`:
+
+| run | pp32 | tg64 | one-token graph | `CONCAT r8192` (30 calls) | `SSM_CONV r1` (30 calls) |
+|---|---|---|---|---|---|
+| HEAD, 1 | 60.54 | 5.66 | 174.4 ms | 62.3 ms | 14.4 ms |
+| before the cleanup, 1 | 60.11 | 7.97 | 123.5 ms | 11.8 ms | 14.4 ms |
+| HEAD, 2 | 60.36 | 7.94 | 123.9 ms | 11.8 ms | 14.4 ms |
+| before the cleanup, 2 | 60.14 | 5.65 | 174.9 ms | 62.3 ms | 14.4 ms |
+
+- Both commits are slow, so the cleanup is not the cause. `SSM_CONV r1` is 14.4 ms in every run of either. `CONCAT r8192` takes one of a few values a process (11.8, 14.8, 25.3, 62.3 ms seen), whichever commit runs: it follows the process, not the build.
+- The machine code of the two kernels, read from the plugin: the plain C loops meant as the scalar reference were vectorized by the compiler. The convolution's sum is an ordered vector sum (`vfredosum`) over 4 elements a channel; the concat's copies are strided vector loads and stores of 3 and 1 elements a row.
+- Not known: why the same loops were fast before the reinstall (the old binaries are gone; the compiler's package revision or its tuning default may differ), and why the concat's time changes from process to process.
+- Next (`~/autovec-test`): the same source built with `-fno-tree-vectorize` beside the build as it is, the two run in turn at pp32, pp128, pp501 and tg64, with the system's settings saved to a file this time.
+
+**It is a different board (the user, 2026-11-25 night).** SpacemiT did not reinstall the old unit: they handed over a new, upgraded one, which is why nothing of ours was on it. So the figures "before the reinstall" in this file, every earlier speed table and the facts in `k3-hardware.md` were measured on another unit. A difference from them can come from the hardware or its firmware as well as from the software. What stays valid: comparisons made on this board in one session (the cleanup against the commit before it). To do: read the new unit's identity (core ids, clocks, caches, firmware) against `k3-hardware.md`, and take this board's own figures as the reference from now on.
+
+**The new unit's identity** is in `k3-hardware.md` section 0: the same core ids, maximum clocks of 2.2 and 1.8 GHz (2.4 and 2.0 on the old unit), 32 KiB first-level caches on the AI cores as sysfs reports them (64 before), more ISA extensions listed, governor `userspace` with both core types at their maximum.
+
+**The slow generation found: the compiler's vector code in two scalar loops (`~/autovec-test`).** The same source built a third time with `-fno-tree-vectorize` for every file, run in turn with the build as it was, two rounds:
+
+| build | pp32 | pp128 | pp501 | tg64 | one-token graph | `CONCAT r8192` | `SSM_CONV r1` |
+|---|---|---|---|---|---|---|---|
+| as built | 59.90, 60.40 | 83.98, 83.57 | 93.89, 93.85 | 7.91, 7.93 | 124.3, 124.0 ms | 11.8 ms | 14.5 ms |
+| no auto-vectorization | 59.71, 59.72 | 83.40, 84.11 | 93.76, 93.94 | 9.83, 9.82 | 99.7, 99.6 ms | 1.4 ms | 0.6 ms |
+
+- Generation is back, and a one-token graph is faster than the old unit's 102.4 ms. The prompt sizes are the same in both builds.
+- Turning the vectorizer off everywhere is not the fix: a few plain C steps are slower without it in a prompt graph (`SCALE r1` 0.3 to 3.0 ms, `GLU SWIGLU` 15% and `L2_NORM` 12% at 128 tokens), which the whole graph does not show.
+- The fix (in `plugin/flagos-spacemit-seq.cpp`): the two reference loops, `ssm_conv_f32_ref` and `concat_dim0_f32_ref`, carry a GCC attribute that keeps them out of line, not vectorized, and with the multiply and the add apart as ggml-cpu's own build has them. Apple clang ignores it, so the Mac's build and its check program are unchanged ("all checks passed"). Not yet built on the K3: whether GCC 15.2 takes the attribute as written, the loops' machine code and the speed are the next run's to show (`~/scalar-conv-loops`), with the full table as this board's reference, the completion and the KLD.
+- Why GCC's version of these loops is so slow on the AI cores (and why the concat's time changed from process to process) is not explained; the loops run 3, 1 and 4 elements at a time, where a vector instruction's fixed cost has nothing to pay it back.

@@ -1,6 +1,27 @@
 # SpacemiT K3 board — facts and investigations
 
-Everything here was measured on the board (2026-09-24) unless marked otherwise.
+Everything here was measured on the board (2026-09-24) unless marked otherwise. That board was replaced on 2026-11-25 by a new, upgraded unit (`board-return-runs.md` section 9): the facts below are the old unit's until each is read again on the new one.
+
+## 0. The new unit (since 2026-11-25), read once, against the old unit's facts below
+
+Read on 2026-11-25 from `/proc/cpuinfo`, sysfs, `/proc/device-tree` and `dmesg`; nothing here is a measurement of speed.
+
+| Item | Old unit (sections 1 and 2) | New unit |
+|---|---|---|
+| Board model | not recorded | `SpacemiT K3 BS01DCMA` (`spacemit,k3-bs01dcma`) |
+| OS, kernel | Bianbu 4.0, 6.18.3-generic | Bianbu 4.0.5, 6.18.3-generic, build `1.0.6.4+custom20261114031826` |
+| Firmware | not recorded | SBI specification 2.0, implementation ID 1, version `0x10006` |
+| X100 (CPUs 0-7) | marchid `0x8000000058000002`, 2.4 GHz | same marchid, mimpid `0x33d8a600`, `cpuinfo_max_freq` 2.2 GHz |
+| A100 (CPUs 8-15) | marchid `0x8000000041000002`, 2.0 GHz | same marchid, mimpid `0x10000000d5686200`, `cpuinfo_max_freq` 1.8 GHz |
+| A100 first-level caches (sysfs) | 64 KiB + 64 KiB | 32 KiB + 32 KiB |
+| X100 caches, both second levels | 64 + 64 KiB; 4 MiB per 4 X100, 1 MiB per 4 A100 | the same |
+| ISA string | no `zvfbfwma` | lists `zvfbfwma`, `zvfbfmin`, `zfbfmin`, `zfa`, `zicond`, `zvbb`, `zvbc` and more; the same on both core types; IME still not listed |
+| Governor | not recorded | `userspace` on both core types |
+| Memory, disk | 31 GiB; about 104 GB free | 32,822,732 kB; one 238.5 GB NVMe |
+| THP | `always [madvise] never` | the same |
+| AI gate | `/proc/set_ai_thread`, world-writable | the same |
+
+Not yet read again on the new unit: the vector lengths, the TCM size and behaviour, the frequency the cores actually run at, and every timing in the sections below. Whether the lower maximum clocks and the smaller AI-core caches are the chip's or only what this device tree reports is not known.
 
 ## 1. System
 
