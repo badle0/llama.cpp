@@ -186,3 +186,15 @@ Decides: a family is a candidate for step 4 when the fork is faster in D2 by mor
 - Turning the vectorizer off everywhere is not the fix: a few plain C steps are slower without it in a prompt graph (`SCALE r1` 0.3 to 3.0 ms, `GLU SWIGLU` 15% and `L2_NORM` 12% at 128 tokens), which the whole graph does not show.
 - The fix (in `plugin/flagos-spacemit-seq.cpp`): the two reference loops, `ssm_conv_f32_ref` and `concat_dim0_f32_ref`, carry a GCC attribute that keeps them out of line, not vectorized, and with the multiply and the add apart as ggml-cpu's own build has them. Apple clang ignores it, so the Mac's build and its check program are unchanged ("all checks passed"). Not yet built on the K3: whether GCC 15.2 takes the attribute as written, the loops' machine code and the speed are the next run's to show (`~/scalar-conv-loops`), with the full table as this board's reference, the completion and the KLD.
 - Why GCC's version of these loops is so slow on the AI cores (and why the concat's time changed from process to process) is not explained; the loops run 3, 1 and 4 elements at a time, where a vector instruction's fixed cost has nothing to pay it back.
+
+**The fix on the K3, and this board's reference table (`~/scalar-conv-loops`, build at `f0cff0e32`, 2026-11-26).** GCC 15.2 took the attribute without a warning: `ssm_conv_f32_ref` and `concat_dim0_f32_ref` are now functions of their own with no vector instruction and no fused multiply-add. The check program: "all checks passed".
+
+| | pp32 | pp128 | pp501 | pp2048 | tg512 | one-token graph | `CONCAT r8192` | `SSM_CONV r1` |
+|---|---|---|---|---|---|---|---|---|
+| this board, with the fix | 60.21 | 84.33 | 93.39 | 86.60 | 9.71 | 100.9 ms | 1.26 ms | 0.77 ms |
+| this board, before it | 60.59 | 83.63 | 93.19 | 85.97 | 7.18 | 137.2 ms | 25.3 ms | 14.4 ms |
+| the old board (`e92642893`) | 59.85 | 82.55 | 92.04 | 84.50 | 9.56 | 102.4 ms | 1.39 ms | 2.52 ms |
+
+- Three more processes at `-p 32 -n 64`: tg64 9.77, 9.75, 9.83; the concat 1.24 ms in each. The change from process to process is gone.
+- The bits did not move: the completion's text is the float run's, and the KLD's figures are the same to the last digit (mean 0.003381, maximum 0.108020, same top 97.647%).
+- Step 1 of `board-return-plan.md` is done: the cleanup and this fix stand on the new board, and the first row is its reference.
