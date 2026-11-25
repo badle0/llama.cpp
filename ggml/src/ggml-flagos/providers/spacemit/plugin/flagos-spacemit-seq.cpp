@@ -21,6 +21,16 @@
 // ddfb41ddc); the ones for L2_NORM and MUL_MAT are ours. Each takes the same rows of the same tile as its reference.
 // Changes to the ported code are marked "flagos".
 
+// GCC 15.2 turns the one-token loops of SSM_CONV and CONCAT below into vector code (an ordered sum of 4 elements a
+// channel, strided loads of 3 and 1 elements a row) that ran 9 to 24 times slower on the A100 cores than the scalar
+// loops (K3, 2026-11-25). These two stay scalar, with the multiply and the add apart as in ggml-cpu's own build, and
+// out of line so that the caller's settings do not reach them
+#if defined(__GNUC__) && !defined(__clang__)
+#    define SPACEMIT_SCALAR_REF __attribute__((noinline, optimize("no-tree-vectorize", "fp-contract=off")))
+#else
+#    define SPACEMIT_SCALAR_REF
+#endif
+
 namespace {
 
 // [begin, end) of n items for one tile, as flagos-spacemit-kernels.cpp splits them (ggml-cpu's row split)
@@ -97,7 +107,7 @@ void l2_norm_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
 
 // ops.cpp ggml_compute_forward_ssm_conv_f32, copied with its row split: one dot product of the sliding window with
 // the kernel's row, summed in float in ggml-cpu's order, so the result is ggml-cpu's bit for bit
-void ssm_conv_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+SPACEMIT_SCALAR_REF void ssm_conv_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // conv_x {d_conv - 1 + n_t, d_inner, n_s}
     const ggml_tensor * src1 = dst->src[1];  // conv1d.weight {d_conv, d_inner}
 
@@ -130,7 +140,7 @@ void ssm_conv_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
 // ops.cpp ggml_compute_forward_concat_f32 for dimension 0 (spacemit_concat_f32_supported): each output element is one
 // source element, read with ggml-cpu's strides (the model's second source is a transposed view), the destination's
 // rows split over the tiles. A copy, so the destination's bytes are ggml-cpu's
-void concat_dim0_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
+SPACEMIT_SCALAR_REF void concat_dim0_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     GGML_TENSOR_BINARY_OP_LOCALS
