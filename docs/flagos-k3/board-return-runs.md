@@ -55,7 +55,7 @@ Setup, in order:
 
 1. The fork's build: reuse `~/llama.cpp-smt-b847/build` if its four programs exist, else unpack `~/smt-b847.tar.gz` with `tar -xzmf`, touch every file, configure and build (`build.md` section 5 flags; 173 steps; the one earlier build's duration was not recorded, allow 45 minutes).
 2. The device check, the stop condition of the whole round: with `GGML_SPACEMIT_BACKEND=1`, `test-backend-ops perf -o MUL_MAT -b SPACEMIT0 -p type_a=q4_0` must print `us/run` rows.
-3. The offload check: one short completion with `-dev SPACEMIT0 -ngl 99 -lm none -lv 4`. Report the lines that say how many layers went to the device, the graph nodes and the graph splits. If the layers are not on the device, stop: the figures would again be its CPU's.
+3. The offload check: one short completion with `-dev SPACEMIT0 -ngl 99 -lm none -lv 4`. The fork never prints an "offloaded N/N layers" line (llama.cpp prints it only for GPU-type devices, and the fork's is of type ACCEL), so the check reads the buffer lines: `SPACEMIT model buffer size` must hold the weights (18,918 MiB for this model; the CPU keeps 273 MiB, the token embedding) and `SPACEMIT KV buffer size` must be there. If the weights are not in the device's buffer, stop: the figures would again be its CPU's.
 
 Measurements, the two backends in turn, three rounds, nothing else running:
 
@@ -99,10 +99,10 @@ Devices: `FlagOS:SpacemiT:0` for ours, `SPACEMIT0` for the fork. The fork has mo
 
 - Ours: `GGML_FLAGOS_OP_STATS` with `llama-bench`, as in every run so far. Per graph size it gives a row per step kind with its wall time.
 - The fork: its profiling build with `GGML_TRACE=1`. It writes `ggml_trace.json` in the working folder: a begin and an end event for every graph node on every worker, with the op, the output's and operands' shapes, types and names. Each run starts in a folder of its own so the files do not overwrite each other.
-- Sizes: 1 token (`-p 0 -n 16`), then 4, 32, 128 and 501 tokens (`-n 0`), each `-r 2`, one size a run.
+- Sizes: 1 token (`-p 0 -n 6 -r 1`), then 4, 32, 128 and 501 tokens (`-n 0 -r 4`), one size a run. The last graph of a run is not used: each worker keeps its events in a 64 KB buffer of its own that is written out when full, and only the main thread's is written at exit (`ggml-profile.c`), so the end of the last graph can be missing.
 - `fork-trace.py` turns a trace into the same kind of table as ours: per graph size, a row per op and weight (for example `MUL_MAT attn_qkv q4_0 m501`), the wall time from the first worker's begin to the last worker's end, and the time between one node's end and the next one's begin (the fork's wait between nodes). The first graph of each size is dropped as the warm-up.
 
-The profiler's own cost is measured, not assumed: for each size the profiling build runs once with `GGML_TRACE` unset and once with it set, and the plain build's figure from round C stands beside them. The model's graph has 3,727 nodes by ggml's count (the fork's device may run fewer as its own); each event formats up to 1 KB of text. My estimate is that this is small against a 5-second graph and large against a 100 ms one, so the one-token table is reported with the measured cost per event taken off, and the isolated one-row cases of D1 are the firmer evidence there. A 501-token trace is about 20 MB per graph by estimate; the traces stay on the board and only the tables are copied.
+The profiler's own cost is measured, not assumed: for each size the profiling build runs once with `GGML_TRACE` unset and once with it set, and the plain build's figure from round C stands beside them. The model's graph has 3,727 nodes by ggml's count (the fork's device may run fewer as its own); each event formats up to 1 KB of text. My estimate is that this is small against a 5-second graph and large against a 100 ms one, so the one-token table is reported with the measured cost per event taken off, and the isolated one-row cases of D1 are the firmer evidence there. A trace is about 20 MB per graph by estimate; the traces are compressed on the board and copied back, and the tables are made on the Mac. A begin event takes its timestamp after its text is formatted and an end event before, so the formatting falls between two nodes and not inside one (read in `ggml-profile.c`).
 
 **The comparison table.** One row per family, for 1, 4, 32, 128 and 501 tokens: ours in ms, the fork's in ms, the ratio.
 
@@ -198,3 +198,42 @@ Decides: a family is a candidate for step 4 when the fork is faster in D2 by mor
 - Three more processes at `-p 32 -n 64`: tg64 9.77, 9.75, 9.83; the concat 1.24 ms in each. The change from process to process is gone.
 - The bits did not move: the completion's text is the float run's, and the KLD's figures are the same to the last digit (mean 0.003381, maximum 0.108020, same top 97.647%).
 - Step 1 of `board-return-plan.md` is done: the cleanup and this fix stand on the new board, and the first row is its reference.
+
+## 10. The fork on its device, first figures (`~/fork-overall`, `~/fork-per-op`, 2026-11-26)
+
+**What ran.** The fork's device came up (`SPACEMIT0`, 8 cores, `use_ime2=1`) and ran the matmul test, the completion and the isolated op timings. The three whole-model rounds and the fork's KLD did not run: the block waited for an "offloaded N/N layers" line that this fork never prints (section 5, item 3). The completion's log shows the model was on the device: 18,918.80 MiB of weights, the KV cache, the recurrent state and a 497 MiB compute buffer in `SPACEMIT` buffers, 272.81 MiB of weights and a 22 MiB compute buffer on the CPU, 3,819 graph nodes in 3 splits (ours: 1).
+
+**The one completion (501 prompt tokens, 31 generated; one run each, ours from `~/scalar-conv-loops` the day before, so an indication and not yet the three rounds in turn).**
+
+| | prompt | generation | load |
+|---|---|---|---|
+| ours | 5,467 ms (91.64 t/s) | 104.58 ms a token (9.56 t/s) | 29.1 s |
+| the fork | 4,262 ms (117.55 t/s) | 114.51 ms a token (8.73 t/s) | 59.9 s |
+
+The fork's text is the float run's, as ours is. Its prompt is 22% shorter; its token takes 9% longer. The loads are not comparable (ours maps the file, the fork ran with `-lm none`).
+
+**Isolated ops, three rounds in turn, the median of each (fork / ours; above 1 ours is faster).** A case counts as won only when the three rounds' ranges do not overlap.
+
+| Op | Case | Ours | The fork | fork / ours |
+|---|---|---|---|---|
+| dense Q4_0 matmul, 4096 x 14336 | 1 row | 1.14 ms | 1.46 ms | 1.28 |
+| | 2 to 8 rows | 1.50 to 1.82 ms | 2.70 to 2.79 ms | 1.51 to 1.81 |
+| | 512 rows | 64.68 ms | 29.07 ms | 0.45 |
+| expert multiply, 128 experts, 8 used | 1 token | 0.287 ms | 0.255 ms | 0.89 |
+| | 4 to 512 tokens | 0.97 to 11.08 ms | 1.12 to 11.91 ms | 1.07 to 1.21 |
+| expert multiply, 32 experts, 4 used | 1 and 4 tokens | | | 0.98, 1.10 (ranges overlap) |
+| | 8 to 512 tokens | 1.51 to 8.91 ms | 1.93 to 9.85 ms | 1.11 to 1.41 |
+| Gated DeltaNet | 10 of 12 cases | | | 0.99 to 1.07 (ranges overlap) |
+| | 16 heads x 64 at 1 token; 4 heads x 128 at 64 tokens | | | 0.92; 0.88 |
+| attention, F16 cache, 4 query rows | depths 4096 to 16384 | | | 1.48 to 1.93 |
+| attention, 1 query row, head 64 | depth 4096; 8192; 16384 | | | 0.90; 1.27; 1.29 |
+| attention, 1 query row, head 128 | depths 4096 to 16384 | | | 1.05; 1.01 and 1.02 (ranges overlap) |
+| attention, 8 heads x 8 rows, depth 7680 | 1 and 4 tokens | | | 1.13; 1.01 |
+
+- The fork wins clearly in one place: the dense Q4_0 matmul at 512 rows, 2.2 times faster. That is its FP16 path (the test's log shows the repack `q4_0_q41block_f16`), the candidate `board-return-plan.md` step 4 expected first.
+- At 1 to 8 rows the same matmul is 1.3 to 1.8 times faster on ours; the fork's time is flat at 2.7 ms from 2 to 8 rows (its 16 rows a call).
+- The expert multiply is faster on ours from 4 tokens up in the 128-expert case and from 8 in the 32-expert one (7 to 41%); at 1 token of the 128-expert case the fork is 11% faster. The Gated DeltaNet is the same on both. Attention is faster on ours in most cases and never more than 10% slower.
+- Both sides refuse the Q4_0 and Q8_0 KV cache cases. The fork has 8-row cases at depths 4096 to 16384 that our tree's test does not have.
+- Sizing the matmul's lead against the whole model (an inference, D2 is the measurement): in our 501-token graph the dense Q4_0 matmuls take 1,221 ms of 5,359, so at the ratio above they would save about 670 ms, about half of the 1,205 ms the fork's prompt was shorter by. All our dense matmuls together take 2,347 ms. Which of the fork's ops make up the rest is what the trace run shows.
+
+**Next (`~/fork-whole-model`, `~/fork-trace`).** The three rounds in turn and the fork's KLD with the corrected check; ours once more with the op tables on, at 4, 32, 128 and 501 tokens and at one; the fork's profiling build with the trace off and then on, one size a run, the traces copied back compressed.
