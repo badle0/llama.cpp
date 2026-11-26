@@ -15,7 +15,7 @@ if [ -n "${SPERT_INCLUDE:-}" ] && [ ! -f "$SPERT_INCLUDE/spert.hpp" ]; then
   echo "SPERT_INCLUDE=$SPERT_INCLUDE: no spert.hpp there" >&2
   exit 1
 fi
-[ $# -gt 0 ] || set -- plugin/flagos-spacemit-rvv-kernels.cpp plugin/flagos-spacemit-kernels.cpp plugin/flagos-spacemit-ime-kernels.cpp plugin/flagos-spacemit-ime.cpp plugin/flagos-spacemit-rvv-attn.cpp plugin/flagos-spacemit-attn.cpp plugin/flagos-spacemit-gdn.cpp plugin/flagos-spacemit-seq.cpp plugin/flagos-spacemit-moe.cpp plugin/flagos-spacemit-ime-id.cpp plugin/flagos-spacemit-weights.cpp plugin/flagos-spacemit-plugin.cpp plugin/flagos-spacemit-exec.cpp plugin/flagos-spacemit-x100.cpp
+[ $# -gt 0 ] || set -- plugin/flagos-spacemit-rvv-kernels.cpp plugin/flagos-spacemit-kernels.cpp plugin/flagos-spacemit-ime-kernels.cpp plugin/flagos-spacemit-ime.cpp plugin/flagos-spacemit-rvv-attn.cpp plugin/flagos-spacemit-attn.cpp plugin/flagos-spacemit-gdn.cpp plugin/flagos-spacemit-seq.cpp plugin/flagos-spacemit-moe.cpp plugin/flagos-spacemit-ime-id.cpp plugin/flagos-spacemit-weights.cpp plugin/flagos-spacemit-plugin.cpp plugin/flagos-spacemit-exec.cpp plugin/flagos-spacemit-x100.cpp plugin/flagos-spacemit-f16-kernels.cpp plugin/flagos-spacemit-f16.cpp
 status=0
 for f in "$@"; do
   log="$LOGS/rvv-syntax-$(basename "$f").log"
