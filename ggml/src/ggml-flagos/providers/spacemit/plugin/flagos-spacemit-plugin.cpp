@@ -174,6 +174,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     (void) spacemit_expert_q4_0();
     (void) spacemit_router_q8();
     (void) spacemit_dense_q4_0_threshold();
+    (void) spacemit_f16_route_pairs();
     (void) spacemit_f16_stats_on();
     return SPACEMIT_STATUS_SUCCESS;
 }
@@ -492,6 +493,9 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_mul_mat_f16_stage_weights") == 0) {
         return reinterpret_cast<void *>(spacemit_mul_mat_f16_stage_weights);
+    }
+    if (std::strcmp(name, "spacemit_mul_mat_f16_route") == 0) {
+        return reinterpret_cast<void *>(spacemit_mul_mat_f16_route);
     }
     if (std::strcmp(name, "spacemit_mul_mat_f16_products_reference") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_step_fn>(spacemit_mul_mat_f16_products_reference));

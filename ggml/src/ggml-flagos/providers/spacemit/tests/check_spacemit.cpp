@@ -1434,6 +1434,8 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     if (check_mul_mat_claims(dev) != 0 || check_weight_round_trip(dev) != 0) {
         return 1;
     }
+    // the IME int8 kernels against the CPU: Q4_0 at 64 rows and up would take the f16 path (check_mul_mat_f16's)
+    env_override   dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -6679,14 +6681,21 @@ static int check_router_q8(ggml_backend_dev_t dev) {
 // test-only (plugin/flagos-spacemit-f16.cpp): the fp16 weights the reference dequantization stages for one slice of K
 // and one 32-column tile, [32 rows][K / 8]. Declared here: the core's header is left alone
 typedef void (*spacemit_mul_mat_f16_stage_fn)(const ggml_tensor * w, int64_t slice, int64_t col_tile, uint16_t * out);
+// test-only (plugin/flagos-spacemit-f16.cpp): the route the two steps take for a node on nth tiles with tcm_size bytes
+// of TCM, under FLAGOS_SPACEMIT_F16_ROUTE as parsed now: out[0] slices, out[1] weight slots, out[2] row passes, out[3]
+// the stage in TCM (all but out[0] 0 on the plain route)
+typedef void (*spacemit_mul_mat_f16_route_fn)(const ggml_tensor * node, uint32_t nth, size_t tcm_size, int64_t * out);
+
+static uint32_t device_tiles(ggml_backend_dev_t dev);
 
 static float f16_round(float v) {
     return ggml_fp16_to_fp32(ggml_fp32_to_fp16(v));
 }
 
 // the f16 path's arithmetic written again, for m rows of x by the n rows of w (both [*, k] floats), a16 and w16 fp16 of
-// the values. out: per slice of k / 8 a float from +0.0f, per group of 8 in order acc + ((p0 + p1) + (p2 + p3)) +
-// ((p4 + p5) + (p6 + p7)), stored as fp16; the 8 slices added in order in float from +0.0f: the references bit for bit.
+// the values, K cut in `slices` (8 on the plain route, 4 on the pairs route). out: per slice of k / slices a float from
+// +0.0f, per group of 8 in order acc + ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)), stored as fp16; the slices
+// added in order in float from +0.0f: the references bit for bit.
 // [lo, hi] bounds the kernels, whose vfwmadot adds a group (the accumulator and 8 exact products) in its own order: at
 // most 8 additions a group, each within one float ulp (2^-23 relative: to nearest, truncated or wider), so a slice's
 // float sum is within eps = 8 2^-23 sum_g (|P_(g-1)| + sum_j |p_gj|) (1 + 2^-10) of its exact sum e (P_g the exact
@@ -6699,8 +6708,9 @@ static float f16_round(float v) {
 struct f16_model {
     std::vector<float> out, lo, hi;
 
-    void init(const std::vector<float> & x, const std::vector<float> & w, int64_t k, int64_t n, int64_t m) {
-        const int64_t      ks = k / 8;
+    void init(const std::vector<float> & x, const std::vector<float> & w, int64_t k, int64_t n, int64_t m,
+              int64_t slices) {
+        const int64_t      ks = k / slices;
         std::vector<float> a16(x.size()), w16(w.size());
         for (size_t i = 0; i < x.size(); i++) {
             a16[i] = f16_round(x[i]);
@@ -6714,7 +6724,7 @@ struct f16_model {
         for (int64_t r = 0; r < m; r++) {
             for (int64_t c = 0; c < n; c++) {
                 float o = 0.0f, o_lo = 0.0f, o_hi = 0.0f;
-                for (int64_t s = 0; s < 8; s++) {
+                for (int64_t s = 0; s < slices; s++) {
                     float  acc = 0.0f;
                     double e = 0.0, nodes = 0.0, abs_sum = 0.0;
                     for (int64_t g = s * ks; g < (s + 1) * ks; g += 8) {
@@ -6788,7 +6798,7 @@ static std::vector<uint8_t> q4_0_raw(int64_t k, int64_t n, const std::function<f
 // written here (the references bit for bit, the kernels within its bound) and against the CPU, the same bytes with a
 // TCM stand-in that forces several row passes and on threads, and the reference steps called directly on 1 and 3
 // tiles the model's bytes; (C2) exact cases, bit for bit in both modes, and the fp16 subnormal probes; (D) an overflow
-// fails the graph with one line, an infinite input does not; (E) int8 and unset give today's steps and bytes; (G)
+// fails the graph with one line, an infinite input does not; (E) unset is f16, int8 the integer path's steps; (G)
 // QUANTIZE=shared; (F) FLAGOS_SPACEMIT_F16_STATS. Kernels run only through a launch: the direct calls take the
 // reference steps (spacemit_mul_mat_f16_*_reference), which never run IME code, so they are safe on the test's thread
 // (an X100 core on the K3)
@@ -6821,12 +6831,22 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
     const auto products_ref =
         reinterpret_cast<spacemit_step_fn>(table->get_proc_address("spacemit_mul_mat_f16_products_reference"));
     const auto sum_ref = reinterpret_cast<spacemit_step_fn>(table->get_proc_address("spacemit_mul_mat_f16_sum_reference"));
-    REQUIRE(stage_weights != nullptr && products_ref != nullptr && sum_ref != nullptr);
+    const auto route_of =
+        reinterpret_cast<spacemit_mul_mat_f16_route_fn>(table->get_proc_address("spacemit_mul_mat_f16_route"));
+    REQUIRE(stage_weights != nullptr && products_ref != nullptr && sum_ref != nullptr && route_of != nullptr);
     spacemit_ops ops;
     std::string  detail;
     REQUIRE(spacemit_ops_bind(table, &ops, &detail));
     const ggml_backend_buffer_type_t buft  = ggml_backend_dev_buffer_type(dev);
     const char *                     dense = "FLAGOS_SPACEMIT_DENSE_Q4_0";
+    const char *                     route = "FLAGOS_SPACEMIT_F16_ROUTE";
+    const uint32_t                   dev_tiles = device_tiles(dev);
+    // the slices the steps take for node on the device's tiles (TCM as the K3's or none: the same stage size)
+    const auto slices_of = [&](const ggml_tensor * node) {
+        int64_t r[4] = {};
+        route_of(node, dev_tiles, 0, r);
+        return r[0];
+    };
 
     int        n_checks = 0, n_ok = 0;
     const auto expect   = [&](bool ok, const std::string & what) {
@@ -6870,16 +6890,16 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             std::vector<std::pair<int64_t, bool>> rows;  // (M, taken by f16)
             bool                                  warns;
         } cases[] = {
-            { nullptr,    { { 64, false }, { 200, false } },                 false },
-            { "",         { { 64, false }, { 200, false } },                 false },
-            { "int8",     { { 64, false }, { 200, false } },                 false },
+            { nullptr,    { { 63, false }, { 64, true }, { 200, true } },    false },
+            { "",         { { 63, false }, { 64, true }, { 200, true } },    false },
+            { "int8",     { { 16, false }, { 64, false }, { 200, false } },  false },
             { "f16",      { { 63, false }, { 64, true }, { 200, true } },    false },
             { "f16:16",   { { 15, false }, { 16, true } },                   false },
             { "f16:128",  { { 127, false }, { 128, true } },                 false },
-            { "x",        { { 64, false }, { 200, false } },                 true  },
-            { "f16:0",    { { 64, false }, { 200, false } },                 true  },
-            { "f16:abc",  { { 64, false }, { 200, false } },                 true  },
-            { "f16:5000", { { 64, false }, { 200, false } },                 true  },
+            { "x",        { { 63, false }, { 64, true }, { 200, true } },    true  },
+            { "f16:0",    { { 63, false }, { 64, true }, { 200, true } },    true  },
+            { "f16:abc",  { { 63, false }, { 64, true }, { 200, true } },    true  },
+            { "f16:5000", { { 63, false }, { 64, true }, { 200, true } },    true  },
         };
         for (const auto & c : cases) {
             env_override      sw(dense, c.setting);
@@ -6957,15 +6977,17 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
     REQUIRE(cpu != nullptr);
     ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
 
-    // C. the arithmetic. Each shape's x, its CPU result and its model once; then the default backend, a TCM stand-in of
-    // 98304 bytes (at K 2048 160 rows a pass, 4 passes at 501 rows; at K 4096 64 rows), the same on threads, and the
-    // reference steps called directly on 1 and 3 tiles with that stage. With spine-runtime the stand-in is ignored and
-    // the board's TCM sets the passes (two at K 4096 and 700 rows); the direct calls still take the small stage
+    // C. the arithmetic on the plain route. Each shape's x, its CPU result and its model once; then the default
+    // backend, a TCM stand-in of 98304 bytes (at K 2048 160 rows a pass, 4 passes at 501 rows; at K 4096 64 rows), the
+    // same on threads, and the reference steps called directly on 1 and 3 tiles with that stage, there under
+    // FLAGOS_SPACEMIT_F16_ROUTE=pairs, which needs 8 tiles. With spine-runtime the stand-in is ignored and the board's
+    // TCM sets the passes (two at K 4096 and 700 rows); the direct calls still take the small stage
     const char * small_tcm = "98304";
     double       worst = 0.0, max_nmse = 0.0;
     int64_t      n_equal = 0, n_pinned = 0, n_outputs = 0;
     {
         env_override sw(dense, "f16:16");
+        env_override rt(route, "plain");
         struct c_case {
             std::unique_ptr<mm_weight> w;
             std::unique_ptr<mm_run>    run;
@@ -6996,7 +7018,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 REQUIRE(ggml_backend_graph_compute(cpu, c.run->g_cpu) == GGML_STATUS_SUCCESS);
                 c.ref.resize((size_t) (s.n * m));
                 ggml_backend_tensor_get(c.run->y_ref, c.ref.data(), 0, ggml_nbytes(c.run->y_ref));
-                c.model.init(x, dequantize(GGML_TYPE_Q4_0, q), s.k, s.n, m);
+                c.model.init(x, dequantize(GGML_TYPE_Q4_0, q), s.k, s.n, m, 8);
                 cases.push_back(std::move(c));
             }
         }
@@ -7029,6 +7051,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             ggml_backend_free(be);
         }
         std::vector<uint8_t> stage(std::stoul(small_tcm));
+        env_override         direct_pairs(route, "pairs");  // on 1 and 3 tiles the plain route all the same
         for (int v = 3; v < 5; v++) {
             const uint32_t nth = v == 3 ? 1 : 3;
             for (size_t i = 0; i < cases.size(); i++) {
@@ -7075,21 +7098,150 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         }
     }
 
-    // C2. exact cases: every product and sum in them is exact in any order, so the outputs are expected bit for bit in
-    // both modes (on the K3 the kernels, through a launch). (1) One 1.0 per slice in each row (row r at r mod ks) reads
-    // the fp16 weights back: out = the float sum in slice order from +0.0f of fp16(w[c][s ks + r mod ks]). (2) A weight
-    // of d = 1 and nibble 9 at one place per slice and column (8 elsewhere) reads the fp16 activations back, of mixed
-    // magnitudes: ties, the smallest normals, negative zeros, large ones; no value is an fp16 subnormal. (3) Integers
-    // in [-16, 16] by d (q - 8) with d a power of two: each slice's sum is exact in float, then rounded to fp16 once.
-    // (4) fp16 subnormals as an activation, a weight and a partial sum: kept by the references (IEEE); what the K3's
-    // kernels do is reported, not required (the first K3 run, 2026-11-26: counted as zero somewhere on the hardware
-    // path)
-    int         n_exact   = 0;
-    int64_t     n_rounded = 0;  // case 3's slice sums that fp16 rounds
-    std::string subnormal[4];   // case 4's outcomes, for the summary
+    // P. the pairs route (FLAGOS_SPACEMIT_F16_ROUTE=pairs): with 8 tiles 4 slices of K / 4, tiles 2 g and 2 g + 1 on
+    // slice g. First the route the plugin takes (spacemit_mul_mat_f16_route) against the fork's rules worked out for a
+    // stage of 384 KiB (the scratch, the K3's TCM and the stand-in below): m_fit for 1 and 2 slots 352 and 320 at K
+    // 2048, 160 and 128 at K 4096, 3040 and 3008 at K 256; 2 slots when there are 2 chunks or more and they cost no
+    // pass more; a pass 2 m_fit rows; K 8192 (64 rows) keeps the plain route's 8 slices; 1 or 3 tiles the plain route.
+    // Then each shape against its model (4 slices; 8 at K 8192) and the CPU: tiles in turn, where a tile dequantizes
+    // its partner's weight tile itself (order B, the waits counted, so unequal counts fail the launch), and on threads,
+    // where it reads its partner's stage (order A with 2 slots, B with 1), each without TCM (the stage the scratch) and
+    // with a TCM stand-in of 393216 bytes (the stage the TCM): the same bytes in all four
+    int64_t p_equal = 0, p_pinned = 0, p_outputs = 0;
+    double  p_worst = 0.0;
     {
-        env_override   sw(dense, "f16:16");
-        ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+        env_override sw(dense, "f16:16");
+        env_override rt(route, "pairs");
+        struct p_case {
+            std::unique_ptr<mm_weight> w;
+            std::unique_ptr<mm_run>    run;
+            int64_t                    k, n, m, slices;
+            std::vector<float>         ref;
+            f16_model                  model;
+        };
+        std::vector<p_case> cases;
+        // per row count: the slices, slots and passes expected
+        const struct {
+            int64_t                             k, n;
+            std::vector<std::array<int64_t, 4>> ms;
+        } shapes[] = {
+            // 3 column tiles: 2 chunks, the second with one tile; at 16 rows the odd tile has none
+            { 2048, 96, { { 16, 4, 2, 1 }, { 64, 4, 2, 1 }, { 129, 4, 2, 1 }, { 501, 4, 2, 1 } } },
+            // 1 chunk: 1 slot; 3 and 4 passes
+            { 4096, 64, { { 64, 4, 1, 1 }, { 700, 4, 1, 3 }, { 1100, 4, 1, 4 } } },
+            // 2 chunks: 2 slots and 3 passes at 700; at 1100 2 slots would take 5 passes, 1 slot 4
+            { 4096, 128, { { 64, 4, 2, 1 }, { 700, 4, 2, 3 }, { 1100, 4, 1, 4 } } },
+            // 10 column tiles: 5 chunks
+            { 256, 320, { { 40, 4, 2, 1 } } },
+            { 8192, 32, { { 64, 8, 0, 0 } } },
+        };
+        for (const auto & s : shapes) {
+            for (const std::array<int64_t, 4> & e : s.ms) {
+                p_case c;
+                c.k      = s.k;
+                c.n      = s.n;
+                c.m      = e[0];
+                c.slices = e[1];
+                c.w      = std::make_unique<mm_weight>();
+                const std::vector<uint8_t> q = quantize_weights(GGML_TYPE_Q4_0, s.k, s.n, seed++);
+                REQUIRE(c.w->init_with(dev, GGML_TYPE_Q4_0, s.k, s.n, q));
+                c.run = std::make_unique<mm_run>();
+                REQUIRE(c.run->init(dev, *c.w, c.m, seed++));
+                const std::string at = "pairs, K " + std::to_string(s.k) + " N " + std::to_string(s.n) + " M " +
+                                       std::to_string(c.m);
+                for (size_t tcm : { (size_t) 0, (size_t) 393216 }) {
+                    int64_t r[4] = {};
+                    route_of(c.run->y, 8, tcm, r);
+                    expect(r[0] == e[1] && r[1] == e[2] && r[2] == e[3] && r[3] == (int64_t) (tcm > 0 && e[1] == 4),
+                           at + ", TCM " + std::to_string(tcm) + ": slices " + std::to_string(r[0]) + ", slots " +
+                               std::to_string(r[1]) + ", passes " + std::to_string(r[2]) + ", in TCM " +
+                               std::to_string(r[3]) + " (expected " + std::to_string(e[1]) + ", " +
+                               std::to_string(e[2]) + ", " + std::to_string(e[3]) + ")");
+                }
+                for (uint32_t few : { 1u, 3u }) {
+                    int64_t r[4] = {};
+                    route_of(c.run->y, few, 0, r);
+                    expect(r[0] == 8 && r[1] == 0, at + ": " + std::to_string(r[0]) + " slices on " +
+                                                       std::to_string(few) + " tiles");
+                }
+                std::vector<float> x((size_t) (s.k * c.m));
+                ggml_backend_tensor_get(c.run->x, x.data(), 0, ggml_nbytes(c.run->x));
+                REQUIRE(ggml_backend_graph_compute(cpu, c.run->g_cpu) == GGML_STATUS_SUCCESS);
+                c.ref.resize((size_t) (s.n * c.m));
+                ggml_backend_tensor_get(c.run->y_ref, c.ref.data(), 0, ggml_nbytes(c.run->y_ref));
+                c.model.init(x, dequantize(GGML_TYPE_Q4_0, q), s.k, s.n, c.m, c.slices);
+                cases.push_back(std::move(c));
+            }
+        }
+        const char * variants[4] = { "in turn", "in turn with TCM", "on threads", "on threads with TCM" };
+        std::vector<std::vector<std::vector<float>>> outs(cases.size(), std::vector<std::vector<float>>(4));
+        for (int v = 0; v < 4; v++) {
+            env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", v % 2 == 1 ? "393216" : nullptr);
+            env_override threads("FLAGOS_SPACEMIT_TEST_THREADS", v >= 2 ? "1" : "0");
+            g_executors_take();
+            ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(be != nullptr);
+            expect(g_executors_take() == 1,
+                   std::string("pairs ") + variants[v] + ": the backend shares an older executor");
+            for (size_t i = 0; i < cases.size(); i++) {
+                p_case &            c  = cases[i];
+                const spacemit_op * op = spacemit_find_op(ops, c.run->y, buft);
+                const std::vector<float> nan((size_t) (c.n * c.m), NAN);
+                ggml_backend_tensor_set(c.run->y, nan.data(), 0, ggml_nbytes(c.run->y));
+                const bool ran = is_f16(op) && ggml_backend_graph_compute(be, c.run->g_dev) == GGML_STATUS_SUCCESS;
+                expect(ran, "pairs, K " + std::to_string(c.k) + " N " + std::to_string(c.n) + " M " +
+                                std::to_string(c.m) + ", " + variants[v] + ": claimed by " + by(op) + ", " +
+                                (ran ? "ran" : "failed"));
+                outs[i][v].assign((size_t) (c.n * c.m), NAN);
+                if (ran) {
+                    ggml_backend_tensor_get(c.run->y, outs[i][v].data(), 0, ggml_nbytes(c.run->y));
+                }
+            }
+            ggml_backend_free(be);
+        }
+        for (size_t i = 0; i < cases.size(); i++) {
+            const p_case &    c  = cases[i];
+            const std::string at = "pairs, K " + std::to_string(c.k) + " N " + std::to_string(c.n) + " M " +
+                                   std::to_string(c.m) + " (" + std::to_string(c.slices) + " slices)";
+            const size_t bytes = outs[i][0].size() * sizeof(float);
+            for (int v = 1; v < 4; v++) {
+                expect(std::memcmp(outs[i][v].data(), outs[i][0].data(), bytes) == 0,
+                       at + ", " + variants[v] + ": not the bytes " + variants[0]);
+            }
+            int64_t       equal = 0;
+            const int64_t bad   = f16_outside(outs[i][0], c.model, equal, p_pinned, p_worst);
+            expect(bad == 0, at + ": " + std::to_string(bad) + " outputs outside the model's bound (" + mode + ")");
+            expect(kernels || equal == (int64_t) outs[i][0].size(),
+                   at + ": " + std::to_string(equal) + " of " + std::to_string(outs[i][0].size()) +
+                       " outputs the model's bytes (references)");
+            p_equal += equal;
+            p_outputs += (int64_t) outs[i][0].size();
+            const double e = nmse(outs[i][0].data(), c.ref.data(), (int64_t) c.ref.size());
+            max_nmse       = std::max(max_nmse, e);
+            expect(e <= k_mul_mat_max_nmse, at + ": NMSE against the CPU " + std::to_string(e));
+        }
+    }
+
+    // C2. exact cases, on the plain route's 8 slices and the pairs route's 4 (ks = K / slices, each case's route
+    // checked by spacemit_mul_mat_f16_route): every product and sum in them is exact in any order, so the outputs are
+    // expected bit for bit in both modes (on the K3 the kernels, through a launch, there with the pairs' real waits).
+    // (1) One 1.0 per slice in each row (row r at r mod ks) reads the fp16 weights back: out = the float sum in slice
+    // order from +0.0f of fp16(w[c][s ks + r mod ks]). (2) A weight of d = 1 and nibble 9 at one place per slice and
+    // column (8 elsewhere) reads the fp16 activations back, of mixed magnitudes: ties, the smallest normals, negative
+    // zeros, large ones; no value is an fp16 subnormal. (3) Integers in [-16, 16] by d (q - 8) with d a power of two:
+    // each slice's sum is exact in float, then rounded to fp16 once. (4) fp16 subnormals as an activation, a weight and
+    // a partial sum: kept by the references (IEEE); what the K3's kernels do is reported, not required (the first K3
+    // run, 2026-11-26: counted as zero somewhere on the hardware path)
+    int         n_exact = 0, p_exact = 0;
+    int64_t     n_rounded = 0;      // case 3's slice sums that fp16 rounds, on the plain route
+    std::string subnormal[2][4];  // case 4's outcomes by route, for the summary
+    for (int ri = 0; ri < 2; ri++) {
+        const int64_t     slices = ri == 0 ? 8 : 4;
+        const std::string on     = ri == 0 ? "" : ", pairs";
+        env_override      sw(dense, "f16:16");
+        env_override      rt(route, ri == 0 ? "plain" : "pairs");
+        int64_t           rounded = 0;
+        ggml_backend_t    be      = ggml_backend_dev_init(dev, nullptr);
         REQUIRE(be != nullptr);
         const auto run_exact = [&](const std::string & at, const std::vector<uint8_t> & q, int64_t k, int64_t n,
                                    const std::vector<float> & x, const std::vector<float> & want) {
@@ -7110,30 +7262,33 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             for (size_t i = 0; i < out.size(); i++) {
                 bad += std::memcmp(&out[i], &want[i], sizeof(float)) != 0;
             }
-            n_exact++;
-            return expect(is_f16(op) && ran && bad == 0,
-                          at + ": claimed by " + by(op) + (ran ? ", " + std::to_string(bad) + " outputs not bit for bit" :
-                                                                 ", failed"));
+            (ri == 0 ? n_exact : p_exact)++;
+            const int64_t taken = slices_of(run.y);
+            return expect(is_f16(op) && taken == slices && ran && bad == 0,
+                          at + on + ": claimed by " + by(op) + ", " + std::to_string(taken) + " slices" +
+                              (ran ? ", " + std::to_string(bad) + " outputs not bit for bit" : ", failed"));
         };
         const auto shape = [](int64_t k, int64_t n, int64_t m) {
             return " [" + std::to_string(k) + ", " + std::to_string(n) + "] by " + std::to_string(m) + " rows";
         };
 
-        // (1) at K 2048 256 rows and at K 4096 512 rows take every position of a slice (two row passes at 4096 with
-        // 384 KiB of TCM); 77 rows end in a partial row tile
-        for (const std::array<int64_t, 3> & s :
-             std::vector<std::array<int64_t, 3>>{ { 2048, 96, 256 }, { 4096, 64, 512 }, { 2048, 96, 77 } }) {
-            const int64_t              k = s[0], n = s[1], m = s[2], ks = k / 8;
+        // (1) a row count of ks at K 2048 and K 4096 takes every position of a slice (on the plain route 256 and 512,
+        // two row passes at 4096 with 384 KiB of TCM; on the pairs route 512 and 1024, four passes at 4096); 77 rows
+        // end in a partial row tile
+        const int64_t f = 8 / slices;
+        for (const std::array<int64_t, 3> & s : std::vector<std::array<int64_t, 3>>{
+                 { 2048, 96, 256 * f }, { 4096, 64, 512 * f }, { 2048, 96, 77 } }) {
+            const int64_t              k = s[0], n = s[1], m = s[2], ks = k / slices;
             const std::vector<uint8_t> q   = quantize_weights(GGML_TYPE_Q4_0, k, n, seed++);
             const std::vector<float>   deq = dequantize(GGML_TYPE_Q4_0, q);
             std::vector<float>         x((size_t) (k * m), 0.0f), want((size_t) (n * m));
             for (int64_t r = 0; r < m; r++) {
-                for (int64_t sl = 0; sl < 8; sl++) {
+                for (int64_t sl = 0; sl < slices; sl++) {
                     x[r * k + sl * ks + r % ks] = 1.0f;
                 }
                 for (int64_t c = 0; c < n; c++) {
                     float o = 0.0f;
-                    for (int64_t sl = 0; sl < 8; sl++) {
+                    for (int64_t sl = 0; sl < slices; sl++) {
                         o = o + f16_round(deq[c * k + sl * ks + r % ks]);
                     }
                     want[r * n + c] = o;
@@ -7144,7 +7299,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
 
         // (2) the position read in slice s by column c varies with both
         for (const std::array<int64_t, 3> & s : std::vector<std::array<int64_t, 3>>{ { 2048, 96, 129 }, { 4096, 64, 64 } }) {
-            const int64_t k = s[0], n = s[1], m = s[2], ks = k / 8;
+            const int64_t k = s[0], n = s[1], m = s[2], ks = k / slices;
             const auto    pos = [ks](int64_t c, int64_t sl) { return (c * 37 + sl * 11) % ks; };
             const std::vector<uint8_t> q = q4_0_raw(
                 k, n, [](int64_t, int64_t) { return 1.0f; },
@@ -7180,7 +7335,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             for (int64_t r = 0; r < m; r++) {
                 for (int64_t c = 0; c < n; c++) {
                     float o = 0.0f;
-                    for (int64_t sl = 0; sl < 8; sl++) {
+                    for (int64_t sl = 0; sl < slices; sl++) {
                         o = o + f16_round(x[r * k + sl * ks + pos(c, sl)]);
                     }
                     want[r * n + c] = o;
@@ -7192,7 +7347,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         // (3) even rows non-negative and every third column's nibbles at least 8, so that many slice sums pass 2048,
         // where fp16 rounds
         for (const std::array<int64_t, 3> & s : std::vector<std::array<int64_t, 3>>{ { 2048, 64, 64 }, { 4096, 64, 48 } }) {
-            const int64_t            k = s[0], n = s[1], m = s[2], ks = k / 8;
+            const int64_t            k = s[0], n = s[1], m = s[2], ks = k / slices;
             const std::vector<float> ux = random_values(k * m, seed++, 1.0f);
             const std::vector<float> uq = random_values(k * n, seed++, 1.0f);
             const std::vector<float> ud = random_values(k / 32 * n, seed++, 1.0f);
@@ -7221,13 +7376,13 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             for (int64_t r = 0; r < m; r++) {
                 for (int64_t c = 0; c < n; c++) {
                     float o = 0.0f;
-                    for (int64_t sl = 0; sl < 8; sl++) {
+                    for (int64_t sl = 0; sl < slices; sl++) {
                         double e = 0.0;
                         for (int64_t i = sl * ks; i < (sl + 1) * ks; i++) {
                             e += (double) x[r * k + i] * (double) dv[c * (k / 32) + i / 32] * (double) (qv[c * k + i] - 8);
                         }
                         const float p = f16_round((float) e);
-                        n_rounded += (double) p != e;
+                        rounded += (double) p != e;
                         largest = std::max(largest, std::fabs(e));
                         o       = o + p;
                     }
@@ -7237,7 +7392,8 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             REQUIRE(largest < 65504.0);  // no slice sum overflows fp16
             run_exact("small integers," + shape(k, n, m), q, k, n, x, want);
         }
-        expect(n_rounded > 0, "small integers: no slice sum rounded by fp16");
+        expect(rounded > 0, "small integers" + on + ": no slice sum rounded by fp16");
+        n_rounded += ri == 0 ? rounded : 0;
 
         // (4) a weight of d at one place per slice and column as in (2), every activation v: each output is 8 v d
         const struct {
@@ -7250,7 +7406,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             { "a partial sum", 0x1p-8f, 0x1p-8f },           // the slice's partial sum only (2^-16)
         };
         for (int p = 0; p < 4; p++) {
-            const int64_t k = 2048, n = 64, m = 24, ks = k / 8;
+            const int64_t k = 2048, n = 64, m = 24, ks = k / slices;
             const auto    pos = [&](int64_t c, int64_t sl) { return (c * 37 + sl * 11) % ks; };
             const float   v = probes[p].v, d = probes[p].d;
             const std::vector<uint8_t> q = q4_0_raw(
@@ -7258,7 +7414,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 [&](int64_t c, int64_t kk) { return kk % ks == pos(c, kk / ks) ? 9 : 8; });
             const std::vector<float> x((size_t) (k * m), v);
             float                    want = 0.0f;
-            for (int sl = 0; sl < 8; sl++) {
+            for (int64_t sl = 0; sl < slices; sl++) {
                 want = want + v * d;
             }
             mm_weight           w;
@@ -7288,21 +7444,26 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             }
             // the references are IEEE and keep every output; on the K3 the hardware decides, zeros are reported
             expect(is_f16(op) && ran && other == 0 && (kernels || zero == 0),
-                   std::string("fp16 subnormals, ") + probes[p].name + ": claimed by " + by(op) + ", " +
+                   std::string("fp16 subnormals") + on + ", " + probes[p].name + ": claimed by " + by(op) + ", " +
                        std::to_string(kept) + " kept, " + std::to_string(zero) + " zero, " + std::to_string(other) +
                        " other of " + std::to_string(total));
-            subnormal[p] = kept == total ? "kept" :
-                           zero == total ? "zero" :
-                                           "kept in " + std::to_string(kept) + " of " + std::to_string(total) +
-                                               ", zero in " + std::to_string(zero);
+            subnormal[ri][p] = kept == total ? "kept" :
+                               zero == total ? "zero" :
+                                               "kept in " + std::to_string(kept) + " of " + std::to_string(total) +
+                                                   ", zero in " + std::to_string(zero);
         }
         ggml_backend_free(be);
     }
 
-    // D. overflow fails the graph with one line; an infinite input passes through
-    {
+    // D. overflow fails the graph with one line; an infinite input passes through. On the plain route, and on the pairs
+    // route (N 96: 2 slots) in turn and on threads, where the failing tile's partner gives up its pair wait when the
+    // launch fails: the graph returns in under 5 s, not after the wait's 10 s
+    for (int ri = 0; ri < 3; ri++) {
+        const bool         pairs = ri > 0;
+        const std::string  at    = ri == 0 ? "" : ri == 1 ? "pairs in turn, " : "pairs on threads, ";
         env_override       sw(dense, "f16");
-        const int64_t      k = 512, n = 64, m = 64;
+        env_override       rt(route, pairs ? "pairs" : "plain");
+        const int64_t      k = 512, n = pairs ? 96 : 64, m = 64, slices = pairs ? 4 : 8;
         std::vector<float> wv = random_values(k * n, seed++, 1.0f);
         std::fill(wv.begin(), wv.begin() + k, 0.5f);  // weight row 0: Q4_0 keeps 0.5 exactly
         std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q4_0, k) * n);
@@ -7313,14 +7474,25 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         mm_run run;
         REQUIRE(run.init(dev, w, m, seed++));
         ggml_set_name(run.y, "f16.overflow");
+        expect(slices_of(run.y) == slices, at + "overflow case: " + std::to_string(slices_of(run.y)) + " slices");
         const std::vector<float> x0 = random_values(k * m, seed++, 2.0f);
-        ggml_backend_t           be = ggml_backend_dev_init(dev, nullptr);
+        ggml_backend_t           be = nullptr;
+        {
+            std::unique_ptr<env_override> threads;
+            if (pairs) {
+                threads = std::make_unique<env_override>("FLAGOS_SPACEMIT_TEST_THREADS", ri == 2 ? "1" : "0");
+            }
+            be = ggml_backend_dev_init(dev, nullptr);
+        }
         REQUIRE(be != nullptr);
-        // x0 with one change; then the status and the overflow lines
+        // x0 with one change; then the status, the overflow lines and the seconds taken
+        double     secs     = 0.0;
         const auto run_with = [&](const std::vector<float> & x, int & lines, std::string & text) {
             ggml_backend_tensor_set(run.x, x.data(), 0, ggml_nbytes(run.x));
             log_capture log;
+            const auto  t0 = std::chrono::steady_clock::now();
             const bool  ok = ggml_backend_graph_compute(be, run.g_dev) == GGML_STATUS_SUCCESS;
+            secs           = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             text           = log.take();
             lines          = count_lines_with(text, "mul_mat.f16: overflow");
             return ok;
@@ -7330,40 +7502,45 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         std::vector<float> x = x0;
         x[5 * k + 3]         = 1e5f;
         const bool ok        = run_with(x, lines, text);
-        expect(!ok && lines == 1 &&
+        expect(!ok && lines == 1 && secs < 5.0 &&
                    count_lines_with(text, "mul_mat.f16: overflow in f16.overflow (weight f16.overflow.weight): "
                                           "activation 100000 exceeds fp16") == 1,
-               "an activation of 1e5: " + std::string(ok ? "success" : "failure") + ", " + std::to_string(lines) +
-                   " overflow lines");
+               at + "an activation of 1e5: " + std::string(ok ? "success" : "failure") + ", " +
+                   std::to_string(lines) + " overflow lines, " + std::to_string(secs) + " s");
         x                 = x0;
         x[0]              = INFINITY;
         const bool inf_ok = run_with(x, lines, text);
-        expect(inf_ok && lines == 0, "an activation of +inf: " + std::string(inf_ok ? "success" : "failure") + ", " +
-                                         std::to_string(lines) + " overflow lines");
-        // row 0's slice 0 by weight row 0: 64 * 3e4 * 0.5; the kernels' line has no value
+        expect(inf_ok && lines == 0, at + "an activation of +inf: " + std::string(inf_ok ? "success" : "failure") +
+                                         ", " + std::to_string(lines) + " overflow lines");
+        // row 0's slice 0 by weight row 0: K / slices * 3e4 * 0.5 (960000, 1.92e+06 on the pairs route); the kernels'
+        // line has no value
         x = x0;
-        std::fill(x.begin(), x.begin() + k / 8, 3e4f);
-        const bool   sum_ok = run_with(x, lines, text);
-        const char * line   = kernels ? "mul_mat.f16: overflow in f16.overflow (weight f16.overflow.weight): a partial "
-                                        "sum exceeds fp16" :
-                                        "mul_mat.f16: overflow in f16.overflow (weight f16.overflow.weight): partial "
-                                        "sum 960000 exceeds fp16";
-        expect(!sum_ok && lines == 1 && count_lines_with(text, line) == 1,
-               std::string("a slice's sum of 960000 (") + mode + "): " + (sum_ok ? "success" : "failure") + ", " +
-                   std::to_string(lines) + " overflow lines");
+        std::fill(x.begin(), x.begin() + k / slices, 3e4f);
+        const bool        sum_ok = run_with(x, lines, text);
+        const std::string value  = pairs ? "1.92e+06" : "960000";
+        const std::string line   = kernels ? "mul_mat.f16: overflow in f16.overflow (weight f16.overflow.weight): a "
+                                             "partial sum exceeds fp16" :
+                                             "mul_mat.f16: overflow in f16.overflow (weight f16.overflow.weight): "
+                                             "partial sum " + value + " exceeds fp16";
+        expect(!sum_ok && lines == 1 && secs < 5.0 && count_lines_with(text, line.c_str()) == 1,
+               at + "a slice's sum of " + value + " (" + mode + "): " + (sum_ok ? "success" : "failure") + ", " +
+                   std::to_string(lines) + " overflow lines, " + std::to_string(secs) + " s");
         ggml_backend_free(be);
     }
 
-    // E. off is today's path: unset and int8 give quantize and gemm and the same bytes
+    // E. the default is f16: unset, empty and f16 give the f16 steps and the same bytes; int8 is today's integer path,
+    // quantize and gemm with the bytes of f16:4096 (below its threshold, so the int8 contract)
     {
         mm_weight w;
         REQUIRE(w.init(dev, 512, 64, seed++));
         for (int64_t m : { (int64_t) 64, (int64_t) 200 }) {
             mm_run run;
             REQUIRE(run.init(dev, w, m, seed++));
-            std::vector<float> out[2];
-            for (int i = 0; i < 2; i++) {
-                env_override        sw(dense, i == 0 ? nullptr : "int8");
+            const char * settings[5] = { nullptr, "", "f16", "int8", "f16:4096" };
+            const char * names[5]    = { "unset", "empty", "f16", "int8", "f16:4096" };
+            std::vector<float> out[5];
+            for (int i = 0; i < 5; i++) {
+                env_override        sw(dense, settings[i]);
                 const spacemit_op * op = spacemit_find_op(ops, run.y, buft);
                 ggml_backend_t      be = ggml_backend_dev_init(dev, nullptr);
                 REQUIRE(be != nullptr);
@@ -7371,11 +7548,52 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 out[i].assign((size_t) (64 * m), NAN);
                 ggml_backend_tensor_get(run.y, out[i].data(), 0, ggml_nbytes(run.y));
                 ggml_backend_free(be);
-                expect(ran && is_int8(op), std::string(i == 0 ? "unset" : "int8") + ", " + std::to_string(m) +
-                                               " rows: " + (ran ? "claimed by " + by(op) : "failed"));
+                expect(ran && (i < 3 ? is_f16(op) : is_int8(op)),
+                       std::string(names[i]) + ", " + std::to_string(m) + " rows: " +
+                           (ran ? "claimed by " + by(op) : "failed"));
             }
-            expect(std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0,
-                   "int8 and unset at " + std::to_string(m) + " rows: not the same bytes");
+            for (int i : { 1, 2, 4 }) {
+                const int with = i == 4 ? 3 : 0;
+                expect(std::memcmp(out[i].data(), out[with].data(), out[0].size() * sizeof(float)) == 0,
+                       std::string(names[i]) + " and " + names[with] + " at " + std::to_string(m) +
+                           " rows: not the same bytes");
+            }
+            expect(std::memcmp(out[0].data(), out[3].data(), out[0].size() * sizeof(float)) != 0,
+                   "unset and int8 at " + std::to_string(m) + " rows: the same bytes (the f16 path not taken?)");
+        }
+    }
+
+    // H. FLAGOS_SPACEMIT_F16_ROUTE (test-only), K 512 N 96 by 64 rows: unset, empty and plain the plain route and the
+    // same bytes, a bad value warned once and plain kept, pairs the pairs route
+    {
+        env_override       sw(dense, "f16");
+        const char * const settings[5] = { nullptr, "", "plain", "x", "pairs" };
+        const char * const names[5]    = { "unset", "empty", "plain", "x", "pairs" };
+        mm_weight          w;
+        REQUIRE(w.init(dev, 512, 96, seed++));
+        mm_run run;
+        REQUIRE(run.init(dev, w, 64, seed++));
+        std::vector<float> out[5];
+        for (int i = 0; i < 5; i++) {
+            log_capture    log;
+            env_override   rt(route, settings[i]);
+            const int64_t  taken = slices_of(run.y);
+            ggml_backend_t be    = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(be != nullptr);
+            const bool ran = ggml_backend_graph_compute(be, run.g_dev) == GGML_STATUS_SUCCESS;
+            ggml_backend_free(be);
+            out[i].assign((size_t) (96 * 64), NAN);
+            if (ran) {
+                ggml_backend_tensor_get(run.y, out[i].data(), 0, ggml_nbytes(run.y));
+            }
+            const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_F16_ROUTE=");
+            expect(ran && taken == (i == 4 ? 4 : 8) && warnings == (i == 3 ? 1 : 0),
+                   std::string("FLAGOS_SPACEMIT_F16_ROUTE ") + names[i] + ": " + (ran ? "ran" : "failed") + ", " +
+                       std::to_string(taken) + " slices, " + std::to_string(warnings) + " warnings");
+        }
+        for (int i = 1; i < 4; i++) {
+            expect(std::memcmp(out[i].data(), out[0].data(), out[0].size() * sizeof(float)) == 0,
+                   std::string("FLAGOS_SPACEMIT_F16_ROUTE ") + names[i] + ": not the bytes of unset");
         }
     }
 
@@ -7439,11 +7657,14 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         ggml_set_name(wb.w_dev, "f16.stats_b.weight");
         mm_run ra, rb, rc;
         REQUIRE(ra.init(dev, wa, 64, seed++) && rb.init(dev, wa, 100, seed++) && rc.init(dev, wb, 64, seed++));
-        for (bool on : { false, true }) {
-            FILE * f = std::fopen(path.c_str(), "w");
+        for (int pass = 0; pass < 3; pass++) {  // off; on, the plain route; on, the pairs route
+            const bool on    = pass > 0;
+            const bool pairs = pass == 2;
+            FILE *     f     = std::fopen(path.c_str(), "w");
             REQUIRE(f != nullptr);
             std::fclose(f);
             env_override   sw(dense, "f16");
+            env_override   rt(route, pairs ? "pairs" : "plain");
             env_override   sw_stats("FLAGOS_SPACEMIT_F16_STATS", on ? path.c_str() : nullptr);
             ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
             REQUIRE(be != nullptr);
@@ -7457,37 +7678,46 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 expect(ran && text.empty(), "stats unset: " + std::to_string(text.size()) + " bytes written");
                 continue;
             }
-            const int  largest = kernels ? 0 : 1;
-            const bool lines   = count_lines_with(text, "mul_mat.f16: matmuls 3, overflows 0, threshold 64") == 1 &&
+            const int    largest = kernels ? 0 : 1;
+            const char * first   = pairs ? "mul_mat.f16: matmuls 3 (pairs 3), overflows 0, threshold 64" :
+                                           "mul_mat.f16: matmuls 3 (pairs 0), overflows 0, threshold 64";
+            const bool   lines   = count_lines_with(text, first) == 1 &&
                                count_lines_with(text, "mul_mat.f16: largest activation ") == largest &&
                                count_lines_with(text, "mul_mat.f16: largest partial sum ") == largest &&
                                count_lines_with(text, "mul_mat.f16: K 512 N 64: 2 matmuls") == 1 &&
                                count_lines_with(text, "mul_mat.f16: K 256 N 32: 1 matmuls") == 1 &&
                                count_lines_with(text, " in f16.stats_") == 2 * largest &&
                                count_lines_with(text, "mul_mat.f16: ") == 3 + 2 * largest;
-            expect(ran && lines, std::string("stats (") + mode + "): " + text);
+            expect(ran && lines, std::string("stats (") + mode + (pairs ? ", pairs" : "") + "): " + text);
         }
     }
     ggml_backend_free(cpu);
 
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     std::printf("f16mm    %s: FLAGOS_SPACEMIT_DENSE_Q4_0 (unset, empty, int8, f16, f16:16, f16:128, x, f16:0, f16:abc, "
-                "f16:5000): Q4_0 [512, 64] taken by mul_mat.f16.products and .sum from the threshold (64, 16, 128), "
-                "else quantize and gemm; bad values warned once; never a Q8_0 or 3-D weight, over 2^24 or K 33024. %d "
-                "staged weight tiles fp16 of ggml's dequantization bit for bit. K 2048 N 96 at 16-501 rows, K 4096 N 64 "
-                "at 64 and 700, K 256 N 32 at 64, K 256 N 320 at 40: default, TCM %s serial and on threads the same "
-                "bytes, the reference steps on 1 and 3 tiles direct the model's; %lld of %lld outputs the model's bytes "
-                "(%lld pinned to it "
-                "by the bound), worst |out - model| / bound %.3f; max NMSE vs the CPU %.2e (bound %.0e). %d exact cases "
-                "bit for bit (weights and activations read back, small integers with %lld slice sums rounded). "
-                "fp16 subnormals: an activation by 1 %s, an activation by 1024 %s, a weight by 1024 %s, a partial sum "
-                "%s. Overflow of an activation and of "
-                "a partial sum fail with one line, +inf passes; unset and int8 the same bytes by quantize and gemm; "
-                "QUANTIZE=shared skips no f16 step; F16_STATS appended at the backend's free, nothing unset: %d/%d in "
-                "%.1f s\n",
+                "f16:5000): Q4_0 [512, 64] taken by mul_mat.f16.products and .sum from the threshold (64 the default: "
+                "unset, empty, f16 or a bad value; 16, 128), else and under int8 quantize and gemm; bad values warned "
+                "once; never a Q8_0 or 3-D weight, over 2^24 or K 33024. %d staged weight tiles fp16 of ggml's "
+                "dequantization bit for bit. K 2048 N 96 at 16-501 rows, K 4096 N 64 at 64 and 700, K 256 N 32 at 64, "
+                "K 256 N 320 at 40: default, TCM %s serial and on threads the same bytes, the reference steps on 1 and "
+                "3 tiles direct the model's; %lld of %lld outputs the model's bytes (%lld pinned to it by the bound), "
+                "worst |out - model| / bound %.3f; max NMSE vs the CPU (both routes) %.2e (bound %.0e). %d exact cases "
+                "bit for bit (weights and activations read back, small integers with %lld slice sums rounded). fp16 "
+                "subnormals: an activation by 1 %s, an activation by 1024 %s, a weight by 1024 %s, a partial sum %s on "
+                "the plain route, on pairs %s, %s, %s and %s. pairs: %lld of %lld outputs the model's bytes (%lld "
+                "pinned), %d exact cases bit for bit, in turn and on threads the same bytes. The pairs route "
+                "(FLAGOS_SPACEMIT_F16_ROUTE=pairs, 8 tiles, 4 slices) at K 2048 N 96 at 16-501 rows, K 4096 N 64 and N "
+                "128 at 64-1100, K 256 N 320 at 40, slots and passes as the fork's rules give, K 8192 the plain "
+                "route's 8 slices, with and without TCM, worst |out - model| / bound %.3f; unset, empty and plain the "
+                "same bytes, a bad value warned once. Overflow of an activation and of a partial sum fail with one "
+                "line, on pairs in turn and on threads in under 5 s, +inf passes; unset, empty and f16 the same bytes "
+                "by the f16 steps, int8 and f16:4096 the same bytes by quantize and gemm; QUANTIZE=shared skips no f16 "
+                "step; F16_STATS appended at the backend's free, nothing unset: %d/%d in %.1f s\n",
                 mode, n_staged, small_tcm, (long long) n_equal, (long long) n_outputs, (long long) n_pinned, worst, max_nmse,
-                k_mul_mat_max_nmse, n_exact, (long long) n_rounded, subnormal[0].c_str(), subnormal[1].c_str(),
-                subnormal[2].c_str(), subnormal[3].c_str(), n_ok, n_checks, secs);
+                k_mul_mat_max_nmse, n_exact, (long long) n_rounded, subnormal[0][0].c_str(), subnormal[0][1].c_str(),
+                subnormal[0][2].c_str(), subnormal[0][3].c_str(), subnormal[1][0].c_str(), subnormal[1][1].c_str(),
+                subnormal[1][2].c_str(), subnormal[1][3].c_str(), (long long) p_equal, (long long) p_outputs,
+                (long long) p_pinned, p_exact, p_worst, n_ok, n_checks, secs);
     return 0;
 }
 
@@ -12167,6 +12397,7 @@ static double ime_row_bytes(ggml_type type, int64_t k) {
 // DRAM: it takes the next of enough copies of the weight (32 MB together)
 static int bench_mm(ggml_backend_dev_t dev) {
     env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
+    env_override   dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");  // the int8 paths: no f16 steps at 64 rows and up
     ggml_backend_t backend = nullptr;
     {
         env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM (check_mm_paths)

@@ -17,7 +17,7 @@
 //                             gemm_kernel_f16f16f16_m16_vfwmadot (341-358) in products
 // Bodies are unchanged except, marked "flagos": the fork's namespaces (mlir::speir::spekernel, ::ime2, ::rvv) are
 // spacemit_f16; the pack wrapper is a plain function; reduce_tile is the reduce wrapper's loop for one 16 x 32 block
-// and 8 slices; products is the gemm wrapper without its accumulate flag; dequant_tile is the fork's
+// and 8 or 4 slices; products is the gemm wrapper without its accumulate flag; dequant_tile is the fork's
 // _spe_pack_cast_q41_fixed8_f16_m32k32 with its two layout operands (block size, scale offset) set for our q4_0 block.
 // New: the flag helpers.
 // The copied asm declares no vector registers: each entry below is out of line and holds no vector values of its own
@@ -1489,10 +1489,11 @@ __attribute__((noinline)) void products(int64_t ks, const uint16_t * b, const ui
 }
 
 // flagos: the block loop of spe_reducesum_mxn<_spe_fp16_, float, 16, 32, 1, 1> for one block (lhs strides 0) and
-// nth = 8 slices
+// nth = slices: the _a100_nth8 form for 8 slices on a full 16 x 32 tile, else the generic kernel per row (the fork's
+// pairs, g = 4)
 __attribute__((noinline)) void reduce_tile(const uint16_t * partials, float * out, int64_t out_stride_bytes,
-                                           int64_t rows, int64_t cols) {
-    constexpr int64_t nth           = 8;
+                                           int64_t rows, int64_t cols, int64_t slices) {
+    const int64_t     nth           = slices;
     constexpr int64_t block_m       = 16;
     constexpr int64_t block_n       = 32;
     constexpr int64_t thread_stride = block_n * sizeof(_spe_fp16_);

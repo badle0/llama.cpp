@@ -12,17 +12,22 @@
 // most tiles one launch can have (the K3 has 8 AI cores); per-tile workspace slices are sized for this many
 constexpr uint32_t SPACEMIT_MAX_TILES = 64;
 
-// for the 1-row matmuls (flagos-spacemit-ime.cpp; plan.md, "1-row matmul bandwidth"): tile ith waits until its partner,
-// tile ith ^ 1 (on the other core of its pair), has called this as often as it has in this launch. Both tiles of a pair
-// must call it equally often in every step. A wait gives up, returning false, once the launch has failed (so a partner
-// that skipped the step cannot hang it) or after 10 s; the kernel should then return false. The host executor, by
-// default running the tiles one after another, only counts the calls there, and fails the launch when a pair's counts
-// differ after a step.
+// for the 1-row matmuls (flagos-spacemit-ime.cpp; plan.md, "1-row matmul bandwidth") and the FP16 path's pairs route
+// (flagos-spacemit-f16.cpp): tile ith waits until its partner, tile ith ^ 1 (on the other core of its pair), has called
+// this as often as it has in this launch. Both tiles of a pair must call it equally often in every step. A wait gives
+// up, returning false, once the launch has failed (so a partner that skipped the step cannot hang it) or after 10 s;
+// the kernel should then return false. The host executor, by default running the tiles one after another, only counts
+// the calls there, and fails the launch when a pair's counts differ after a step.
 bool spacemit_pair_wait(const spacemit_tile & tile);
+
+// true when tile ith has a partner ((ith ^ 1) < nth) and the launch's tiles run at the same time, so that the two may
+// read each other's memory between two pair waits; false on the host's serial executor, where a tile must not read
+// what its partner will only write after it ran
+bool spacemit_pair_shared(const spacemit_tile & tile);
 
 // how the provider runs one op: its steps run in order on every tile with a barrier after each, so a step may read
 // what all tiles wrote in the step before; kernels never wait inside a step (plan.md §2.4), except the two tiles of a
-// pair for each other in 1-row matmuls (spacemit_pair_wait)
+// pair for each other in 1-row matmuls and in the FP16 pairs route (spacemit_pair_wait)
 constexpr uint32_t SPACEMIT_MAX_OP_STEPS = 2;
 
 // a contract bound to the plugin's kernels: its steps in order, each the plugin's entry under the contract's name

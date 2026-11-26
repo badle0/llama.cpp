@@ -2,7 +2,7 @@
 
 // The IME2 and RVV leaves of the FP16 path for dense Q4_0 matmuls (flagos-spacemit-f16.cpp; origin and changes: the
 // .cpp). Layouts: A [ks / 8][16 rows][8 values] fp16, B [ks / 8][32 columns][8 values] fp16, a partial tile
-// [16 rows][8 slices][32 columns] fp16. The scalar references live in flagos-spacemit-f16.cpp.
+// [16 rows][8 or 4 slices][32 columns] fp16. The scalar references live in flagos-spacemit-f16.cpp.
 // Only with GGML_FLAGOS_SPACEMIT_IME2, and only on an AI-core tile: the X100 cores have no IME and VLEN 256.
 
 #include <cstdint>
@@ -21,8 +21,10 @@ void dequant_tile(const uint8_t * w, int64_t ks, uint16_t * b);
 // values, row stride c_stride_elems
 void products(int64_t ks, const uint16_t * b, const uint16_t * a, uint16_t * c, int64_t rows, int64_t cols,
               int64_t c_stride_elems);
-// a partial tile's 8 slices added in order from +0.0f into rows x cols floats (row stride out_stride_bytes)
-void reduce_tile(const uint16_t * partials, float * out, int64_t out_stride_bytes, int64_t rows, int64_t cols);
+// a partial tile [16 rows][slices][32 columns]: its slices added in order from +0.0f into rows x cols floats (row
+// stride out_stride_bytes)
+void reduce_tile(const uint16_t * partials, float * out, int64_t out_stride_bytes, int64_t rows, int64_t cols,
+                 int64_t slices);
 // the accrued floating-point flags: cleared, and whether overflow (OF) was raised since
 void clear_flags();
 bool overflow_raised();

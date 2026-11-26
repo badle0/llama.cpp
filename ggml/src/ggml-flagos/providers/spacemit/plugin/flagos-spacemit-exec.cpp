@@ -53,6 +53,11 @@ bool spacemit_pair_wait(const spacemit_tile & tile) {
     return true;
 }
 
+bool spacemit_pair_shared(const spacemit_tile & tile) {
+    GGML_ASSERT(tile.pairs != nullptr);
+    return (tile.ith ^ 1u) < tile.nth && tile.pairs->concurrent;
+}
+
 namespace {
 
 std::atomic<uint64_t> g_steps_launched{ 0 };    // test-only (spacemit_steps_take)
