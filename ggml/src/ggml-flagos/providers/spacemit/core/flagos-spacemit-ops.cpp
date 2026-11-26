@@ -482,6 +482,8 @@ static const spacemit_contract k_contracts[] = {
     { GGML_OP_GET_ROWS,        spacemit_get_rows_f32_supported, { "get_rows.f32" },                                  1 },
     { GGML_OP_GET_ROWS,        spacemit_get_rows_quant_supported, { "get_rows.quant" },                              1 },
     { GGML_OP_GLU,             spacemit_swiglu_f32_supported,   { "swiglu.f32" },                                    1 },
+    // FLAGOS_SPACEMIT_DENSE_Q4_0=f16: tried first, its kernels' supports pick the 2-D Q4_0 nodes it takes
+    { GGML_OP_MUL_MAT,         spacemit_mul_mat_ime_supported,  { "mul_mat.f16.products", "mul_mat.f16.sum" },       2 },
     { GGML_OP_MUL_MAT,         spacemit_mul_mat_ime_supported,  { "mul_mat.quantize", "mul_mat.gemm" },              2 },
     { GGML_OP_MUL_MAT_ID,      spacemit_mul_mat_id_supported,   { "mul_mat_id.quantize", "mul_mat_id.gemm" },        2 },
     { GGML_OP_FLASH_ATTN_EXT,  spacemit_always, { "flash_attn.kvh.partial", "flash_attn.kvh.merge" },                2 },
@@ -517,6 +519,7 @@ const char * const spacemit_required_kernels[] = {
     "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
     "set_rows",         "cpy.quant",        "get_rows.f32",             "get_rows.quant",
     "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",
+    "mul_mat.f16.products",                 "mul_mat.f16.sum",
     "mul_mat_id.quantize",                  "mul_mat_id.gemm",          "flash_attn",
     "flash_attn.split.partial",             "flash_attn.split.partial_paired",
     "flash_attn.split.merge",               "flash_attn.kvh.partial",   "flash_attn.kvh.merge",

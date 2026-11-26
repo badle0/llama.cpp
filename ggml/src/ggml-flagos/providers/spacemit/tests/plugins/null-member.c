@@ -116,6 +116,8 @@ static const spacemit_plugin_kernel * fake_kernels(uint32_t * count) {
         { "swiglu.f32", fake_step, NULL, NULL },
         { "mul_mat.quantize", fake_step, NULL, NULL },
         { "mul_mat.gemm", fake_step, NULL, NULL },
+        { "mul_mat.f16.products", fake_step, NULL, NULL },
+        { "mul_mat.f16.sum", fake_step, NULL, NULL },
         { "mul_mat_id.quantize", fake_step, NULL, NULL },
         { "mul_mat_id.gemm", fake_step, NULL, NULL },
         { "flash_attn", fake_step, NULL, NULL },

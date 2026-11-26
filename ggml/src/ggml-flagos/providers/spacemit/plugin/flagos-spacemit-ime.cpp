@@ -1,5 +1,6 @@
 #include "flagos-spacemit-ime.h"
 
+#include "flagos-spacemit-f16.h"
 #include "flagos-spacemit-ime-format.h"
 #include "flagos-spacemit-ime-kernels.h"
 #include "flagos-spacemit-kernels.h"
@@ -333,8 +334,12 @@ void spacemit_mm_tail_take(uint64_t * rows, uint64_t * calls, uint32_t n_tiles) 
     }
 }
 
-// the quantize step writes only what its activations and its layout's quantizers give (the 32x32 layouts share theirs)
+// the quantize step writes only what its activations and its layout's quantizers give (the 32x32 layouts share theirs);
+// a node of the f16 path has no quantize step and writes its partials there
 bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b) {
+    if (spacemit_mul_mat_f16_supported(a) || spacemit_mul_mat_f16_supported(b)) {
+        return false;
+    }
     const ggml_tensor * xa = a->src[1];
     const ggml_tensor * xb = b->src[1];
     const mm_dims       da = mm_dims_of(a);

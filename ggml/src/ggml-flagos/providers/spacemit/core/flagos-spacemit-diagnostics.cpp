@@ -117,7 +117,10 @@ std::string spacemit_step_label(const std::vector<spacemit_plugin_step> & steps,
     switch (n->op) {
         case GGML_OP_MUL_MAT:
             std::snprintf(buf, sizeof(buf), "MUL_MAT.%s %s %s m%lld",
-                          std::strcmp(name, "mul_mat.quantize") == 0 ? "quantize" : "gemm",
+                          std::strcmp(name, "mul_mat.quantize") == 0     ? "quantize" :
+                          std::strcmp(name, "mul_mat.f16.products") == 0 ? "f16.products" :
+                          std::strcmp(name, "mul_mat.f16.sum") == 0      ? "f16.sum" :
+                                                                           "gemm",
                           spacemit_role(n->src[0]).c_str(), ggml_type_name(n->src[0]->type),
                           static_cast<long long>(ggml_nrows(n->src[1])));
             break;

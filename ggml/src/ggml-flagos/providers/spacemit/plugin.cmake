@@ -22,6 +22,8 @@ add_library(flagos-provider-spacemit SHARED
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-x100.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-format.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-id.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-id.cpp"

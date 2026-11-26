@@ -7,6 +7,7 @@
 
 #include "flagos-spacemit-attn.h"
 #include "flagos-spacemit-exec.h"
+#include "flagos-spacemit-f16.h"
 #include "flagos-spacemit-gdn.h"
 #include "flagos-spacemit-ime.h"
 #include "flagos-spacemit-ime-id.h"
@@ -172,6 +173,9 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     spacemit_flash_attn_read_switch();
     (void) spacemit_expert_q4_0();
     (void) spacemit_router_q8();
+    (void) spacemit_dense_q4_0_threshold();
+    (void) spacemit_f16_sum_f32();
+    (void) spacemit_f16_stats_on();
     return SPACEMIT_STATUS_SUCCESS;
 }
 
@@ -344,6 +348,7 @@ void plugin_stream_destroy(spacemit_plugin_stream * stream) {
     }
     spacemit_plugin_device * dev = stream->dev;
     delete stream;
+    spacemit_mul_mat_f16_stats_flush();  // test-only (FLAGOS_SPACEMIT_F16_STATS)
     // the reset stays under the mutex, so a stream_create at the same time waits until the grant is released
     std::lock_guard<std::mutex> lock(dev->streams_mutex);
     if (--dev->n_streams == 0) {
@@ -369,6 +374,9 @@ const spacemit_plugin_kernel * plugin_kernels(uint32_t * count) {
         { "swiglu.f32",       spacemit_kernel_swiglu_f32,    nullptr,                     nullptr                              },
         { "mul_mat.quantize", spacemit_mul_mat_quantize,     nullptr,                     spacemit_mul_mat_workspace           },
         { "mul_mat.gemm",     spacemit_mul_mat_gemm,         nullptr,                     spacemit_mul_mat_workspace           },
+        { "mul_mat.f16.products", spacemit_mul_mat_f16_products, spacemit_mul_mat_f16_supported,
+          spacemit_mul_mat_f16_workspace                                                                                       },
+        { "mul_mat.f16.sum",  spacemit_mul_mat_f16_sum,      spacemit_mul_mat_f16_supported, spacemit_mul_mat_f16_workspace    },
         { "mul_mat_id.quantize", spacemit_mul_mat_id_quantize, nullptr,                   spacemit_mul_mat_id_workspace        },
         { "mul_mat_id.gemm",  spacemit_mul_mat_id_gemm,      nullptr,                     spacemit_mul_mat_id_workspace        },
         { "flash_attn",       spacemit_kernel_flash_attn,    spacemit_flash_attn_one_step_supported, nullptr                    },
@@ -482,6 +490,9 @@ void * plugin_get_proc_address(const char * name) {
     }
     if (std::strcmp(name, "spacemit_switches_generation") == 0) {
         return reinterpret_cast<void *>(static_cast<spacemit_switches_generation_fn>(spacemit_switches_generation));
+    }
+    if (std::strcmp(name, "spacemit_mul_mat_f16_stage_weights") == 0) {
+        return reinterpret_cast<void *>(spacemit_mul_mat_f16_stage_weights);
     }
     if (std::strcmp(name, "spacemit_mul_mat_same_activations") == 0) {
         return reinterpret_cast<void *>(
