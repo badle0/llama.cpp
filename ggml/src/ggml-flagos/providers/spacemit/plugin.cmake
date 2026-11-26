@@ -24,6 +24,8 @@ add_library(flagos-provider-spacemit SHARED
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16.cpp"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16-kernels.h"
+    "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16-kernels.cpp"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-format.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-id.h"
     "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-id.cpp"
@@ -71,7 +73,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     target_link_libraries(flagos-provider-spacemit PRIVATE "${FLAGOS_SPACEMIT_SPERT_LIB}")
     target_compile_definitions(flagos-provider-spacemit PRIVATE GGML_FLAGOS_SPACEMIT_SPERT)
 
-    # the instructions the copied IME2 kernels use (flagos-spacemit-ime-kernels.cpp)
+    # the instructions the copied IME2 kernels use (flagos-spacemit-ime-kernels.cpp, flagos-spacemit-f16-kernels.cpp)
     include(CheckCSourceCompiles)
     set(FLAGOS_SPACEMIT_IME_MARCH "-march=rv64gcv_zfh_zvfh_zba_zicbop_xsmtvdotii")
     set(CMAKE_REQUIRED_FLAGS "${FLAGOS_SPACEMIT_IME_MARCH} -mabi=lp64d")
@@ -80,9 +82,10 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     check_c_source_compiles("int main(void) { __asm__ volatile(\"vpack.vv v2, v0, v1, 2\"); return 0; }" FLAGOS_SPACEMIT_HAS_VPACK)
     check_c_source_compiles("int main(void) { __asm__ volatile(\"vnpack4.vv v12, v0, v1, 3\"); return 0; }" FLAGOS_SPACEMIT_HAS_VNPACK4)
     check_c_source_compiles("int main(void) { __asm__ volatile(\"vupack.vv v2, v12, v12, 2\"); return 0; }" FLAGOS_SPACEMIT_HAS_VUPACK)
+    check_c_source_compiles("int main(void) { __asm__ volatile(\"vfwmadot v16, v0, v8\"); return 0; }" FLAGOS_SPACEMIT_HAS_VFWMADOT)
     unset(CMAKE_REQUIRED_FLAGS)
     if (NOT (FLAGOS_SPACEMIT_HAS_VMADOTU_HP AND FLAGOS_SPACEMIT_HAS_VMADOTSU_HP AND FLAGOS_SPACEMIT_HAS_VPACK AND
-             FLAGOS_SPACEMIT_HAS_VNPACK4 AND FLAGOS_SPACEMIT_HAS_VUPACK))
+             FLAGOS_SPACEMIT_HAS_VNPACK4 AND FLAGOS_SPACEMIT_HAS_VUPACK AND FLAGOS_SPACEMIT_HAS_VFWMADOT))
         message(FATAL_ERROR "FlagOS SpacemiT: the compiler lacks the SpacemiT IME2 instructions (needs GCC >= 15); "
                             "see CMakeFiles/CMakeConfigureLog.yaml for the failed checks")
     endif()
@@ -97,7 +100,8 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
                                 "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-seq.cpp"
                                 "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-moe.cpp" PROPERTIES
         COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba;-mabi=lp64d")
-    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.cpp" PROPERTIES
+    set_source_files_properties("${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-ime-kernels.cpp"
+                                "${FLAGOS_SPACEMIT_DIR}/plugin/flagos-spacemit-f16-kernels.cpp" PROPERTIES
         COMPILE_OPTIONS "${FLAGOS_SPACEMIT_IME_MARCH};-mabi=lp64d")
     message(STATUS "FlagOS: enabling SpacemiT K3 provider with spine-runtime at ${FLAGOS_SPACEMIT_SPERT_DIR} and IME2 kernels")
 else()
