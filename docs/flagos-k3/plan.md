@@ -3944,7 +3944,7 @@ The price above goes into the same `build.md` paragraph. Whether to adopt is the
 
 ### The dense Q4_0 matmuls: the fork's FP16 path, a reference run first (spec, 2026-11-23)
 
-**Status:** written 2026-11-23 on the user's word (second of three). Part A approved the same day ("agreed to partA"). The fork builds on the board; its first measurement ran the fork's plain CPU, because at this commit its backend is off unless `GGML_SPACEMIT_BACKEND=1` is set ("Part A on the board, first attempts" below). The corrected run was started and the board then left for an upgrade; its outcome is not known. Part B not specified.
+**Status:** written 2026-11-23 on the user's word (second of three). Part A approved the same day ("agreed to partA"). The fork builds on the board; its first measurement ran the fork's plain CPU, because at this commit its backend is off unless `GGML_SPACEMIT_BACKEND=1` is set ("Part A on the board, first attempts" below). The corrected run was started and the board then left for an upgrade; its outcome is not known. Part A was then done on the new unit (`board-return-runs.md` sections 10 and 11) and its rule is met; Part B is specified in "The dense Q4_0 matmuls in FP16: the port" below.
 
 **What it is about.** The 2-D Q4_0 weights of Qwen3.6-35B-A3B (`attn_qkv`, `attn_gate`, `ssm_out`, `attn_q`, `attn_output`): 1,171 ms of a 5,437 ms graph at 501 tokens (21.5%, item 109), more than the expert multiply. The provider multiplies them with int8 activations, 4 rows a kernel call. SpacemiT's fork multiplies them in FP16, 16 rows a call (its PR #53, read at `mtmd-backend` `b847bf396`; the provider has never run it).
 
@@ -4081,14 +4081,14 @@ Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 t
 
 ### The router as Q8_0, from SpacemiT's fork (spec, 2026-11-26)
 
-**Status:** written and built on the Mac 2026-11-26 on the user's word ("port the router first"), after the op-by-op comparison (`board-return-runs.md` section 11). Not yet run on the K3.
+**Status:** written and built on the Mac 2026-11-26 on the user's word ("port the router first"), after the op-by-op comparison (`board-return-runs.md` section 11). Run on the K3 the same day (`~/router-q8`, `board-return-runs.md` section 12): all three points of the rule hold. `q8` was made the default the same day on the user's word ("Make q8 the default"), `f32` the way back; the default's own K3 run (`~/router-default`) is not yet made.
 
 **What it is about.** The MoE router weight `blk.N.ffn_gate_inp.weight` of Qwen3.6-35B-A3B: F32 in the file, 2048 by 256, one matmul a layer (40 a graph). The provider multiplies it on its plain F32 path: 353.2 ms of a 5,354.6 ms graph at 501 tokens, 94.7 of 1,520.7 at 128, 3.9 of 99.9 at one token. SpacemiT's fork (`b847bf396`) takes 43.0, 11.7 and 1.6 ms (the last with its trace's cost inside).
 
 **What the fork does (read in `ime.cpp:2622-2631` and `repack.cpp:1838-1849`, and now measured).** At load an F32 tensor whose name holds `ffn_gate_inp`, not `shexp`, and ends in `.weight`, 2-D with rows and row length multiples of 32, is quantized to Q8_0 by ggml's own quantizer (per 32 values d = max|w| / 127, q = round(w / d)) and stored in its q8_0 32x32 layout; the matmul then runs on its 8-bit kernels. Its read-back is d x q as floats. It is lossy and has no switch.
 
 **The port.** The provider has the same layout and kernels (`q8_0_32x32`: Q8_0, Q5_0, and Q6_K and Q4_1 requantized). So: one more load-time conversion onto it.
-- *The switch:* `FLAGOS_SPACEMIT_ROUTER=f32|q8`. Unset, empty or `f32`: today's path, the default. `q8`: the new layout. Parsed once, read wherever a layout is decided and at registration.
+- *The switch:* `FLAGOS_SPACEMIT_ROUTER=f32|q8`. Unset, empty or `f32`: today's path, the default. `q8`: the new layout. Parsed once, read wherever a layout is decided and at registration. (As first built; since 2026-11-26 unset, empty or `q8` is the new layout and `f32` the old path.)
 - *The layout* `f32_q8_0_32x32`, by the fork's rule on the name and shape. The allocation stays `ggml_nbytes` (the packed bytes take 34/128 of it), so the switch does not change any buffer's size. Reads give d x q; writes and fills must be whole, as for the other requantized layouts.
 - *The claims:* with a layout the weight's `MUL_MAT` is taken by the two-step matmul contract (quantize, gemm) and refused by the F32 one. New in the core: an F32 tensor in a layout is read only by `MUL_MAT` as its weight; every other contract refuses it (they read F32 as ggml stores it). Until now no F32 tensor had a layout.
 - *Not in this step:* sharing the router's quantized activations with the shared experts' Q8_0 matmuls, which read the same input.
@@ -4109,6 +4109,67 @@ Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 t
 - *Runs:* "all checks passed" unset and with `FLAGOS_SPACEMIT_ROUTER=q8` set for the whole program; `test-backend-ops -o MUL_MAT` 32/32 as before the change. Three older checks build F32 matmuls under the router's name to test the F32 path; they now pin the switch to its default, or a global `q8` failed 12 of their cases.
 - *Mutations caught:* the `shexp` exclusion dropped, the read-back without its scale, the guard removed (the coder's), the rule ignoring the switch (mine).
 - *Not tested:* the model itself (no MoE model fits the Mac), so the load of the 40 router weights, the speed and the KLD are the K3 run's (`~/router-q8`).
+
+**On the K3 (2026-11-26, build `a8f92959a`, `~/router-q8`; the tables are in `board-return-runs.md` section 12).**
+1. The check program passes under both settings with the device.
+2. Speed, three rounds in turn: pp501 `q8` 98.71 to 99.39 against `f32` 93.76 to 94.12 t/s, 5.7, 6.0 and 4.9% by round; pp128 5.3%, pp32 4.1%, one token 2.8% faster, pp4 higher in each round with ranges that overlap. Nothing slower. The estimates were 6%, 5% and level to 3%.
+3. Accuracy on 8 chunks against the new base `~/kld-wiki/base-8.bin`: `q8` 0.007150 +- 0.000383 against `f32` 0.006936 +- 0.000374, bound 0.007310. Same top token 97.304% against 97.010%, maximum 0.315684 against 0.279836. The completion's text is unchanged.
+- The router's steps at 501 tokens: 353.2 ms to 35.4 + 17.4 (the fork 43.0). The graph is 302 ms shorter.
+- *The default changed (2026-11-26, Mac only so far):* `parse_router` gives `q8` for unset, empty and a bad value (which still warns once); `f32` is the old path. The check program's router check covers unset as `q8` and `f32` as the way back (155 points); the checks and the benchmark that build F32 matmuls under the router's name pin `f32`. "All checks passed" unset, with `q8` and with `f32`; `test-backend-ops -o MUL_MAT` 32/32; three mutations caught (unset as `f32`, `f32` as `q8`, a bad value as `f32`).
+- The router is not the fork's accuracy cost: on 2 chunks it moves our mean from 0.003381 to 0.003553, the fork is at 0.021611. This matters for the dense FP16 port, the lossy path that is left: its KLD is the open point, to be judged on the 8-chunk base.
+
+### The dense Q4_0 matmuls in FP16: the port (Part B; spec, 2026-11-26)
+
+**Status:** written 2026-11-26 on the user's word ("Write the FP16 spec"), after the router. Not approved; no code. It replaces the outline "Part B" of the section of 2026-11-23; Part A's rule for going on is met (`board-return-runs.md` sections 10 and 11).
+
+**What it is about.** The five 2-D Q4_0 weights of Qwen3.6-35B-A3B (`attn_qkv`, `attn_gate`, `ssm_out`, `attn_q`, `attn_output`; 92 matmuls a graph). At 501 tokens they take 1,220.5 ms of ours and 387.7 ms of the fork's; at 128 tokens 273.0 against 133.6; at 32 the two are level; at 4 and at one token ours is ahead. With the router as Q8_0 this is what is left of the fork's lead: 19% at pp501, 10% at pp128. Their shapes are not in our logs; by their times K is 2,048 or 4,096 and N 2,048 to 8,192 (inferred; the first block prints them).
+
+**Why the fork is faster there (read in `ime.cpp:1777-2417`, `ime2_kernels.cpp`, `spe_kernels_core.h`; which point gives how much is not measured).**
+- *The weights are read once a matmul.* Ours (path A) stages 4 quantized rows in a tile's TCM and streams every weight past them: at 501 rows each tile reads the whole weight 16 times.
+- *K is cut in slices,* one a worker or a pair of workers, so that a slice of every row's activations stays in TCM while the weight tiles of 32 columns pass through once.
+- *The kernel* multiplies 16 rows by 32 columns a call, FP16 by FP16 with fp32 accumulators (`vfwmadot`, IME2); ours 4 rows by 32 columns on int8.
+- *A slice's sums are stored as fp16* (`_spe_hpgemm_impl_m16n32k8_none`), half the bytes of f32, and a second pass adds the slices in f32.
+- The fork's int8 matmuls (Q8_0, Q6_K, Q5_0) are within 2 to 10% of ours in the same graphs, so the gain is this path's, not its executor's.
+
+**The arithmetic, and where it can lose.**
+- Activations f32 to fp16: 11 bits each with its own exponent, finer than today's int8 with one scale per 32 values; above 65,504 it overflows to infinity.
+- Weights d x (q - 8) rounded to fp16.
+- Products summed in fp32 inside a kernel call.
+- A slice's sum rounded to fp16: an error of 1/2,048 of the slice's sum, not of the result, so slices that cancel lose more; above 65,504 infinity.
+- So the lossy step today's path does not have is the fp16 partial sum. The fork's KLD is 6.4 times ours and the router is not the cause (section 12 of `board-return-runs.md`); this path is the suspect, not shown. Stage 1 below settles it before any kernel is ported.
+
+**Decisions proposed.**
+1. *The weight layout stays `q4_0_32x256`,* with a dequantization of our own from it to the kernel's fp16 tile ([K/8][32 rows][8 values]). The fork's layout (`Q41Block`, 19 bytes for 32 weights) would be a second layout for the same tensors, and its short-batch path is slower than ours (1.5 to 1.8 times at 2 to 8 rows, twice at 4 tokens in the model). With ours, one row and short batches keep today's bytes and kernels. Cost: one RVV routine written, not copied (the fork's `_spe_pack_cast_q41_fixed8_f16_m32k32` is the model).
+2. *Where it applies:* `MUL_MAT` on a 2-D weight in `q4_0_32x256`, with TCM, K a multiple of 256 times the slice count, and M at or above a threshold. The threshold is measured (32, 64, 128); 64 until then. Below it, and for every other case, today's path, unchanged.
+3. *The steps.* A contract `mul_mat.f16` of two steps, with no quantize step: `mul_mat.f16.products` (each tile casts its K slice of the rows into TCM, then for each weight tile dequantizes its slice and multiplies, writing partial sums to the workspace) and `mul_mat.f16.sum` (the tiles add the slices into the f32 output). The workspace holds the partials: rows padded to 16, times N, times the slices, 2 bytes each (67 MB for 501 rows by 8,192 columns in 8 slices; rows are taken in passes of what TCM holds).
+4. *Two routes, in this order.* First the fork's plain one (`ime.cpp:2271-2414`): 8 slices, one a tile, no waits. Then, only if the first leaves gain behind, the fork's pairs (`ime.cpp:2093-2268`): 4 slices, the two tiles of a pair each dequantize a weight tile into their own TCM and multiply their half of the rows by both, with flags and waits between them. That one reads the sibling's TCM and waits inside a step; our 1-row matmul already has pair turns (`spacemit_pair_wait`), so the rule "no waits inside a step" is bent where it already is.
+5. *Overflow.* Each tile clears the floating-point flags before its work and reads them after; on overflow the step fails with the node's name, as any failed kernel does, and the graph fails. No infinity is passed on silently. Stage 1 reports the largest activation and partial sum seen, so the margin is known before this is relied on. The alternative, clamping to 65,504 and going on, changes results without a sign; not proposed.
+6. *The switch:* `FLAGOS_SPACEMIT_DENSE_Q4_0=int8|f16`, `int8` the default. Test-only beside it: `f16:<rows>` for the threshold, and in stage 1 `FLAGOS_SPACEMIT_F16_SUM=f16|f32` (the partials kept as fp16 or as f32), removed once decided.
+
+**Stage 1: the arithmetic alone (no kernel copied).**
+- *Built:* the switch, the claims, the two steps with the plain route, and scalar references for all five pieces (cast, dequantize, multiply with fp32 sums, the fp16 store, the sum). They are the check program's references later, so nothing is thrown away.
+- *Check program:* the references against a double-precision product within a stated bound; the claims (threshold, K, layout, switch); the overflow guard (an activation of 1e5 fails the step); `int8` byte for byte as before.
+- *On the Mac:* Qwen3.5-4B Q4_0 has the same dense Q4_0 weights; its KLD under `int8`, `f16` and `f16` with f32 partials. A first sign only.
+- *On the K3:* the 35B on the reference kernels, 8 chunks against `~/kld-wiki/base-8.bin`, the same three settings; the largest activation and partial; the shapes. Slow: about half an hour a setting by estimate.
+- *The rule:* `f16`'s mean KLD at most `int8`'s mean plus its error bar (0.007150 + 0.000383 with the router as Q8_0, remeasured in the same block). Holds: stage 2 as specified. Fails with fp16 partials and holds with f32: stage 2 on the f32 kernel with f32 partials, twice the bytes, its gain to be estimated first. Fails both ways: dropped and recorded, and the fork's speed there is known to cost accuracy.
+
+**Stage 2: the kernels, the plain route.**
+- *Copied from the fork with their scalar references beside them:* `gemm_kernel_f16f16f32_m16_vfwmadot` (about 400 lines), `_spe_hpgemm_impl_m16n32k8_none` with the assembler macros it needs (about 900), the casts `_spe_pack_cast_f32_f16_*` (about 450), the sum `_spe_reducesum_mxn_f16_f32_16x32_1x1` (about 100). Written: the dequantization, the driver. About 1,900 lines copied and 900 written with the checks, by estimate.
+- *Check program:* each kernel against its reference within a rounding bound (the order of `vfwmadot`'s sums is the hardware's, so not byte for byte); rows of 16, 17, 64, 501 and 700 (two passes); K 2,048 and 4,096; the last columns and rows. IME kernels run only through a launch, never on the test's thread.
+- *The rule,* three rounds in turn of `-p 4,32,128,501 -n 64`: pp501 at least 8% above `int8` in every round; pp4, pp32 and one token not slower by more than the rounds differ; pp2048 once, not slower; KLD on 8 chunks inside stage 1's bound on the real kernels. Then the threshold from one run at 32, 64 and 128 rows.
+- *Estimates:* the fork's whole gain would be 833 ms at 501 tokens (99 to about 118 t/s) and 139 ms at 128 (87.5 to about 97). The plain route moves twice the partial bytes of the pairs; between half and all of that gain, not known.
+
+**Stage 3: the pairs, only if** stage 2 leaves the dense Q4_0 matmuls above 600 ms at 501 tokens (the fork's 388). Its rule: 3% more at pp501 in every round, the same KLD bound, the check program with a forced failed wait.
+
+**Not in this spec.** Q4_1 and Q4_K weights (the fork maps them lossily); the experts (3-D), which keep the integer path in the fork too; the fork's one-row kernel on its own layout; sharing the router's quantize step.
+
+**Risks.**
+- The gain may sit in the pairs; then stage 2 shows little and stage 3 is the larger, more delicate half.
+- The workspace: 134 MB of partials at 2,048 rows by 8,192 columns in the pairs' 4 slices, twice that in 8. If pp2048 suffers, the rows are cut into more than one pair of steps.
+- TCM's size was not read again on the new unit (384 KiB a tile on the old); the first block prints it. At K 4,096 the plain route holds 352 rows a pass.
+- `vfwmadot` is known to us only from the fork's use of it.
+
+**For the user's word.** (1) Stage 1 before any kernel: I recommend it; it costs one board run of about two hours and no thrown-away code, and it answers whether this path is what costs the fork its accuracy. (2) Our layout, not the fork's: I recommend it. (3) Overflow fails the graph rather than clamping: I recommend it, to be looked at again with stage 1's figures.
 
 ### Not planned
 

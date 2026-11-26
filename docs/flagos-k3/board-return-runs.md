@@ -301,3 +301,50 @@ The fork also spends 37.8 ms between nodes. Checked apart from the script: the d
 
 With both at the fork's speed our 501-token graph would be about 4.2 s (119 t/s) by sum, the fork's own figure, with our leads at small sizes and in generation kept. Part A's rule for going on to Part B (`plan.md`) is met: the Q4_0 matmul is more than 15% faster at 512 rows and the fork's pp501 is above ours. Not candidates: the expert multiply (the views disagree), convolution, `ADD` and `UNARY` (each under 1%).
 
+
+## 12. The router as Q8_0 on the board (`~/router-q8`, 2026-11-26)
+
+The first port from section 11's candidates (`plan.md`, "The router as Q8_0, from SpacemiT's fork"; its rule was fixed before this run). Build `a8f92959a`: 53 steps, rc 0. The check program with the device passes under both settings of `FLAGOS_SPACEMIT_ROUTER`, so the new layout's matmul ran on the real Q8_0 kernels at the router's shape.
+
+**Speed, both settings in turn, three rounds (t/s; the range of the three; `f32` first in rounds 1 and 3, `q8` first in round 2).**
+
+| size | `f32` (the default) | `q8` | medians | verdict |
+|---|---|---|---|---|
+| pp4 | 21.72 to 23.38 | 23.15 to 23.80 | 22.88, 23.56 | ranges overlap; `q8` higher in each round |
+| pp32 | 60.13 to 60.49 | 62.66 to 62.75 | 60.26, 62.72 | `q8` 4.1% faster |
+| pp128 | 82.90 to 83.21 | 87.46 to 87.57 | 83.12, 87.56 | `q8` 5.3% faster |
+| pp501 | 93.76 to 94.12 | 98.71 to 99.39 | 93.79, 99.17 | `q8` 5.7% faster (5.7, 6.0 and 4.9% by round) |
+| tg64 | 9.95 to 10.00 | 10.22 to 10.24 | 9.95, 10.23 | `q8` 2.8% faster (100.5 to 97.8 ms a token) |
+
+The estimates before the run were about 6% at pp501, about 5% at pp128 and level to 3% at one token.
+
+**The router's steps, from the op tables of one more run of each setting (ms a graph, 40 matmuls).**
+
+| rows | `f32`: one step | `q8`: gemm + quantize | the fork (section 11) | the graph, `f32` to `q8` |
+|---|---|---|---|---|
+| 1 | 3.9 | 1.1 + 0.2 | 1.6 | 100.1 to 97.7 |
+| 4 | 5.0 | 1.2 + 0.9 | 2.0 | 178.2 to 167.4 |
+| 32 | 24.6 | 3.4 + 1.1 | 5.1 | 529.7 to 509.7 |
+| 128 | 94.8 | 10.9 + 3.5 | 11.7 | 1,539.0 to 1,463.3 |
+| 501 | 353.2 | 35.4 + 17.4 | 43.0 | 5,364.3 to 5,062.2 |
+
+At 501 tokens the router went from 353.2 to 52.8 ms and the graph is 302.1 ms shorter, with 40 more steps (2,556). A third of what is left is the activations' quantize step; sharing it with the shared experts' Q8_0 matmuls, which read the same input, is not done.
+
+**Accuracy.** A new CPU base of 8 chunks was made for this: `~/kld-wiki/base-8.bin` on the board, by `FLAGOS_SPACEMIT_DISABLE=1 llama-perplexity -m <the model> -f ~/wiki.test.raw -c 512 --chunks 8 -t 1 --kl-divergence-base <file>`; PPL 6.2963 +- 0.3449, 33 minutes (991 s a pass of 4 chunks). Its first two chunks give the 2-chunk base's PPL (5.8619).
+
+| | mean KLD | median | 99.9% | maximum | same top token |
+|---|---|---|---|---|---|
+| `f32`, 8 chunks | 0.006936 +- 0.000374 | 0.002501 | 0.191495 | 0.279836 | 97.010 +- 0.377% |
+| `q8`, 8 chunks | 0.007150 +- 0.000383 | 0.002594 | 0.187847 | 0.315684 | 97.304 +- 0.359% |
+| `f32`, 2 chunks (section 9) | 0.003381 +- 0.000361 | 0.001238 | 0.096165 | 0.108020 | 97.647 +- 0.672% |
+| `q8`, 2 chunks | 0.003553 +- 0.000364 | 0.001162 | 0.098536 | 0.114114 | 97.647 +- 0.672% |
+
+- The rule's bound is `f32`'s mean plus its error bar, 0.007310; `q8` is at 0.007150, 3.1% above `f32` and 0.6 of an error bar. The two runs score the same tokens, so the error bars are not independent and this is the rule as written, not a test of the difference.
+- The completion of the 501-token prompt under `q8` is the float run's text, byte for byte; 1 graph split.
+- Our own mean on 8 chunks is twice the 2-chunk figure: chunks 3 to 8 score about 0.0075 each against 0.003 for the first two. 0.006936 is this text's reference from now on; the bound of 0.01 is closer than the 2-chunk run said.
+- The first two chunks score 0.00360 inside the 8-chunk run against 0.003381 alone: the decodes differ (4 chunks a batch against 2). Not looked into.
+- The router is not what costs the fork its accuracy: on the same 2 chunks the fork's mean is 0.021611 and the router as Q8_0 moves ours from 0.003381 to 0.003553. Of the two lossy paths named in section 11 that leaves its FP16 dense matmuls, by elimination and not measured; the fork was not run on 8 chunks.
+
+**Verdict by the rule:** all three points hold, so `q8` is proposed as the default, the user's decision.
+
+**Against the fork with `q8` (the fork's figures are section 11's, another session of the same day).** pp501 98.71 to 99.39 against 117.79 to 119.10, the fork 19% ahead (27% before); pp128 87.46 to 87.57 against 95.80 to 97.03, the fork 10% ahead (16%); pp32 ours 9% ahead (6%); tg64 10.22 to 10.24 against 8.80 to 8.84, ours 16% ahead (13%). What is left of the fork's lead at long prompts is the dense Q4_0 matmuls.
