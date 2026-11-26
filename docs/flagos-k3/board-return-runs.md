@@ -463,4 +463,48 @@ The 501-token graph is 4,617 ms against 5,021 (404 ms shorter; the dense Q4_0 ma
 - *The sum step:* 200 ms at 501 rows, at the memory's speed (`attn_qkv` moves about 84 MB in 3.5 ms). We keep 8 slices of partial sums, the fork's pairs 4, so its sum reads half.
 - *The products by the row:* 0.78 ms a row against 0.68 for the fork's whole matmul, its sum included: twice the partial sums written and twice the kernel calls at half the K each.
 
-None of the three is the references or their switch. The first is our weight layout and a slow kernel of mine; the other two follow from 8 slices instead of the pairs' 4, and the pairs need two cores to wait on each other inside a step, which our steps do not do today (stage 3).
+None of the three is the references or their switch. The first is our weight layout and a slow kernel of mine; the other two follow from 8 slices instead of the pairs' 4, and the pairs need two cores to wait on each other inside a step (stage 3). Corrected after section 16: such a wait exists in our executor since the 1-row path (`spacemit_pair_wait`); what the FP16 steps lack is its use and a view of the partner's TCM.
+
+## 16. The fork's dequantization kernel on the board (`~/fp16-fork-dequant`, 2026-11-26)
+
+The FP16 path with SpacemiT's dequantization kernel on our weight block in place of the one written here (`plan.md`, "The fork's dequantization kernel on our block"). Section 15's block again; the board's commit line was not sent back (the bundle's head was `3d003fee0`).
+
+**Build and checks.** Build rc 0 (34 steps): the board's assembler takes the ten instructions new to the plugin. The check program passes on the kernels under `int8` and `f16` and on the references, 0 FAIL lines; the seven exact cases bit for bit, the three that read the weights back through the new kernel among them; 132,700 of 133,536 outputs the model's bytes and the four subnormal probes as in section 15.
+
+**The same bits.** The KLD summary under `f16` is section 15's line for line (0.006689 +- 0.000337, maximum 0.209118, same top token 97.108%), and the completion is the same text, the float run's. 736 matmuls, no overflow.
+
+**Speed, t/s (`-p 4,32,128,501 -n 64 -r 3`, the two arms in turn).**
+
+| size | `int8`, rounds 1 to 3 | `f16`, rounds 1 to 3 | `f16` against `int8` | section 15 |
+|---|---|---|---|---|
+| pp4 | 22.89, 23.11, 23.18 | 23.49, 22.91, 23.22 | level | level |
+| pp32 | 62.58, 62.60, 62.68 | 62.77, 62.88, 62.72 | level | level |
+| pp128 | 87.59, 87.53, 87.57 | 95.04, 96.51, 94.64 | +8.5, +10.3, +8.1% | -7.5% |
+| pp501 | 99.36, 99.21, 99.35 | 114.39, 114.80, 114.44 | +15.1, +15.7, +15.2% | +8.4 to +9.5% |
+| tg64 | 10.27, 10.28, 10.25 | 10.29, 10.29, 10.24 | level | level |
+| pp2048 (one pair, `-r 2`) | 91.21 | 101.40 | +11.2% | +4.3% |
+
+**The threshold pair (`int8` against `f16:16`, one run each, `-r 3`).**
+
+| rows | `int8` | `f16` | |
+|---|---|---|---|
+| 16 | 46.57 | 44.61 | 4.2% slower |
+| 32 | 62.94 | 63.30 | level |
+| 64 | 75.61 | 78.86 | +4.3% |
+| 128 | 88.90 | 95.32 | +7.2% |
+| 256 | 93.75 | 105.04 | +12.0% |
+
+The two paths cross near 32 rows; from 64 rows, the threshold as built, FP16 is the faster one. One run an arm, so 32 against 64 is not settled finer than that.
+
+**The dense Q4_0 matmuls by the op tables (ms a graph).**
+
+| rows | `int8` | `f16` in section 15 | `f16` now: products + sum | the fork (section 11) |
+|---|---|---|---|---|
+| 128 | 268.6 | 381.3 | 156.7 = 110.9 + 45.8 | 133.6 |
+| 501 | 1,210.7 | 822.3 | 538.3 = 357.2 + 181.2 | 387.7 |
+
+- The kernel took 225 ms off a graph at 128 rows and 284 at 501, more than the 190 estimated. What does not grow with the rows is now about 26 ms a graph (two points a line), below the fork's 46.
+- The 501-token graph is 4,344 ms against 4,993 on `int8` (the fork's was 4,214 in its own session). Our pp501 of 114.4 to 114.8 is 3 to 4% below the fork's 117.8 to 119.1 of section 11, measured in another session; at 128 tokens we are level with it (94.6 to 96.5 against 95.8 to 97.0), and ahead at 4 and 32 tokens and in generation as before.
+- What is left to the fork is 151 ms at 501 rows (3.5% of the graph) and 23 ms at 128. It grows with the rows: the sum step, 181 ms at 501 rows over 8 slices where the fork's pairs sum 4, and the products' share of the same.
+
+**Verdict.** Stage 2's rule is met with room: pp501 at least 15% above `int8` in every round, nothing slower, pp2048 11% above, the KLD unchanged inside its bound. The dense Q4_0 matmuls are at 538 ms at 501 rows, below the 600 that would call for stage 3.
