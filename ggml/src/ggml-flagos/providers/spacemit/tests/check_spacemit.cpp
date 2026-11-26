@@ -6787,11 +6787,11 @@ static std::vector<uint8_t> q4_0_raw(int64_t k, int64_t n, const std::function<f
 // staged weights are fp16 of ggml's dequantization bit for bit; (C) the outputs against a model of the arithmetic
 // written here (the references bit for bit, the kernels within its bound) and against the CPU, the same bytes with a
 // TCM stand-in that forces several row passes and on threads, and the reference steps called directly on 1 and 3
-// tiles the model's bytes; (C2) exact cases, bit for bit in both modes; (D) an overflow fails the graph with one line,
-// an infinite input does not; (E) int8 and unset give today's steps and bytes; (G) QUANTIZE=shared; (F)
-// FLAGOS_SPACEMIT_F16_STATS. Kernels run only through a launch: the direct calls take the reference steps
-// (spacemit_mul_mat_f16_*_reference), which never run IME code, so they are safe on the test's thread (an X100 core on
-// the K3)
+// tiles the model's bytes; (C2) exact cases, bit for bit in both modes, and the fp16 subnormal probes; (D) an overflow
+// fails the graph with one line, an infinite input does not; (E) int8 and unset give today's steps and bytes; (G)
+// QUANTIZE=shared; (F) FLAGOS_SPACEMIT_F16_STATS. Kernels run only through a launch: the direct calls take the
+// reference steps (spacemit_mul_mat_f16_*_reference), which never run IME code, so they are safe on the test's thread
+// (an X100 core on the K3)
 static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
     const auto                 t_start = std::chrono::steady_clock::now();
     const bool                 kernels = !host && *reference_label() == '\0';
@@ -7079,10 +7079,14 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
     // both modes (on the K3 the kernels, through a launch). (1) One 1.0 per slice in each row (row r at r mod ks) reads
     // the fp16 weights back: out = the float sum in slice order from +0.0f of fp16(w[c][s ks + r mod ks]). (2) A weight
     // of d = 1 and nibble 9 at one place per slice and column (8 elsewhere) reads the fp16 activations back, of mixed
-    // magnitudes: ties, fp16 subnormals, negative zeros, large ones. (3) Integers in [-16, 16] by d (q - 8) with d a
-    // power of two: each slice's sum is exact in float, then rounded to fp16 once
-    int     n_exact   = 0;
-    int64_t n_rounded = 0;  // case 3's slice sums that fp16 rounds
+    // magnitudes: ties, the smallest normals, negative zeros, large ones; no value is an fp16 subnormal. (3) Integers
+    // in [-16, 16] by d (q - 8) with d a power of two: each slice's sum is exact in float, then rounded to fp16 once.
+    // (4) fp16 subnormals as an activation, a weight and a partial sum: kept by the references (IEEE); what the K3's
+    // kernels do is reported, not required (the first K3 run, 2026-11-26: counted as zero somewhere on the hardware
+    // path)
+    int         n_exact   = 0;
+    int64_t     n_rounded = 0;  // case 3's slice sums that fp16 rounds
+    std::string subnormal[4];   // case 4's outcomes, for the summary
     {
         env_override   sw(dense, "f16:16");
         ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
@@ -7154,7 +7158,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                         x[i] = -0.0f;
                         break;
                     case 1:
-                        x[i] = a * 6e-5f;  // fp16 subnormals, and below them zeros
+                        x[i] = std::copysign(6.2e-5f + std::fabs(a) * 1e-3f, a);  // fp16's smallest normals
                         break;
                     case 2:
                         x[i] = a * 3e4f;
@@ -7167,6 +7171,10 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                     default:
                         x[i] = a * 2.0f;
                         break;
+                }
+                // no fp16 subnormal here (fp16's smallest normal instead): they are probed in (4)
+                if (x[i] != 0.0f && std::fabs(f16_round(x[i])) < 0x1p-14f) {
+                    x[i] = std::copysign(0x1p-14f, x[i]);
                 }
             }
             for (int64_t r = 0; r < m; r++) {
@@ -7230,6 +7238,64 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             run_exact("small integers," + shape(k, n, m), q, k, n, x, want);
         }
         expect(n_rounded > 0, "small integers: no slice sum rounded by fp16");
+
+        // (4) a weight of d at one place per slice and column as in (2), every activation v: each output is 8 v d
+        const struct {
+            const char * name;
+            float        v, d;
+        } probes[4] = {
+            { "an activation by 1", 0x1p-16f, 1.0f },        // the activation and the slice's partial sum
+            { "an activation by 1024", 0x1p-16f, 1024.0f },  // the activation only (product 2^-6)
+            { "a weight by 1024", 1024.0f, 0x1p-16f },       // the weight's scale only
+            { "a partial sum", 0x1p-8f, 0x1p-8f },           // the slice's partial sum only (2^-16)
+        };
+        for (int p = 0; p < 4; p++) {
+            const int64_t k = 2048, n = 64, m = 24, ks = k / 8;
+            const auto    pos = [&](int64_t c, int64_t sl) { return (c * 37 + sl * 11) % ks; };
+            const float   v = probes[p].v, d = probes[p].d;
+            const std::vector<uint8_t> q = q4_0_raw(
+                k, n, [d](int64_t, int64_t) { return d; },
+                [&](int64_t c, int64_t kk) { return kk % ks == pos(c, kk / ks) ? 9 : 8; });
+            const std::vector<float> x((size_t) (k * m), v);
+            float                    want = 0.0f;
+            for (int sl = 0; sl < 8; sl++) {
+                want = want + v * d;
+            }
+            mm_weight           w;
+            mm_run              run;
+            const spacemit_op * op  = nullptr;
+            bool                ran = false;
+            std::vector<float>  out((size_t) (n * m), NAN);
+            if (w.init_with(dev, GGML_TYPE_Q4_0, k, n, q) && run.init(dev, w, m, 0)) {
+                ggml_backend_tensor_set(run.x, x.data(), 0, ggml_nbytes(run.x));
+                op  = spacemit_find_op(ops, run.y, buft);
+                ran = ggml_backend_graph_compute(be, run.g_dev) == GGML_STATUS_SUCCESS;
+                if (ran) {
+                    ggml_backend_tensor_get(run.y, out.data(), 0, ggml_nbytes(run.y));
+                }
+            }
+            const float   zero_f = 0.0f;
+            const int64_t total  = (int64_t) out.size();
+            int64_t       kept = 0, zero = 0, other = 0;
+            for (size_t i = 0; i < out.size(); i++) {
+                if (std::memcmp(&out[i], &want, sizeof(float)) == 0) {
+                    kept++;
+                } else if (std::memcmp(&out[i], &zero_f, sizeof(float)) == 0) {
+                    zero++;
+                } else {
+                    other++;
+                }
+            }
+            // the references are IEEE and keep every output; on the K3 the hardware decides, zeros are reported
+            expect(is_f16(op) && ran && other == 0 && (kernels || zero == 0),
+                   std::string("fp16 subnormals, ") + probes[p].name + ": claimed by " + by(op) + ", " +
+                       std::to_string(kept) + " kept, " + std::to_string(zero) + " zero, " + std::to_string(other) +
+                       " other of " + std::to_string(total));
+            subnormal[p] = kept == total ? "kept" :
+                           zero == total ? "zero" :
+                                           "kept in " + std::to_string(kept) + " of " + std::to_string(total) +
+                                               ", zero in " + std::to_string(zero);
+        }
         ggml_backend_free(be);
     }
 
@@ -7414,12 +7480,14 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 "(%lld pinned to it "
                 "by the bound), worst |out - model| / bound %.3f; max NMSE vs the CPU %.2e (bound %.0e). %d exact cases "
                 "bit for bit (weights and activations read back, small integers with %lld slice sums rounded). "
-                "Overflow of an activation and of "
+                "fp16 subnormals: an activation by 1 %s, an activation by 1024 %s, a weight by 1024 %s, a partial sum "
+                "%s. Overflow of an activation and of "
                 "a partial sum fail with one line, +inf passes; unset and int8 the same bytes by quantize and gemm; "
                 "QUANTIZE=shared skips no f16 step; F16_STATS appended at the backend's free, nothing unset: %d/%d in "
                 "%.1f s\n",
                 mode, n_staged, small_tcm, (long long) n_equal, (long long) n_outputs, (long long) n_pinned, worst, max_nmse,
-                k_mul_mat_max_nmse, n_exact, (long long) n_rounded, n_ok, n_checks, secs);
+                k_mul_mat_max_nmse, n_exact, (long long) n_rounded, subnormal[0].c_str(), subnormal[1].c_str(),
+                subnormal[2].c_str(), subnormal[3].c_str(), n_ok, n_checks, secs);
     return 0;
 }
 
