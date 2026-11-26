@@ -401,3 +401,24 @@ The stats file gives 36 matmuls at [2,048, 8,192], 30 at [2,048, 4,096] and 26 a
 **Speed is the scalar code's and means nothing:** one 501-token graph 163.7 s (3.06 t/s), the products step 152.7 s and the sum step 7.2 s of it; a KLD arm about 21 minutes.
 
 **Verdict by the rule:** holds, with fp16 partials. Stage 2 (the kernels, the plain route) follows as specified.
+
+## 14. The FP16 kernels on the board, the first attempt (`~/fp16-kernels`, build `a99a2f74f`, 2026-11-26)
+
+Stage 2 of the FP16 port (`plan.md`, "Stage 2 as built"): SpacemiT's FP16 kernels under `FLAGOS_SPACEMIT_DENSE_Q4_0=f16`. Read from the block's printed lines; the folder was not copied back. The run stopped at the check program, as the block is written to, so it holds no speed and no KLD.
+
+**The build passed** (rc 0, 38 steps, without `llama-server`): GCC assembles the copied text, the configure step found `vfwmadot`, no warning in the two FP16 files.
+
+**The check program on the kernels failed in two of its points,** the same two under `int8` and under `f16`:
+
+- Bit for bit on the hardware: the weights read back (three cases) and the small integers (two cases). These go through the written dequantization, the pack, the product kernel, the two reduce kernels and the real TCM as the stage.
+- Not bit for bit: the activations read back, 3,056 of 12,384 outputs at [2048, 96] by 129 rows and 1,024 of 4,096 at [4096, 64] by 64 rows.
+- For random inputs 132,700 of 133,536 outputs are the model's bytes and every one lies inside the model's bound; the largest NMSE against the CPU is 1.47e-05 (bound 5e-04).
+- With `GGML_FLAGOS_KERNEL_VARIANTS=0` (the references, on the board) all checks pass.
+
+**The reading: fp16 subnormals count as zero on the kernels' path** (inferred, not observed directly). The failing case is the only one that feeds fp16 subnormals (values below 2^-14 = 6.1e-05). Computed again on the Mac with every such activation taken as zero, the expected outputs differ from the IEEE ones in exactly 3,056 and 1,024 places. Six other candidates do not give these counts: ties rounded away from zero (3,796 and 1,253), to odd (6,394 and 2,076) or toward zero (3,794 and 1,230), a negative zero taken as positive (0 and 0), the slices summed in reverse (3,645 and 1,218) or in pairs (2,653 and 861). The counts agree; that the same outputs differ was not compared (the folder's outputs are not printed).
+
+- Where the value is lost is not known: the pack's narrowing, `vfwmadot`'s inputs, the store of a slice's partial sum, or the sum's widening.
+- The references keep subnormals (IEEE), so the Mac could not have shown this.
+- For a model the effect is an activation below 6.1e-05 read as zero; the KLD of the retry measures whether it shows.
+
+**What follows:** the bit-for-bit case no longer holds subnormals, and four probes report what the kernels do with a subnormal activation, weight and partial sum (`plan.md`, "Stage 2 on the K3, the first attempt"). The retry is `~/fp16-kernels-retry`.
