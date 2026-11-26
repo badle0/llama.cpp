@@ -348,3 +348,14 @@ At 501 tokens the router went from 353.2 to 52.8 ms and the graph is 302.1 ms sh
 **Verdict by the rule:** all three points hold, so `q8` is proposed as the default, the user's decision.
 
 **Against the fork with `q8` (the fork's figures are section 11's, another session of the same day).** pp501 98.71 to 99.39 against 117.79 to 119.10, the fork 19% ahead (27% before); pp128 87.46 to 87.57 against 95.80 to 97.03, the fork 10% ahead (16%); pp32 ours 9% ahead (6%); tg64 10.22 to 10.24 against 8.80 to 8.84, ours 16% ahead (13%). What is left of the fork's lead at long prompts is the dense Q4_0 matmuls.
+
+**The default confirmed (`~/router-default`, build `196eb4aaf`, the same day).** On the user's word `q8` became the default, with `FLAGOS_SPACEMIT_ROUTER=f32` the way back. The check program passes with the device under the default and under `f32`.
+
+| | pp4 | pp32 | pp128 | pp501 | pp2048 | tg64 | tg512 |
+|---|---|---|---|---|---|---|---|
+| the default (`q8`) | 22.41 | 62.62 | 87.57 | 98.77 | 88.79 | | 10.15 |
+| `f32` | 22.40 | 60.29 | 83.09 | 93.91 | | 9.94 | |
+
+- Both rows are inside the three rounds' ranges above (`q8` pp501 98.71 to 99.39, `f32` 93.76 to 94.12). The default's row is this board's reference from now on; it replaces section 9's (pp32 60.21, pp128 84.33, pp501 93.39, pp2048 86.60, tg512 9.71 on build `f0cff0e32`, another session).
+- The op table at 501 tokens: under the default the router is the gemm and quantize rows (35.3 and 17.9 ms, 2,556 steps a graph), under `f32` the gemm row alone (353.2 ms, 2,516 steps).
+- The KLD under the default is the `q8` arm's to the last digit, on 8 chunks (0.007150 +- 0.000383, maximum 0.315684, same top token 97.304%) and on 2 (0.003553 +- 0.000364); the 8-chunk output file is the same bytes. The completion's text is the float run's, 1 graph split, 501 tokens at 99.80 t/s and 99.55 ms a token.
