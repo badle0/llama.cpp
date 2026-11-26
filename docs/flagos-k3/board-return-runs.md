@@ -237,3 +237,67 @@ The fork's text is the float run's, as ours is. Its prompt is 22% shorter; its t
 - Sizing the matmul's lead against the whole model (an inference, D2 is the measurement): in our 501-token graph the dense Q4_0 matmuls take 1,221 ms of 5,359, so at the ratio above they would save about 670 ms, about half of the 1,205 ms the fork's prompt was shorter by. All our dense matmuls together take 2,347 ms. Which of the fork's ops make up the rest is what the trace run shows.
 
 **Next (`~/fork-whole-model`, `~/fork-trace`).** The three rounds in turn and the fork's KLD with the corrected check; ours once more with the op tables on, at 4, 32, 128 and 501 tokens and at one; the fork's profiling build with the trace off and then on, one size a run, the traces copied back compressed.
+
+## 11. The fork against ours: the three rounds, its KLD and the op tables (`~/fork-whole-model`, `~/fork-trace`, 2026-11-26)
+
+**The whole model, both backends in turn, three rounds (t/s; the range of the three).**
+
+| size | ours | the fork | verdict |
+|---|---|---|---|
+| pp4 | 22.64 to 22.93 | 17.21 to 17.37 | ours 32% faster |
+| pp32 | 60.16 to 60.45 | 56.79 to 57.84 | ours 6% faster |
+| pp128 | 83.02 to 84.08 | 95.80 to 97.03 | the fork 16% faster |
+| pp501 | 93.54 to 94.35 | 117.79 to 119.10 | the fork 27% faster |
+| tg64 | 9.97 to 10.01 | 8.80 to 8.84 | ours 13% faster |
+
+No ranges overlap. At 501 tokens the fork's graph is 1,137 ms shorter (4,214 against 5,351 ms); a token of ours is 13.4 ms shorter (100.1 against 113.5 ms). Our op tables cost 2% of a token (tg64 9.80 with them on) and nothing visible at the prompt sizes.
+
+**The fork's KLD against our CPU base (2 chunks).** Mean 0.021611 +- 0.003827, median 0.004617, 99.9% 1.099585, maximum 1.546852, same top token 94.902 +- 0.975%. Ours against the same base: 0.003381 +- 0.000361, 0.001238, 0.096165, 0.108020, 97.647%. The fork's mean is 6.4 times ours and above our bound of 0.01. Which of its paths costs this is not isolated: it has no switch for any of them. Two of its paths are lossy by its own source and absent from ours: the dense Q4_0 products and partial sums in fp16, and the router weight `ffn_gate_inp` converted from f32 to Q8_0 at load (`ime.cpp:2622-2631`), which picks the experts.
+
+**The trace.** The device runs 2,165 nodes a prompt graph (2,105 a token after the first) against our 2,516 steps; every worker logs each. As read in the source, the last graph of each file is cut short; the first is the warm-up; three clean graphs remain for each prompt size, four at one token. `scripts/fork-trace.py` (new; `show` and `compare`) makes the tables: a node's time is the slowest worker's end minus begin, and the time between nodes is counted apart. The profiler's cost, the same build with the trace off and on:
+
+| | pp4 | pp32 | pp128 | pp501 | one token |
+|---|---|---|---|---|---|
+| trace off, t/s | 17.06 | 57.12 | 96.02 | 119.44 | 8.49 |
+| trace on, t/s | 13.82 | 52.47 | 93.28 | 117.77 | 5.89 |
+| time added | 23% | 9% | 3% | 1.4% | 44% |
+
+So the tables at 128 and 501 tokens stand as they are. At 1 and 4 tokens the nodes' own times sum to more than the untraced graph (132.1 ms against 113.5 at one token): a begin's timestamp is taken before its text is written, so each node carries some of the cost, and the small ops' rows there (an `ADD` 12.6 us in the fork against 2.3 in ours) are the profiler's, not the fork's. There the three rounds and the isolated one-row cases are the evidence.
+
+**By family at 501 tokens (ms a graph; ours from the op tables of the same session).**
+
+| family | ours | the fork | fork / ours | the fork's gain |
+|---|---|---|---|---|
+| dense Q4_0 matmuls | 1,220.5 | 387.7 | 0.32 | 833 |
+| the router, `ffn_gate_inp` (f32 in the file) | 353.2 | 43.0 | 0.12 | 310 |
+| norms and their multiplies (`RMS_NORM`, `L2_NORM`, `MUL`) | 389.2 | 270.4 | 0.69 | 119 |
+| expert multiply | 1,209.7 | 1,109.1 | 0.92 | 101 |
+| convolution (`SSM_CONV`, `CONCAT`) | 141.3 | 102.2 | 0.72 | 39 |
+| dense Q8_0 | 414.3 | 377.1 | 0.91 | 37 |
+| `ADD` | 271.3 | 245.9 | 0.91 | 25 |
+| `UNARY` | 116.2 | 93.4 | 0.80 | 23 |
+| dense Q6_K and Q5_0 | 277.7 | 262.5 | 0.95 | 15 |
+| Gated DeltaNet | 579.5 | 583.1 | 1.01 | -4 |
+| the other f32 matmuls (`ssm_alpha`, `ssm_beta`, `ffn_gate_inp_shexp`) | 79.4 | 102.2 | 1.29 | -23 |
+| the rest (`ARGSORT`, `GLU`, `ROPE`, `SCALE`, copies, ...) | 144.2 | 191.7 | 1.33 | -48 |
+| attention | 158.1 | 443.8 | 2.81 | -286 |
+| total | 5,354.6 | 4,212.1 | 0.79 | 1,143 |
+
+The fork also spends 37.8 ms between nodes. Checked apart from the script: the dense Q4_0, f32, expert, attention, router and DeltaNet figures recomputed from the trace by a second program, the same to 0.1 ms.
+
+- Two things make the fork's long prompt faster, and they are 1,143 ms of its 1,143 ms lead: the dense Q4_0 matmuls in FP16 (3.1 times faster here, more than the 2.2 of the isolated case at K 14,336) and the router run as Q8_0 (8 times faster). Everything else nets to zero: its gains in norms, experts and convolution against our 286 ms lead in attention.
+- By weight, the Q4_0 gain is in every one of them (`attn_qkv` 565.7 to 180.9, `attn_gate` 284.2 to 95.2, `ssm_out` 157.9 to 46.0, `attn_q` 113.7 to 36.1, `attn_output` 99.1 to 29.4). The Q8_0, Q6_K and Q5_0 weights run on 8-bit paths in both and are within 2 to 10%.
+- The norms row is not one kernel against another: the fork's graph has 151 `MUL` and 191 `RMS_NORM` nodes and no `L2_NORM`, ours 281, 131 and 60 steps. The two trees build this part differently.
+- The expert multiply is 8% faster in the fork inside the model, where the isolated cases had ours ahead. The shapes differ (256 experts of 2048 to 512 here), so the two views do not agree and it is not a candidate by the rule.
+- At 128 tokens the same two: dense Q4_0 273.0 to 133.6 ms, the router 94.7 to 11.7; attention 15.2 against 58.3. At 32 tokens the Q4_0 matmuls are level (75.3 against 64.0, with 9% of trace cost in the fork's figure) and the router is 24.6 to 5.1. At 4 tokens the fork's Q4_0 matmuls take twice ours (27.3 against 59.4), as the isolated 2 to 8 row cases said.
+- The router is faster in the fork at every size, one token included (3.9 against 1.6 ms a token, the trace's cost inside the 1.6).
+
+**Candidates for step 4, by the rule of section 6 (faster by more than the spread, both views agree where both exist, at least 1% of a graph), ordered by ms at 501 tokens.**
+
+| candidate | gain at 501 tokens | isolated view | size of the port | open |
+|---|---|---|---|---|
+| dense Q4_0 in FP16, from about 16 rows | 833 ms, 15.6% | agrees (0.45 at 512 rows) | the largest so far (`plan.md`, Part B) | its KLD |
+| the router as Q8_0 | 310 ms, 5.8%; 2 ms a token | no shared case | small: one more load-time conversion onto the Q8_0 path we have | its KLD: it decides which experts run |
+
+With both at the fork's speed our 501-token graph would be about 4.2 s (119 t/s) by sum, the fork's own figure, with our leads at small sizes and in generation kept. Part A's rule for going on to Part B (`plan.md`) is met: the Q4_0 matmul is more than 15% faster at 512 rows and the fork's pp501 is above ours. Not candidates: the expert multiply (the views disagree), convolution, `ADD` and `UNARY` (each under 1%).
+

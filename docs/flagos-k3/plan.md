@@ -4079,6 +4079,37 @@ Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 t
 
 **Not from either document.** The four properties asked about on 2026-11-24 stand on the deck or on measurements: an op as several steps is the deck's L2 ("一个算子可展开为多步"); the workspace held by the core is the deck's; one launch a graph with a barrier after each step is the K3's form of the deck's optional capture, taken because a launch a kernel cost 14.2% and 35.8% of generation (E3a) and ordered launches were not correct (E3b, F16); the grid of always 8 tiles and the variant chosen by code are departures from the deck recorded as G3 to G5, the mentor's to rule on. The one of the four that neither the deck nor a measurement against the fork supports is "no waits inside a step".
 
+### The router as Q8_0, from SpacemiT's fork (spec, 2026-11-26)
+
+**Status:** written and built on the Mac 2026-11-26 on the user's word ("port the router first"), after the op-by-op comparison (`board-return-runs.md` section 11). Not yet run on the K3.
+
+**What it is about.** The MoE router weight `blk.N.ffn_gate_inp.weight` of Qwen3.6-35B-A3B: F32 in the file, 2048 by 256, one matmul a layer (40 a graph). The provider multiplies it on its plain F32 path: 353.2 ms of a 5,354.6 ms graph at 501 tokens, 94.7 of 1,520.7 at 128, 3.9 of 99.9 at one token. SpacemiT's fork (`b847bf396`) takes 43.0, 11.7 and 1.6 ms (the last with its trace's cost inside).
+
+**What the fork does (read in `ime.cpp:2622-2631` and `repack.cpp:1838-1849`, and now measured).** At load an F32 tensor whose name holds `ffn_gate_inp`, not `shexp`, and ends in `.weight`, 2-D with rows and row length multiples of 32, is quantized to Q8_0 by ggml's own quantizer (per 32 values d = max|w| / 127, q = round(w / d)) and stored in its q8_0 32x32 layout; the matmul then runs on its 8-bit kernels. Its read-back is d x q as floats. It is lossy and has no switch.
+
+**The port.** The provider has the same layout and kernels (`q8_0_32x32`: Q8_0, Q5_0, and Q6_K and Q4_1 requantized). So: one more load-time conversion onto it.
+- *The switch:* `FLAGOS_SPACEMIT_ROUTER=f32|q8`. Unset, empty or `f32`: today's path, the default. `q8`: the new layout. Parsed once, read wherever a layout is decided and at registration.
+- *The layout* `f32_q8_0_32x32`, by the fork's rule on the name and shape. The allocation stays `ggml_nbytes` (the packed bytes take 34/128 of it), so the switch does not change any buffer's size. Reads give d x q; writes and fills must be whole, as for the other requantized layouts.
+- *The claims:* with a layout the weight's `MUL_MAT` is taken by the two-step matmul contract (quantize, gemm) and refused by the F32 one. New in the core: an F32 tensor in a layout is read only by `MUL_MAT` as its weight; every other contract refuses it (they read F32 as ggml stores it). Until now no F32 tensor had a layout.
+- *Not in this step:* sharing the router's quantized activations with the shared experts' Q8_0 matmuls, which read the same input.
+
+**Predictions (estimates, from the provider's Q8_0 matmuls in the same graphs, about 270 GMAC/s at 501 rows).** The router's 353 ms at 501 tokens becomes about 50 ms: pp501 about 6% faster (93.6 to about 99 t/s), pp128 about 5%. At one token 40 more steps and a weight of 0.56 MB in place of 2 MB: between level and 3% faster.
+
+**The rule, fixed before the run.**
+1. The check program passes on the K3 under both settings of the switch.
+2. Speed, both settings in turn, three rounds of `-p 4,32,128,501 -n 64`: `q8`'s pp501 at least 3% above `f32`'s in every round, and at no size `q8` below `f32` by more than the rounds differ.
+3. Accuracy, on 8 chunks of the wiki text against a new CPU base of 8 chunks (the 2-chunk base scores 512 tokens, too few to judge a change of which experts run): `q8`'s mean KLD at most `f32`'s mean plus `f32`'s error bar. The maximum and the same-top share are reported beside it.
+- All three: `q8` is proposed as the default (the user's decision), with `f32` as the way back.
+- 2 without 3: it stays a switch, off, and the router is recorded as part of what the fork's speed costs it in accuracy (its KLD is 0.0216 against our 0.0034).
+- 3 without 2: dropped and recorded.
+
+**As built (2026-11-26; by a coder to this spec, the diff read and the runs repeated by me; Mac only, the simulated device and reference kernels).**
+- *The code:* the switch, the rule and the layout in `plugin/flagos-spacemit-weights.{h,cpp}` (layout id 8, appended, so no id moved); `repack_f32_q8_0` and `unpack_f32_q8_0` in `plugin/flagos-spacemit-ime-kernels.cpp`, sharing the float-to-Q8_0 group with the Q4_1 route (`quantize_q8_0_group`; the Q4_1 bytes unchanged); one case in `mm_format_of`; the read at registration; the guard in `spacemit_find_op` (`core/flagos-spacemit-ops.cpp`). No kernel was touched: on the K3 the router's matmul runs the Q8_0 kernels the model's other Q8_0 weights already run.
+- *The check program* (`check_router_q8`, 119 points): the rule by name, shape and switch (the shared expert's gate, other names, 48 columns, 31 rows and 3-D stay plain; a bad value warns once); the read-back equal bit for bit to ggml's Q8_0 of the floats, whole and in part, on a small weight and on 2048 by 256 (repacked in 8 ranges); `MUL_MAT` at 1, 4, 32 and 129 rows, with and without the TCM stand-in, taken by the two matmul steps and equal byte for byte to the same graph on a Q8_0 weight, NMSE against the CPU's F32 at most 3.46e-05 (bound 5e-04); unset, taken by `mul_mat.f32` as before; the guard (`ADD`, `MUL` and `MUL_MAT`'s second operand refused, the weight operand taken).
+- *Runs:* "all checks passed" unset and with `FLAGOS_SPACEMIT_ROUTER=q8` set for the whole program; `test-backend-ops -o MUL_MAT` 32/32 as before the change. Three older checks build F32 matmuls under the router's name to test the F32 path; they now pin the switch to its default, or a global `q8` failed 12 of their cases.
+- *Mutations caught:* the `shexp` exclusion dropped, the read-back without its scale, the guard removed (the coder's), the rule ignoring the switch (mine).
+- *Not tested:* the model itself (no MoE model fits the Mac), so the load of the 40 router weights, the speed and the KLD are the K3 run's (`~/router-q8`).
+
 ### Not planned
 
 - Design Phase 5 (split compiler): the K3 has no vendor graph compiler. One launch per split is an executor detail, not a compiler.
