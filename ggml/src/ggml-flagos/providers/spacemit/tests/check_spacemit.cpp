@@ -7563,16 +7563,28 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         }
     }
 
-    // H. FLAGOS_SPACEMIT_F16_ROUTE (test-only), K 512 N 96 by 64 rows: unset, empty and plain the plain route and the
-    // same bytes, a bad value warned once and plain kept, pairs the pairs route
+    // H. FLAGOS_SPACEMIT_F16_ROUTE (test-only), K 512 N 96 by 64 rows: unset, empty and pairs the pairs route and the
+    // same bytes, a bad value warned once and pairs kept, plain the plain route. The two routes must differ here: some
+    // outputs are pinned by both models' bounds to different values
     {
-        env_override       sw(dense, "f16");
-        const char * const settings[5] = { nullptr, "", "plain", "x", "pairs" };
-        const char * const names[5]    = { "unset", "empty", "plain", "x", "pairs" };
-        mm_weight          w;
-        REQUIRE(w.init(dev, 512, 96, seed++));
+        env_override               sw(dense, "f16");
+        const char * const         settings[5] = { nullptr, "", "pairs", "x", "plain" };
+        const char * const         names[5]    = { "unset", "empty", "pairs", "x", "plain" };
+        const std::vector<uint8_t> q           = quantize_weights(GGML_TYPE_Q4_0, 512, 96, seed++);
+        mm_weight                  w;
+        REQUIRE(w.init_with(dev, GGML_TYPE_Q4_0, 512, 96, q));
         mm_run run;
         REQUIRE(run.init(dev, w, 64, seed++));
+        std::vector<float> x((size_t) (512 * 64));
+        ggml_backend_tensor_get(run.x, x.data(), 0, ggml_nbytes(run.x));
+        f16_model model4, model8;
+        model4.init(x, dequantize(GGML_TYPE_Q4_0, q), 512, 96, 64, 4);
+        model8.init(x, dequantize(GGML_TYPE_Q4_0, q), 512, 96, 64, 8);
+        int64_t apart = 0;
+        for (size_t i = 0; i < model4.out.size(); i++) {
+            apart += model4.lo[i] == model4.hi[i] && model8.lo[i] == model8.hi[i] && model4.out[i] != model8.out[i];
+        }
+        expect(apart > 0, "FLAGOS_SPACEMIT_F16_ROUTE: no output pinned apart by the two routes' models");
         std::vector<float> out[5];
         for (int i = 0; i < 5; i++) {
             log_capture    log;
@@ -7587,7 +7599,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 ggml_backend_tensor_get(run.y, out[i].data(), 0, ggml_nbytes(run.y));
             }
             const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_F16_ROUTE=");
-            expect(ran && taken == (i == 4 ? 4 : 8) && warnings == (i == 3 ? 1 : 0),
+            expect(ran && taken == (i == 4 ? 8 : 4) && warnings == (i == 3 ? 1 : 0),
                    std::string("FLAGOS_SPACEMIT_F16_ROUTE ") + names[i] + ": " + (ran ? "ran" : "failed") + ", " +
                        std::to_string(taken) + " slices, " + std::to_string(warnings) + " warnings");
         }
@@ -7595,6 +7607,9 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             expect(std::memcmp(out[i].data(), out[0].data(), out[0].size() * sizeof(float)) == 0,
                    std::string("FLAGOS_SPACEMIT_F16_ROUTE ") + names[i] + ": not the bytes of unset");
         }
+        expect(std::memcmp(out[4].data(), out[0].data(), out[0].size() * sizeof(float)) != 0,
+               "FLAGOS_SPACEMIT_F16_ROUTE plain: the bytes of unset (" + std::to_string(apart) +
+                   " outputs pinned apart)");
     }
 
     // G. FLAGOS_SPACEMIT_QUANTIZE=shared (test-only) skips no f16 step: two f16 matmuls of one input give the bytes and
@@ -7698,21 +7713,22 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 "f16:5000): Q4_0 [512, 64] taken by mul_mat.f16.products and .sum from the threshold (64 the default: "
                 "unset, empty, f16 or a bad value; 16, 128), else and under int8 quantize and gemm; bad values warned "
                 "once; never a Q8_0 or 3-D weight, over 2^24 or K 33024. %d staged weight tiles fp16 of ggml's "
-                "dequantization bit for bit. K 2048 N 96 at 16-501 rows, K 4096 N 64 at 64 and 700, K 256 N 32 at 64, "
-                "K 256 N 320 at 40: default, TCM %s serial and on threads the same bytes, the reference steps on 1 and "
-                "3 tiles direct the model's; %lld of %lld outputs the model's bytes (%lld pinned to it by the bound), "
-                "worst |out - model| / bound %.3f; max NMSE vs the CPU (both routes) %.2e (bound %.0e). %d exact cases "
-                "bit for bit (weights and activations read back, small integers with %lld slice sums rounded). fp16 "
-                "subnormals: an activation by 1 %s, an activation by 1024 %s, a weight by 1024 %s, a partial sum %s on "
-                "the plain route, on pairs %s, %s, %s and %s. pairs: %lld of %lld outputs the model's bytes (%lld "
-                "pinned), %d exact cases bit for bit, in turn and on threads the same bytes. The pairs route "
-                "(FLAGOS_SPACEMIT_F16_ROUTE=pairs, 8 tiles, 4 slices) at K 2048 N 96 at 16-501 rows, K 4096 N 64 and N "
-                "128 at 64-1100, K 256 N 320 at 40, slots and passes as the fork's rules give, K 8192 the plain "
-                "route's 8 slices, with and without TCM, worst |out - model| / bound %.3f; unset, empty and plain the "
-                "same bytes, a bad value warned once. Overflow of an activation and of a partial sum fail with one "
-                "line, on pairs in turn and on threads in under 5 s, +inf passes; unset, empty and f16 the same bytes "
-                "by the f16 steps, int8 and f16:4096 the same bytes by quantize and gemm; QUANTIZE=shared skips no f16 "
-                "step; F16_STATS appended at the backend's free, nothing unset: %d/%d in %.1f s\n",
+                "dequantization bit for bit. On the plain route K 2048 N 96 at 16-501 rows, K 4096 N 64 at 64 and "
+                "700, K 256 N 32 at 64, K 256 N 320 at 40: default, TCM %s serial and on threads the same bytes, the "
+                "reference steps on 1 and 3 tiles direct the model's; %lld of %lld outputs the model's bytes (%lld "
+                "pinned to it by the bound), worst |out - model| / bound %.3f; max NMSE vs the CPU (both routes) %.2e "
+                "(bound %.0e). %d exact cases bit for bit (weights and activations read back, small integers with %lld "
+                "slice sums rounded). fp16 subnormals: an activation by 1 %s, an activation by 1024 %s, a weight by "
+                "1024 %s, a partial sum %s on the plain route, on pairs %s, %s, %s and %s. pairs: %lld of %lld outputs "
+                "the model's bytes (%lld pinned), %d exact cases bit for bit, in turn and on threads the same bytes. "
+                "The pairs route (the default, 8 tiles, 4 slices) at K 2048 N 96 at 16-501 rows, K 4096 N 64 and N 128 "
+                "at 64-1100, K 256 N 320 at 40, slots and passes as the fork's rules give, K 8192 the plain route's 8 "
+                "slices, with and without TCM, worst |out - model| / bound %.3f; unset, empty, pairs and a bad value "
+                "the same bytes, the bad value warned once, plain 8 slices and other bytes. Overflow of an activation and of a partial "
+                "sum fail with one line, on pairs in turn and on threads in under 5 s, +inf passes; unset, empty and "
+                "f16 the same bytes by the f16 steps, int8 and f16:4096 the same bytes by quantize and gemm; "
+                "QUANTIZE=shared skips no f16 step; F16_STATS appended at the backend's free, nothing unset: %d/%d in "
+                "%.1f s\n",
                 mode, n_staged, small_tcm, (long long) n_equal, (long long) n_outputs, (long long) n_pinned, worst, max_nmse,
                 k_mul_mat_max_nmse, n_exact, (long long) n_rounded, subnormal[0][0].c_str(), subnormal[0][1].c_str(),
                 subnormal[0][2].c_str(), subnormal[0][3].c_str(), subnormal[1][0].c_str(), subnormal[1][1].c_str(),
@@ -12852,9 +12868,9 @@ static int bench(ggml_backend_dev_t dev) {
     ggml_free(ctx);
 
     // Q4_0 matmul at Qwen3-4B's FFN shapes, and Q4_1 at its ffn_down shape (its first 4 layers): 1 row (the 1-row path),
-    // small batches and 64 rows (by default path B where TCM holds the activations next to a slab, here at 4-64 rows
-    // for gate and up, 4 and 16 for down, 4 for the Q4_1 down; else path A from 32 rows, else path C), 128 rows (path
-    // A; split, the default until 2026-10-25, kept gate and up on path C there, fusion-and-splitting.md §7.3,
+    // small batches (by default path B where TCM holds the activations next to a slab, here at 4 and 16 rows for gate,
+    // up and down, 4 for the Q4_1 down; else path A from 32 rows, else path C), 64 and 128 rows (Q4_0 on the FP16 path,
+    // with 8 tiles the pairs route for gate and up, K 2560, the plain route for down, K 9728; the Q4_1 down on path A,
     // bench_mm). Q6_K (run as Q8_0, against the CPU's Q6_K) at its output head, whose 1 row is a generated token's: up
     // to 16 rows (path B) and fewer iterations, as the head holds 15x an FFN matrix's weights. Q4_1 has no CPU timing:
     // ggml-cpu's Q4_1 matmul under 8 threads is where question 8's fault strikes (build.md section 7, the eighth

@@ -5,11 +5,11 @@
 #include <cstdint>
 
 // MUL_MAT on 2-D Q4_0 weights (q4_0 32x256) in FP16 arithmetic (plan.md "The dense Q4_0 matmuls in FP16: the port"),
-// behind FLAGOS_SPACEMIT_DENSE_Q4_0 (on by default). K is cut in 8 slices (the plain route) or 4 (the pairs route,
-// FLAGOS_SPACEMIT_F16_ROUTE=pairs); the products step writes each slice's fp16 partial sums of a 16 x 32 output tile to
-// the workspace, the sum step adds the slices into the f32 output. On the K3 the IME2 kernels
-// (flagos-spacemit-f16-kernels.h), elsewhere the scalar references. The routes, the arithmetic, the passes and the
-// workspace layout are in the .cpp.
+// behind FLAGOS_SPACEMIT_DENSE_Q4_0 (on by default). K is cut in 4 slices (the pairs route, the default with 8 tiles)
+// or 8 (the plain route, else or under FLAGOS_SPACEMIT_F16_ROUTE=plain); the products step writes each slice's fp16
+// partial sums of a 16 x 32 output tile to the workspace, the sum step adds the slices into the f32 output. On the K3
+// the IME2 kernels (flagos-spacemit-f16-kernels.h), elsewhere the scalar references. The routes, the arithmetic, the
+// passes and the workspace layout are in the .cpp.
 
 // the claim of both steps: the switch on, a 2-D weight in q4_0 32x256, K % 256 == 0 and K <= 32768, M at or above the
 // threshold, GGML_PAD(M, 16) * GGML_PAD(N, 32) <= 2^24. Otherwise the int8 contract takes the node
@@ -24,8 +24,8 @@ bool   spacemit_mul_mat_f16_sum(const spacemit_tile * tile, ggml_tensor * node);
 uint32_t spacemit_dense_q4_0_threshold();
 uint32_t spacemit_f16_stats_on();
 
-// FLAGOS_SPACEMIT_F16_ROUTE (test-only) as parsed: 0 the plain route (unset, empty, plain or a bad value, the
-// default), 1 the pairs route where the shape, 8 tiles and the stage admit it (the .cpp's route_of). Read at
+// FLAGOS_SPACEMIT_F16_ROUTE (test-only) as parsed: 1 the pairs route where the shape, 8 tiles and the stage admit it
+// (the .cpp's route_of; unset, empty, pairs or a bad value, the default), 0 the plain route (plain). Read at
 // registration too
 uint32_t spacemit_f16_route_pairs();
 

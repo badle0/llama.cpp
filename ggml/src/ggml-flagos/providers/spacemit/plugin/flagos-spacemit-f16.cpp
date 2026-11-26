@@ -20,14 +20,15 @@
 #include <vector>
 
 // The FP16 path (plan.md "The dense Q4_0 matmuls in FP16: the port"), two routes of the same two steps, both steps
-// taking the one route_of gives. The plain route, SpacemiT's plain split-K (its ime.cpp 2271-2414): K is cut in 8
-// slices, ks = K / 8, slice s one per tile (tile ith takes ith, ith + nth, ...). The products step takes a slice's rows
-// in passes of m_block; per pass it casts each 16-row tile of the rows into the stage, A [ks / 8][16][8] fp16 per tile,
-// then for each weight tile (N rotated by ith, as the row tiles) dequantizes its slice into the stage's
-// B [ks / 8][32][8] and multiplies every row tile by it, storing each 16 x 32 result as fp16 partials. The pairs route
-// (test-only for now, FLAGOS_SPACEMIT_F16_ROUTE=pairs; the fork's ime.cpp 2093-2283): 4 slices, ks = K / 4, each one
-// a pair of tiles that read each other's weight tiles (products_pairs). The sum step adds the slices of each output
-// in slice order in float, from +0.0f.
+// taking the one route_of gives. The pairs route (the fork's ime.cpp 2093-2283), taken with 8 tiles and K to 4,864 (the
+// stage holds 128 rows of K / 4 beside a weight tile): 4 slices, ks = K / 4, each one a pair of tiles that read each
+// other's weight tiles (products_pairs). The plain route, SpacemiT's plain split-K (its ime.cpp 2271-2414), for other
+// tile counts and larger K, and under FLAGOS_SPACEMIT_F16_ROUTE=plain: K is cut in 8 slices, ks = K / 8, slice s one
+// per tile (tile ith takes ith, ith + nth, ...). Its products step takes a slice's rows in passes of m_block; per pass
+// it casts each 16-row tile of the rows into the stage, A [ks / 8][16][8] fp16 per tile, then for each weight tile (N
+// rotated by ith, as the row tiles) dequantizes its slice into the stage's B [ks / 8][32][8] and multiplies every row
+// tile by it, storing each 16 x 32 result as fp16 partials. The sum step adds the slices of each output in slice order
+// in float, from +0.0f.
 // The stage is the tile's TCM, else its scratch in the workspace. Workspace: the partials, 64-byte aligned (each fp16
 // row store stays in one DDR bank, as the fork), [mt][nt][16 rows][slices][32 columns] with mt = m / 16, nt = n / 32,
 // sized for 8 slices; the pairs route's table of 8 stage addresses (64 bytes); then 8 tiles' scratch of stage_default
@@ -97,22 +98,22 @@ int parse_dense_q4_0() {
     return 64;
 }
 
-// FLAGOS_SPACEMIT_F16_ROUTE (test-only): unset, empty or plain: the plain route (the default); pairs: the pairs route
-// where route_of admits it. Parsed once; anything else warns once per parse generation and keeps plain
+// FLAGOS_SPACEMIT_F16_ROUTE (test-only): unset, empty or pairs: the pairs route where route_of admits it (the
+// default); plain: the plain route. Parsed once; anything else warns once per parse generation and keeps pairs
 int parse_f16_route() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_F16_ROUTE");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "plain") == 0) {
-        return 0;
-    }
-    if (std::strcmp(v, "pairs") == 0) {
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "pairs") == 0) {
         return 1;
+    }
+    if (std::strcmp(v, "plain") == 0) {
+        return 0;
     }
     static std::atomic<uint32_t> warned_in{ 0 };
     const uint32_t               generation = spacemit_switches_generation();
     if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_F16_ROUTE=%s: not plain or pairs, the default (plain) kept\n", __func__, v);
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_F16_ROUTE=%s: not plain or pairs, the default (pairs) kept\n", __func__, v);
     }
-    return 0;
+    return 1;
 }
 
 // FLAGOS_SPACEMIT_F16_STATS=<path> (test-only): the file the stats are appended to; the path kept beside the flag
@@ -178,7 +179,7 @@ struct f16_route {
     int64_t m_fit  = 0;
 };
 
-// the pairs route when FLAGOS_SPACEMIT_F16_ROUTE=pairs, 8 tiles, and a stage (the TCM if it holds them, else the
+// the pairs route unless FLAGOS_SPACEMIT_F16_ROUTE=plain: 8 tiles, and a stage (the TCM if it holds them, else the
 // scratch) of at least 128 rows of K / 4 beside one weight slot; else the plain route. 2 slots when there is more than
 // one chunk and the second slot costs no further pass (the fork's rule)
 f16_route route_of(const f16_dims & d, const spacemit_tile & tile) {
