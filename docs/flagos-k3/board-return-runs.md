@@ -359,3 +359,45 @@ At 501 tokens the router went from 353.2 to 52.8 ms and the graph is 302.1 ms sh
 - Both rows are inside the three rounds' ranges above (`q8` pp501 98.71 to 99.39, `f32` 93.76 to 94.12). The default's row is this board's reference from now on; it replaces section 9's (pp32 60.21, pp128 84.33, pp501 93.39, pp2048 86.60, tg512 9.71 on build `f0cff0e32`, another session).
 - The op table at 501 tokens: under the default the router is the gemm and quantize rows (35.3 and 17.9 ms, 2,556 steps a graph), under `f32` the gemm row alone (353.2 ms, 2,516 steps).
 - The KLD under the default is the `q8` arm's to the last digit, on 8 chunks (0.007150 +- 0.000383, maximum 0.315684, same top token 97.304%) and on 2 (0.003553 +- 0.000364); the 8-chunk output file is the same bytes. The completion's text is the float run's, 1 graph split, 501 tokens at 99.80 t/s and 99.55 ms a token.
+
+## 13. The FP16 arithmetic on the board (`~/fp16-arithmetic-retry`, build `b92ccfcc7`, 2026-11-26)
+
+Stage 1 of the FP16 port (`plan.md`, "The dense Q4_0 matmuls in FP16: the port"): the dense Q4_0 matmuls under `FLAGOS_SPACEMIT_DENSE_Q4_0=f16` on scalar reference code, no kernel yet. The run measures accuracy, not speed.
+
+**The first attempt (`~/fp16-arithmetic`) stopped in the build,** at upstream's web UI step (`llama-ui-assets`), which only `llama-server` needs; the provider's new file had compiled. The step downloads the UI archive named after the build number (`b10646`, which does not exist for a fork's count), falls back to upstream's `latest`, and embeds it. `latest` now holds a newer UI (`_app/immutable/...`) than this tree's `llama-ui-embed` expects (`bundle[hash].js`, `bundle[hash].css`, `workbox[hash].js`), so the embed fails: "missing required asset(s)". The two builds of the same morning passed; upstream's archive changed in between (inferred from the two logs, not looked up). Until the tree is rebased or the step is configured away, `llama-server` cannot be rebuilt on the board; its binary there is build `196eb4aaf`'s. The retry built the named targets without it (rc 0, 22 steps).
+
+**The check program** passes with the device under `int8` and under `f16` (0 FAIL lines, the two outputs the same bytes; the new check's 323 points among them). The loader line reads `tcm 393216 per tile`: 384 KiB on this unit too.
+
+**The default did not move** (one run, `-r 3`): pp4 23.60, pp32 63.23, pp128 88.77, pp501 100.40, tg64 10.29 t/s. All are 1 to 2% above section 12's reference (pp501 98.71 to 99.39 over four runs); one run, not repeated, and nothing in the int8 path changed, so it is read as the session's drift. Its KLD file is the default's of section 12 line for line apart from the time estimate.
+
+**The shapes of the five dense Q4_0 weights** (from the stats file's counts per shape and the op table's time per matmul; 92 a graph):
+
+| weight | matmuls a graph | K | N |
+|---|---|---|---|
+| `attn_qkv` | 30 | 2,048 | 8,192 |
+| `attn_q` | 6 | 2,048 | 8,192 |
+| `attn_gate` | 30 | 2,048 | 4,096 |
+| `ssm_out` | 16 | 4,096 | 2,048 |
+| `attn_output` | 10 | 4,096 | 2,048 |
+
+The stats file gives 36 matmuls at [2,048, 8,192], 30 at [2,048, 4,096] and 26 at [4,096, 2,048]; which name has which is from the times (`attn_qkv` and `attn_q` 2.39 s a matmul on the scalar code, the other three 1.19 to 1.20 s).
+
+**The values.** Over the KLD run's 736 matmuls (8 graphs of 512 rows): largest activation 58.13 (`blk.20.attn_qkv`), largest partial sum 22.57 (`blk.38.attn_qkv`), no overflow. fp16 holds 65,504, so the margin is three orders of magnitude on this text.
+
+**Accuracy, 8 chunks against `~/kld-wiki/base-8.bin`.**
+
+| | mean KLD | median | 99.9% | maximum | same top token |
+|---|---|---|---|---|---|
+| `int8` (the default) | 0.007150 +- 0.000383 | 0.002594 | 0.187847 | 0.315684 | 97.304 +- 0.359% |
+| `f16` | 0.006329 +- 0.000342 | 0.002324 | 0.192597 | 0.326131 | 97.598 +- 0.339% |
+| `f16`, partials as f32 | 0.006655 +- 0.000376 | 0.002328 | 0.205979 | 0.345795 | 97.108 +- 0.371% |
+
+- The rule's bound is `int8`'s mean plus its error bar, 0.007533. `f16` is at 0.006329 and `f16` with f32 partials at 0.006655: both hold.
+- `f16` is 11.5% below `int8`, 2.1 of its error bars; the mean and the median are lower, the maximum and the 99.9% point slightly higher. The runs score the same tokens, so the bars are not independent; no test of the difference was made.
+- Storing the partials as fp16 costs nothing that shows: that arm is the lower of the two FP16 arms, by less than one error bar. It is not shown to be better.
+- The completion of the 501-token prompt under `f16` is the float run's text, byte for byte; 1 graph split.
+- FP16 arithmetic of this kind is not what costs the fork its accuracy. The first two chunks inside this run score 0.00296 under `f16` (0.00375 under `int8`); the fork scored 0.021611 on those two chunks alone (section 11). What in the fork's path differs from ours (its dequantization, its other lossy paths) is not isolated.
+
+**Speed is the scalar code's and means nothing:** one 501-token graph 163.7 s (3.06 t/s), the products step 152.7 s and the sum step 7.2 s of it; a KLD arm about 21 minutes.
+
+**Verdict by the rule:** holds, with fp16 partials. Stage 2 (the kernels, the plain route) follows as specified.
