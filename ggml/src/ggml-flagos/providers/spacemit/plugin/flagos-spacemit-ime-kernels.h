@@ -4,11 +4,12 @@
 // layouts, all with 32 rows interleaved:
 // - "q4_0 32x256" (Q4_0): K in blocks of 256; activations quantized to int8 with fp16 scales per 32 values and a
 //   block scale ("hp"). Lossless: a byte permutation of the GGUF blocks.
-// - "q8_0 32x32" (Q8_0, Q4_1, Q6_K, Q5_0): K in blocks of 32, each [fp16 scale x 32][int8 x 32 x 32] (34 bytes per
-//   row and block); activations quantized to int8 with an fp32 scale and the negated sum per 32 values ("i8"). From
-//   Q8_0 lossless (a byte permutation); from Q4_1 and Q6_K requantized at load, per 32 values scale = max|w| / 127
-//   (stored in fp16), so each weight moves by about half a Q8_0 step at most (20 and 26.25 bytes per 32 weights become
-//   34); from Q5_0 exactly, its scale kept and qs = q - 16 (22 bytes per 32 weights become 34).
+// - "q8_0 32x32" (Q8_0, Q4_1, Q6_K, Q5_0, the F32 router): K in blocks of 32, each [fp16 scale x 32][int8 x 32 x 32]
+//   (34 bytes per row and block); activations quantized to int8 with an fp32 scale and the negated sum per 32 values
+//   ("i8"). From Q8_0 lossless (a byte permutation); from Q4_1, Q6_K and F32 quantized at load, per 32 values scale =
+//   max|w| / 127 (stored in fp16), so each weight moves by about half a Q8_0 step at most (20 and 26.25 bytes per 32
+//   weights become 34; F32's 128 become 34); from Q5_0 exactly, its scale kept and qs = q - 16 (22 bytes per 32 weights
+//   become 34).
 // - "q4_1 min 32x256" (3-D Q4_1 experts): each 32-row tile is the q4_0 32x256
 //   form of the Q4_1 d and nibbles, then the tile's fp16 minimums, [K/32 block][32 rows]. A weight d q + m is
 //   d (q - 8) + (m + 8 d): the q4_0 kernels give the first part, q4_1_min_gemm adds the second. Lossless, 20 bytes per
@@ -138,5 +139,10 @@ void unpack_q4_1_min(const ggml_tensor * t, void * data);
 // Q4_0 in the q4_0s layout, exactly both ways: repack_q4_0 and the nibble bytes ^ 0x88; unpack restores the GGUF bytes
 int  repack_q4_0s(ggml_tensor * t, const void * data, size_t size);
 void unpack_q4_0s(const ggml_tensor * t, void * data);
+// F32 quantized to Q8_0 by ggml's quantizer in the q8_0 32x32 layout: repack writes
+// nrows * q8_0_weight_row_bytes(ne[0]) bytes, less than ggml_nbytes(t); unpack returns the stored values d * qs as
+// floats (approximate)
+int  repack_f32_q8_0(ggml_tensor * t, const void * data, size_t size);
+void unpack_f32_q8_0(const ggml_tensor * t, void * data);
 
 }  // namespace spacemit_ime

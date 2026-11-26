@@ -91,6 +91,7 @@ const mm_format & mm_format_of(const ggml_tensor * w) {
         case spacemit_layout::q8_0_32x32:
         case spacemit_layout::q6_k_q8_0_32x32:
         case spacemit_layout::q5_0_q8_0_32x32:
+        case spacemit_layout::f32_q8_0_32x32:
             return k_q8_0_32x32;
         case spacemit_layout::plain:
             break;

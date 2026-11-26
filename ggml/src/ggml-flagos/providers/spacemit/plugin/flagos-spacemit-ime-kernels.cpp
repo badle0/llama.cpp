@@ -3040,10 +3040,30 @@ void unpack_q6_k(const ggml_tensor * t, void * data) {
     }
 }
 
-// flagos: Q4_1 weights requantized to Q8_0 by ggml's own quantizer (per 32 values d = max|w| / 127, q = round(w / d);
-// quantize_row_q8_0_ref), then stored in the q8_0 32x32 layout as repack_q8_0_to_q8_0_32_bl_ref stores Q8_0. Each
-// weight moves by at most half a Q8_0 step, where the q4_1 32x32 layout moves every weight of a block by its minimum's
-// rounding to a whole Q4_1 step (fusion-and-splitting.md §7.3, 2026-10-23). 32 rows at a time
+// flagos: nr (at most 32) rows of k floats quantized to Q8_0 by ggml's own quantizer (per 32 values d = max|w| / 127,
+// q = round(w / d); quantize_row_q8_0_ref) into q8 (32 * k / QK8_0 blocks), then stored as one 32-row group of the q8_0
+// 32x32 layout as repack_q8_0_to_q8_0_32_bl_ref stores Q8_0, the rows past nr zero. Returns the next group
+static block_q8_0x32 * quantize_q8_0_group(const float * rows, int64_t nr, int64_t k, block_q8_0 * q8,
+                                           block_q8_0x32 * dst) {
+    const int64_t nblocks = k / QK8_0;
+    block_q8_0    group[32];
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, rows, q8, 0, nr, k, nullptr);
+    for (int64_t x = 0; x < nblocks; x++) {
+        int64_t i = 0;
+        for (; i < nr; i++) {
+            group[i] = q8[x + i * nblocks];
+        }
+        for (; i < 32; i++) {
+            std::memset(&group[i], 0, sizeof(block_q8_0));
+        }
+        *dst++ = make_block_q8_0x32(group, 32);
+    }
+    return dst;
+}
+
+// flagos: Q4_1 weights requantized to Q8_0 by ggml's own quantizer (quantize_q8_0_group). Each weight moves by at most
+// half a Q8_0 step, where the q4_1 32x32 layout moves every weight of a block by its minimum's rounding to a whole Q4_1
+// step (fusion-and-splitting.md section 7.3, 2026-10-23). 32 rows at a time
 int repack_q4_1_q8_0(ggml_tensor * t, const void * data, size_t size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_1);
     const int64_t nrow    = ggml_nrows(t);
@@ -3057,24 +3077,53 @@ int repack_q4_1_q8_0(ggml_tensor * t, const void * data, size_t size) {
     block_q8_0x32 *         dst      = static_cast<block_q8_0x32 *>(t->data);
     std::vector<float>      rows((size_t) (32 * k));
     std::vector<block_q8_0> q8((size_t) (32 * nblocks));
-    block_q8_0              group[32];
 
     for (int64_t b = 0; b < nrow; b += 32) {
         const int64_t nr = std::min<int64_t>(32, nrow - b);
         ggml_get_type_traits(GGML_TYPE_Q4_1)->to_float(src + b * row_size, rows.data(), nr * k);
-        ggml_quantize_chunk(GGML_TYPE_Q8_0, rows.data(), q8.data(), 0, nr, k, nullptr);
-        for (int64_t x = 0; x < nblocks; x++) {
-            int64_t i = 0;
-            for (; i < nr; i++) {
-                group[i] = q8[x + i * nblocks];
-            }
-            for (; i < 32; i++) {
-                std::memset(&group[i], 0, sizeof(block_q8_0));
-            }
-            *dst++ = make_block_q8_0x32(group, 32);
-        }
+        dst = quantize_q8_0_group(rows.data(), nr, k, q8.data(), dst);
     }
     return 0;
+}
+
+// flagos: the F32 MoE router weight quantized to Q8_0 at load, as SpacemiT's fork does (ggml-spacemit repack.cpp
+// repack_f32_to_q8_0_32: quantize_row_q8_0_ref per row, then the q8_0 32x32 layout). 32 rows at a time
+int repack_f32_q8_0(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t k       = t->ne[0];
+    const int64_t nblocks = k / QK8_0;
+    if (k % QK8_0 != 0 || size != ggml_nbytes(t)) {
+        return -1;
+    }
+    const float *           src = static_cast<const float *>(data);
+    block_q8_0x32 *         dst = static_cast<block_q8_0x32 *>(t->data);
+    std::vector<block_q8_0> q8((size_t) (32 * nblocks));
+
+    for (int64_t b = 0; b < nrow; b += 32) {
+        dst = quantize_q8_0_group(src + b * k, std::min<int64_t>(32, nrow - b), k, q8.data(), dst);
+    }
+    return 0;
+}
+
+// flagos: the stored Q8_0 values d * qs as floats in ggml's row order, as ggml's dequantize_row_q8_0 gives them
+void unpack_f32_q8_0(const ggml_tensor * t, void * data) {
+    const block_q8_0x32 * src  = static_cast<const block_q8_0x32 *>(t->data);
+    float *               dst  = static_cast<float *>(data);
+    const int64_t         nrow = ggml_nrows(t);
+    const int64_t         k    = t->ne[0];
+
+    for (int64_t b = 0; b < nrow; b += 32) {
+        const int64_t nr = std::min<int64_t>(32, nrow - b);
+        for (int64_t x = 0; x < k / QK8_0; x++, src++) {
+            for (int64_t i = 0; i < nr; i++) {
+                const float d = GGML_FP16_TO_FP32(src->d[i]);
+                for (int64_t j = 0; j < QK8_0; j++) {
+                    dst[(b + i) * k + x * QK8_0 + j] = d * (float) (int8_t) src->qs[i * QK8_0 + j];
+                }
+            }
+        }
+    }
 }
 
 // flagos: as unpack_q6_k, the requantization cannot be undone: Q4_1 cannot express the stored Q8_0 values, so this

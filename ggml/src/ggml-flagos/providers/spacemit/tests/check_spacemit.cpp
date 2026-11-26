@@ -5149,6 +5149,7 @@ static moe_op_result moe_op_run(ggml_backend_dev_t dev, ggml_backend_t backend, 
 }
 
 static int check_moe_ops(ggml_backend_dev_t dev) {
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", nullptr);  // the F32 matmul path: its weights carry the router's name
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -5842,6 +5843,7 @@ static std::string mm_f32_what(const mm_f32_shape & s) {
 }
 
 static int check_seq_ops(ggml_backend_dev_t dev) {
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", nullptr);  // the F32 matmul path: its weights carry the router's name
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -6420,7 +6422,260 @@ static std::vector<uint8_t> mm_f32_out(const ggml_tensor * y) {
     return b;
 }
 
+// FLAGOS_SPACEMIT_ROUTER=q8 (SpacemiT's fork's router route): the F32 MoE router weight quantized to Q8_0 at load in
+// the q8_0 32x32 layout. Checked: the rule by the plugin's layout answers (only q8, only the router's name, 2-D, rows
+// % 32, K % 32; another type keeps its layout; a bad value warns once and keeps plain; the alloc size ggml_nbytes);
+// the read-back is ggml's Q8_0 of the floats dequantized, bit for bit, whole and in part, small and split over the
+// repack's ranges; MUL_MAT at 1, 4, 32 and 129 rows (without and with TCM) claimed by the two 8-bit steps, the bytes
+// of the same graph on a Q8_0 weight of ggml's Q8_0 of the floats, within the MUL_MAT bound of the CPU on the floats;
+// unset, mul_mat.f32 within that bound; the core's guard: no contract but MUL_MAT's weight reads the router under q8
+static int check_router_q8(ggml_backend_dev_t dev) {
+    const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    REQUIRE(table != nullptr);
+    uint32_t                       n_kernels = 0;
+    const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
+    REQUIRE(kernels != nullptr);
+    const auto entry = [&](const char * name) -> const spacemit_plugin_kernel * {
+        for (uint32_t k = 0; k < n_kernels; k++) {
+            if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
+                return &kernels[k];
+            }
+        }
+        return nullptr;
+    };
+    const spacemit_plugin_kernel * k_quantize = entry("mul_mat.quantize");
+    const spacemit_plugin_kernel * k_gemm     = entry("mul_mat.gemm");
+    const spacemit_plugin_kernel * k_f32      = entry("mul_mat.f32");
+    REQUIRE(k_quantize != nullptr && k_gemm != nullptr && k_f32 != nullptr);
+    spacemit_ops ops;
+    std::string  detail;
+    REQUIRE(spacemit_ops_bind(table, &ops, &detail));
+    const ggml_backend_buffer_type_t buft   = ggml_backend_dev_buffer_type(dev);
+    const char *                     router = "blk.0.ffn_gate_inp.weight";
+
+    int        n_checks = 0, n_ok = 0;
+    const auto expect   = [&](bool ok, const std::string & what) {
+        n_checks++;
+        n_ok += ok;
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: router q8, %s\n", what.c_str());
+            g_failures++;
+        }
+        return ok;
+    };
+    // ggml's Q8_0 of n rows of k floats, dequantized
+    const auto q8_values = [](const std::vector<float> & v, int64_t k, int64_t n) {
+        std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q8_0, k) * n);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, v.data(), q.data(), 0, n, k, nullptr);
+        return dequantize(GGML_TYPE_Q8_0, q);
+    };
+
+    // A. the rule
+    uint32_t router_layout = 0;
+    for (const char * setting : { (const char *) nullptr, "", "f32", "q8", "x" }) {
+        env_override     sw("FLAGOS_SPACEMIT_ROUTER", setting);
+        log_capture      log;
+        const bool       q8  = setting != nullptr && std::strcmp(setting, "q8") == 0;
+        const std::string at = std::string("FLAGOS_SPACEMIT_ROUTER=") + (setting != nullptr ? setting : "(unset)");
+        ggml_init_params p   = { ggml_tensor_overhead() * 16, nullptr, true };
+        ggml_context *   ctx = ggml_init(p);
+        REQUIRE(ctx != nullptr);
+        const auto named = [&](ggml_tensor * t, const char * name) {
+            ggml_set_name(t, name);
+            return t;
+        };
+        ggml_tensor *  w      = named(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32), router);
+        const uint32_t l      = table->tensor_layout(w);
+        const uint32_t l_again = table->tensor_layout(w);
+        expect(q8 ? l != 0 && l_again == l : l == 0 && l_again == 0, at + ": the router's layout " + std::to_string(l));
+        expect(ggml_backend_buft_get_alloc_size(buft, w) == ggml_nbytes(w), at + ": the alloc size is not ggml_nbytes");
+        if (q8) {
+            router_layout = l;
+        }
+        const struct {
+            ggml_tensor * t;
+            const char *  what;
+        } plain[] = {
+            { named(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32), "blk.0.ffn_gate_inp_shexp.weight"), "shexp" },
+            { named(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32), "blk.0.ffn_gate_inp"), "a name without .weight" },
+            { named(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32), "blk.0.ssm_alpha.weight"), "ssm_alpha" },
+            { named(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 48, 32), router), "[48, 32]" },
+            { named(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 31), router), "[64, 31]" },
+            { named(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 32, 2), router), "[64, 32, 2]" },
+        };
+        for (const auto & c : plain) {
+            expect(table->tensor_layout(c.t) == 0, at + ": " + c.what + " has layout " +
+                                                       std::to_string(table->tensor_layout(c.t)));
+        }
+        ggml_tensor *  w8         = named(ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 32), router);
+        const uint32_t q8_0_named = table->tensor_layout(w8);
+        const uint32_t q8_0_other = table->tensor_layout(ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 32));
+        expect(q8_0_named != 0 && q8_0_named == q8_0_other && (!q8 || q8_0_named != l),
+               at + ": a Q8_0 weight under the router's name has layout " + std::to_string(q8_0_named));
+        const int warnings = count_lines_with(log.take(), "FLAGOS_SPACEMIT_ROUTER=");
+        const int want     = setting != nullptr && std::strcmp(setting, "x") == 0 ? 1 : 0;
+        expect(warnings == want, at + ": " + std::to_string(warnings) + " warnings, not " + std::to_string(want));
+        ggml_free(ctx);
+    }
+
+    // B. the round trip: whole and partial reads, small (one thread) and split over the repack's ranges
+    uint64_t big_ranges = 0;
+    uint32_t seed       = 7100;
+    for (const std::array<int64_t, 2> & s : std::vector<std::array<int64_t, 2>>{ { 256, 64 }, { 2048, 256 } }) {
+        env_override     sw("FLAGOS_SPACEMIT_ROUTER", "q8");
+        const std::string at  = "[" + std::to_string(s[0]) + ", " + std::to_string(s[1]) + "]";
+        ggml_init_params p   = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   ctx = ggml_init(p);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s[0], s[1]);
+        ggml_set_name(w, router);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        REQUIRE(buf != nullptr);
+        const std::vector<float> v    = random_values(s[0] * s[1], seed++, 1.0f);
+        const std::vector<float> want = q8_values(v, s[0], s[1]);
+        std::vector<float>       read(v.size()), part(300);
+        uint64_t                 threaded = 0, ranges = 0;
+        g_repack_take(&threaded, &ranges);
+        ggml_backend_tensor_set(w, v.data(), 0, ggml_nbytes(w));
+        g_repack_take(&threaded, &ranges);
+        const bool big = ggml_nbytes(w) >= ((size_t) 1 << 20);
+        expect(table->tensor_layout(w) == router_layout && router_layout != 0, at + ": not in the router's layout");
+        expect(big ? threaded == 1 && ranges >= 2 : threaded == 0,
+               at + ": " + std::to_string(threaded) + " threaded repacks of " + std::to_string(ranges) + " ranges");
+        if (big) {
+            big_ranges = ranges;
+        }
+        ggml_backend_tensor_get(w, read.data(), 0, ggml_nbytes(w));
+        expect(std::memcmp(read.data(), want.data(), ggml_nbytes(w)) == 0,
+               at + ": the read-back is not ggml's Q8_0 of the floats");
+        const size_t at_byte = ggml_nbytes(w) / 3 + 4 * 37;
+        ggml_backend_tensor_get(w, part.data(), at_byte, part.size() * sizeof(float));
+        expect(std::memcmp(part.data(), reinterpret_cast<const uint8_t *>(want.data()) + at_byte,
+                           part.size() * sizeof(float)) == 0,
+               at + ": a partial read is not that part of ggml's Q8_0 of the floats");
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // C. MUL_MAT: y = W x with x in a CPU buffer and y in ours, through be (nullptr: the CPU backend, y in a CPU
+    // buffer); got is the contract spacemit_find_op chose
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    const auto mm = [&](ggml_backend_t be, ggml_tensor * w, const std::vector<float> & xv, int64_t m,
+                        std::vector<float> & out, const spacemit_op ** got) {
+        ggml_init_params p  = { ggml_tensor_overhead() * 2 + ggml_graph_overhead(), nullptr, true };
+        ggml_context *   ch = ggml_init(p);
+        ggml_context *   cd = ggml_init(p);
+        ggml_tensor *    x  = ggml_new_tensor_2d(ch, GGML_TYPE_F32, w->ne[0], m);
+        ggml_tensor *    y  = ggml_mul_mat(cd, w, x);
+        ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ch, ggml_backend_cpu_buffer_type());
+        ggml_backend_buffer_t bd =
+            ggml_backend_alloc_ctx_tensors_from_buft(cd, be != nullptr ? buft : ggml_backend_cpu_buffer_type());
+        bool ok = bh != nullptr && bd != nullptr;
+        if (ok) {
+            ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+            if (got != nullptr) {
+                *got = spacemit_find_op(ops, y, buft);
+            }
+            ggml_cgraph * g = ggml_new_graph(cd);
+            ggml_build_forward_expand(g, y);
+            ok = (be == nullptr || ggml_backend_dev_supports_op(dev, y)) &&
+                 ggml_backend_graph_compute(be != nullptr ? be : cpu, g) == GGML_STATUS_SUCCESS;
+            out.assign((size_t) ggml_nelements(y), NAN);
+            ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
+        }
+        ggml_backend_buffer_free(bh);
+        ggml_backend_buffer_free(bd);
+        ggml_free(ch);
+        ggml_free(cd);
+        return ok;
+    };
+    const int64_t            k = 256, n = 64;
+    const std::vector<float> wv = random_values(k * n, seed++, 1.0f);
+    double                   max_q8 = 0.0, max_f32 = 0.0;
+    for (const char * setting : { "q8", (const char *) nullptr }) {
+        env_override      sw("FLAGOS_SPACEMIT_ROUTER", setting);
+        const bool        q8 = setting != nullptr;
+        const std::string at = q8 ? "q8" : "unset";
+        ggml_init_params  p   = { ggml_tensor_overhead() * 3, nullptr, true };
+        ggml_context *    ctx = ggml_init(p);
+        ggml_context *    ctc = ggml_init(p);
+        REQUIRE(ctx != nullptr && ctc != nullptr);
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w8  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, n);
+        ggml_tensor * w_c = ggml_new_tensor_2d(ctc, GGML_TYPE_F32, k, n);
+        ggml_set_name(w, router);
+        ggml_set_name(w_c, router);
+        ggml_backend_buffer_t buf  = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        ggml_backend_buffer_t bufc = ggml_backend_alloc_ctx_tensors_from_buft(ctc, ggml_backend_cpu_buffer_type());
+        REQUIRE(buf != nullptr && bufc != nullptr);
+        std::vector<uint8_t> q8w(ggml_nbytes(w8));
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, wv.data(), q8w.data(), 0, n, k, nullptr);
+        ggml_backend_tensor_set(w, wv.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(w8, q8w.data(), 0, q8w.size());
+        ggml_backend_tensor_set(w_c, wv.data(), 0, ggml_nbytes(w_c));
+        for (bool tcm : { false, true }) {
+            ggml_backend_t be = tcm ? tcm_backend(dev, nullptr) : ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(be != nullptr);
+            for (int64_t m : { (int64_t) 1, (int64_t) 4, (int64_t) 32, (int64_t) 129 }) {
+                const std::string   what = at + (tcm ? ", TCM, " : ", ") + std::to_string(m) + " rows";
+                const std::vector<float> xv = random_values(k * m, seed++, 2.0f);
+                std::vector<float>  out, out8, ref;
+                const spacemit_op * got = nullptr;
+                const bool ran = mm(be, w, xv, m, out, &got) && mm(nullptr, w_c, xv, m, ref, nullptr);
+                const bool two = got != nullptr && got->n_steps == 2 && got->steps[0] == k_quantize &&
+                                 got->steps[1] == k_gemm;
+                const bool one = got != nullptr && got->n_steps == 1 && got->steps[0] == k_f32;
+                expect(ran, what + ": refused or failed");
+                const std::string by = got == nullptr ? "nothing" : got->steps[0]->name;
+                expect(q8 ? two : one, what + ": claimed by " + by);
+                const double e = ran ? nmse(out.data(), ref.data(), (int64_t) out.size()) : HUGE_VAL;
+                expect(e <= k_mul_mat_max_nmse, what + ": NMSE against the CPU " + std::to_string(e));
+                (q8 ? max_q8 : max_f32) = std::max(q8 ? max_q8 : max_f32, e);
+                if (q8) {
+                    expect(mm(be, w8, xv, m, out8, nullptr) && out8.size() == out.size() &&
+                               std::memcmp(out.data(), out8.data(), out.size() * sizeof(float)) == 0,
+                           what + ": not the bytes of the Q8_0 weight");
+                }
+            }
+            ggml_backend_free(be);
+        }
+
+        // D. the core's guard: under q8 only MUL_MAT's weight reads the router; unset, ADD takes it as before
+        ggml_init_params pg = { ggml_tensor_overhead() * 8, nullptr, true };
+        ggml_context *   cg = ggml_init(pg);
+        REQUIRE(cg != nullptr);
+        ggml_tensor * a  = ggml_new_tensor_2d(cg, GGML_TYPE_F32, k, n);
+        ggml_tensor * x4 = ggml_new_tensor_2d(cg, GGML_TYPE_F32, k, 4);
+        expect(ggml_backend_dev_supports_op(dev, ggml_add(cg, w, a)) == !q8, at + ": ADD of the router");
+        if (q8) {
+            expect(!ggml_backend_dev_supports_op(dev, ggml_mul(cg, a, w)), at + ": MUL by the router claimed");
+            expect(!ggml_backend_dev_supports_op(dev, ggml_mul_mat(cg, a, w)), at + ": MUL_MAT with the router as "
+                                                                                   "src[1] claimed");
+            expect(ggml_backend_dev_supports_op(dev, ggml_mul_mat(cg, w, x4)), at + ": MUL_MAT of the router refused");
+        }
+        ggml_free(cg);
+        ggml_backend_buffer_free(buf);
+        ggml_backend_buffer_free(bufc);
+        ggml_free(ctx);
+        ggml_free(ctc);
+    }
+    ggml_backend_free(cpu);
+
+    std::printf("router   FLAGOS_SPACEMIT_ROUTER (unset, empty, f32, q8, x): the F32 router weight in a layout (%u) "
+                "only under q8, not the shexp gate, other names, [48, 32], [64, 31] or 3-D; Q8_0 its own; x warned once; "
+                "alloc ggml_nbytes. q8 read-back ggml's Q8_0 of the floats bit for bit, whole and in part, [256, 64] "
+                "and [2048, 256] (%llu ranges). MUL_MAT [256, 64] by 1, 4, 32 and 129 rows, without and with TCM: q8 "
+                "by mul_mat.quantize and mul_mat.gemm, the bytes of the Q8_0 weight, max NMSE vs the CPU's F32 %.2e; "
+                "unset by mul_mat.f32, max NMSE %.2e (bound %.0e). Guard: ADD, MUL and MUL_MAT src[1] of the q8 "
+                "router refused, MUL_MAT src[0] taken, ADD taken unset: %d/%d\n",
+                router_layout, (unsigned long long) big_ranges, max_q8, max_f32, k_mul_mat_max_nmse, n_ok, n_checks);
+    return 0;
+}
+
 static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", nullptr);  // the F32 matmul path: its weights carry the router's name
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
     uint32_t                       n_kernels = 0;
@@ -12362,7 +12617,7 @@ int main(int argc, char ** argv) {
         check_rows(dev) != 0 || check_embedding(dev) != 0 || check_cache_ops(dev) != 0 ||
         check_state_ops(dev) != 0 || check_mul_mat_id(dev, host, full) != 0 || check_gdn(dev) != 0 ||
         check_state_pass(dev) != 0 || check_seq_ops(dev) != 0 || check_mul_mat_f32_split(dev) != 0 ||
-        check_conv_pair(dev) != 0 || check_moe_ops(dev) != 0 ||
+        check_router_q8(dev) != 0 || check_conv_pair(dev) != 0 || check_moe_ops(dev) != 0 ||
         check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
         check_shared_stream(dev, host) != 0) {

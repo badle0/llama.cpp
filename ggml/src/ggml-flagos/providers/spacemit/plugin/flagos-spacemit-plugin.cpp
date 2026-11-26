@@ -171,6 +171,7 @@ enum spacemit_status plugin_device_open(uint32_t index, spacemit_plugin_device *
     // the plugin's own switch, read at registration: first read in llama.cpp's trial load, its warning would be hidden
     spacemit_flash_attn_read_switch();
     (void) spacemit_expert_q4_0();
+    (void) spacemit_router_q8();
     return SPACEMIT_STATUS_SUCCESS;
 }
 

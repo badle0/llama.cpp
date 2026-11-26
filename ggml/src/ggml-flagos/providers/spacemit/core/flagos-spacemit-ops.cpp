@@ -161,7 +161,8 @@ static constexpr int64_t k_gdn_max_state = 256;
 //   divide H and n_seqs, and they carry every token;
 //   K (the snapshot slots, op_params 0) >= 1 and the output contiguous of ggml_gated_delta_net's shape,
 //   [S_v * H, n_tokens * n_seqs + K * S_v * n_seqs].
-// An F32 tensor never has an IME layout (the layout rule is by type, shape and name), so no layout check here.
+// An F32 tensor in an IME layout (only the MoE router weight, by name) is refused by spacemit_find_op before any
+// contract but MUL_MAT's weight, so no layout check here.
 // Anything else is refused and runs on the CPU
 static bool spacemit_gdn_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 *,
                                        ggml_backend_buffer_type_t) {
@@ -280,10 +281,11 @@ static bool spacemit_cont_f32_supported(const ggml_tensor * op, const spacemit_p
            ggml_nelements(src) == ggml_nelements(op) && table->tensor_layout(op) == 0;
 }
 
-// MUL_MAT of an F32 2-D weight by F32 activations (ssm_alpha and ssm_beta, src/models/qwen35.cpp:362, :369): these
-// weights have no IME layout, so they are stored as the file holds them and read in ggml's layout, in our buffer or in
-// a host buffer. The weight is a tensor of its own, never a view, so a view of an F32 KV cache stays refused; the
-// activations and the output are contiguous, and the weight broadcasts over the activations' higher dimensions
+// MUL_MAT of an F32 2-D weight by F32 activations (ssm_alpha and ssm_beta, src/models/qwen35.cpp:362, :369, and the
+// MoE router by default): a weight without an IME layout, stored as the file holds it and read in ggml's layout, in our
+// buffer or in a host buffer (the router under FLAGOS_SPACEMIT_ROUTER=q8 has one: spacemit_mul_mat_ime_supported). The
+// weight is a tensor of its own, never a view, so a view of an F32 KV cache stays refused; the activations and the
+// output are contiguous, and the weight broadcasts over the activations' higher dimensions
 static bool spacemit_mul_mat_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
                                            ggml_backend_buffer_type_t) {
     const ggml_tensor * w = op->src[0];
@@ -406,9 +408,10 @@ static bool spacemit_swiglu_f32_supported(const ggml_tensor * op, const spacemit
             (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1) && ggml_are_same_shape(src0, src1)));
 }
 
-// a weight in an IME layout (Q4_0 32x256; Q8_0, Q4_1, Q6_K and Q5_0 in q8_0 32x32), read in that layout: so it must
-// sit in our buffer (or be unallocated at placement time), never in a host buffer. The layout comes from the weight's
-// type, shape and name, the plugin's rule through the table (tensor_layout, which answers for a view's storage, so a
+// a weight in an IME layout (Q4_0 32x256; Q8_0, Q4_1, Q6_K, Q5_0 and the F32 router under FLAGOS_SPACEMIT_ROUTER=q8
+// in q8_0 32x32), read in that layout: so it must sit in our buffer (or be unallocated at placement time), never in a
+// host buffer. The layout comes from the weight's type, shape and name, the plugin's rule through the table
+// (tensor_layout, which answers for a view's storage, so a
 // view is excluded here): llama.cpp's cache tensors never have one, so a MUL_MAT never reads a quantized KV cache as a
 // weight. The answer must not depend on the row count: llama.cpp asks once per weight, at load, with 512 rows
 // (plan.md M2b design). A 3-D weight may have a layout (MUL_MAT_ID's experts) but is never a MUL_MAT weight here
@@ -614,6 +617,18 @@ const spacemit_op * spacemit_find_op(const spacemit_ops & ops, const ggml_tensor
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] != nullptr && !spacemit_buffer_usable(op->src[i], own_buft)) {
+            return nullptr;
+        }
+    }
+    // an F32 tensor in an IME layout (the router under FLAGOS_SPACEMIT_ROUTER=q8) is read only as a MUL_MAT weight;
+    // every other contract reads F32 as ggml stores it. tensor_layout answers for a view's storage
+    if (op->type == GGML_TYPE_F32 && ops.table->tensor_layout(op) != 0) {
+        return nullptr;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_tensor * src = op->src[i];
+        if (src != nullptr && src->type == GGML_TYPE_F32 && ops.table->tensor_layout(src) != 0 &&
+            !(op->op == GGML_OP_MUL_MAT && i == 0)) {
             return nullptr;
         }
     }

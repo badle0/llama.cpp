@@ -58,10 +58,48 @@ int expert_q4_0_from_env() {
     return spacemit_cached_switch(value, seen, parse_expert_q4_0);
 }
 
+// FLAGOS_SPACEMIT_ROUTER: how the F32 MoE router weight is stored. f32, unset or empty (the default): plain, run by
+// mul_mat.f32. q8: quantized to Q8_0 at load in the q8_0 32x32 layout and run by the 8-bit matmul, as SpacemiT's fork
+// does. Parsed once (spacemit_cached_switch); anything else warns once per parse generation and keeps the default. As
+// FLAGOS_SPACEMIT_EXPERT_Q4_0, a process must not change it after its first weight
+int parse_router() {
+    const char * v = std::getenv("FLAGOS_SPACEMIT_ROUTER");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "f32") == 0) {
+        return 0;
+    }
+    if (std::strcmp(v, "q8") == 0) {
+        return 1;
+    }
+    static std::atomic<uint32_t> warned_in{ 0 };
+    const uint32_t               generation = spacemit_switches_generation();
+    if (warned_in.exchange(generation) != generation) {
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ROUTER=%s: not f32 or q8, the default (f32) kept\n", __func__, v);
+    }
+    return 0;
+}
+
+int router_from_env() {
+    static std::atomic<int>      value{ 0 };
+    static std::atomic<uint32_t> seen{ 0 };
+    return spacemit_cached_switch(value, seen, parse_router);
+}
+
+// the MoE router weight as SpacemiT's fork recognizes it: a name containing ffn_gate_inp, not shexp (the shared
+// expert's gate), ending in .weight
+bool is_router_name(const char * name) {
+    const size_t n = std::strlen(name);
+    return std::strstr(name, "ffn_gate_inp") != nullptr && std::strstr(name, "shexp") == nullptr && n > 7 &&
+           std::strcmp(name + n - 7, ".weight") == 0;
+}
+
 }  // namespace
 
 uint32_t spacemit_expert_q4_0() {
     return (uint32_t) expert_q4_0_from_env();
+}
+
+uint32_t spacemit_router_q8() {
+    return (uint32_t) router_from_env();
 }
 
 // a 3-D tensor (MUL_MAT_ID's experts, [K, N, n_expert]) is stored as its ggml_nrows rows in 32-row groups, each
@@ -69,7 +107,8 @@ uint32_t spacemit_expert_q4_0() {
 // only: the requantization's read-back is the nearest Q4_1, on which test-backend-ops' MUL_MAT_ID cases fail under
 // imatrix quantization (NMSE about 6e-4 against 5e-4). A 3-D Q4_1 weight takes the q4_1 min layout (lossless). A 3-D
 // Q4_0 weight takes the q4_0s layout
-// (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain), a 2-D one never
+// (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain), a 2-D one never. An F32 tensor only as the router under
+// FLAGOS_SPACEMIT_ROUTER=q8 (2-D)
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[3] != 1 ||
         !ggml_is_contiguous(t) || spacemit_is_cache_name(t->name)) {
@@ -94,18 +133,27 @@ spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_Q5_0 && t->ne[0] % spacemit_ime::q8_0_k_block == 0) {  // always true for Q5_0
         return spacemit_layout::q5_0_q8_0_32x32;
     }
+    if (t->type == GGML_TYPE_F32 && t->ne[2] == 1 && t->ne[0] % spacemit_ime::q8_0_k_block == 0 &&
+        router_from_env() != 0 && is_router_name(t->name)) {
+        return spacemit_layout::f32_q8_0_32x32;
+    }
     return spacemit_layout::plain;
 }
 
-// the layouts requantized to Q8_0 at load: reads give the nearest weight of the tensor's type, writes must be whole
+// the layouts quantized or requantized to Q8_0 at load: reads give the nearest weight of the tensor's type (the F32
+// router: the stored values), writes must be whole
 static bool spacemit_requantized(spacemit_layout layout) {
-    return layout == spacemit_layout::q4_1_q8_0_32x32 || layout == spacemit_layout::q6_k_q8_0_32x32;
+    return layout == spacemit_layout::q4_1_q8_0_32x32 || layout == spacemit_layout::q6_k_q8_0_32x32 ||
+           layout == spacemit_layout::f32_q8_0_32x32;
 }
 
 static_assert(spacemit_ime::q4_1_min_weight_row_bytes(256) == 256 / 32 * 20, "the q4_1 min layout is Q4_1's size");
 
 size_t spacemit_weight_alloc_size(const ggml_tensor * t) {
     const spacemit_layout layout = spacemit_weight_layout(t);
+    if (layout == spacemit_layout::f32_q8_0_32x32) {  // F32 is larger than its Q8_0; the size ignores the switch
+        return ggml_nbytes(t);
+    }
     if (spacemit_requantized(layout) || layout == spacemit_layout::q5_0_q8_0_32x32) {
         return (size_t) ggml_nrows(t) * spacemit_ime::q8_0_weight_row_bytes((size_t) t->ne[0]);
     }
@@ -158,6 +206,8 @@ int spacemit_repack(spacemit_layout layout, ggml_tensor * t, const void * data, 
             return spacemit_ime::repack_q4_1_min(t, data, size);
         case spacemit_layout::q4_0s_32x256:
             return spacemit_ime::repack_q4_0s(t, data, size);
+        case spacemit_layout::f32_q8_0_32x32:
+            return spacemit_ime::repack_f32_q8_0(t, data, size);
         case spacemit_layout::plain:
             break;
     }
@@ -225,7 +275,8 @@ static void spacemit_pack(ggml_tensor * t, const void * data) {
     }
 
     // a weight layout has ne[1] % 32 == 0, ne[3] == 1 and no view; each range's stand-in is a 2-D tensor of its rows.
-    // The Q8_0 layouts store 34 bytes per 32 weights, Q4_0's (both) and the q4_1 min layout their own row size
+    // The Q8_0 layouts (the F32 router's too) store 34 bytes per 32 weights, Q4_0's (both) and the q4_1 min layout
+    // their own row size
     const size_t src_row = ggml_row_size(t->type, t->ne[0]);
     const size_t dst_row = layout == spacemit_layout::q4_0_32x256 || layout == spacemit_layout::q4_0s_32x256 ||
                                    layout == spacemit_layout::q4_1_min_32x256 ?
@@ -306,19 +357,22 @@ static void spacemit_unpack(const ggml_tensor * t, void * data) {
         case spacemit_layout::q4_0s_32x256:
             spacemit_ime::unpack_q4_0s(t, data);
             return;
+        case spacemit_layout::f32_q8_0_32x32:
+            spacemit_ime::unpack_f32_q8_0(t, data);
+            return;
         case spacemit_layout::plain:
             break;
     }
     GGML_ABORT("tensor has no IME layout");
 }
 
-// a partial write into a lossy layout goes through the read-back of the whole tensor. Requantized to Q8_0 (Q4_1, Q6_K):
-// the read-back is approximate, so writing it back would requantize every block the write leaves alone; only a write
-// of the whole tensor is allowed. llama.cpp writes weights whole on this device.
+// a partial write into a lossy layout goes through the read-back of the whole tensor. Quantized to Q8_0 (Q4_1, Q6_K,
+// the F32 router): the read-back is approximate, so writing it back would requantize every block the write leaves
+// alone; only a write of the whole tensor is allowed. llama.cpp writes weights whole on this device.
 static void spacemit_check_partial(const ggml_tensor * base, size_t offset, size_t size) {
     const spacemit_layout layout = spacemit_weight_layout(base);
     GGML_ASSERT((!spacemit_requantized(layout) || (offset == 0 && size == ggml_nbytes(base))) &&
-                "a partial write to a Q4_1 or Q6_K weight must cover the whole tensor");
+                "a partial write to a weight quantized to Q8_0 at load must cover the whole tensor");
 }
 
 spacemit_layout spacemit_storage_layout(const ggml_tensor * t) {
