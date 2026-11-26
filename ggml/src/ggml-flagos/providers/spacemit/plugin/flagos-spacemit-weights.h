@@ -23,7 +23,7 @@ enum class spacemit_layout {
     q4_0s_32x256,     // 3-D Q4_0 MUL_MAT_ID weights (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain): the q4_0 32x256 bytes
                       // with every nibble byte ^ 0x88, signed nibbles q - 8 for SpacemiT's fork's kernels (lossless,
                       // same size; reads restore the GGUF bytes)
-    f32_q8_0_32x32,   // the F32 MoE router weight under FLAGOS_SPACEMIT_ROUTER=q8, quantized to Q8_0 by ggml's
+    f32_q8_0_32x32,   // the F32 MoE router weight (unless FLAGOS_SPACEMIT_ROUTER=f32), quantized to Q8_0 by ggml's
                       // quantizer at load and stored in the q8_0 32x32 layout, as SpacemiT's fork does (lossy; reads
                       // give the stored values d x qs as floats). The allocation stays ggml_nbytes; the packed bytes
                       // use the first 34/128 of it
@@ -35,8 +35,8 @@ enum class spacemit_layout {
 // one 2-D weight's are, so each expert's rows start at a 32-row group; a 3-D Q4_1 tensor takes the q4_1 min layout
 // (2-D Q4_1 keeps the Q8_0 route); a 3-D Q4_0 tensor
 // takes the q4_0s layout unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain (2-D Q4_0 keeps q4_0 32x256). An F32 tensor has a
-// layout only under FLAGOS_SPACEMIT_ROUTER=q8: 2-D, ne[0] % 32 == 0, named *ffn_gate_inp*.weight without shexp (the
-// MoE router weight) takes f32_q8_0_32x32. A 4-D tensor never has a layout.
+// layout only as the router, unless FLAGOS_SPACEMIT_ROUTER=f32: 2-D, ne[0] % 32 == 0, named *ffn_gate_inp*.weight
+// without shexp (the MoE router weight) takes f32_q8_0_32x32. A 4-D tensor never has a layout.
 // A view is stored the way its view_src is; it never has a layout of its own. llama.cpp's cache tensors (named
 // cache_k_, cache_v_, cache_r_ and cache_s_ before allocation) always keep ggml's layout, whatever their type and shape,
 // as they are written row by row (SET_ROWS, CPY, the context shift's ROPE).
@@ -63,9 +63,9 @@ void spacemit_tensor_fill(ggml_tensor * t, uint8_t value, size_t offset, size_t 
 // 32x256 and the kernels before it, the fallback). Read at registration too, so a bad value's warning shows
 uint32_t spacemit_expert_q4_0();
 
-// FLAGOS_SPACEMIT_ROUTER as parsed: 0 f32 (unset, empty or f32, the default: the F32 router weight stays plain, run by
-// mul_mat.f32), 1 q8 (the f32_q8_0_32x32 layout, run by the 8-bit matmul steps). Read at registration too, so a bad
-// value's warning shows
+// FLAGOS_SPACEMIT_ROUTER as parsed: 1 q8 (unset, empty or q8, the default: the F32 router weight in the
+// f32_q8_0_32x32 layout, run by the 8-bit matmul steps), 0 f32 (the plain path, run by mul_mat.f32, the way back). Read
+// at registration too, so a bad value's warning shows
 uint32_t spacemit_router_q8();
 
 // test-only: the repacks since the last call that ran on several threads (on either route), and the most ranges one of

@@ -282,8 +282,8 @@ static bool spacemit_cont_f32_supported(const ggml_tensor * op, const spacemit_p
 }
 
 // MUL_MAT of an F32 2-D weight by F32 activations (ssm_alpha and ssm_beta, src/models/qwen35.cpp:362, :369, and the
-// MoE router by default): a weight without an IME layout, stored as the file holds it and read in ggml's layout, in our
-// buffer or in a host buffer (the router under FLAGOS_SPACEMIT_ROUTER=q8 has one: spacemit_mul_mat_ime_supported). The
+// MoE router under FLAGOS_SPACEMIT_ROUTER=f32): a weight without an IME layout, stored as the file holds it and read in
+// ggml's layout, in our buffer or in a host buffer (the router has one by default: spacemit_mul_mat_ime_supported). The
 // weight is a tensor of its own, never a view, so a view of an F32 KV cache stays refused; the activations and the
 // output are contiguous, and the weight broadcasts over the activations' higher dimensions
 static bool spacemit_mul_mat_f32_supported(const ggml_tensor * op, const spacemit_plugin_v1 * table,
@@ -408,7 +408,7 @@ static bool spacemit_swiglu_f32_supported(const ggml_tensor * op, const spacemit
             (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1) && ggml_are_same_shape(src0, src1)));
 }
 
-// a weight in an IME layout (Q4_0 32x256; Q8_0, Q4_1, Q6_K, Q5_0 and the F32 router under FLAGOS_SPACEMIT_ROUTER=q8
+// a weight in an IME layout (Q4_0 32x256; Q8_0, Q4_1, Q6_K, Q5_0 and the F32 router unless FLAGOS_SPACEMIT_ROUTER=f32
 // in q8_0 32x32), read in that layout: so it must sit in our buffer (or be unallocated at placement time), never in a
 // host buffer. The layout comes from the weight's type, shape and name, the plugin's rule through the table
 // (tensor_layout, which answers for a view's storage, so a
@@ -620,7 +620,7 @@ const spacemit_op * spacemit_find_op(const spacemit_ops & ops, const ggml_tensor
             return nullptr;
         }
     }
-    // an F32 tensor in an IME layout (the router under FLAGOS_SPACEMIT_ROUTER=q8) is read only as a MUL_MAT weight;
+    // an F32 tensor in an IME layout (the router unless FLAGOS_SPACEMIT_ROUTER=f32) is read only as a MUL_MAT weight;
     // every other contract reads F32 as ggml stores it. tensor_layout answers for a view's storage
     if (op->type == GGML_TYPE_F32 && ops.table->tensor_layout(op) != 0) {
         return nullptr;

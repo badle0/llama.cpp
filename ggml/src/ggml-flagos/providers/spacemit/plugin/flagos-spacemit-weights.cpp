@@ -58,28 +58,28 @@ int expert_q4_0_from_env() {
     return spacemit_cached_switch(value, seen, parse_expert_q4_0);
 }
 
-// FLAGOS_SPACEMIT_ROUTER: how the F32 MoE router weight is stored. f32, unset or empty (the default): plain, run by
-// mul_mat.f32. q8: quantized to Q8_0 at load in the q8_0 32x32 layout and run by the 8-bit matmul, as SpacemiT's fork
-// does. Parsed once (spacemit_cached_switch); anything else warns once per parse generation and keeps the default. As
-// FLAGOS_SPACEMIT_EXPERT_Q4_0, a process must not change it after its first weight
+// FLAGOS_SPACEMIT_ROUTER: how the F32 MoE router weight is stored. q8, unset or empty (the default): quantized to Q8_0
+// at load in the q8_0 32x32 layout and run by the 8-bit matmul, as SpacemiT's fork does. f32: plain, run by
+// mul_mat.f32, the way back. Parsed once (spacemit_cached_switch); anything else warns once per parse generation and
+// keeps the default. As FLAGOS_SPACEMIT_EXPERT_Q4_0, a process must not change it after its first weight
 int parse_router() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_ROUTER");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "f32") == 0) {
-        return 0;
-    }
-    if (std::strcmp(v, "q8") == 0) {
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "q8") == 0) {
         return 1;
+    }
+    if (std::strcmp(v, "f32") == 0) {
+        return 0;
     }
     static std::atomic<uint32_t> warned_in{ 0 };
     const uint32_t               generation = spacemit_switches_generation();
     if (warned_in.exchange(generation) != generation) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ROUTER=%s: not f32 or q8, the default (f32) kept\n", __func__, v);
+        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_ROUTER=%s: not f32 or q8, the default (q8) kept\n", __func__, v);
     }
-    return 0;
+    return 1;
 }
 
 int router_from_env() {
-    static std::atomic<int>      value{ 0 };
+    static std::atomic<int>      value{ 1 };
     static std::atomic<uint32_t> seen{ 0 };
     return spacemit_cached_switch(value, seen, parse_router);
 }
@@ -107,8 +107,8 @@ uint32_t spacemit_router_q8() {
 // only: the requantization's read-back is the nearest Q4_1, on which test-backend-ops' MUL_MAT_ID cases fail under
 // imatrix quantization (NMSE about 6e-4 against 5e-4). A 3-D Q4_1 weight takes the q4_1 min layout (lossless). A 3-D
 // Q4_0 weight takes the q4_0s layout
-// (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain), a 2-D one never. An F32 tensor only as the router under
-// FLAGOS_SPACEMIT_ROUTER=q8 (2-D)
+// (unless FLAGOS_SPACEMIT_EXPERT_Q4_0=plain), a 2-D one never. An F32 tensor only as the router (2-D), unless
+// FLAGOS_SPACEMIT_ROUTER=f32
 spacemit_layout spacemit_weight_layout(const ggml_tensor * t) {
     if (t->view_src != nullptr || t->ne[1] % spacemit_ime::row_tile != 0 || t->ne[3] != 1 ||
         !ggml_is_contiguous(t) || spacemit_is_cache_name(t->name)) {

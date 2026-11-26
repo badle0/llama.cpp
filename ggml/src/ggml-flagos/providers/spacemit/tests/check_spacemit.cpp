@@ -5149,7 +5149,7 @@ static moe_op_result moe_op_run(ggml_backend_dev_t dev, ggml_backend_t backend, 
 }
 
 static int check_moe_ops(ggml_backend_dev_t dev) {
-    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", nullptr);  // the F32 matmul path: its weights carry the router's name
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", "f32");  // the F32 matmul path: its weights carry the router's name
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -5843,7 +5843,7 @@ static std::string mm_f32_what(const mm_f32_shape & s) {
 }
 
 static int check_seq_ops(ggml_backend_dev_t dev) {
-    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", nullptr);  // the F32 matmul path: its weights carry the router's name
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", "f32");  // the F32 matmul path: its weights carry the router's name
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
@@ -6422,13 +6422,14 @@ static std::vector<uint8_t> mm_f32_out(const ggml_tensor * y) {
     return b;
 }
 
-// FLAGOS_SPACEMIT_ROUTER=q8 (SpacemiT's fork's router route): the F32 MoE router weight quantized to Q8_0 at load in
-// the q8_0 32x32 layout. Checked: the rule by the plugin's layout answers (only q8, only the router's name, 2-D, rows
-// % 32, K % 32; another type keeps its layout; a bad value warns once and keeps plain; the alloc size ggml_nbytes);
-// the read-back is ggml's Q8_0 of the floats dequantized, bit for bit, whole and in part, small and split over the
-// repack's ranges; MUL_MAT at 1, 4, 32 and 129 rows (without and with TCM) claimed by the two 8-bit steps, the bytes
-// of the same graph on a Q8_0 weight of ggml's Q8_0 of the floats, within the MUL_MAT bound of the CPU on the floats;
-// unset, mul_mat.f32 within that bound; the core's guard: no contract but MUL_MAT's weight reads the router under q8
+// FLAGOS_SPACEMIT_ROUTER=q8, the default (SpacemiT's fork's router route): the F32 MoE router weight quantized to Q8_0
+// at load in the q8_0 32x32 layout; f32 the way back. Checked: the rule by the plugin's layout answers (unless f32,
+// only the router's name, 2-D, rows % 32, K % 32; another type keeps its layout; a bad value warns once and keeps q8;
+// the alloc size ggml_nbytes); the read-back is ggml's Q8_0 of the floats dequantized, bit for bit, whole and in part,
+// small and split over the repack's ranges; MUL_MAT at 1, 4, 32 and 129 rows (without and with TCM), q8 and unset,
+// claimed by the two 8-bit steps, the bytes of the same graph on a Q8_0 weight of ggml's Q8_0 of the floats, within the
+// MUL_MAT bound of the CPU on the floats; f32, mul_mat.f32 within that bound; the core's guard: no contract but
+// MUL_MAT's weight reads the router unless f32
 static int check_router_q8(ggml_backend_dev_t dev) {
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -6475,7 +6476,7 @@ static int check_router_q8(ggml_backend_dev_t dev) {
     for (const char * setting : { (const char *) nullptr, "", "f32", "q8", "x" }) {
         env_override     sw("FLAGOS_SPACEMIT_ROUTER", setting);
         log_capture      log;
-        const bool       q8  = setting != nullptr && std::strcmp(setting, "q8") == 0;
+        const bool       q8  = setting == nullptr || std::strcmp(setting, "f32") != 0;  // x keeps the default
         const std::string at = std::string("FLAGOS_SPACEMIT_ROUTER=") + (setting != nullptr ? setting : "(unset)");
         ggml_init_params p   = { ggml_tensor_overhead() * 16, nullptr, true };
         ggml_context *   ctx = ggml_init(p);
@@ -6594,10 +6595,10 @@ static int check_router_q8(ggml_backend_dev_t dev) {
     const int64_t            k = 256, n = 64;
     const std::vector<float> wv = random_values(k * n, seed++, 1.0f);
     double                   max_q8 = 0.0, max_f32 = 0.0;
-    for (const char * setting : { "q8", (const char *) nullptr }) {
+    for (const char * setting : { "q8", (const char *) nullptr, "f32" }) {
         env_override      sw("FLAGOS_SPACEMIT_ROUTER", setting);
-        const bool        q8 = setting != nullptr;
-        const std::string at = q8 ? "q8" : "unset";
+        const bool        q8 = setting == nullptr || std::strcmp(setting, "q8") == 0;
+        const std::string at = setting != nullptr ? setting : "unset";
         ggml_init_params  p   = { ggml_tensor_overhead() * 3, nullptr, true };
         ggml_context *    ctx = ggml_init(p);
         ggml_context *    ctc = ggml_init(p);
@@ -6642,7 +6643,7 @@ static int check_router_q8(ggml_backend_dev_t dev) {
             ggml_backend_free(be);
         }
 
-        // D. the core's guard: under q8 only MUL_MAT's weight reads the router; unset, ADD takes it as before
+        // D. the core's guard: under q8 (and unset) only MUL_MAT's weight reads the router; under f32, ADD takes it
         ggml_init_params pg = { ggml_tensor_overhead() * 8, nullptr, true };
         ggml_context *   cg = ggml_init(pg);
         REQUIRE(cg != nullptr);
@@ -6664,18 +6665,18 @@ static int check_router_q8(ggml_backend_dev_t dev) {
     ggml_backend_free(cpu);
 
     std::printf("router   FLAGOS_SPACEMIT_ROUTER (unset, empty, f32, q8, x): the F32 router weight in a layout (%u) "
-                "only under q8, not the shexp gate, other names, [48, 32], [64, 31] or 3-D; Q8_0 its own; x warned once; "
-                "alloc ggml_nbytes. q8 read-back ggml's Q8_0 of the floats bit for bit, whole and in part, [256, 64] "
-                "and [2048, 256] (%llu ranges). MUL_MAT [256, 64] by 1, 4, 32 and 129 rows, without and with TCM: q8 "
-                "by mul_mat.quantize and mul_mat.gemm, the bytes of the Q8_0 weight, max NMSE vs the CPU's F32 %.2e; "
-                "unset by mul_mat.f32, max NMSE %.2e (bound %.0e). Guard: ADD, MUL and MUL_MAT src[1] of the q8 "
-                "router refused, MUL_MAT src[0] taken, ADD taken unset: %d/%d\n",
+                "unless f32, not the shexp gate, other names, [48, 32], [64, 31] or 3-D; Q8_0 its own; x warned once, "
+                "q8 kept; alloc ggml_nbytes. q8 read-back ggml's Q8_0 of the floats bit for bit, whole and in part, "
+                "[256, 64] and [2048, 256] (%llu ranges). MUL_MAT [256, 64] by 1, 4, 32 and 129 rows, without and with "
+                "TCM: q8 and unset by mul_mat.quantize and mul_mat.gemm, the bytes of the Q8_0 weight, max NMSE vs the "
+                "CPU's F32 %.2e; f32 by mul_mat.f32, max NMSE %.2e (bound %.0e). Guard: ADD, MUL and MUL_MAT src[1] of "
+                "the q8 router refused, MUL_MAT src[0] taken, ADD taken under f32: %d/%d\n",
                 router_layout, (unsigned long long) big_ranges, max_q8, max_f32, k_mul_mat_max_nmse, n_ok, n_checks);
     return 0;
 }
 
 static int check_mul_mat_f32_split(ggml_backend_dev_t dev) {
-    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", nullptr);  // the F32 matmul path: its weights carry the router's name
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", "f32");  // the F32 matmul path: its weights carry the router's name
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
     uint32_t                       n_kernels = 0;
@@ -11462,6 +11463,7 @@ static uint32_t device_tiles(ggml_backend_dev_t dev) {
 // the faster kept. As in the model, where a token reads each weight once, every call reads its weight from DRAM: it
 // takes the next of enough copies of the weight (32 MB together, as bench_mm)
 static int bench_mm_f32(ggml_backend_dev_t dev) {
+    env_override router_f32("FLAGOS_SPACEMIT_ROUTER", "f32");  // the F32 matmul path: its weights carry the router's name
     const uint32_t tiles   = device_tiles(dev);
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     REQUIRE(backend != nullptr);
