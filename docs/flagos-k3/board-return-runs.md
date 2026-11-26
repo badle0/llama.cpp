@@ -508,3 +508,37 @@ The two paths cross near 32 rows; from 64 rows, the threshold as built, FP16 is 
 - What is left to the fork is 151 ms at 501 rows (3.5% of the graph) and 23 ms at 128. It grows with the rows: the sum step, 181 ms at 501 rows over 8 slices where the fork's pairs sum 4, and the products' share of the same.
 
 **Verdict.** Stage 2's rule is met with room: pp501 at least 15% above `int8` in every round, nothing slower, pp2048 11% above, the KLD unchanged inside its bound. The dense Q4_0 matmuls are at 538 ms at 501 rows, below the 600 that would call for stage 3.
+
+## 17. The pairs on the board (`~/fp16-pairs`, 2026-11-27)
+
+Stage 3 of the FP16 port (`plan.md`, "`f16` as the default, and stage 3 as specified"), with `f16` the default. Three arms in turn: `int8` (`FLAGOS_SPACEMIT_DENSE_Q4_0=int8`), `plain` (nothing set: the default, 8 slices) and `pairs` (`FLAGOS_SPACEMIT_F16_ROUTE=pairs`: 4 slices, a pair of cores sharing each other's weight tile). The board's commit line was not sent back (the bundle's head was `39f983f78`).
+
+**Build and checks.** Build rc 0 (49 steps; one warning in `core/flagos-spacemit.cpp:482`, a file this change did not touch, recompiled for a header). The check program passes on the kernels unset, under `pairs` and under `int8`, and on the references under both routes, 0 FAIL lines in the five. Under `pairs` on the kernels the seven exact cases are bit for bit, so two cores of a pair read each other's TCM correctly through the pair waits; 438,902 of 440,896 outputs are the 4-slice model's bytes and all are inside its bound (the plain route's 132,700 of 133,536 as before). The subnormal probes read the same on both routes. No pair wait gave up in any run.
+
+**Speed, t/s (`-p 4,32,128,501 -n 64 -r 3`, three rounds).**
+
+| size | `int8` | `plain` | `pairs` | `pairs` against `plain` |
+|---|---|---|---|---|
+| pp4 | 23.12, 23.89, 23.08 | 23.39, 22.92, 23.36 | 23.04, 23.27, 23.26 | level |
+| pp32 | 62.91, 62.76, 62.96 | 62.88, 62.88, 62.97 | 62.83, 62.58, 63.16 | level |
+| pp128 | 87.67, 89.17, 88.85 | 95.23, 94.91, 96.11 | 97.87, 97.73, 97.90 | +2.8, +3.0, +1.9% |
+| pp501 | 99.04, 100.03, 99.96 | 115.00, 114.86, 115.26 | 119.53, 119.62, 119.52 | +3.9, +4.1, +3.7% |
+| tg64 | 10.28, 10.31, 10.34 | 10.30, 10.28, 10.30 | 10.33, 10.27, 10.28 | level |
+| pp2048 (one run, `-r 2`) | 88.68 | 100.25 | 107.90 | +7.6% |
+
+Against `int8` the pairs are 19.6 to 20.7% above at pp501, 9.6 to 11.6% at pp128 and 21.7% at pp2048. From 16 rows (`f16:16`, one run an arm) the pairs are level with the plain route or 1% above at 16, 32, 64, 128 and 256 rows (44.52 against 44.50, 64.11 against 63.61, 80.22 against 79.16, 97.50 against 96.40, 108.38 against 107.13), so the threshold of 64 holds for them too.
+
+**Accuracy.** KLD on 8 chunks under `pairs`: 0.006362 +- 0.000344 (median 0.002430, 99.9% 0.188862, maximum 0.313382, same top token 97.108 +- 0.371%), inside the bound of 0.007533. The plain route's is section 16's line for line (0.006689 +- 0.000337). All 736 matmuls took the pairs, no overflow. The completion of the 501-token prompt is the float run's text; 118.62 t/s in that run.
+
+**The dense Q4_0 matmuls by the op tables (ms a graph).**
+
+| rows | `plain`: products + sum | `pairs`: products + sum | the fork (section 11) |
+|---|---|---|---|
+| 128 | 156.4 = 111.4 + 45.1 | 128.4 = 101.9 + 26.5 | 133.6 |
+| 501 | 540.0 = 360.3 + 179.7 | 388.9 = 284.8 + 104.1 | 387.7 |
+
+- The pairs take 151 ms off a graph at 501 rows, half of it in the sum (4 slices read where there were 8) and half in the products. They are at the fork's figure at 501 rows and below it at 128.
+- The 501-token graph is 4,206 ms (the plain route 4,370; the fork's 4,214 in its own session). Our pp501 of 119.5 to 119.6 is at the top of the fork's 117.8 to 119.1 of section 11, measured in another session, so the two are level there; at 4 and 32 tokens and in generation we stay ahead as before.
+- The waits cost nothing that shows: the products steps' imbalance between tiles is 2.9 ms of `attn_qkv`'s 128.0.
+
+**Verdict by stage 3's rule.** `pairs` is at least 3% above `plain` at pp501 in every round (3.7 to 4.1%); nothing is slower at pp4, pp32, pp128, one token or pp2048; the KLD holds; the check program passes on the kernels and the references. The rule is met: the pairs become the default route.
