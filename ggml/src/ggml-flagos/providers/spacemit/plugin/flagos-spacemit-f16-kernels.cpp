@@ -5,8 +5,10 @@
 //   repack.h                  _spe_fp16_ (19)
 //   spe_kernels_core.h        SPINE_FORCE_INLINE (9-15), SPE_ASSERT (17-21), PACK_X16_M16N8 (138-162),
 //                             PACK_CAST_LOAD_F32_M8K64 to PACK_CAST_STORE_F16_M16K64 (167-266),
+//                             PACK_CAST_UNPACK_U4_F16_M32K32 to PACK_CAST_STORE_F16_M16K32 (268-419),
 //                             the MMT4D_FP16_* macros of the plain epilogue (427-447, 456-512, 622-632, 674-714,
 //                             716-880, 903-919, 958-1059),
+//                             _spe_pack_cast_q41_fixed8_f16_m32k32 (1160-1209),
 //                             _spe_pack_cast_f32_f16_contiguous to _spe_pack_cast_f16_pad_blocks (1356-1811),
 //                             _spe_hpgemm_impl_m16n32k8_none (1817-1818, 1901-1921),
 //                             _spe_reducesum_mxn_f16_f32_16x32_1x1 and its _a100_nth8 form (2002-2099)
@@ -15,9 +17,9 @@
 //                             gemm_kernel_f16f16f16_m16_vfwmadot (341-358) in products
 // Bodies are unchanged except, marked "flagos": the fork's namespaces (mlir::speir::spekernel, ::ime2, ::rvv) are
 // spacemit_f16; the pack wrapper is a plain function; reduce_tile is the reduce wrapper's loop for one 16 x 32 block
-// and 8 slices; products is the gemm wrapper without its accumulate flag. New: dequant_tile, from our q4_0 32x256
-// layout (the fork's _spe_pack_cast_q41_fixed8_f16_m32k32, spe_kernels_core.h 1160-1209, was the model for the
-// technique only), and the flag helpers.
+// and 8 slices; products is the gemm wrapper without its accumulate flag; dequant_tile is the fork's
+// _spe_pack_cast_q41_fixed8_f16_m32k32 with its two layout operands (block size, scale offset) set for our q4_0 block.
+// New: the flag helpers.
 // The copied asm declares no vector registers: each entry below is out of line and holds no vector values of its own
 // across an asm block (as copy() in flagos-spacemit-ime-kernels.cpp). Built only with GGML_FLAGOS_SPACEMIT_IME2.
 
@@ -184,6 +186,159 @@ using _spe_fp16_ = _Float16;
     "addi           t1, t1, %[tile_stride]                               \n\t" \
     "vse16.v        v23, (t0)                                            \n\t" \
     "vse16.v        v31, (t1)                                            \n\t"
+
+// Preserve v0: later scaling uses its paired-row mask.
+
+#define PACK_CAST_UNPACK_U4_F16_M32K32                                         \
+    "vzext.vf2      v8, v4                                               \n\t" \
+    "vsrl.vi        v16, v8, 4                                           \n\t" \
+    "vand.vi        v8, v8, 15                                           \n\t" \
+    "vsll.vi        v16, v16, 8                                          \n\t" \
+    "vor.vv         v24, v8, v16                                         \n\t" \
+    "vzext.vf2      v8, v24                                              \n\t" \
+    "vzext.vf2      v16, v28                                             \n\t" \
+    "vsub.vx        v8, v8, %[zero_point]                                \n\t" \
+    "vsub.vx        v16, v16, %[zero_point]                              \n\t" \
+    "vfcvt.f.x.v    v8, v8                                               \n\t" \
+    "vfcvt.f.x.v    v16, v16                                             \n\t"
+
+#define PACK_CAST_LOAD_SCALE_F16_M16_LO                                        \
+    "flh            ft0, 0(t1)                                           \n\t" \
+    "flh            ft1, 2(t1)                                           \n\t" \
+    "flh            ft2, 4(t1)                                           \n\t" \
+    "flh            ft3, 6(t1)                                           \n\t" \
+    "flh            ft4, 8(t1)                                           \n\t" \
+    "flh            ft5, 10(t1)                                          \n\t" \
+    "flh            ft6, 12(t1)                                          \n\t" \
+    "flh            ft7, 14(t1)                                          \n\t" \
+    "flh            fa0, 16(t1)                                          \n\t" \
+    "flh            fa1, 18(t1)                                          \n\t" \
+    "flh            fa2, 20(t1)                                          \n\t" \
+    "flh            fa3, 22(t1)                                          \n\t" \
+    "flh            fa4, 24(t1)                                          \n\t" \
+    "flh            fa5, 26(t1)                                          \n\t" \
+    "flh            fa6, 28(t1)                                          \n\t" \
+    "flh            fa7, 30(t1)                                          \n\t"
+
+#define PACK_CAST_LOAD_SCALE_F16_M16_HI                                        \
+    "flh            ft0, 32(t1)                                          \n\t" \
+    "flh            ft1, 34(t1)                                          \n\t" \
+    "flh            ft2, 36(t1)                                          \n\t" \
+    "flh            ft3, 38(t1)                                          \n\t" \
+    "flh            ft4, 40(t1)                                          \n\t" \
+    "flh            ft5, 42(t1)                                          \n\t" \
+    "flh            ft6, 44(t1)                                          \n\t" \
+    "flh            ft7, 46(t1)                                          \n\t" \
+    "flh            fa0, 48(t1)                                          \n\t" \
+    "flh            fa1, 50(t1)                                          \n\t" \
+    "flh            fa2, 52(t1)                                          \n\t" \
+    "flh            fa3, 54(t1)                                          \n\t" \
+    "flh            fa4, 56(t1)                                          \n\t" \
+    "flh            fa5, 58(t1)                                          \n\t" \
+    "flh            fa6, 60(t1)                                          \n\t" \
+    "flh            fa7, 62(t1)                                          \n\t"
+
+// v0 selects the upper row of each pair; v1/v2 carry row scales.
+
+#define PACK_CAST_SCALE_F16_M16K32_LO                                          \
+    "vfmv.v.f       v1, ft0                                              \n\t" \
+    "vfmv.v.f       v2, ft2                                              \n\t" \
+    "vfmerge.vfm    v1, v1, ft1, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, ft3, v0                                      \n\t" \
+    "vfmul.vv       v8, v8, v1                                           \n\t" \
+    "vfmul.vv       v9, v9, v2                                           \n\t" \
+    "vfmv.v.f       v1, ft4                                              \n\t" \
+    "vfmv.v.f       v2, ft6                                              \n\t" \
+    "vfmerge.vfm    v1, v1, ft5, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, ft7, v0                                      \n\t" \
+    "vfmul.vv       v10, v10, v1                                         \n\t" \
+    "vfmul.vv       v11, v11, v2                                         \n\t" \
+    "vfmv.v.f       v1, fa0                                              \n\t" \
+    "vfmv.v.f       v2, fa2                                              \n\t" \
+    "vfmerge.vfm    v1, v1, fa1, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, fa3, v0                                      \n\t" \
+    "vfmul.vv       v12, v12, v1                                         \n\t" \
+    "vfmul.vv       v13, v13, v2                                         \n\t" \
+    "vfmv.v.f       v1, fa4                                              \n\t" \
+    "vfmv.v.f       v2, fa6                                              \n\t" \
+    "vfmerge.vfm    v1, v1, fa5, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, fa7, v0                                      \n\t" \
+    "vfmul.vv       v14, v14, v1                                         \n\t" \
+    "vfmul.vv       v15, v15, v2                                         \n\t"
+
+#define PACK_CAST_SCALE_F16_M16K32_HI                                          \
+    "vfmv.v.f       v1, ft0                                              \n\t" \
+    "vfmv.v.f       v2, ft2                                              \n\t" \
+    "vfmerge.vfm    v1, v1, ft1, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, ft3, v0                                      \n\t" \
+    "vfmul.vv       v16, v16, v1                                         \n\t" \
+    "vfmul.vv       v17, v17, v2                                         \n\t" \
+    "vfmv.v.f       v1, ft4                                              \n\t" \
+    "vfmv.v.f       v2, ft6                                              \n\t" \
+    "vfmerge.vfm    v1, v1, ft5, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, ft7, v0                                      \n\t" \
+    "vfmul.vv       v18, v18, v1                                         \n\t" \
+    "vfmul.vv       v19, v19, v2                                         \n\t" \
+    "vfmv.v.f       v1, fa0                                              \n\t" \
+    "vfmv.v.f       v2, fa2                                              \n\t" \
+    "vfmerge.vfm    v1, v1, fa1, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, fa3, v0                                      \n\t" \
+    "vfmul.vv       v20, v20, v1                                         \n\t" \
+    "vfmul.vv       v21, v21, v2                                         \n\t" \
+    "vfmv.v.f       v1, fa4                                              \n\t" \
+    "vfmv.v.f       v2, fa6                                              \n\t" \
+    "vfmerge.vfm    v1, v1, fa5, v0                                      \n\t" \
+    "vfmerge.vfm    v2, v2, fa7, v0                                      \n\t" \
+    "vfmul.vv       v22, v22, v1                                         \n\t" \
+    "vfmul.vv       v23, v23, v2                                         \n\t"
+
+// Preserve v0 and the next packed block in v4..v7.
+
+#define PACK_CAST_PACK_F16_M16K32_LO                                           \
+    "vpack.vv       v24, v8, v9, 1                                       \n\t" \
+    "vpack.vv       v26, v10, v11, 1                                     \n\t" \
+    "vpack.vv       v8, v24, v25, 1                                      \n\t" \
+    "vpack.vv       v10, v26, v27, 1                                     \n\t" \
+    "vpack.vv       v24, v8, v10, 3                                      \n\t" \
+    "vpack.vv       v26, v9, v11, 3                                      \n\t" \
+    "vpack.vv       v28, v12, v13, 1                                     \n\t" \
+    "vpack.vv       v30, v14, v15, 1                                     \n\t" \
+    "vpack.vv       v12, v28, v29, 1                                     \n\t" \
+    "vpack.vv       v14, v30, v31, 1                                     \n\t" \
+    "vpack.vv       v28, v12, v14, 3                                     \n\t" \
+    "vpack.vv       v30, v13, v15, 3                                     \n\t"
+
+#define PACK_CAST_PACK_F16_M16K32_HI                                           \
+    "vpack.vv       v24, v16, v17, 1                                     \n\t" \
+    "vpack.vv       v26, v18, v19, 1                                     \n\t" \
+    "vpack.vv       v16, v24, v25, 1                                     \n\t" \
+    "vpack.vv       v18, v26, v27, 1                                     \n\t" \
+    "vpack.vv       v24, v16, v18, 3                                     \n\t" \
+    "vpack.vv       v26, v17, v19, 3                                     \n\t" \
+    "vpack.vv       v28, v20, v21, 1                                     \n\t" \
+    "vpack.vv       v30, v22, v23, 1                                     \n\t" \
+    "vpack.vv       v20, v28, v29, 1                                     \n\t" \
+    "vpack.vv       v22, v30, v31, 1                                     \n\t" \
+    "vpack.vv       v28, v20, v22, 3                                     \n\t" \
+    "vpack.vv       v30, v21, v23, 3                                     \n\t"
+
+// tile_stride is 512 bytes; t3 starts eight rows after t2.
+
+#define PACK_CAST_STORE_F16_M16K32                                             \
+    "vse16.v        v24, (t2)                                            \n\t" \
+    "vse16.v        v28, (t3)                                            \n\t" \
+    "addi           t2, t2, %[tile_stride]                               \n\t" \
+    "addi           t3, t3, %[tile_stride]                               \n\t" \
+    "vse16.v        v25, (t2)                                            \n\t" \
+    "vse16.v        v29, (t3)                                            \n\t" \
+    "addi           t2, t2, %[tile_stride]                               \n\t" \
+    "addi           t3, t3, %[tile_stride]                               \n\t" \
+    "vse16.v        v26, (t2)                                            \n\t" \
+    "vse16.v        v30, (t3)                                            \n\t" \
+    "addi           t2, t2, %[tile_stride]                               \n\t" \
+    "addi           t3, t3, %[tile_stride]                               \n\t" \
+    "vse16.v        v27, (t2)                                            \n\t" \
+    "vse16.v        v31, (t3)                                            \n\t"
 
 // VLEN=1024; A=[kc][16][8], B=[kc][32][8], C uses byte row strides.
 // v0..v7 hold A, v8..v15 B, and v16..v31 FP32 accumulators.
@@ -607,6 +762,63 @@ using _spe_fp16_ = _Float16;
     MMT4D_FP16_SAVING_LT16_IMPL(_C, _CS, _M)
 
 // clang-format on
+
+SPINE_FORCE_INLINE void _spe_pack_cast_q41_fixed8_f16_m32k32(const void * in,
+                                                             void *       out,
+                                                             int32_t      zero_point,
+                                                             int64_t      blocks) {
+    // flagos: our block is [32 scales][32 x 16 nibble bytes], the fork's [nibbles][zp][scales]; in points at the
+    // nibbles, so the scales are 64 bytes before it and the next block 576 bytes on
+    constexpr int64_t q4_0_blk_bytes    = 32 * 2 + 32 * 16;
+    constexpr int64_t q4_0_scale_offset = -(32 * 2);
+    static_assert(sizeof(_spe_fp16_) == 2);  // flagos: no block_type, no uint4x2_t
+    if (blocks == 0) {
+        return;
+    }
+    const auto * src = reinterpret_cast<const uint8_t *>(in);
+    auto *       dst = reinterpret_cast<uint8_t *>(out);
+
+    // clang-format off
+    __asm__ volatile(
+        "vsetvli        t0, zero, e16, m1, tu, mu                                \n\t"
+        "vid.v          v1                                                       \n\t"
+        "li             t0, 31                                                   \n\t"
+        "vmsgtu.vx      v0, v1, t0                                               \n\t"
+        "vl4re8.v       v4, (%[in])                                              \n\t"
+        "LOOP_Q41_BLOCK%=:                                                       \n\t"
+        "addi           t1, %[in], %[scale_offset]                               \n\t"
+        "vsetvli        t0, zero, e16, m8, tu, mu                                \n\t"
+        PACK_CAST_UNPACK_U4_F16_M32K32
+        "addi           %[blocks], %[blocks], -1                                 \n\t"
+        "beqz           %[blocks], Q41_SCALE_BLOCK%=                             \n\t"
+        "addi           %[in], %[in], %[block_bytes]                             \n\t"
+        "vl4re8.v       v4, (%[in])                                              \n\t"
+        "Q41_SCALE_BLOCK%=:                                                      \n\t"
+        "vsetvli        t0, zero, e16, m1, tu, mu                                \n\t"
+        PACK_CAST_LOAD_SCALE_F16_M16_LO
+        PACK_CAST_SCALE_F16_M16K32_LO
+        PACK_CAST_PACK_F16_M16K32_LO
+        "mv             t2, %[out]                                               \n\t"
+        "addi           t3, t2, 128                                              \n\t"
+        PACK_CAST_STORE_F16_M16K32
+
+        PACK_CAST_LOAD_SCALE_F16_M16_HI
+        PACK_CAST_SCALE_F16_M16K32_HI
+        PACK_CAST_PACK_F16_M16K32_HI
+        "addi           t2, %[out], 256                                          \n\t"
+        "addi           t3, t2, 128                                              \n\t"
+        PACK_CAST_STORE_F16_M16K32
+        "addi           %[out], %[out], 1024                                     \n\t"
+        "addi           %[out], %[out], 1024                                     \n\t"
+        "bnez           %[blocks], LOOP_Q41_BLOCK%=                              \n\t"
+        : [in] "+&r"(src), [out] "+&r"(dst), [blocks] "+&r"(blocks)
+        : [zero_point] "r"(zero_point), [tile_stride] "i"(32 * 8 * sizeof(_spe_fp16_)),
+          [block_bytes] "i"(q4_0_blk_bytes), [scale_offset] "i"(q4_0_scale_offset)  // flagos: our block
+        : "cc", "memory", "t0", "t1", "t2", "t3",
+          "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+          "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7");
+    // clang-format on
+}
 
 // One K8 tile is already row-major.
 
@@ -1252,40 +1464,16 @@ __attribute__((noinline)) void cast_tile(const float * x, int64_t x_stride_float
                                ks * 16 * (int64_t) sizeof(_spe_fp16_), rows, ks, 1, ks / 8);
 }
 
-// flagos: new. Per 32-value block and group of 8 values, a strided load takes the group's 4 bytes of each row (value e
-// in byte e / 2, low nibble first); the nibbles are spread to bytes as PACK_CAST_UNPACK_U4_F16_M32K32 does, widened,
-// converted and multiplied by the row's d, spread to its 8 values. The multiply is one fp16 vfmul (frm: to nearest
-// even) of d by q - 8, an exact fp16 integer in [-8, 7]: the exact product rounded once. GGML_FP32_TO_FP16(d * (float)
-// (q - 8)) rounds the same exact product once (11 by 4 bits fit in float), so the bits are equal, infinity on overflow
-// included. A zero takes the xor of the two signs in both: q = 8 gives +0, so -0 for a negative d; d = -0 gives -0 for
-// q >= 8 and +0 below. A |d| above 8188 overflows here and raises OF, which the products step reports
+// flagos: the fork's _spe_pack_cast_q41_fixed8_f16_m32k32 on our block, from its nibbles (w + 64). It converts q - 8,
+// an exact fp16 integer in [-8, 7], and multiplies it by the row's d in one fp16 vfmul (frm: to nearest even): the
+// exact product rounded once. GGML_FP32_TO_FP16(d * (float) (q - 8)) rounds the same exact product once (11 by 4 bits
+// fit in float), so the bits are equal, infinity on overflow included. A zero takes the xor of the two signs in both:
+// q = 8 gives +0, so -0 for a negative d; d = -0 gives -0 for q >= 8 and +0 below. A |d| above 8188 overflows here and
+// raises OF, which the products step reports
 __attribute__((noinline)) void dequant_tile(const uint8_t * w, int64_t ks, uint16_t * b) {
-    constexpr int64_t blk_bytes = 32 * 2 + 32 * 16;
-    for (int64_t c0 = 0; c0 < 32;) {
-        const size_t      vl     = __riscv_vsetvl_e32m1((size_t) (32 - c0));  // rows a pass: all 32 at VLEN 1024
-        const size_t      vl4    = 4 * vl;
-        const size_t      vl8    = 8 * vl;
-        const vuint16m4_t spread = __riscv_vsrl_vx_u16m4(__riscv_vid_v_u16m4(vl8), 3, vl8);  // value p: row p / 8
-        for (int64_t i = 0; i < ks / 32; i++) {
-            const uint8_t *    blk = w + i * blk_bytes;
-            const vfloat16m4_t d   = __riscv_vrgather_vv_f16m4(
-                __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16 *>(blk) + c0, vl), spread, vl8);
-            for (int64_t g = 0; g < 4; g++) {
-                const vuint32m1_t quads = __riscv_vlse32_v_u32m1(
-                    reinterpret_cast<const uint32_t *>(blk + 64 + c0 * 16 + 4 * g), 16, vl);
-                const vuint16m2_t by   = __riscv_vzext_vf2_u16m2(__riscv_vreinterpret_v_u32m1_u8m1(quads), vl4);
-                const vuint16m2_t lohi = __riscv_vor_vv_u16m2(
-                    __riscv_vand_vx_u16m2(by, 15, vl4), __riscv_vsll_vx_u16m2(__riscv_vsrl_vx_u16m2(by, 4, vl4), 8, vl4),
-                    vl4);
-                const vint16m4_t q = __riscv_vreinterpret_v_u16m4_i16m4(
-                    __riscv_vzext_vf2_u16m4(__riscv_vreinterpret_v_u16m2_u8m2(lohi), vl8));
-                const vfloat16m4_t v = __riscv_vfcvt_f_x_v_f16m4(__riscv_vsub_vx_i16m4(q, 8, vl8), vl8);
-                __riscv_vse16_v_f16m4(reinterpret_cast<_Float16 *>(b) + ((4 * i + g) * 32 + c0) * 8,
-                                      __riscv_vfmul_vv_f16m4(d, v, vl8), vl8);
-            }
-        }
-        c0 += (int64_t) vl;
-    }
+    GGML_ASSERT(ks % 32 == 0);
+    SPE_ASSERT(__riscv_vlenb() == 128);
+    _spe_pack_cast_q41_fixed8_f16_m32k32(w + 64, b, 8, ks / 32);
 }
 
 // flagos: gemm_kernel_f16f16f16_m16_vfwmadot without its accumulate flag (always false there)
