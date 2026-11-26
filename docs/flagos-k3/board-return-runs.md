@@ -422,3 +422,45 @@ Stage 2 of the FP16 port (`plan.md`, "Stage 2 as built"): SpacemiT's FP16 kernel
 - For a model the effect is an activation below 6.1e-05 read as zero; the KLD of the retry measures whether it shows.
 
 **What follows:** the bit-for-bit case no longer holds subnormals, and four probes report what the kernels do with a subnormal activation, weight and partial sum (`plan.md`, "Stage 2 on the K3, the first attempt"). The retry is `~/fp16-kernels-retry`.
+
+## 15. The FP16 kernels on the board, the retry (`~/fp16-kernels-retry`, build `539c1c976`, 2026-11-26)
+
+Stage 2 of the FP16 port with the check program's subnormal probes (section 14). Default arm `int8`, other arm `FLAGOS_SPACEMIT_DENSE_Q4_0=f16` (from 64 rows); the two in turn, three rounds.
+
+**Build and checks.** Build rc 0 (34 steps, without `llama-server`). The check program passes on the kernels under `int8` and under `f16` (233 points, 0 FAIL lines) and on the references (`GGML_FLAGOS_KERNEL_VARIANTS=0`). All seven exact cases are bit for bit on the kernels, the activations read back among them now that they hold no subnormal. For random inputs 132,700 of 133,536 outputs are the model's bytes, all inside the bound.
+
+**The subnormal probes on the kernels:** an activation by 1 zero, an activation by 1,024 zero, a weight by 1,024 zero, a partial sum kept (all four kept on the references). A subnormal that enters the product is lost on either side, and one that the product makes from normal inputs is stored and summed. One cause fits all four: `vfwmadot` reads an fp16 subnormal operand as zero (inferred; the narrowing that packs the activations is the instruction that stores the partial sum, which keeps its subnormal). Section 14's reading stands.
+
+**Speed, t/s (`-p 4,32,128,501 -n 64 -r 3`).**
+
+| size | `int8`, rounds 1 to 3 | `f16`, rounds 1 to 3 | `f16` against `int8` |
+|---|---|---|---|
+| pp4 | 23.64, 23.20, 22.79 | 23.22, 23.04, 22.48 | -0.7 to -1.8%, inside the runs' own spread (0.6 to 1.7); the path is not taken below 64 rows |
+| pp32 | 62.44, 63.15, 62.34 | 62.85, 62.80, 62.53 | level |
+| pp128 | 88.36, 88.13, 88.28 | 81.79, 81.65, 81.61 | 7.4 to 7.6% slower |
+| pp501 | 99.04, 99.87, 99.44 | 108.48, 108.26, 108.19 | +9.5, +8.4, +8.8% |
+| tg64 | 10.25, 10.28, 10.26 | 10.26, 10.26, 10.25 | level |
+| pp2048 (one pair, `-r 2`) | 91.26 | 95.18 | +4.3% |
+
+The threshold pair (`-p 16,32,64,128 -r 3`, `int8` against `f16:16`): 46.64 against 27.68 at 16 rows, 63.14 against 43.45 at 32, 75.46 against 62.14 at 64, 87.89 against 82.01 at 128. FP16 is slower at every size up to 128 rows.
+
+**Accuracy.** KLD on 8 chunks: `f16` on the kernels 0.006689 +- 0.000337 (median 0.002378, 99.9% 0.181019, maximum 0.209118, same top token 97.108 +- 0.371%); `int8` 0.007150 +- 0.000383 as before. The bound is 0.007533: holds. Stage 1's scalar code gave 0.006329. 736 matmuls took the path, no overflow. The completion of the 501-token prompt is the float run's text, byte for byte; 1 graph split.
+
+**The dense Q4_0 matmuls by the op tables (ms a graph).**
+
+| rows | `int8` | `f16`: products + sum | the fork (section 11) |
+|---|---|---|---|
+| 128 | 269.5 | 381.3 = 333.2 + 48.2 | 133.6 |
+| 501 | 1,211.7 | 822.3 = 622.4 + 200.2 | 387.7 |
+
+The 501-token graph is 4,617 ms against 5,021 (404 ms shorter; the dense Q4_0 matmuls 389 of it).
+
+**Verdict by stage 2's rule.** pp501 is at least 8% above `int8` in every round (narrowly: 8.4% in the second); pp4, pp32 and one token are not slower; pp2048 is not slower; the KLD holds. The rule is met. Outside the rule: pp128 is 7.5% slower, because the default threshold of 64 rows is below the break-even, which lies between 128 and 501 rows and was not measured (the sizes run were 16 to 128).
+
+**The same kernels take 2.1 times the fork's time at 501 rows and 2.9 times at 128.** The kernels are the fork's text, so the difference is in what surrounds them. Read from the fork's driver after the run (`ime.cpp` 2093-2283): with 8 threads and K from 2,048 the fork does not take the plain split-K route that stage 2 follows; it takes the pairs (two cores share a slice of K/4 and each other's weight tile), and the plain route is its fallback. Three differences, sized from the two row counts (two points a line, so estimates):
+
+- *A cost that does not grow with the rows:* about 234 ms a graph in our products step, against about 46 ms in the fork's whole matmul. Per weight it follows the weight's size at the same rate (`attn_qkv` 3.9 ms a matmul for 16.8 M values, `attn_gate` 2.0 ms for 8.4 M, `ssm_out` 2.0 ms a pass for 8.4 M: 4.2 G values a second on 8 cores). The only work of that kind is the dequantization of the weights, the one kernel written here and not copied (a strided load of 32 quads a group and a gather for the scales). The fork's, an assembler kernel on its own layout, runs near the memory's speed.
+- *The sum step:* 200 ms at 501 rows, at the memory's speed (`attn_qkv` moves about 84 MB in 3.5 ms). We keep 8 slices of partial sums, the fork's pairs 4, so its sum reads half.
+- *The products by the row:* 0.78 ms a row against 0.68 for the fork's whole matmul, its sum included: twice the partial sums written and twice the kernel calls at half the K each.
+
+None of the three is the references or their switch. The first is our weight layout and a slow kernel of mine; the other two follow from 8 slices instead of the pairs' 4, and the pairs need two cores to wait on each other inside a step, which our steps do not do today (stage 3).
