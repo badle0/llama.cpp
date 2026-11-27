@@ -22,8 +22,11 @@ struct spacemit_pairs {
     struct alignas(64) counter {  // one cache line each: the two tiles of a pair spin on theirs
         std::atomic<uint32_t> calls{ 0 };
     };
+    struct alignas(64) own {  // one cache line each too: in one line every tile's wait would take it from the others
+        uint32_t calls = 0;
+    };
     counter                   by_pair[SPACEMIT_MAX_TILES / 2];  // the calls of both tiles of the pair
-    uint32_t                  by_tile[SPACEMIT_MAX_TILES] = {};  // each tile's own calls, written only by that tile
+    own                       by_tile[SPACEMIT_MAX_TILES];      // each tile's own calls, written only by that tile
     const std::atomic<bool> * failed     = nullptr;             // the launch's failure flag
     bool                      concurrent = true;                // false: the tiles run one after another; only count
 };
@@ -31,7 +34,7 @@ struct spacemit_pairs {
 bool spacemit_pair_wait(const spacemit_tile & tile) {
     GGML_ASSERT(tile.pairs != nullptr);
     spacemit_pairs & p = *tile.pairs;
-    const uint32_t   n = ++p.by_tile[tile.ith];
+    const uint32_t   n = ++p.by_tile[tile.ith].calls;
     if (!p.concurrent) {
         return true;
     }
@@ -261,9 +264,9 @@ class spert_executor final : public spacemit_executor {
 // tiles waited unequally often in a step would wait until the launch fails
 bool spacemit_pairs_balanced(const spacemit_pairs & p, uint32_t n_tiles) {
     for (uint32_t t = 0; t + 1 < n_tiles; t += 2) {
-        if (p.by_tile[t] != p.by_tile[t + 1]) {
-            GGML_LOG_ERROR("FlagOS SpacemiT: tiles %u and %u made %u and %u pair waits\n", t, t + 1, p.by_tile[t],
-                           p.by_tile[t + 1]);
+        if (p.by_tile[t].calls != p.by_tile[t + 1].calls) {
+            GGML_LOG_ERROR("FlagOS SpacemiT: tiles %u and %u made %u and %u pair waits\n", t, t + 1,
+                           p.by_tile[t].calls, p.by_tile[t + 1].calls);
             return false;
         }
     }
