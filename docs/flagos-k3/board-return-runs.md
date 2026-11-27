@@ -1118,3 +1118,25 @@ No rebuild (`e485300ca`, documents only since section 26). `spacemit_ttft.py` wi
 **`second`.** A second server beside the first is up after 63 and 66 s, its request is refused after 30.0 s with "Compute error." in the stream, and after the first has gone it answers with the first's text: as on the old unit.
 
 **Read across the three models.** At depth the 4B is the slowest of the three, not the 35B: 110 tokens at depth 4096 2,531 ms against 2,107, 4,095 fresh tokens 50.9 s against 42.7, 512 generated tokens from depth 4096 7.53 t/s against 9.50. Every 4B layer attends over the whole cache; most of the 35B's layers keep a recurrent state instead.
+
+## 28. Two to 8 tokens at depth: the code cleared (`~/few-token-tails-at-depth-retry`, 2026-11-28)
+
+Section 27's question, code or board. Two more checkouts built on this unit, `3311a9d0a` (the commit before the kernel port) and `c13d1d21d` (the port), both rc 0 with no error line; HEAD's build as it stood. `llama-bench -t 8 -fa 1 -n 0 -d 0,4096 -r 3`, the three in turn: three rounds on Qwen3-0.6B with 1, 2, 3, 4, 8 and 12 tokens, two on Qwen3-4B with 3, 4 and 8. Every run rc 0 on `FlagOS`.
+
+**At depth 4096, t/s, the rounds' range.**
+
+| | before the port | the port | HEAD |
+|---|---|---|---|
+| 0.6B, 2 tokens | 20.12 to 20.45 | 21.26 to 21.46 | 21.13 to 21.61 |
+| 0.6B, 3 | 12.59 to 12.74 | 12.76 to 12.85 | 12.69 to 13.01 |
+| 0.6B, 4 | 33.83 to 34.07 | 33.58 to 34.24 | 33.71 to 34.10 |
+| 0.6B, 8 | 60.63 to 60.68 | 61.83 to 61.86 | 61.49 to 61.73 |
+| 0.6B, 1 and 12 (controls) | 20.03 to 20.27; 86.85 to 87.05 | 20.08 to 20.23; 86.45 to 86.91 | 20.05 to 20.26; 86.98 to 87.13 |
+| 4B, 3 | 7.18, 7.19 | 7.26, 7.34 | 7.28, 7.32 |
+| 4B, 4 | 15.63, 15.74 | 15.90, 15.95 | 15.83, 15.83 |
+| 4B, 8 | 8.74, 8.76 | 8.83, 8.91 | 8.86, 8.89 |
+
+- **The three builds are level, so no commit of ours is the cause.** The port made 2 and 8 tokens 1 to 6% faster, not slower, and nothing after it moved them. At depth 0 the three are level too (4B: 23.7 to 24.1, 36.5 to 37.2 and 59.1 to 59.6 t/s at 3, 4 and 8 tokens).
+- **`llama-bench` shows the harness's figures:** on the 4B at depth 4096, 3, 4 and 8 tokens in 411, 253 and 904 ms (the grid: 414, 263, 908).
+- **Against the old unit's `llama-bench` of 2026-11-05** (Qwen3-4B, the KV-head split's own run, `plan.md`): at depth 4096 3 tokens 9.44 t/s then and 7.3 now (-23%), 4 tokens 17.71 and 15.8 (-11%), 8 tokens 11.80 and 8.9 (-25%); at depth 0 23.92, 37.46 and 60.25 then, within 2% of now. So the same code runs the KV-head split slower on this unit at depth, while one token, the tiled kernel from 9 tokens and generation are where they were (section 27). What about the unit does it is not known: its sysfs reports lower maximum clocks and 32 KiB first-level caches on the AI cores (`k3-hardware.md` section 0), and the TCM and the DRAM's rate have not been measured here.
+- **Taken as this unit's baseline (the user, 2026-11-28): no kernel change.** The figures of section 27 stand as what 2 to 8 tokens at depth cost here. Not run: the tiled kernel for 2 to 8 tokens against the split (it has no slowdown and beats the split from above, 12 tokens 440 ms against 8 tokens' 908 on the 4B at depth 4096; the port's checkout has both test switches, `FLAGOS_SPACEMIT_ATTN_KVH=off FLAGOS_SPACEMIT_ATTN_TILED=2`; such a change would also reach the attention layers of Qwen3.5 and 3.6, not their expert kernels). Next is the move out of tree.
