@@ -18,7 +18,7 @@ size_t spacemit_mul_mat_f16_workspace(const ggml_tensor * node);
 bool   spacemit_mul_mat_f16_products(const spacemit_tile * tile, ggml_tensor * node);
 bool   spacemit_mul_mat_f16_sum(const spacemit_tile * tile, ggml_tensor * node);
 
-// FLAGOS_SPACEMIT_DENSE_Q4_0 as parsed: 0 off (int8), else the row threshold (unset, empty, f16 or a bad value: 64,
+// FLAGOS_SPACEMIT_DENSE_Q4_0 as parsed: 0 off (int8), else the row threshold (unset, empty, f16 or a bad value: 32,
 // the default; f16:<rows>: 1 to 4096). Test-only: FLAGOS_SPACEMIT_F16_STATS (1 when set). Both read at registration
 // too, so a bad value's warning shows
 uint32_t spacemit_dense_q4_0_threshold();

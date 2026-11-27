@@ -1438,7 +1438,7 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     if (check_mul_mat_claims(dev) != 0 || check_weight_round_trip(dev) != 0) {
         return 1;
     }
-    // the IME int8 kernels against the CPU: Q4_0 at 64 rows and up would take the f16 path (check_mul_mat_f16's)
+    // the IME int8 kernels against the CPU: Q4_0 at 32 rows and up would take the f16 path (check_mul_mat_f16's)
     env_override   dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_t cpu     = ggml_backend_cpu_init();
@@ -1640,7 +1640,7 @@ static int64_t ime_act_row_bytes(ggml_type type, int64_t k) {
 // host without the AI cores, there also with tiles on threads
 static int check_mm_paths(ggml_backend_dev_t dev, bool host) {
     env_override mm("FLAGOS_SPACEMIT_MM", nullptr);
-    env_override dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");  // the int8 path's counters: no f16 steps at 64 rows and up
+    env_override dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");  // the int8 path's counters: no f16 steps from 32 rows
 
     struct mm_case { ggml_type type; int64_t k, n, m; };
     const mm_case cases[] = {
@@ -6851,6 +6851,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         route_of(node, dev_tiles, 0, r);
         return r[0];
     };
+    const int64_t f16_default = 32;  // the threshold under unset, empty, f16 or a bad value
 
     int        n_checks = 0, n_ok = 0;
     const auto expect   = [&](bool ok, const std::string & what) {
@@ -6889,21 +6890,23 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                                     buft);
         };
         ggml_tensor * w = weight(GGML_TYPE_Q4_0, 512, 64, 1);
+        const std::vector<std::pair<int64_t, bool>> by_default = { { f16_default - 1, false }, { f16_default, true },
+                                                                   { 200, true } };
         const struct {
             const char *                          setting;
             std::vector<std::pair<int64_t, bool>> rows;  // (M, taken by f16)
             bool                                  warns;
         } cases[] = {
-            { nullptr,    { { 63, false }, { 64, true }, { 200, true } },    false },
-            { "",         { { 63, false }, { 64, true }, { 200, true } },    false },
-            { "int8",     { { 16, false }, { 64, false }, { 200, false } },  false },
-            { "f16",      { { 63, false }, { 64, true }, { 200, true } },    false },
-            { "f16:16",   { { 15, false }, { 16, true } },                   false },
-            { "f16:128",  { { 127, false }, { 128, true } },                 false },
-            { "x",        { { 63, false }, { 64, true }, { 200, true } },    true  },
-            { "f16:0",    { { 63, false }, { 64, true }, { 200, true } },    true  },
-            { "f16:abc",  { { 63, false }, { 64, true }, { 200, true } },    true  },
-            { "f16:5000", { { 63, false }, { 64, true }, { 200, true } },    true  },
+            { nullptr,    by_default,                                       false },
+            { "",         by_default,                                       false },
+            { "int8",     { { 16, false }, { 32, false }, { 200, false } }, false },
+            { "f16",      by_default,                                       false },
+            { "f16:16",   { { 15, false }, { 16, true } },                  false },
+            { "f16:128",  { { 127, false }, { 128, true } },                false },
+            { "x",        by_default,                                       true  },
+            { "f16:0",    by_default,                                       true  },
+            { "f16:abc",  by_default,                                       true  },
+            { "f16:5000", by_default,                                       true  },
         };
         for (const auto & c : cases) {
             env_override      sw(dense, c.setting);
@@ -6941,8 +6944,8 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         const spacemit_op * b3 =
             spacemit_find_op(ops, ggml_mul_mat(ctx, w, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 512, 8, 25)), buft);
         const spacemit_op * b2 =
-            spacemit_find_op(ops, ggml_mul_mat(ctx, w, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 512, 7, 9)), buft);
-        expect(is_f16(b3) && is_int8(b2), "f16, [512, 8, 25] and [512, 7, 9] activations: " + by(b3) + ", " + by(b2));
+            spacemit_find_op(ops, ggml_mul_mat(ctx, w, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 512, 5, 6)), buft);
+        expect(is_f16(b3) && is_int8(b2), "f16, [512, 8, 25] and [512, 5, 6] activations: " + by(b3) + ", " + by(b2));
         for (ggml_tensor * t : placed) {
             ggml_backend_buffer_free(t->buffer);
             t->buffer = nullptr;
@@ -7713,7 +7716,8 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
             }
             const int         largest = kernels ? 0 : 1;
             const std::string first   = std::string("mul_mat.f16: matmuls 3 (pairs ") + (pairs ? "3" : "0") +
-                                      "), overflows 0, threshold 64, pair waits " + std::to_string(waits);
+                                      "), overflows 0, threshold " + std::to_string(f16_default) +
+                                      ", pair waits " + std::to_string(waits);
             const bool        lines   = (waits > 0) == pairs && text.substr(0, text.find('\n')) == first &&
                                count_lines_with(text, "mul_mat.f16: matmuls ") == 1 &&
                                count_lines_with(text, "mul_mat.f16: largest activation ") == largest &&
@@ -7729,7 +7733,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
 
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     std::printf("f16mm    %s: FLAGOS_SPACEMIT_DENSE_Q4_0 (unset, empty, int8, f16, f16:16, f16:128, x, f16:0, f16:abc, "
-                "f16:5000): Q4_0 [512, 64] taken by mul_mat.f16.products and .sum from the threshold (64 the default: "
+                "f16:5000): Q4_0 [512, 64] taken by mul_mat.f16.products and .sum from the threshold (32 the default: "
                 "unset, empty, f16 or a bad value; 16, 128), else and under int8 quantize and gemm; bad values warned "
                 "once; never a Q8_0 or 3-D weight, over 2^24 or K 33024. %d staged weight tiles fp16 of ggml's "
                 "dequantization bit for bit. On the plain route K 2048 N 96 at 16-501 rows, K 4096 N 64 at 64 and "
@@ -12432,7 +12436,7 @@ static double ime_row_bytes(ggml_type type, int64_t k) {
 // DRAM: it takes the next of enough copies of the weight (32 MB together)
 static int bench_mm(ggml_backend_dev_t dev) {
     env_override   mm("FLAGOS_SPACEMIT_MM", nullptr);
-    env_override   dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");  // the int8 paths: no f16 steps at 64 rows and up
+    env_override   dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");  // the int8 paths: no f16 steps at 32 rows and up
     ggml_backend_t backend = nullptr;
     {
         env_override tcm("FLAGOS_SPACEMIT_TEST_TCM", "393216");  // the host executor's TCM (check_mm_paths)

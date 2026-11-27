@@ -61,18 +61,19 @@ constexpr size_t  bases_bytes   = 64;  // the pairs route's stage addresses, uin
 constexpr size_t  stage_default = 393216;  // the stage's bytes without TCM (384 KiB, the K3's TCM a tile)
 constexpr int64_t max_ks        = 4096;    // so that 16 rows and a weight tile fit in stage_default
 constexpr int64_t max_threshold = 4096;
+constexpr int     default_threshold = 32;  // rows from which this path is taken unless f16:<rows> says otherwise
 constexpr int64_t max_elements  = int64_t(1) << 24;  // GGML_PAD(M, 16) * GGML_PAD(N, 32)
 // a 32-row tile's bytes per 32 values of K in q4_0 32x256: [fp16 d x 32][16 bytes x 32]; a tile's blocks follow each
 // other along K, across the 256-value blocks too
 constexpr int64_t q4_0_sub_blk  = 32 * 2 + 32 * 16;
 
-// FLAGOS_SPACEMIT_DENSE_Q4_0: f16, unset or empty (the default): this path from 64 rows; f16:<rows>: from that many
+// FLAGOS_SPACEMIT_DENSE_Q4_0: f16, unset or empty (the default): this path from 32 rows; f16:<rows>: from that many
 // rows (1 to 4096); int8: the integer path at every row count. Parsed once (spacemit_cached_switch); anything else
 // warns once per parse generation and keeps the default
 int parse_dense_q4_0() {
     const char * v = std::getenv("FLAGOS_SPACEMIT_DENSE_Q4_0");
     if (v == nullptr || *v == '\0' || std::strcmp(v, "f16") == 0) {
-        return 64;
+        return default_threshold;
     }
     if (std::strcmp(v, "int8") == 0) {
         return 0;
@@ -95,7 +96,7 @@ int parse_dense_q4_0() {
         GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_DENSE_Q4_0=%s: not int8, f16 or f16:<rows>, the default (f16) kept\n",
                       __func__, v);
     }
-    return 64;
+    return default_threshold;
 }
 
 // FLAGOS_SPACEMIT_F16_ROUTE (test-only): unset, empty or pairs: the pairs route where route_of admits it (the
