@@ -865,3 +865,59 @@ No rebuild (the build of `2cec2e84d`; only notes changed since). Three rounds in
 **The likely cause (an inference from these figures and an older measurement; not tested).** The elementwise kernels, ours copied from the fork's, give each tile one block of rows (`dr * ith` in `plugin/flagos-spacemit-rvv-kernels.cpp`). At 512 rows of the 35B's width (2,048 floats) a tensor is exactly 4 MiB and a tile's block 512 KiB, so the 8 tiles stream from addresses a power of two apart; the expert steps' tensors are 8 and 32 times as many rows. That is the case `k3-hardware.md` records from 2026-10-13 on the old unit ("Huge pages and power-of-two strides": 8 AI cores streaming from starts a multiple of 2 MiB apart ran 2.1 to 2.2 times slower on huge pages) with its rule to stagger the tiles' starts. It fits the dip being in both backends, being at one size, and the 4B (width 2,560: 640 KiB blocks at 512 rows) not showing it. Not explained by it: why 511 and 513 rows lose too, and why processes differ.
 
 **Why it matters beyond the benchmark.** `llama-bench`, `llama-server` and the other tools decode a long prompt in batches of 512 tokens by default, so every 512-token batch of a long prompt is at the bottom of the dip; a batch size beside it (`-ub 528` or 576) would not be. Not measured yet.
+
+## 23. A batch size beside 512, and the dip at 1,024 (`~/long-prompt-batch-sizes`, 2026-11-27)
+
+No rebuild (the build of `2cec2e84d`). Every rc 0; `-n 0 -r 3` throughout.
+
+**A 2,048-token prompt by batch size, three rounds in turn, the 35B (t/s).**
+
+| batch (`-ub`) | ours | against its 512 | the fork | against its 512 |
+|---|---|---|---|---|
+| 512 (the tools' default) | 107.83, 107.25, 107.12 | | 96.46, 93.83, 92.48 | |
+| 528 | 108.68, 109.58, 109.23 | +0.8, +2.2, +2.0% | | |
+| 576 | 108.94, 108.65, 109.69 | +1.0, +1.3, +2.4% | 98.77, 99.97, 100.10 | +2.4, +6.5, +8.2% |
+
+- A batch beside 512 is a small gain for us on a long prompt, 1 to 2% (18.7 to 18.9 s against 19.0 to 19.1 s), and a larger one for the fork, 2 to 8%.
+- On a 2,048-token prompt ours is 12 to 16% faster than the fork at the default batch and 9 to 10% at 576: the first long-prompt comparison with the fork on this board.
+
+**Around 256 and 1,024 tokens in one graph (`-ub 1100`), ours, the 35B (t/s).**
+
+| tokens | the three rounds | against the mean of its neighbours |
+|---|---|---|
+| 248 | 111.64, 111.08, 110.48 | |
+| 256 | 108.13, 110.21, 111.20 | -2.7, -0.6, +0.7% |
+| 264 | 110.53, 110.70, 110.48 | |
+| 1,008 | 120.05, 119.66, 120.06 | |
+| 1,024 | 114.77, 113.22, 112.61 | -4.3, -5.5, -6.0% |
+| 1,040 | 119.76, 119.92, 119.66 | |
+
+- 1,024 tokens dip in every round, as section 22's likely cause predicted before the run; 256 dips in one round of three. 1,008 and 1,040 rows in one graph ran for the first time and read what 501 does (120 t/s).
+
+**The op tables at 501 and 512 rows in three processes (ms a graph).** Two of the three are deep ones (pp512 6.2 and 4.5% under pp501), one shallow (2.2%).
+
+| | process 1 (deep) | process 2 (shallow) | process 3 (deep) |
+|---|---|---|---|
+| 512 rows over 501 scaled by rows, the whole graph | +281 | +97 | +201 |
+| the elementwise steps | +324 | +120 | +220 |
+| the matmuls | -37 | -1 | -11 |
+| `UNARY` (170), against scaled | 1.68 times | 1.38 | 1.54 |
+| `GLU SWIGLU` (80) | 2.41 times | 1.66 | 2.17 |
+| `MUL` on the expert rows (30) | 2.08 times | 1.59 | 2.01 |
+| `RMS_NORM ssm_norm` (30) | 1.98 times | at scale | 1.85 |
+
+- The whole dip is in the elementwise steps in the deep processes too; the matmuls, attention and the Gated DeltaNet stay at or under their scaled figures. The factors of about 2 are the size `k3-hardware.md` records for the power-of-two strides.
+- A deep process differs from a shallow one by more of the same steps slowing (the recurrent layers' norm only in the deep ones), not by another kind of step.
+
+**Qwen3-4B past 512 in one graph (`-ub 1024`, t/s).**
+
+| tokens | the three rounds | against its 501 |
+|---|---|---|
+| 501 | 203.64, 204.07, 204.17 | |
+| 512 | 195.12, 197.01, 198.05 | -4.2, -3.5, -3.0% |
+| 528 | 199.40, 199.56, 200.39 | -2.1, -2.2, -1.9% |
+| 576 | 192.94, 192.40, 192.69 | -5.3, -5.7, -5.6% |
+
+- The 4B dips at 512 as well, by 2 to 3% under the line from 501 to 528 (528 tokens are faster a token than 512), on top of its slope. Section 22 read no dip there; it had no sizes past 512. Its blocks at 512 rows are 640 KiB, not a power of two, so the cause as section 22 words it (blocks a power of two apart) is too narrow: a multiple of a smaller power of two is enough to lose some.
+
+**What stands.** The dip is real, at 512 and 1,024 rows on the 35B and smaller on the 4B, in the elementwise steps, in both backends. The cause is still an inference: the direct test is the staggered blocks, not built. On a long prompt it costs us 1 to 2%.
