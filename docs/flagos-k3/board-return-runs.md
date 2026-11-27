@@ -544,3 +544,38 @@ Against `int8` the pairs are 19.6 to 20.7% above at pp501, 9.6 to 11.6% at pp128
 **Verdict by stage 3's rule.** `pairs` is at least 3% above `plain` at pp501 in every round (3.7 to 4.1%); nothing is slower at pp4, pp32, pp128, one token or pp2048; the KLD holds; the check program passes on the kernels and the references. The rule is met: the pairs become the default route.
 
 **The default confirmed (`~/fp16-pairs-default`, the same day; one run an arm).** With the pairs as the default route the build passes (37 steps) and the check program passes on the kernels with nothing set, under `plain` and under `int8`, 0 FAIL lines, the same counts as above. With nothing set the KLD is the `pairs` arm's above line for line (0.006362 +- 0.000344), all 736 matmuls take the pairs, and the completion is the float run's text (118.42 t/s for the prompt, 10.12 for the 31 tokens). Speed: nothing set 23.62, 62.98, 97.40, 119.05 and 10.34 t/s at pp4, pp32, pp128, pp501 and one token; `plain` 23.65, 63.37, 96.58, 114.37 and 10.31. pp501 is 4.1% above `plain`, as in the three rounds; both arms read 0.4 to 0.6% below those rounds, one run each, taken as the session's drift.
+
+## 18. The acceptance script on the small models under the new defaults (`~/acceptance-small-models`, 2026-11-27)
+
+The defaults (`f16` from 64 rows, the pairs as its route) were decided on Qwen3.6-35B-A3B alone and apply to every model. This run is the acceptance script (`tools/spacemit_check.py`, with `--skip-server`: the board's `llama-server` is an older build's and cannot be rebuilt there) on Qwen3-0.6B and Qwen3-4B Q4_0, downloaded to the new board for it (sha256 as recorded from the old board), then three rounds of `FLAGOS_SPACEMIT_DENSE_Q4_0=int8` against nothing set. Build `6d8142b96`, no rebuild. The text is `wiki.test.raw` (8 chunks), not the old board's `ppl.txt`, so perplexities and KLDs are not comparable with earlier acceptance runs.
+
+**The script.** 56/56 checks on both models, its first runs on this board.
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| perplexity, provider / CPU | 23.0355 / 23.0657 (-0.13%) | 14.9383 / 14.9376 (+0.00%) |
+| KLD against the CPU, 512-token batches | 0.002826 +- 0.000146 | 0.001736 +- 0.000230 |
+| KLD against the CPU, `-ub 1 -b 512` | 0.003130 +- 0.000102 | 0.001767 +- 0.000096 |
+| greedy text against the CPU's | identical | differs after 143 characters, as before the FP16 port |
+| the script's `llama-bench`, pp128 / tg128, t/s | 946.24 / 56.52 | 216.56 / 11.12 |
+| the same on the CPU (8 X100 threads) | 152.57 / 28.99 | 21.23 / 5.41 |
+
+The 512-token batches go through the FP16 path and `-ub 1` through the 1-row integer path; the two KLDs are within their errors of each other on the 4B and 10% apart on the 0.6B, the FP16 one the lower. No TCM block check (no `~/tcmtest` on this board).
+
+**`int8` against nothing set, three rounds in turn (`-p 32,128,512 -n 32 -r 3`), t/s.**
+
+| | `int8` | nothing set | nothing set against `int8` |
+|---|---|---|---|
+| Qwen3-0.6B pp32 | 598.04, 606.11, 599.20 | 602.10, 603.89, 602.65 | level (32 rows are below the threshold: the same path) |
+| Qwen3-0.6B pp128 | 712.08, 703.04, 701.59 | 962.66, 943.11, 956.02 | +34 to +36% |
+| Qwen3-0.6B pp512 | 528.68, 526.00, 525.59 | 741.78, 744.30, 743.68 | +40 to +42% |
+| Qwen3-0.6B tg32 | 58.45, 58.21, 58.36 | 58.35, 57.98, 57.75 | level (the ranges overlap) |
+| Qwen3-4B pp32 | 108.36, 108.44, 108.42 | 108.36, 108.91, 108.57 | level (the same path) |
+| Qwen3-4B pp128 | 106.49, 106.61, 106.97 | 214.99, 213.41, 215.39 | 2.00 to 2.02 times |
+| Qwen3-4B pp512 | 96.16, 96.28, 95.61 | 199.18, 195.12, 196.94 | 2.03 to 2.07 times |
+| Qwen3-4B tg32 | 11.19, 11.21, 11.20 | 11.20, 11.21, 11.19 | level |
+
+- The defaults regress nothing on the small models and gain far more than on the 35B (pp501 +20% there): in Qwen3 the dense Q4_0 matmuls are most of a prompt graph, in the 35B a quarter of it.
+- The `int8` arm reads what the old board read in its last acceptance runs (Qwen3-4B pp128 106.2 to 106.8, pp512 96.3; Qwen3-0.6B about 700 and 529), so the two units agree on that path.
+- Which route each weight took was not counted in this run. By the rule (pairs up to a row length of 4,864) Qwen3-4B's K 2,560 weights take the pairs and its K 9,728 projection the plain route; an inference.
+- **Open, seen here:** below 64 rows both arms run the integer path, and on the 4B that path at 32 tokens (108 t/s) is half the FP16 path's speed at 128 (215). The threshold of 64 was set on the 35B, where 32 rows were level and 16 rows 4% slower in FP16. On Qwen3 a lower threshold may gain at 16 to 63 tokens; not measured. `FLAGOS_SPACEMIT_DENSE_Q4_0=f16:<rows>` measures it.
