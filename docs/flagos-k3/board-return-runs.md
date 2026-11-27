@@ -579,3 +579,92 @@ The 512-token batches go through the FP16 path and `-ub 1` through the 1-row int
 - The `int8` arm reads what the old board read in its last acceptance runs (Qwen3-4B pp128 106.2 to 106.8, pp512 96.3; Qwen3-0.6B about 700 and 529), so the two units agree on that path.
 - Which route each weight took was not counted in this run. By the rule (pairs up to a row length of 4,864) Qwen3-4B's K 2,560 weights take the pairs and its K 9,728 projection the plain route; an inference.
 - **Open, seen here:** below 64 rows both arms run the integer path, and on the 4B that path at 32 tokens (108 t/s) is half the FP16 path's speed at 128 (215). The threshold of 64 was set on the 35B, where 32 rows were level and 16 rows 4% slower in FP16. On Qwen3 a lower threshold may gain at 16 to 63 tokens; not measured. `FLAGOS_SPACEMIT_DENSE_Q4_0=f16:<rows>` measures it.
+
+## 19. The fork against the new defaults, the pair wait and the threshold (`~/fork-against-pairs`, 2026-11-27)
+
+Step 2 of the order agreed after the FP16 port: one session with both backends in turn, on build `df80f446d` (the pair-wait benchmark and the wait count; board at `bdf40b59c`). Build rc 0 (62 steps, without `llama-server`); the check program passes with 0 FAIL lines, `pairchk` 2/2, the pairs' exact cases bit for bit. The completion is the float run's text (119.89 t/s for the 501-token prompt, 10.06 for the 31 tokens).
+
+**The whole model, Qwen3.6-35B-A3B, three rounds in turn (t/s).**
+
+| size | ours | the fork | verdict |
+|---|---|---|---|
+| pp4 | 23.26, 23.30, 23.30 | 17.10, 17.33, 17.51 | ours 34% faster |
+| pp32 | 63.10, 62.75, 62.79 | 57.42, 57.80, 58.23 | ours 9% faster |
+| pp128 | 97.49, 96.81, 96.95 | 96.06, 97.17, 95.60 | level (the ranges overlap) |
+| pp501 | 119.53, 118.50, 118.03 | 114.63, 118.56, 116.98 | level (the ranges overlap; ours the higher in two rounds of three) |
+| tg64 | 10.26, 10.25, 10.26 | 8.88, 8.83, 8.82 | ours 16% faster |
+
+Section 11 had the fork 16% ahead at pp128 and 27% at pp501. The fork leads nowhere now.
+
+**KLD against our CPU base, the same 8 chunks.** Ours 0.006362 +- 0.000344 (maximum 0.313382, same top token 97.108%), the figures of section 17 to the last digit. The fork 0.023747 +- 0.001695 (median 0.007783, 99.9% 1.005546, maximum 2.038259, same top token 93.873 +- 0.531%): 3.7 times ours. Its 2-chunk figure of section 11 (0.021611) holds on 8.
+
+**By family at 501 tokens (ms a graph; ours from the op tables, the fork from its trace, both this session).**
+
+| family | ours | the fork | fork / ours | the fork's gain |
+|---|---|---|---|---|
+| expert multiply | 1,235.6 | 1,139.8 | 0.92 | 96 |
+| norms and their multiplies (`RMS_NORM`, `L2_NORM`, `MUL`) | 369.4 | 274.3 | 0.74 | 95 |
+| dense Q8_0 | 410.8 | 362.7 | 0.88 | 48 |
+| `UNARY` | 116.9 | 94.7 | 0.81 | 22 |
+| dense Q6_K and Q5_0 | 277.5 | 257.0 | 0.93 | 21 |
+| the router, `ffn_gate_inp` | 52.6 | 40.1 | 0.76 | 13 |
+| dense Q4_0 | 402.8 | 396.7 | 0.98 | 6 |
+| convolution (`SSM_CONV`, `CONCAT`) | 138.5 | 133.5 | 0.96 | 5 |
+| `ADD` | 242.6 | 240.9 | 0.99 | 2 |
+| Gated DeltaNet | 582.6 | 582.2 | 1.00 | 0 |
+| the other f32 matmuls | 78.0 | 113.0 | 1.45 | -35 |
+| the rest | 136.5 | 189.6 | 1.39 | -53 |
+| attention | 158.2 | 443.2 | 2.80 | -285 |
+| total | 4,202.0 | 4,267.7 (4,307.7 with the time between nodes) | 1.02 | -66 |
+
+- The dense Q4_0 matmuls and the router, 1,143 ms of the fork's lead in section 11, are level now (6 and 13 ms left).
+- What the fork still does faster adds to 308 ms, 7% of our graph: the experts (96, though the isolated cases of section 10 had ours ahead, so the two views still disagree), the norms and their multiplies (95; the two trees build this part differently, 281 `MUL` steps against 151 nodes), the dense Q8_0 (48, of it `ssm_out` 27 and the shared experts 17). Each of the others is under 1% of a graph.
+- At 128 tokens the graph is 1,299.8 against 1,342.1 ms: experts 487.6 against 483.8, dense Q4_0 133.6 against 128.3, Q8_0 103.2 against 91.2, attention 15.2 against 58.5.
+
+**The pair wait (`--bench-pairwait`: 8 tiles, 1,000,000 rendezvous a tile, three rounds; spine-runtime's executor, `pause` compiled into ours).**
+
+| wait | ns a rendezvous, the three rounds | spread between tiles |
+|---|---|---|
+| ours (`spacemit_pair_wait`) | 1,357.9, 1,353.0, 1,356.7 | 3 ns |
+| SpacemiT's barrier, copied | 109.2, 109.2, 109.2 | 0.1 ns |
+| SpacemiT's barrier with our two exits | 161.1, 160.8, 161.5 | 0.3 ns |
+
+- Ours costs 12 times SpacemiT's back to back. The exits are not the reason: they add 52 ns to SpacemiT's.
+- What it costs a prompt: tile 0 makes 8,310 pair waits in the 501-token graph's 92 FP16 matmuls, 90 a matmul (66,480 in the KLD run's 736). At the benchmark's figures that is at most 11.3 ms of a 4,202 ms graph with ours and 1.3 ms with SpacemiT's and our exits: 10 ms, 0.24%. An upper bound: in the benchmark all 8 tiles wait back to back, in a matmul a wait comes between kernels.
+- The waits of generation (the 1-row matmuls, attention, the experts) are not counted by this run.
+- Why ours is slow, found on the Mac the same day: each tile counts its own waits in `by_tile`, and the 8 counters lay in one cache line, so every wait of every tile took the line from the others. With a line a counter the Mac's threads read 196 ns for ours (420 before; SpacemiT's 149, with our exits 175). The K3's figure with the fix is not measured yet.
+
+**The threshold, `f16` from 64, 32 and 16 rows, three rounds in turn (t/s).**
+
+| | from 64 (the default) | from 32 | from 16 |
+|---|---|---|---|
+| Qwen3-0.6B pp16 | 463.78, 474.49, 464.21 | 474.22, 475.77, 475.45 | 382.67, 381.73, 381.98 |
+| Qwen3-0.6B pp32 | 606.75, 605.28, 606.46 | 611.16, 612.26, 604.98 | 602.48, 607.89, 602.10 |
+| Qwen3-0.6B pp48 | 652.86, 652.85, 650.69 | 722.16, 716.06, 721.55 | 722.41, 720.35, 723.99 |
+| Qwen3-4B pp16 | 83.08, 83.08, 83.09 | 83.33, 83.26, 83.26 | 71.02, 71.13, 71.12 |
+| Qwen3-4B pp32 | 108.80, 108.33, 108.63 | 126.96, 126.63, 127.23 | 126.48, 127.09, 126.63 |
+| Qwen3-4B pp48 | 106.36, 106.51, 106.10 | 150.19, 150.03, 150.97 | 150.26, 149.75, 149.80 |
+| Qwen3.6-35B pp16 | 46.38, 46.28, 46.77 | 46.71, 46.37, 46.14 | 44.14, 44.62, 44.69 |
+| Qwen3.6-35B pp32 | 62.25, 63.13, 62.31 | 64.27, 63.72, 63.98 | 64.24, 64.11, 64.10 |
+| Qwen3.6-35B pp48 | 69.00, 71.29, 68.87 | 74.25, 71.62, 74.10 | 74.14, 74.18, 74.19 |
+
+- From 32 rows: Qwen3-4B +17% at 32 tokens and +41% at 48; Qwen3-0.6B level at 32 and +10% at 48; the 35B +1 to +3% at 32 and about +6% at 48 (one round of `from 32` reads 71.62 there). Nothing is slower.
+- From 16 rows the 16-token prompt is slower on all three (-18%, -14%, -4.5%): the FP16 route dequantizes the whole weight whatever the rows, the integer path does not. Between 17 and 31 rows is not measured.
+- So 32 is the better default on every model measured; the 64 came from the plain route on the 35B (section 16), where 32 rows were level.
+
+**The fork on the small models, its first runs on them, three rounds in turn (t/s).** Its weights are in its device's buffers (407.55 and 2,455.18 MiB).
+
+| | ours | the fork |
+|---|---|---|
+| Qwen3-0.6B pp32 | 604.18, 605.68, 599.72 | 603.56, 595.62, 587.80 |
+| Qwen3-0.6B pp128 | 950.82, 954.57, 946.15 | 552.50, 550.12, 550.67 |
+| Qwen3-0.6B pp512 | 743.18, 751.17, 748.54 | 371.45, 371.55, 371.21 |
+| Qwen3-0.6B tg32 | 58.04, 58.06, 58.06 | 52.82, 53.21, 53.43 |
+| Qwen3-4B pp32 | 108.88, 108.54, 108.55 | 121.58, 120.51, 121.38 |
+| Qwen3-4B pp128 | 217.19, 216.49, 216.43 | 152.43, 152.92, 152.66 |
+| Qwen3-4B pp512 | 202.64, 201.93, 202.97 | 118.80, 118.87, 118.79 |
+| Qwen3-4B tg32 | 11.21, 11.21, 11.08 | 10.11, 10.09, 10.11 |
+
+Ours is 1.4 to 2.0 times the fork at 128 and 512 tokens and 9 to 11% faster a token. The one place the fork leads is the 4B at 32 tokens (+11%), which `f16` from 32 rows passes (126.6 to 127.2).
+
+**The fork's own `test-backend-ops` against the CPU (never run before).** It did not finish: 714 cases OK, 19 FAIL, 8,793 not supported, then an abort in a kernel (`rvv_kernels.cpp:2828: GGML_ASSERT(epsilon > 0.0f)`) at the case after `SILU_BACK`, before the norms, the matmuls and attention were reached. The failures: 13 `CPY` (NaN in an f16 copy with a permuted source), 5 `SCALE` with a bias (error 0.73 to 0.75), 1 in the first test's `iq3_xxs` case. So this run says nothing on what costs the fork its KLD.
