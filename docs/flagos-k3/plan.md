@@ -4252,6 +4252,8 @@ Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 t
 - *`llama-server` on this unit, 2026-11-27 (section 24 of `board-return-runs.md`; `progress.md` item 140).* Rebuilt with the base's UI archive; the acceptance script with its server checks 62/62 on both small models, the TTFT harness `--quick` 11/11 on the 0.6B. Next: the six server checks and the harness's `--quick` cases on the 35B (`second` and `alongside` left out: two processes of that model in 32 GiB are not tried).
 - *The 35B through the server, 2026-11-27 (section 25; item 141).* The server checks 5/5 and the harness's `--quick` cases 10/10. Next: the harness at full size on the 35B, for the cells the targets name (500 tokens fresh, chat turns at depth 4096, 512 generated tokens).
 - *The harness at full size on the 35B, 2026-11-27 (section 26; item 142).* 11/12. The user-facing waits it shows, largest first: a chat turn with thinking off (3.9 to 10.9 s, the previous reply decoded again), a request after a cancelled one (19.4 s), a fresh 500-token prompt (4.4 s), a turn of 38 or more tokens at depth 4096 (1.1 s and up). Open, the user's: which of these becomes the 35B's target. Still without evidence on this unit: the harness at full size on the two small models; `control`, `alongside` and the TCM tools.
+- *The harness at full size on the two small models, 2026-11-27 (section 27; item 144).* 13/13 and 13/13. The evidence gap on this unit is closed but for `control`, `alongside` and the TCM tools (no `build-ime`, no `~/tcmtest` here). Found: 2 to 8 tokens at depth are 11 to 33% slower than the old unit's baseline on both Qwen3 models, level at depth 0; the KV-head split's kernel changed on 2026-11-14 (`c13d1d21d`) and the board on 2026-11-25. The top priority, the user's word 2026-11-28, ahead of the move out of tree. Next: the commit before `c13d1d21d`, that commit and HEAD on this board in turn, `llama-bench -p 1,2,3,4,8,12 -d 0,4096` (`~/few-token-tails-at-depth-retry`), to say which; then the fix where the cause is.
+- *Two to 8 tokens at depth: the code cleared, 2026-11-28 (section 28; item 145).* The commit before the kernel port, the port and HEAD are level on this unit, so the unit runs the KV-head split slower than the old one did, for a reason not known. The user's word the same day: this is the unit's baseline, no kernel change; the tiled kernel for 2 to 8 tokens against the split stays untried (section 28 says how). Next: the move out of tree, below.
 
 **Not in this spec.** Q4_1 and Q4_K weights (the fork maps them lossily); the experts (3-D), which keep the integer path in the fork too; the fork's one-row kernel on its own layout; sharing the router's quantize step.
 
@@ -4262,6 +4264,90 @@ Before the 8-row path the waiting was 6.7, 13.5 and 27.7 ms at 32, 128 and 501 t
 - `vfwmadot` is known to us only from the fork's use of it.
 
 **For the user's word.** (1) Stage 1 before any kernel: I recommend it; it costs one board run of about two hours and no thrown-away code, and it answers whether this path is what costs the fork its accuracy. (2) Our layout, not the fork's: I recommend it. (3) Overflow fails the graph rather than clamping: I recommend it, to be looked at again with stage 1's figures.
+
+### The move out of tree: `ggml-flagos` built in a FlagOS repository, loaded by stock llama.cpp (plan, 2026-11-28)
+
+**Status:** planned with the user 2026-11-27 and 28; no code. Phases 1 to 3 run in this fork and wait on no one; phase 4 waits on the mentor's answer to (a) below. AOTriton (M3.0) comes after phase 6 (the user, 2026-11-27).
+
+**What it is about.** Today `libggml-flagos` (Common and our core, with our K3 plugin beside it) is built inside this llama.cpp fork, and llama.cpp runs it through the mentor's lines in ggml's build. After the move it is built in a FlagOS repository against an unmodified llama.cpp, which loads it at start through ggml's own route for a backend built elsewhere, `GGML_BACKEND_PATH` (`ggml/src/ggml-backend-reg.cpp:596-600`; the same code on upstream master `4c73444`, read 2026-11-27). ggml `dlopen`s the file, calls its `ggml_backend_init`, compares one integer, `api_version` (`:253`), and adds its devices to the global list (`load_backend`, `:227-271`). llama.cpp needs no change, as the deck asks: "ggml backend 接口（llama.cpp 不用改）" (page 6).
+
+**Decisions (the user, 2026-11-27 and 28).**
+1. What moves: `ggml/src/ggml-flagos/` as it is, Common with our core and plugin in their current form, less the mentor's `providers/amd` and `providers/denglin` and the files that belong to them (below), which he moves later.
+2. AOTriton waits until after the move.
+3. An Iluvatar CoreX plugin will later join the same core beside the K3, and some core and plugin designs will change then; this move changes neither.
+4. llama.cpp's newest release, b12816 on 2026-11-27 (backend API 3); the core is meant to become an upstream llama.cpp PR eventually.
+5. The notes stay in this fork.
+6. How `libspert` reaches users: the user with the mentor.
+
+**What was checked (2026-11-27 and 28; reading, and `nm` on the Mac).**
+- *Links.* On the Mac (`build-host`) the core and the plugin import only symbols that `libggml-base` exports, nothing from `libggml` or the CPU backend. The K3 plugin compiles more code; phase 3 checks it on the board.
+- *Upstream's backend interface, API 2 to 3* (`ggml-backend-impl.h`, ours against master's): the buffer type gains `alloc_buffer_n` and `get_alloc_size_n`, the buffer `set_tensor_n`, `get_tensor_n` and `cpy_tensor_n`, all optional; `graph_optimize` takes a parameter struct; `ggml_backend_meta_alloc_ctx_tensors_from_buft` is gone; the device and registration tables are unchanged. Our core defines one buffer type, one buffer and one backend table and leaves `graph_optimize` empty; Common defines none.
+- *Numbering* (`ggml.h`, ours against master's): of the 98 ops in both, 94 have another value (`ADD1`, `DIAG_MASK_INF` and `DIAG_MASK_ZERO` removed; `SIGMOID_BACK`, `SLEEP` and `TOP_K_MASK` added); `GGML_GLU_OP_SWIGLU_CLAMP` and `GGML_TYPE_F8_E4M3` appended; `struct ggml_tensor` unchanged. No code that moves uses a removed op. Recompiling takes the new values; nothing at load time would notice a library built with the old ones.
+- *The fork's edits to upstream files:* the mentor's 44 lines in 4 files and our option line (U3): the `GGML_FLAGOS_*` options (`ggml/CMakeLists.txt:201-205`), `ggml_add_backend(FLAGOS)` (`ggml/src/CMakeLists.txt:476`), the registration and `"flagos"` in the loader's name list (`ggml-backend-reg.cpp`, three hunks, the list at `:583`), and 31 lines of AMD and Denglin test shapes in `tests/test-backend-ops.cpp`. None in llama.cpp's `src/`. After the move none is needed.
+- *The CPU backend on riscv64* takes its `-march` from `GGML_RVV` and `GGML_RV_*` in both build modes; "GGML_NATIVE is not compatible with GGML_BACKEND_DL" is raised in the x86 branch only (`ggml/src/ggml-cpu/CMakeLists.txt:371-375`). The IME CPU path stays off unless `GGML_CPU_RISCV64_SPACEMIT` is set.
+- *Paths into llama.cpp's tree.* 24 files that move reach ggml's private headers by relative paths (`"../../../../ggml-impl.h"`): our 18; Common's `flagos-provider.cpp`, `flagos-registry.cpp` and `flagos-graph-plan.cpp`; Common's checks `check_provider`, `check_registry` and `check_graph_plan`. Plain names work in the fork as well, since every target there already has `ggml/src` on its include path (`ggml_add_backend_library`'s `..`, `plugin.cmake:43`, the checks' `${CMAKE_CURRENT_SOURCE_DIR}/..`). The CMake uses `${CMAKE_SOURCE_DIR}/vendor` (needed only by AMD and Denglin, for `nlohmann/json.hpp`) and `${CMAKE_SOURCE_DIR}/ggml/include` (`flagos-check-target`). The runner finds the repository as the sixth parent of its own file and configures with the in-tree options (`spacemit_check.py:49`, `:111-112`).
+- *The check programs.* `flagos-check-spacemit` links `ggml` and `ggml-flagos` and calls the CPU backend directly on 117 lines; in a dynamic-loading build both are modules, which cannot be linked, so it is left out of such builds (`ggml/src/ggml-flagos/CMakeLists.txt:159`). Common's four checks compile Common's sources into themselves and link no module. `check_registry` builds the registry with `GGML_FLAGOS_HAVE_AMD` and `GGML_FLAGOS_HAVE_DENGLIN` defined and stands in for both providers (`tests/check_registry.cpp:207`, `:226`): the registry's `#ifdef` blocks for them are its test hooks.
+- *llama.cpp as a CMake subdirectory* builds no tools, tests or common library unless asked (`CMakeLists.txt:112-118`); ggml's version variables, which `ggml_add_backend_library` reads, are local to `ggml/CMakeLists.txt` (`:6-31`).
+- *`llama-server`'s web UI step* fetches the archive named after the commit count (`progress.md` item 139): after the merge the fork needs the new base's archive in `tools/ui/dist`, as it has `ba360ef`'s (item 140). A full clone of a release tag counts its own number; a shallow one does not (inferred from the same script).
+- *Before:* on 2026-10-20, on the old board, stock `ba360ef` built with `GGML_BACKEND_DL=ON` ran the provider of the day through `GGML_BACKEND_PATH`: identical logits, five of six speeds within 0.3%, the sixth apart because the two arms then reported different device types (`structural-experiments.md` run 2, E4). That was before the core and plugin split.
+
+**What stays behind, and what the deck says.** The deck names no source files. Page 6 colours each part by owner: green "FlagOS 共享" (FlagOS shared) for the core and the hostsim reference plugin, orange "硬件 / 厂商提供" (hardware or vendor provided) for the runtime plugins and FlagTree's compiler backend, dashed "数据与工具链" (data and toolchain) for the kernel package.
+- AMD's: `providers/amd` (22 files, 17,299 lines, compiled into `libggml-flagos`), `kernels/triton/` (the JIT path's kernels; the JIT option requires AMD), `tests/check_amd*.cpp`. The deck draws AMD's runtime as an orange plugin outside the core (`amd-rt`: HIP, 488 lines, only `libamdhip64`), and its kernel route is AOT through FlagTree, with no JIT.
+- Denglin's: `providers/denglin`, `kernels/aot/` (34 kernels as `.cubin` and a merged module, with `manifest.json`), `kernels/generate_flagos_kernels.py`, `kernels/merge_flagos_module.py`, `kernels/check_merged_module.cpp`, `validate_denglin.sh`; only Denglin's build reads `kernels/aot/`. Denglin is not in the deck (neither page 6's plugin row nor page 2's chip list). The deck's package is data "与 .so 分开发布" (released apart from the .so) whose manifest gives every kernel `sha256`, `argument_count`, `contract`, `priority` and `when`; this manifest (format 2) has none of them.
+- Both: the 31 `test-backend-ops` lines.
+- Moves with no caller left: `flagos-graph-plan.*` (2,000 lines; its check 1,472), called only by AMD and Denglin. It moves because it is neither's and the deck puts it in the core as L1: "融合 pattern 扫描 · 必需输出与 alias 检查 · 执行计划缓存" (fusion pattern scan, required outputs and alias checks, plan cache). It stays idle until a provider fuses (D9).
+
+**Phase 1: in the fork, at today's base; nothing in the libraries changes.**
+1. *Plain include paths* in the 24 files. Check: `objdump -d` of every object of `ggml-flagos`, the plugin and Common's checks, before against after, identical (S2's step 3 did the same).
+2. *The check program in both build modes.* Its CPU backend through ggml's registry: the CPU device by type (already registered in a static build; in a dynamic one the CPU module is loaded by its path with `ggml_backend_load`), the buffer type from the device, the thread count through `get_proc_address("ggml_backend_set_n_threads")`, as `test-backend-ops` does (`tests/test-backend-ops.cpp:10602`, `:10635`); a helper keeps the 117 lines a substitution. In a dynamic-loading build it compiles the core's and Common's sources in, as Common's checks do, and `CMakeLists.txt:159` loses `AND NOT GGML_BACKEND_DL`. Not `ggml_backend_load_all()`: in the fork that also loads `libggml-flagos` through the mentor's name entry, a second copy of the core in the process with its own state and its own stream.
+3. *Check* (`~/move-includes-and-check`): on the Mac and on the K3 the check program's points as before in the in-tree build, then on the Mac in a dynamic-loading build; Common's four checks as before.
+
+**Phase 2: in the fork, the newest release.**
+4. *Merge the release tag,* the newest when the phase starts (b12816 on 2026-11-27), rather than rebase: 275 of our commits sit on the mentor's 22, and only the four upstream files above differ, so conflicts stay in them. The mentor's lines stay until phase 6; the fork's in-tree build needs them.
+5. *Port:* our three backend tables (the new members empty; a misplaced entry fails to compile, since the signatures differ), and whatever else fails to compile in the core, the plugin and Common. AMD and Denglin are not built here. R11's check at this merge (§6): upstream's and SpacemiT's changes to the functions we copied.
+6. *The web UI archive* of the new base in `tools/ui/dist` before `llama-server` builds.
+7. *Acceptance on Qwen3-0.6B, Qwen3-4B and Qwen3.6-35B-A3B* (`~/move-release-port`): graph splits per token first (a node the contract table no longer matches goes to the CPU and shows here); the check program; `test-backend-ops` entire; the runner with the server checks; the TTFT harness on the 35B. KLD against a new CPU base at the new tag, single-threaded, made twice and byte-compared (`PROJECT.md` §6). Speed against phase 1's build, three or more runs per arm, interleaved. The rule: the check program and `test-backend-ops` pass, and splits per token are as before on every model; a KLD above phase 1's by more than its error bar, or a speed below phase 1's by more than the spread, is explained before phase 3 and accepted by the user. Moved replies and KLDs become the new baselines once explained.
+
+**Phase 3: in the fork, the move rehearsed.**
+8. *The fork built with `GGML_BACKEND_DL=ON`* (`~/move-module-rehearsal`), beside a stock worktree of the same tag built the same way; the stock binaries run with `GGML_BACKEND_PATH=<fork build>/bin/libggml-flagos.so`. On the K3, `nm -D` and `readelf -d` show the plugin needing only `libggml-base` and `libspert` beyond the system. The rule: perplexity, KLD and server replies as phase 2's in-tree build to the last digit, splits per token the same, speed within spread (three runs per arm, interleaved), the check program passing in the dynamic build with the device. The same on the Mac with the simulated device, without the speed.
+
+**Phase 4: the FlagOS repository (after the mentor's answer to (a)).**
+9. *Layout:*
+   ```
+   <repository>/
+     CMakeLists.txt         the top level
+     llama.cpp/             submodule at the pinned release tag, full history
+     ggml-flagos/           this fork's ggml/src/ggml-flagos/ without what stays behind
+       CMakeLists.txt       as an in-tree backend's
+       flagos-*.{h,cpp}, ggml-flagos.h, tests/   Common and its checks
+       providers/spacemit/  core/, plugin/, tests/, tools/, *.cmake
+   ```
+   `ggml-flagos/` keeps the shape it has in `ggml/src/`: a later PR copies it (decision 4), and `providers/` takes a second chip (decision 3) and AMD and Denglin when they come (decision 1).
+10. *The top level:* `add_subdirectory(llama.cpp)` with `GGML_BACKEND_DL=ON`, `BUILD_SHARED_LIBS=ON` and llama.cpp's tools, tests and common library on; it declares the options `ggml-flagos/` reads (`GGML_FLAGOS`, `GGML_FLAGOS_SPACEMIT`); then `ggml-flagos/`, given what `ggml_add_backend_library` expects from ggml's folder: llama.cpp's `ggml/src` on the include path, the output folder `<build>/bin`, ggml's version variables. If calling ggml's function from outside proves fragile, the top level repeats its few lines instead.
+11. *`ggml-flagos/CMakeLists.txt` without what stays behind:* the AMD, Denglin and JIT branches, Denglin's kernel check, the AMD checks, both package installs and the `vendor/` path go; `flagos-check-target`'s `ggml/include` path points into the submodule. Common's sources stay the mentor's but for phase 1's include lines, which work in his tree too, so he can take them and the two copies stay alike. The registry's `#ifdef` blocks for AMD and Denglin stay (`check_registry`'s hooks).
+12. *The runner and the TTFT harness:* the repository root from the new depth; `--build` configures the top level; `GGML_BACKEND_PATH` set for every provider process and unset for the CPU references. The IME baseline build stays a separate stock build that never loads our library: an IME-enabled CPU backend in the same process would share TCM with ours (inferred from the clash between processes, item 52; not run).
+13. *Install:* the core and the plugin in one folder (the loader looks beside the core, `providers/spacemit/core/flagos-spacemit-loader.cpp:62`); `libspert` by the answer to (b).
+14. *Automated builds* on x86 or the Mac with the simulated device: the check programs and `test-backend-ops` through `GGML_BACKEND_PATH` at the pinned tag.
+
+**Phase 5: llama.cpp versions.**
+15. Each FlagOS release names its llama.cpp tag, and users run that tag's binaries: the load check covers neither op numbering nor the private structs the core reads (`ggml_cgraph`).
+16. Proposed, for a spec of its own: at registration, compare the running ggml's names (`ggml_op_name`, `ggml_type_name`, `ggml_unary_op_name`, `ggml_glu_op_name`) for every value the contract table uses with the names compiled in, and register no device on a mismatch, logging both. Once at start; it cannot catch a changed struct, so 15 stays.
+17. An update: the submodule to the new tag, the port, phase 2's acceptance, the tag recorded. How often: (d).
+
+**Phase 6: acceptance from the FlagOS repository** (`~/move-flagos-acceptance`).
+18. The deck's four steps (page 8) with the tag's stock binaries: the device in `--list-devices`, `test-backend-ops` passing entirely, the whole model's KLD below 0.01, a llama-bench baseline; with the runner and the server checks. The rule: logits as phase 3's to the last digit.
+19. Speed against the fork's in-tree build of the same tag, three or more runs per arm, interleaved: within spread.
+20. Then the fork's copy of `ggml-flagos` stops changing. Sessions still start in the fork, so these notes load, with the repository's checkout added as a second working directory; the notes cite the repository's paths and commits; `upstream-changes.md` closes with a last entry.
+
+**Open, for the mentor.**
+- (a) Which FlagOS repository, and who can write to it.
+- (b) `libspert`: a closed runtime as the plugin's hard dependency (§7 question 3; the deck's plugin "只链接自家 SDK", links only its own SDK); who ships it to users, SpacemiT's release or FlagOS beside the plugin (permission and licence terms not known to us); which spine-runtime versions a plugin build supports (ours were built against 0.6.3).
+- (c) Common in two places: who changes it while AMD and Denglin still build against his copy.
+- (d) How often to update llama.cpp.
+
+**Not in this move.**
+- The second chip (decision 3). The core's K3-specific parts stay as they are: its interface to the plugin (tiles, barriers, one launch per split), the loader opening one fixed file where the deck scans `flagos-providers/`, the contract table describing the K3's kernels, buffers in host memory with the weight repack inside set and get.
+- The upstream PR (decision 4). New core code is written for it from now on: ASCII only, short comments that do not cite these notes (today 19 of the core's 3,325 lines hold non-ASCII characters and 35 cite the notes). The PR also needs a plugin that runs without hardware (today the simulated device is compiled into the K3 plugin) and an upstream issue first (the root `AGENTS.md`).
 
 ### Not planned
 

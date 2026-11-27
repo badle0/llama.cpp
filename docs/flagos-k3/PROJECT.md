@@ -38,6 +38,7 @@ Loaded at every Claude Code session, with `CLAUDE.md` beside it, through `.claud
 | D8 | `flagos_provider_kind::cpu_accelerator`; `ai_accelerator` would classify the K3 as an NPU | proposed, open |
 | D9 | FlagTree AOT package (M3): FlagGems' kernels through FlagTree for the ops they have; the IME and RVV kernels for the rest | decided (user, 2026-10-26); deferred until the structural work is done |
 | D10 | The core / plugin split, K3-only, no separate `flagos-runtime.h`; the core first (S1), then the plugin (S2) with the weights code | decided (user and mentor, 2026-10-26); S1's code steps done, S2's exit met on the K3 2026-11-06 |
+| D11 | `ggml-flagos` (Common, our core and plugin unchanged; without the mentor's `providers/amd` and `providers/denglin`) moves to a FlagOS repository, built against llama.cpp's newest release and loaded by stock llama.cpp through `GGML_BACKEND_PATH`; AOTriton after it | decided (user, 2026-11-27 and 28); plan in `plan.md` "The move out of tree"; the repository and `libspert`'s distribution are for the mentor to answer |
 
 Caveat: ggml's scheduler runs splits sequentially (`ggml_backend_sched_compute_splits`); do not assume the X100 CPU backend and A100 provider run concurrently.
 
@@ -128,7 +129,7 @@ Priority order for the mentor (2026-10-26, `structural-review.md` §7.1): (4) `c
 
 ## 8. Current state and next step (2026-11-09)
 
-The log of every milestone and experiment, items 1-142 with their numbers, is `progress.md` §D; the acceptance runs are in `build.md` §7; the plan with its exit criteria is `plan.md` §4.
+The log of every milestone and experiment, items 1-145 with their numbers, is `progress.md` §D; the acceptance runs are in `build.md` §7; the plan with its exit criteria is `plan.md` §4.
 
 - Done: M0-M2 (items 1-18), the structural experiments E1-E7b and E3r (items 20, 31; `structural-experiments.md`), the matmul path work (item 21), the IGPU switch (item 22), S1 step 1 (the C interface header, the `dlopen` loader, item 29), step 2 (the contract table bound by name, item 30), step 2b (the default path pruned: the kernel switches parsed once, item 32). The K3-only core / plugin split (D10, `plan.md` S1 and S2) was the work that followed, its exit met on the K3 2026-11-06.
 - S1 step 3 (A4's plan-cache experiment, `FLAGOS_SPACEMIT_PLAN=none|structure|uid`) ran on the K3 2026-10-31 (item 33; `structural-experiments.md` run 11): both candidates hit every generation graph with identical logits, but neither passes the rule, since the per-node contract check (about 0.5 ms of a 4B token) runs on every graph under both and the expansion the cache replaces is about 0.1 ms; S's compare costs 0.8-1.0 ms on the X100.
