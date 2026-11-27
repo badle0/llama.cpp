@@ -131,11 +131,12 @@ int parse_f16_stats() {
 // references (act_weight empty when none recorded)
 struct f16_stats {
     std::mutex                                     mutex;
-    uint64_t                                       matmuls   = 0;
-    uint64_t                                       pairs     = 0;  // of them, those that took the pairs route
-    uint64_t                                       overflows = 0;
-    float                                          max_act   = 0.0f;
-    float                                          max_sum   = 0.0f;
+    uint64_t                                       matmuls    = 0;
+    uint64_t                                       pairs      = 0;  // of them, those that took the pairs route
+    uint64_t                                       overflows  = 0;
+    uint64_t                                       pair_waits = 0;  // tile 0's on the pairs route (every tile's)
+    float                                          max_act    = 0.0f;
+    float                                          max_sum    = 0.0f;
     std::string                                    act_weight, sum_weight;
     std::map<std::pair<int64_t, int64_t>, uint64_t> shapes;  // (K, N): matmuls
 };
@@ -474,9 +475,10 @@ bool products_plain(const spacemit_tile & tile, const f16_dims & d, const f16_ro
 // time, which this tile then does not read: it dequantizes the partner's tile itself, into slot 0): cast the rows; per
 // chunk dequantize, wait, multiply by both, wait (2 chunks waits a pass). Safe because between two waits a tile reads
 // only a partner's slot that the partner filled before the earlier wait and overwrites only after the later one. A
-// column tile past N is neither dequantized nor multiplied; the waits are the same for both tiles of a pair
+// column tile past N is neither dequantized nor multiplied; the waits, counted in waits, are the same for both tiles
+// of a pair
 bool products_pairs(const spacemit_tile & tile, const f16_dims & d, const f16_route & r, f16_leaves & lv,
-                    const uint8_t * wb, const float * x, uint8_t * base) {
+                    const uint8_t * wb, const float * x, uint8_t * base, uint64_t & waits) {
     const int64_t    group     = tile.ith / 2;
     const int64_t    intra     = tile.ith % 2;
     const int64_t    k0        = group * r.ks;
@@ -493,6 +495,7 @@ bool products_pairs(const spacemit_tile & tile, const f16_dims & d, const f16_ro
 
     bases[tile.ith] = (uint64_t) reinterpret_cast<uintptr_t>(stage);
     const auto wait = [&] {
+        waits++;
         if (!spacemit_pair_wait(tile)) {
             return false;
         }
@@ -601,7 +604,15 @@ bool f16_products(const spacemit_tile & tile, ggml_tensor * node, bool kernels) 
         spacemit_f16::clear_flags();
     }
 #endif
-    if (!(r.pairs ? products_pairs(tile, d, r, lv, wb, x, base) : products_plain(tile, d, r, lv, wb, x, base))) {
+    uint64_t   waits = 0;
+    const bool ok    = r.pairs ? products_pairs(tile, d, r, lv, wb, x, base, waits) :
+                                 products_plain(tile, d, r, lv, wb, x, base);
+    if (record && tile.ith == 0 && waits > 0) {
+        f16_stats &                 st = stats();
+        std::lock_guard<std::mutex> lock(st.mutex);
+        st.pair_waits += waits;
+    }
+    if (!ok) {
         return false;
     }
 #if defined(GGML_FLAGOS_SPACEMIT_IME2)
@@ -727,9 +738,10 @@ void spacemit_mul_mat_f16_stats_flush() {
     }
     if (!path.empty()) {
         if (FILE * f = std::fopen(path.c_str(), "a")) {
-            std::fprintf(f, "mul_mat.f16: matmuls %llu (pairs %llu), overflows %llu, threshold %u\n",
+            std::fprintf(f, "mul_mat.f16: matmuls %llu (pairs %llu), overflows %llu, threshold %u, pair waits %llu\n",
                          (unsigned long long) st.matmuls, (unsigned long long) st.pairs,
-                         (unsigned long long) st.overflows, spacemit_dense_q4_0_threshold());
+                         (unsigned long long) st.overflows, spacemit_dense_q4_0_threshold(),
+                         (unsigned long long) st.pair_waits);
             if (!st.act_weight.empty()) {
                 std::fprintf(f, "mul_mat.f16: largest activation %.6g in %s\n", (double) st.max_act,
                              st.act_weight.c_str());
@@ -745,11 +757,12 @@ void spacemit_mul_mat_f16_stats_flush() {
             GGML_LOG_WARN("mul_mat.f16: cannot append the stats to %s\n", path.c_str());
         }
     }
-    st.matmuls   = 0;
-    st.pairs     = 0;
-    st.overflows = 0;
-    st.max_act   = 0.0f;
-    st.max_sum   = 0.0f;
+    st.matmuls    = 0;
+    st.pairs      = 0;
+    st.overflows  = 0;
+    st.pair_waits = 0;
+    st.max_act    = 0.0f;
+    st.max_sum    = 0.0f;
     st.act_weight.clear();
     st.sum_weight.clear();
     st.shapes.clear();

@@ -838,6 +838,11 @@ const spacemit_plugin * spacemit_device_plugin(ggml_backend_dev_t dev) {
     return dev != nullptr && dev->context == &g_device ? g_device.plugin : nullptr;
 }
 
+spacemit_plugin_device * spacemit_device_plugin_device(ggml_backend_dev_t dev) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return dev != nullptr && dev->context == &g_device ? g_device.dev : nullptr;
+}
+
 const flagos_provider_v1 * flagos_spacemit_provider() {
     static const flagos_provider_v1 provider = {
         /* .api_version        = */ FLAGOS_PROVIDER_API_VERSION,

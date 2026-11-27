@@ -36,3 +36,6 @@ uint64_t spacemit_steps_take();
 
 // test-only: the executors created since the last call
 uint64_t spacemit_executors_take();
+
+// test-only (spacemit_pairwait_launch_fn): the pair-wait benchmark's launch on executor
+bool spacemit_pairwait_run(spacemit_executor & executor, uint32_t variant, uint32_t n, spacemit_pairwait_result * out);

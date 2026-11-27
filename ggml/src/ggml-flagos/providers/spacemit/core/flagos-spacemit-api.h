@@ -10,3 +10,8 @@ const flagos_provider_v1 * flagos_spacemit_provider();
 // plan.md "S1 step 1 spec" §7).
 struct spacemit_plugin;
 const spacemit_plugin * spacemit_device_plugin(ggml_backend_dev_t dev);
+
+// test-only: the plugin's device handle the core opened for this device, or nullptr for any other device; a stream
+// made on it shares the executor of the device's backends (flagos-check-spacemit's pair-wait launches)
+struct spacemit_plugin_device;
+spacemit_plugin_device * spacemit_device_plugin_device(ggml_backend_dev_t dev);

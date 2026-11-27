@@ -1,7 +1,7 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
 //                              [--bench | --bench-attn | --bench-mm | --bench-f32 | --bench-embd | --bench-repack |
-//                               --bench-x100 | --bench-mmid]
+//                               --bench-x100 | --bench-mmid | --bench-pairwait]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -34,6 +34,10 @@
 //                    ([2048, 512, 256] and [512, 2048, 256], 8 ids a token): 1 token, 4 tokens of 32 experts, 4 and 8
 //                    tokens of the same 8 experts, 32 tokens of random ids, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against
 //                    the default taking turns twice; median and minimum of 60 computes (not run by --bench)
+//   --bench-pairwait of the benchmarks only the pair wait: one launch a variant on all tiles, each making 1,000,000
+//                    rendezvous with its partner, spacemit_pair_wait against SpacemiT's barrier (spine_barrier.h)
+//                    without and with our two exits, three rounds in rotated order; lines "pairwait ...", skipped on
+//                    the serial host executor (not run by --bench)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
 // them: requantized to Q8_0.
 
@@ -7693,10 +7697,25 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 expect(ran && text.empty(), "stats unset: " + std::to_string(text.size()) + " bytes written");
                 continue;
             }
-            const int    largest = kernels ? 0 : 1;
-            const char * first   = pairs ? "mul_mat.f16: matmuls 3 (pairs 3), overflows 0, threshold 64" :
-                                           "mul_mat.f16: matmuls 3 (pairs 0), overflows 0, threshold 64";
-            const bool   lines   = count_lines_with(text, first) == 1 &&
+            // tile 0's pair waits on the pairs route (products_pairs): order A (2 slots, the tiles at the same time)
+            // 1 + chunks a pass, order B 2 chunks a pass; the route under the backend's TCM, 384 KiB on the K3
+            const char * tcm_env    = std::getenv("FLAGOS_SPACEMIT_TEST_TCM");
+            const char * thr_env    = std::getenv("FLAGOS_SPACEMIT_TEST_THREADS");
+            const size_t host_tcm   = tcm_env != nullptr ? (size_t) std::max(0LL, std::atoll(tcm_env)) : 0;
+            const size_t tcm        = host ? host_tcm : 393216;
+            const bool   concurrent = !host || (thr_env != nullptr && std::strcmp(thr_env, "0") != 0);
+            int64_t      waits      = 0;
+            for (const mm_run * r : { &ra, &rb, &rc }) {
+                int64_t q[4] = {};
+                route_of(r->y, dev_tiles, tcm, q);
+                const int64_t chunks = (r->y->ne[0] / 32 + 1) / 2;
+                waits += q[2] * (q[1] == 2 && concurrent ? 1 + chunks : 2 * chunks);  // 0 passes on the plain route
+            }
+            const int         largest = kernels ? 0 : 1;
+            const std::string first   = std::string("mul_mat.f16: matmuls 3 (pairs ") + (pairs ? "3" : "0") +
+                                      "), overflows 0, threshold 64, pair waits " + std::to_string(waits);
+            const bool        lines   = (waits > 0) == pairs && text.substr(0, text.find('\n')) == first &&
+                               count_lines_with(text, "mul_mat.f16: matmuls ") == 1 &&
                                count_lines_with(text, "mul_mat.f16: largest activation ") == largest &&
                                count_lines_with(text, "mul_mat.f16: largest partial sum ") == largest &&
                                count_lines_with(text, "mul_mat.f16: K 512 N 64: 2 matmuls") == 1 &&
@@ -13585,6 +13604,151 @@ static int bench_mmid(ggml_backend_dev_t dev) {
     return 0;
 }
 
+// the pair-wait launches (spacemit_pairwait_launch) on a stream of the plugin device the core opened: a backend alive
+// would share its executor and core grant. Made where no backend is alive, so the stream makes the one executor (1
+// created, else a FAIL), which reads FLAGOS_SPACEMIT_TEST_THREADS then; the launches' steps are taken off the counter
+struct pairwait_stream {
+    const spacemit_plugin_v1 *  table  = nullptr;
+    spacemit_plugin_stream *    stream = nullptr;
+    spacemit_pairwait_launch_fn launch = nullptr;
+
+    bool init(ggml_backend_dev_t dev) {
+        table                         = spacemit_plugin_table(spacemit_device_plugin(dev));
+        spacemit_plugin_device * pdev = spacemit_device_plugin_device(dev);
+        launch = table != nullptr ? reinterpret_cast<spacemit_pairwait_launch_fn>(
+                                        table->get_proc_address("spacemit_pairwait_launch")) :
+                                    nullptr;
+        if (pdev == nullptr || launch == nullptr) {
+            std::fprintf(stderr, "FAIL: pairwait: no plugin device or no spacemit_pairwait_launch\n");
+            g_failures++;
+            return false;
+        }
+        g_executors_take();
+        const bool     made = table->stream_create(pdev, device_tiles(dev), &stream) == SPACEMIT_STATUS_SUCCESS;
+        const uint64_t own  = g_executors_take();
+        if (!made || own != 1) {
+            std::fprintf(stderr, "FAIL: pairwait: stream %s, %llu executors created (1 expected: no backend alive)\n",
+                         made ? "made" : "not made", (unsigned long long) own);
+            g_failures++;
+            return false;
+        }
+        return true;
+    }
+
+    ~pairwait_stream() {
+        if (stream != nullptr) {
+            table->stream_destroy(stream);
+        }
+        g_steps_take();
+    }
+};
+
+static const char * const k_pairwait_names[3] = { "ours", "spine", "spine+exit" };
+
+// the pair-wait launches of --bench-pairwait, small: with the tiles at the same time (the AI cores, the host's threads)
+// every variant makes its 10,000 rendezvous on every tile; on the serial executor every variant returns at once. On
+// the AI cores spine, which has no exit, is left to --bench-pairwait: a launch gone wrong would hang this check
+static int check_pairwait(ggml_backend_dev_t dev, bool host) {
+    constexpr uint32_t n     = 10000;
+    const uint32_t     tiles = device_tiles(dev);
+    int                n_checks = 0, n_ok = 0;
+    for (const char * threads : { "0", "1" }) {
+        if (!host && threads[0] == '1') {
+            break;  // the AI cores: one pass
+        }
+        env_override    on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
+        const bool      concurrent = !host || threads[0] == '1';
+        pairwait_stream s;
+        if (!s.init(dev)) {
+            continue;
+        }
+        for (uint32_t v = 0; v < 3; v++) {
+            if (!host && v == SPACEMIT_PAIRWAIT_SPINE) {
+                continue;
+            }
+            spacemit_pairwait_result r   = {};
+            const bool               ran = s.launch(s.stream, v, n, &r);
+            bool ok = ran && r.n_tiles == tiles && r.concurrent == concurrent && r.executor != nullptr;
+            for (uint32_t t = 0; t < r.n_tiles; t++) {
+                ok = ok && r.waits[t] == (concurrent ? n : 0);
+            }
+            n_checks++;
+            n_ok += ok;
+            if (!ok) {
+                std::fprintf(stderr, "FAIL: pairwait %s, %s: %s, %u tiles, concurrent %d, tile 0 %u waits\n",
+                             k_pairwait_names[v], r.executor != nullptr ? r.executor : "?", ran ? "ran" : "failed",
+                             r.n_tiles, (int) r.concurrent, r.waits[0]);
+                g_failures++;
+            }
+        }
+    }
+    std::printf("pairchk  %s, 10000 rendezvous a tile%s: %d/%d\n",
+                host ? "ours, spine and spine+exit" : "ours and spine+exit", host ? " on threads, none in turn" : "",
+                n_ok, n_checks);
+    return 0;
+}
+
+// --bench-pairwait: what a pair rendezvous costs on the device's tiles. A launch a variant on all tiles, each tile
+// making n rendezvous with tile ith ^ 1 back to back after 1,000 untimed, timing its own loop: ours
+// (spacemit_pair_wait), spine (SpacemiT's barrier, ggml-cpu/spacemit/spine_barrier.h, no exit) and spine+exit (the
+// same with our two exits). Three rounds, the order rotated each round; a round's figure the mean over the tiles of
+// tile ns / n, a variant's the median of its rounds. Skipped where the tiles run in turn (the serial host executor)
+static int bench_pairwait(ggml_backend_dev_t dev) {
+    constexpr uint32_t n        = 1000000;
+    constexpr int      n_rounds = 3;
+    pairwait_stream    s;
+    if (!s.init(dev)) {
+        return 1;
+    }
+    spacemit_pairwait_result probe = {};
+    REQUIRE(s.launch(s.stream, SPACEMIT_PAIRWAIT_OURS, 1000, &probe));
+    std::printf("pairwait: %u tiles, pause in ours: %s (__riscv_zihintpause), executor %s\n", probe.n_tiles,
+                probe.pause_in_ours ? "yes" : "no", probe.executor);
+    if (!probe.concurrent) {
+        std::printf("pairwait: skipped, the tiles run in turn\n");
+        return 0;
+    }
+    std::vector<double> rounds[3];
+    for (int round = 0; round < n_rounds; round++) {
+        for (int j = 0; j < 3; j++) {
+            const int                v   = (round + j) % 3;
+            spacemit_pairwait_result r   = {};
+            const bool               ran = s.launch(s.stream, (uint32_t) v, n, &r);
+            bool                     all = ran && r.n_tiles > 0;
+            std::vector<double>      per;
+            for (uint32_t t = 0; t < r.n_tiles; t++) {
+                all = all && r.waits[t] == n;
+                per.push_back((double) r.ns[t] / n);
+            }
+            if (!all) {
+                std::fprintf(stderr, "FAIL: pairwait round %d %s: %s, tile 0 made %u of %u waits\n", round + 1,
+                             k_pairwait_names[v], ran ? "ran" : "the launch failed", r.waits[0], n);
+                g_failures++;
+                continue;
+            }
+            std::sort(per.begin(), per.end());
+            double mean = 0;
+            for (double x : per) {
+                mean += x / per.size();
+            }
+            const double median = (per[(per.size() - 1) / 2] + per[per.size() / 2]) / 2;
+            std::printf("pairwait round %d %s: %.1f ns a wait (tiles min %.1f, median %.1f, max %.1f), %u waits a "
+                        "tile\n",
+                        round + 1, k_pairwait_names[v], mean, per.front(), median, per.back(), n);
+            rounds[v].push_back(mean);
+        }
+    }
+    for (int v = 0; v < 3; v++) {
+        std::vector<double> & m = rounds[v];
+        if (!m.empty()) {
+            std::sort(m.begin(), m.end());
+            std::printf("pairwait %s: median of %zu rounds %.1f ns a wait\n", k_pairwait_names[v], m.size(),
+                        (m[(m.size() - 1) / 2] + m[m.size() / 2]) / 2);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     bool expect_device = false;
     bool expect_none   = false;
@@ -13597,6 +13761,7 @@ int main(int argc, char ** argv) {
     bool run_repack    = false;
     bool run_x100      = false;
     bool run_mmid      = false;
+    bool run_pairwait  = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -13620,10 +13785,13 @@ int main(int argc, char ** argv) {
             run_x100 = true;
         } else if (std::strcmp(argv[i], "--bench-mmid") == 0) {
             run_mmid = true;
+        } else if (std::strcmp(argv[i], "--bench-pairwait") == 0) {
+            run_pairwait = true;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
-                         "--bench-f32 | --bench-embd | --bench-repack | --bench-x100 | --bench-mmid]\n"
+                         "--bench-f32 | --bench-embd | --bench-repack | --bench-x100 | --bench-mmid | "
+                         "--bench-pairwait]\n"
                          "  --bench-attn: flash attention only\n"
                          "  --bench-f32: the F32 matmul only\n"
                          "  --bench-embd: the token embedding lookup only, ggml's dequantizers against an F32 copy\n"
@@ -13631,7 +13799,8 @@ int main(int argc, char ** argv) {
                          "  --bench-x100: the 1-row matmul beside readers on the X100 cores, and split between the "
                          "provider and the CPU backend\n"
                          "  --bench-mmid: one MUL_MAT_ID node of Q4_0 experts, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against "
-                         "the default\n",
+                         "the default\n"
+                         "  --bench-pairwait: the pair wait against SpacemiT's barrier, without and with our exits\n",
                          argv[0]);
             return 2;
         }
@@ -13685,7 +13854,7 @@ int main(int argc, char ** argv) {
         check_router_q8(dev) != 0 || check_mul_mat_f16(dev, host) != 0 || check_conv_pair(dev) != 0 || check_moe_ops(dev) != 0 ||
         check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
-        check_shared_stream(dev, host) != 0) {
+        check_pairwait(dev, host) != 0 || check_shared_stream(dev, host) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 :
@@ -13693,7 +13862,7 @@ int main(int argc, char ** argv) {
                         (run_mm && bench_mm(dev) != 0) || (run_f32 && bench_mm_f32(dev) != 0) ||
                         (run_embd && bench_embd(dev) != 0) ||
                         (run_repack && bench_repack(dev, !host) != 0) || (run_x100 && bench_x100(dev) != 0) ||
-                        (run_mmid && bench_mmid(dev) != 0)) {
+                        (run_mmid && bench_mmid(dev) != 0) || (run_pairwait && bench_pairwait(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

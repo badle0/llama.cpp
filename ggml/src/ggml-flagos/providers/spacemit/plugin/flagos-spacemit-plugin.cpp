@@ -450,6 +450,21 @@ void spacemit_run_stats_attach(spacemit_plugin_stream * stream, struct spacemit_
     }
 }
 
+// test-only (--bench-pairwait): a launch on the stream's executor outside the replay; the caller keeps the runs one at
+// a time, as the core's run_mutex does
+bool spacemit_pairwait_launch(spacemit_plugin_stream * stream, uint32_t variant, uint32_t n,
+                              spacemit_pairwait_result * out) {
+    if (stream == nullptr || out == nullptr) {
+        return false;
+    }
+    try {
+        return spacemit_pairwait_run(*stream->executor, variant, n, out);
+    } catch (...) {
+        GGML_LOG_ERROR("FlagOS SpacemiT: the launch threw an exception\n");
+        return false;
+    }
+}
+
 // what is not contract (plan.md "S1 design" §2, A2): the test counters, by their current names
 void * plugin_get_proc_address(const char * name) {
     if (name == nullptr) {
@@ -506,6 +521,9 @@ void * plugin_get_proc_address(const char * name) {
     if (std::strcmp(name, "spacemit_mul_mat_same_activations") == 0) {
         return reinterpret_cast<void *>(
             static_cast<spacemit_mul_mat_same_activations_fn>(spacemit_mul_mat_same_activations));
+    }
+    if (std::strcmp(name, "spacemit_pairwait_launch") == 0) {
+        return reinterpret_cast<void *>(static_cast<spacemit_pairwait_launch_fn>(spacemit_pairwait_launch));
     }
     return nullptr;
 }

@@ -30,7 +30,9 @@ uint32_t spacemit_f16_stats_on();
 uint32_t spacemit_f16_route_pairs();
 
 // test-only (FLAGOS_SPACEMIT_F16_STATS=<path>): appends what the products steps recorded since the last flush to the
-// file and clears it; nothing when no matmul was taken. Called when a stream is destroyed
+// file and clears it; nothing when no matmul was taken. Called when a stream is destroyed. The first line:
+// "mul_mat.f16: matmuls <n> (pairs <n>), overflows <n>, threshold <rows>, pair waits <n>", the last tile 0's on the
+// pairs route
 void spacemit_mul_mat_f16_stats_flush();
 
 // test-only: the fp16 bits of weight w's slice `slice` and 32-column tile `col_tile` as the reference dequantization

@@ -130,6 +130,26 @@ typedef void (*spacemit_switches_reset_fn)(void);
 // configuration word, plan.md "S1 step 3 spec"), so a switch that changes the step list cannot reuse a cached plan
 typedef uint32_t (*spacemit_switches_generation_fn)(void);
 
+// test-only (flagos-check-spacemit --bench-pairwait): the pair rendezvous of one launch, tile by tile
+enum {
+    SPACEMIT_PAIRWAIT_OURS = 0,    // spacemit_pair_wait
+    SPACEMIT_PAIRWAIT_SPINE,       // SpacemiT's barrier (ggml-cpu/spacemit/spine_barrier.h), no exit
+    SPACEMIT_PAIRWAIT_SPINE_EXIT,  // the same with spacemit_pair_wait's two exits
+};
+#define SPACEMIT_PAIRWAIT_MAX_TILES 64
+typedef struct {
+    uint32_t     n_tiles;
+    bool         concurrent;     // false: the tiles ran in turn, so no tile made a rendezvous
+    bool         pause_in_ours;  // spacemit_pair_wait's spin has the pause hint (__riscv_zihintpause)
+    const char * executor;       // the executor's name
+    uint64_t     ns[SPACEMIT_PAIRWAIT_MAX_TILES];     // per tile: its timed loop
+    uint32_t     waits[SPACEMIT_PAIRWAIT_MAX_TILES];  // per tile: the timed rendezvous it made
+} spacemit_pairwait_result;
+// one launch on the stream's executor in which every tile makes n timed rendezvous with tile ith ^ 1 by the variant,
+// after 1,000 untimed in a step before; false if the launch failed (a wait gave up)
+typedef bool (*spacemit_pairwait_launch_fn)(spacemit_plugin_stream * stream, uint32_t variant, uint32_t n,
+                                            spacemit_pairwait_result * out);
+
 typedef struct {
     uint32_t api_version;  // the mentor's fields (flagos-provider.h:66-67)
     uint32_t struct_size;
