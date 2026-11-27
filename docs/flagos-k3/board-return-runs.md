@@ -978,3 +978,45 @@ No code change (`59a1aaea7`, documents only since the build of `2cec2e84d`). The
 **Not run on this unit yet.** The harness's `control` and `alongside` (there is no `build-ime` here), the read of marked TCM blocks after a kill (no `~/tcmtest`), the harness at full size on either model, and the 35B through the server.
 
 **Before the 35B: the six checks on the Mac with a small model of its family** (Qwen3.5-0.8B, the simulated device). Five pass, with the follow-ups and the prompt cache reused (`cache_n` 50, 51, 52 and 21). KV shifting cannot: llama-server prints "cache_reuse is not supported by this context, it will be disabled" at its start, since this family gives a token several positions (`llama_kv_cache::get_can_shift`). `spacemit_check.py` now reports that check as not applicable when the server prints the line, and counts five. Whether the 35B's server prints it is an inference from the family until its run.
+
+## 25. The 35B through `llama-server` (`~/server-checks-35b`, 2026-11-27)
+
+No rebuild (`814adb20a`: the build of `2cec2e84d` with `llama-server`; the script's change of section 24). The first run of the server checks on Qwen3.6-35B-A3B, and of the harness's cases beyond `grid` on it.
+
+**The server checks: 5/5**, KV shifting reported as not applicable (the server printed the line section 24 inferred).
+
+| | the 35B |
+|---|---|
+| up, every layer and the KV cache on the provider, 4 slots, 1 split | 53.1 s, 42/42 |
+| the greedy reply against `llama-completion` | 150 characters equal |
+| a follow-up on its cache against from scratch (KLD, limit 0.1) | 0.000832 |
+| interleaved conversations from the prompt cache (KLD) | 0.000306, 0.001506 |
+| a follow-up ending in 4 tokens (KLD) | 0.002474 |
+| a fresh 500-token prompt to the first token (one request) | 4,385 ms |
+| a generated token | 97.7 ms |
+| a 13-token follow-up with the cache, and its 63 tokens from scratch | 529 and 1,080 ms |
+| a 4-token follow-up with the cache, and its 25 tokens from scratch | 211 and 628 ms |
+
+- 4,385 ms is 114 t/s. `llama-bench` takes 4.23 s for 501 tokens on this build (section 21); the 0.16 s more is about what the server's separate batch of the last 4 tokens would add over having them in the main batch (an inference from the 4-token tail's 182 ms below, not measured apart). It is 0.39 s over the 4 s that `batch-one.md` section 5 sets for a fresh 500-token prompt (a target agreed on the Qwen3 models).
+
+**The TTFT harness, `--quick`, without `second` and `alongside`: 10/10.** Client ms, p50 of 2, with the old unit's grid of 2026-11-22 (item 98; older code, another board) beside it:
+
+| tail (tokens) | depth 0 | old unit | depth 256 | old unit |
+|---|---|---|---|---|
+| 1 | 117.3 | 139.8 | 159.2 | 191.4 |
+| 4 | 181.7 | 182.9 | 239.3 | 241.2 |
+| 9 | 406.7 | 418.2 | | |
+| 12 | | | 537.2 | 543.2 |
+| 63 | | | 1,099.6 | 1,187.1 |
+| 64 | 1,025.8 | 1,112.7 | 1,074.1 | 1,190.2 |
+| 65 | 1,012.7 | 1,109.7 | | |
+
+- Short tails are where the 35B is slow a token: 64 tokens take 1.03 s (62 t/s) against 114 t/s for 500. The 4-token tail is as it was on the old unit; the gains since then are at 1 token and from 63 up.
+- 9 tokens cost 225 ms more than 4: the server's own split of a prompt's last 4 tokens for this family (item 98), so 9 runs as 5 and 4.
+- Chat, three turns of 128 tokens: thinking off, the first content after 735, 2,235 and 2,152 ms (turns 2 and 3 decode the last reply again, 148 and 149 tokens; `batch-one.md` conclusion 3); thinking on, the first reasoning after 725, 888 and 1,075 ms (20 and 21 new tokens).
+- 64 generated tokens: 10.44 t/s from an empty cache, 10.33 from depth 256.
+- `cancel`: a 512-token request closed after 0.5 s is not stopped, and the next request waited 4.08 and 4.02 s for it. On the 0.6B the same wait is 0.41 s (section 24); at this model's speed it is what a user who stops and asks again would feel.
+- `restart`: after a `kill -9` one second into a request the next server was up in 60.1 s with no "could not get" line and the same speed (10.33 against 10.27 t/s).
+- Start-up: 53.1, 42.1 and 60.1 s to `/health` in the three starts that were timed.
+
+**Not run.** The harness at full size on the 35B on this unit (the 500-token and deeper cells, 20 chat turns, 512 generated tokens); `second` and `alongside`.

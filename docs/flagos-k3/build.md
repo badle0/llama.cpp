@@ -1016,6 +1016,10 @@ Manual checks:
 - The runner **62/62** on Qwen3-0.6B and **62/62** on Qwen3-4B with `--ppl-text ~/wiki.test.raw --segv ~/segv.so`, the six server checks included for the first time on this unit. The server's own lines: up in 3.0 and 6.0 s; a fresh 500-token prompt to the first token 674 and 2,470 ms; a generated token 24.0 and 95.6 ms.
 - `spacemit_ttft.py --quick` on Qwen3-0.6B **11/11**: a 1-token tail 21.2 ms at depth 0 and 27.3 ms at depth 256; 64 generated tokens at 56.93 t/s. `control` and `alongside` skipped (no `build-ime` on this unit).
 
+**Qwen3.6-35B-A3B through `llama-server`, 2026-11-27** (`board-return-runs.md` section 25; `progress.md` item 141). On `814adb20a`, no rebuild; the logs on the Mac: `~/k3-logs/server-checks-35b`.
+- The runner's server checks alone (`server_checks` called from a one-line `python3 -c`) **5/5**, KV shifting not applicable to this family. Up in 53.1 s; a fresh 500-token prompt to the first token 4,385 ms; a generated token 97.7 ms.
+- `spacemit_ttft.py --quick --cases grid,chat,cancel,tg512,restart` **10/10**: a 1-token tail 117.3 ms at depth 0 and 159.2 ms at depth 256; 64 generated tokens at 10.44 t/s.
+
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 
 | Variable | Applies to | Effect |
