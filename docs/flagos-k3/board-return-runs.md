@@ -809,3 +809,59 @@ Only pp32 is on another path than before (the sizes from 64 rows took FP16 alrea
 Perplexities and KLDs are section 18's to the last digit, as they should be: the script's batches are 512 tokens and 1, on neither side of the change. So the script shows that nothing else moved; the 32 to 63 rows themselves are covered by the check program (31 and 32 rows on both sides) and by the KLDs above.
 
 **So 32 rows stay the default.** Open from this run: the 4% between 501 and 512 tokens on the 35B.
+
+## 22. The dip at 512 tokens (`~/prompt-512-step`, 2026-11-27)
+
+No rebuild (the build of `2cec2e84d`; only notes changed since). Three rounds in turn on the 35B: ours at eight sizes up to 512, ours at five sizes around 512 in one graph (`-ub 1024`), the fork at three sizes; then one run of ours with the op tables on, then the two small models. All `-n 0 -r 3`, every rc 0.
+
+**The 35B, t/s, the three rounds.**
+
+| tokens | ours | against its 501 | ours, `-ub 1024` | against its 501 | the fork | against its 501 |
+|---|---|---|---|---|---|---|
+| 448 | 119.25, 118.31, 117.71 | +0.4, -1.2, -0.4% | | | | |
+| 480 | 119.40, 121.24, 120.51 | +0.6, +1.2, +2.0% | | | 120.23, 116.20, 117.29 | -0.4, 0.0, -1.5% |
+| 496 | 118.29, 119.90, 119.60 | -0.4, +0.1, +1.2% | | | | |
+| 501 | 118.72, 119.75, 118.15 | | 118.01, 118.48, 118.48 | | 120.73, 116.18, 119.08 | |
+| 504 | 119.21, 120.73, 119.29 | +0.4, +0.8, +1.0% | | | | |
+| 508 | 116.65, 118.75, 117.39 | -1.7, -0.8, -0.6% | | | | |
+| 511 | 113.30, 117.02, 114.62 | -4.6, -2.3, -3.0% | | | | |
+| 512 | 112.41, 117.24, 112.30 | -5.3, -2.1, -5.0% | 112.54, 114.97, 112.97 | -4.6, -3.0, -4.7% | 116.63, 113.74, 113.94 | -3.4, -2.1, -4.3% |
+| 513 | | | 115.85, 116.54, 115.49 | -1.8, -1.6, -2.5% | | |
+| 528 | | | 119.54, 118.96, 118.94 | +1.3, +0.4, +0.4% | | |
+| 576 | | | 119.96, 119.80, 119.59 | +1.7, +1.1, +0.9% | | |
+
+- It is a dip, not a step: speed is level from 448 to 504, falls from 508, is lowest at 512 and is back by 528. In the `-ub 1024` rounds a 512-token prompt takes 4.45 to 4.55 s and a 528-token one 4.42 to 4.44 s.
+- The fork has the same dip (2 to 4% at 512). So section 21's 4% is not ours alone, and at 512 tokens the two are level as they are at 501: ours 112.3 to 117.2, the fork 113.7 to 116.6.
+- The depth differs between processes: about 5% in four of ours and 2 to 3% in two, each steady inside its process (errors of 0.15 to 0.3).
+- Graphs of 513, 528 and 576 rows, the first of more than 512 rows on the board, ran without a failure.
+
+**Where the time goes: the op tables at 496, 501 and 512 rows (one process; ms a graph).** That process read pp512 118.18 against pp501 119.18, so it is one of the shallow ones: 36 ms over what 501 rows scale to (4,326.3 against 4,290.1), where the deep ones lose 210 to 240.
+
+| steps | 501 rows | 512 rows | 512 against 501 scaled by rows |
+|---|---|---|---|
+| `UNARY` (170) | 116.3 | 160.7 | +42 ms, 1.35 times |
+| `GLU SWIGLU` (80) | 50.6 | 80.9 | +29 ms, 1.56 times |
+| `MUL` on the expert rows (30 `node_*` steps) | 31.1 | 46.5 | +15 ms, 1.47 times |
+| `ADD` (420) | 249.6 | 260.8 | +6 ms |
+| `CPY` (30) | 1.6 | 6.9 | +5 ms |
+| the matmuls, attention, the Gated DeltaNet | | | at or under the scaled figure |
+| `SSM_CONV` (30) | 102.4 | 80.0 | -25 ms (88.9 at 496: its 501 is the odd one) |
+
+- The loss is in the elementwise steps, not in the matmuls. Inside them the tiles differ at 512 rows where they are level at 501: `UNARY` on 512 rows 74.9 to 101.6 ms between tiles (69.7 to 73.1 at 501), a `MUL` on the expert rows 0.67 to 1.89 ms (1.057 to 1.058), and the graph's imbalance rises from 102.5 to 138.5 ms.
+- What a deep process loses, and where, is not in this table.
+
+**The small models, ours (t/s).**
+
+| tokens | Qwen3-4B | Qwen3-0.6B |
+|---|---|---|
+| 448 | 211.57, 210.32, 209.02 | 813.47, 802.70, 815.63 |
+| 480 | 209.07, 209.22, 208.98 | 789.92, 729.04, 795.51 |
+| 501 | 204.86, 205.23, 203.95 | 764.37, 704.99, 761.73 |
+| 511 | 201.27, 200.23, 201.30 | 819.23, 700.67, 739.44 |
+| 512 | 200.15, 198.09, 201.15 | 814.22, 749.37, 740.94 |
+
+- Qwen3-4B slopes down evenly (5% from 448 to 512, 511 and 512 alike): no dip of its own at 512 shows, though sizes past 512 were not run. Qwen3-0.6B varies by up to 10% between processes at these sizes (one round reads 511 and 512 above 501), so it shows nothing either way.
+
+**The likely cause (an inference from these figures and an older measurement; not tested).** The elementwise kernels, ours copied from the fork's, give each tile one block of rows (`dr * ith` in `plugin/flagos-spacemit-rvv-kernels.cpp`). At 512 rows of the 35B's width (2,048 floats) a tensor is exactly 4 MiB and a tile's block 512 KiB, so the 8 tiles stream from addresses a power of two apart; the expert steps' tensors are 8 and 32 times as many rows. That is the case `k3-hardware.md` records from 2026-10-13 on the old unit ("Huge pages and power-of-two strides": 8 AI cores streaming from starts a multiple of 2 MiB apart ran 2.1 to 2.2 times slower on huge pages) with its rule to stagger the tiles' starts. It fits the dip being in both backends, being at one size, and the 4B (width 2,560: 640 KiB blocks at 512 rows) not showing it. Not explained by it: why 511 and 513 rows lose too, and why processes differ.
+
+**Why it matters beyond the benchmark.** `llama-bench`, `llama-server` and the other tools decode a long prompt in batches of 512 tokens by default, so every 512-token batch of a long prompt is at the bottom of the dip; a batch size beside it (`-ub 528` or 576) would not be. Not measured yet.
