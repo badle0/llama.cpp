@@ -1065,3 +1065,56 @@ No rebuild (`09bca38da`, documents only since section 25). `spacemit_ttft.py --c
 - What failed: the follow-up was to find 4,096 tokens cached and decode 1; it found 4,092 or 4,093 and decoded 5 or 4 (457, 319 and 312 ms). For a model whose state cannot be rolled back the server returns to a context checkpoint, and it places those 4 tokens before a prompt's end (item 98). So the answer is right and costs 4 tokens instead of 1; the harness's expectation was written for Qwen3. (The checkpoint lines are at trace level and not in the log, so the mechanism is inferred from the counts.)
 
 **`restart`, three kills (0.5, 1.0, 1.5 s into a request): 3/3.** The next server up after 68.1, 51.1 and 56.1 s, no "could not get" line, the first token after 0.68 s, 64 tokens at 10.32 to 10.43 t/s as before.
+
+## 27. The TTFT harness at full size on the two small models (`~/ttft-full-small-models`, 2026-11-27)
+
+No rebuild (`e485300ca`, documents only since section 26). `spacemit_ttft.py` with every case, 5 repeats: **13/13 on Qwen3-0.6B and 13/13 on Qwen3-4B**. `control` and `alongside` skip (no `build-ime` on this unit), and `restart` does not read the marked blocks (no `~/tcmtest`). With this the three models each have a full-size run on this unit.
+
+**The targets of `batch-one.md` section 5 against this run.**
+
+| target | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| a chat turn at depth 4096 at most 1 s | 26 tokens 268 ms; 38 355; 110 901: met | 26 tokens 871 ms, met; 38 1,039, 39 ms over; 110 2,531 |
+| a fresh 500-token prompt at most 4 s | 656 ms | 2,445 ms, met (5,210 in the baseline) |
+| 512 generated tokens from depth 4096 at least 9 t/s | 19.22 t/s | 7.53 t/s, not met, the baseline's figure to the digit |
+| 512 generated tokens from depth 0 | 47.00 t/s | 10.59 t/s |
+
+**The grid against the old unit's baseline of 2026-11-08 and 09** (`~/k3-logs/ttft-base-06`, `ttft-base-4b`; client ms p50 of 5, the baseline in brackets; 395 of 395 requests answered on each model, `cache_n` and `prompt_n` as asked). Qwen3-4B:
+
+| tail | depth 0 | 256 | 1024 | 4096 | 8192 |
+|---|---|---|---|---|---|
+| 1 | 94 (94) | 100 (100) | 107 (106) | 136 (136) | 175 (176) |
+| 2 | 111 (111) | 118 (115) | 141 (132) | 219 (188) | 317 (264) |
+| 3 | 129 (131) | 147 (140) | 207 (185) | 414 (328) | 629 (491) |
+| 4 | 112 (116) | 121 (119) | 148 (142) | 263 (238) | 396 (345) |
+| 8 | 142 (138) | 184 (167) | 342 (285) | 908 (686) | 1,430 (1,197) |
+| 12 | | 185 (324) | 250 (921) | 440 (3,342) | 728 (6,970) |
+| 26 | | 366 (693) | 474 (1,982) | 871 (7,255) | 1,420 (15,332) |
+| 38 | | 358 (960) | 497 (2,843) | 1,039 (10,562) | 1,778 (22,290) |
+| 63 | 374 (676) | 445 (1,566) | 653 (4,687) | 1,519 (17,584) | 2,665 (37,191) |
+| 64 | 358 (556) | 426 (624) | 630 (826) | 1,475 (1,673) | 2,592 (2,789) |
+| 110 | | 679 (1,144) | 1,042 (1,507) | 2,531 (3,000) | 4,496 (4,965) |
+| 500 | 2,445 (5,210) | | | | |
+| 2048 | 16,768 (27,837) | | | | |
+| 4095 | 50,851 (73,191) | | | | |
+
+- Long prompts take 31 to 54% less on the 4B (500 tokens 53%, 2,048 40%, 4,095 31%; 575, whose last 63 are T1's as well, 61%) and 12 to 32% less on the 0.6B (500 tokens 656 ms against 954): the FP16 path for dense Q4_0, which the baseline did not have.
+- 12 to 63 tokens at depth take a tenth of the baseline (T1's tiled attention); against T1's own run of 2026-11-11 (`build.md` section 7) 12 and 26 tokens at depth 4096 are where they were (440 against 443, 871 against 870) and 38 and 63 are 9 and 14% shorter (FP16 from 32 rows).
+- One token is unchanged at every depth, on both models, and so is generation: 10.59, 9.85 and 7.53 t/s from depths 0, 500 and 4096 on the 4B (10.56, 9.83, 7.53), 47.00, 37.16 and 19.22 on the 0.6B (46.58, 36.98, 19.16), the ten runs within 0.3%.
+- **Two to 8 tokens at depth are slower than the baseline, and more so the deeper the cache.** On the 4B at depth 4096: 2 tokens +17%, 3 +26%, 4 +11%, 8 +32% (222 ms); at depth 0 all four are level. On the 0.6B at depth 4096: +27%, +33%, +22%, +14%; level at depth 0. From depth 1024 p95 lies within 5% of p50 in each of these cells. So it is the attention for 2 to 8 new tokens, the KV-head split, and not the matmuls. Its kernel (`kvh_inner_mrow`) was changed on 2026-11-14 (`c13d1d21d`, the port of ggml-spacemit's kernels for 256-wide heads: `dst` and `sinks` arguments back, a branch on `partial`), after the last Qwen3 grid on the old unit (the 4B's of 2026-11-11, where these tails read "as in the baseline"); the one-token kernel and the tiled one, which that commit left as they were, are level. The board changed too, so the cause is not shown: the code change (my first suspect, by the pattern), or this unit. The 35B's grid has it faintly, +2 to +5% at 3, 4 and 8 tokens at depths 4096 and 8192 against 2026-11-22 (section 26 called those cells unchanged), with few attention layers and the same kernel code on both dates. Not seen before because no Qwen3 grid ran between 2026-11-11 and this one. Next: the commit before `c13d1d21d`, that commit and HEAD on this board in turn.
+- 3 tokens cost more than 4 at depth (414 against 263 ms at 4096 on the 4B), as in the baseline (328 against 238). On the 4B 8 tokens now cost more than 12 at every depth from 1024 (908 against 440 ms at 4096): the tiled kernel starts at 9 tokens, and below it the KV-head split is the slower of the two at depth. Not looked into; the threshold of 9 was set on the old unit before the slowdown above.
+- On the 4B 26 tokens cost as much as 38 at depth 256 (366 against 358 ms): 26 rows take the integer path and 38 the FP16 path (the threshold of 32 rows, sections 20 and 21).
+- 511, 512 and 513 tokens on the 4B: 2,567, 2,582 and 2,665 ms; 575 and 576: 3,080 and 3,057.
+
+**Chat, 20 turns of up to 512 tokens.**
+
+- Thinking off, the first content: on the 0.6B 0.10 s in turn 1, then 0.7 to 7.2 s; on the 4B 0.43 s, then 3.2 s in turn 2 rising to 23.9 s in turn 19 (9,046 tokens cached; 42.0 s in the baseline, 26.4 after T1). Every turn decodes the previous reply again, 533 to 537 tokens on the 4B, as the 35B does (section 26): the wait belongs to the server and the template with thinking off, not to one model family.
+- Thinking on, the first reasoning: 0.13 to 1.7 s on the 0.6B, 0.47 to 2.1 s on the 4B, where most turns add 16 to 23 tokens. 17 and 19 of the 20 answers ended at 512 tokens; on the 4B 13 never left the reasoning.
+
+**`cancel`.** A 2,048-token request at depth 4096 closed after 2.0 s; the next request waited 17.2 s on the 0.6B and 50.4 s on the 4B (18.4 and 61.4 in the baseline). The server's log: "cancel task" 2.0 s in, and the cancelled request's "prompt eval time" 19.2 and 52.4 s for all 2,048 tokens, one `llama_decode` call. So the server honours a cancel only when the call in flight returns, as on the 35B (section 26). The follow-up finds 4,096 tokens cached and decodes 1, as the harness expects of Qwen3.
+
+**`restart`, three kills: 3/3 on both.** The next server up after 4.0 s (0.6B) and 6.0 s (4B; 5.0 and 11.0 on the old unit), nine `/dev/tcm` lines, no "could not get" line, 64 tokens within 0.2% of before.
+
+**`second`.** A second server beside the first is up after 63 and 66 s, its request is refused after 30.0 s with "Compute error." in the stream, and after the first has gone it answers with the first's text: as on the old unit.
+
+**Read across the three models.** At depth the 4B is the slowest of the three, not the 35B: 110 tokens at depth 4096 2,531 ms against 2,107, 4,095 fresh tokens 50.9 s against 42.7, 512 generated tokens from depth 4096 7.53 t/s against 9.50. Every 4B layer attends over the whole cache; most of the 35B's layers keep a recurrent state instead.

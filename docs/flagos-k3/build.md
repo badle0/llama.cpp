@@ -1020,6 +1020,7 @@ Manual checks:
 - The runner's server checks alone (`server_checks` called from a one-line `python3 -c`) **5/5**, KV shifting not applicable to this family. Up in 53.1 s; a fresh 500-token prompt to the first token 4,385 ms; a generated token 97.7 ms.
 - `spacemit_ttft.py --quick --cases grid,chat,cancel,tg512,restart` **10/10**: a 1-token tail 117.3 ms at depth 0 and 159.2 ms at depth 256; 64 generated tokens at 10.44 t/s.
 - The same cases at full size (`board-return-runs.md` section 26; `progress.md` item 142; `~/k3-logs/ttft-full-35b`) **11/12**: a fresh 500-token prompt 4,447 ms; a 26-token turn at depth 4096 926 ms; 512 generated tokens at 10.17 t/s from depth 0 and 9.50 t/s from depth 4096. The failure is `cancel`'s cached-token count (4,092 or 4,093 for 4,096), the server's checkpoint for this family.
+- The harness at full size on the two small models (`board-return-runs.md` section 27; `progress.md` item 144; `~/k3-logs/ttft-full-small-models`): Qwen3-0.6B **13/13**, Qwen3-4B **13/13**. On the 4B a fresh 500-token prompt 2,445 ms (5,210 in the old unit's baseline), a 26-token turn at depth 4096 871 ms, 512 generated tokens at 10.59 t/s from depth 0 and 7.53 from depth 4096; on the 0.6B 656 ms, 268 ms, 47.00 and 19.22 t/s. Two to 8 tokens at depth are 11 to 33% slower than the baseline (4B, depth 4096: 8 tokens 908 ms against 686), cause open.
 
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 
