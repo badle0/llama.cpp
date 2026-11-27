@@ -1007,6 +1007,11 @@ Manual checks:
 - The runner **56/56** on Qwen3-0.6B and **56/56** on Qwen3-4B with `--skip-server --ppl-text ~/wiki.test.raw` (another text than the runs above: perplexity 23.0355 against the CPU's 23.0657 and 14.9383 against 14.9376; KLDs 0.002826 and 0.003130, 0.001736 and 0.001767).
 - Against `FLAGOS_SPACEMIT_DENSE_Q4_0=int8`, three rounds in turn, t/s: Qwen3-4B pp128 213.4 to 215.4 against 106.5 to 107.0 and pp512 195.1 to 199.2 against 95.6 to 96.3; Qwen3-0.6B pp128 943.1 to 962.7 against 701.6 to 712.1 and pp512 741.8 to 744.3 against 525.6 to 528.7; pp32 and tg32 level on both (below the threshold of 64 rows).
 
+**32 rows as the default threshold, 2026-11-27** (`board-return-runs.md` section 21; `progress.md` item 136). On the build of `2cec2e84d`; the logs on the Mac: `~/k3-logs/f16-from-32-rows`.
+- The runner **56/56** on Qwen3-0.6B and **56/56** on Qwen3-4B with `--skip-server --ppl-text ~/wiki.test.raw`; perplexities and both KLDs are the run above's to the last digit (its batches, 512 tokens and 1, are on neither side of the change).
+- Against `FLAGOS_SPACEMIT_DENSE_Q4_0=f16:64`, three rounds in turn, t/s: Qwen3-4B pp32 127.9 to 128.5 against 108.5 to 108.7 and pp48 150.5 to 151.1 against 106.2 to 106.6; Qwen3-0.6B pp32 612.6 to 619.8 against 598.1 to 607.2 and pp48 722.3 to 725.9 against 651.7 to 653.0; Qwen3.6-35B-A3B pp32 64.2 to 64.9 against 62.5 to 63.7 and pp48 72.0 to 74.4 against 71.0 to 71.7; pp16 level on all three.
+- Qwen3.6-35B-A3B, one bench: pp4 22.56, pp32 63.86, pp128 98.71, pp501 119.35, tg64 10.28 t/s; pp512 113.50 against pp501 118.49 in one later process (the 4.2% between them is open).
+
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 
 | Variable | Applies to | Effect |

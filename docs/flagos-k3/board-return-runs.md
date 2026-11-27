@@ -735,3 +735,77 @@ Seven of the nine rows' ranges overlap; the 4B's pp32 and tg64 are 0.3% higher a
 - On the 4B FP16 halves the mean, and its mean and error are section 18's 512-token figures to the last digit. On the 35B the means are equal. The top token agrees a little more often under FP16 on both. The single worst token is worse under FP16 on both (0.33 against 0.19, 0.46 against 0.12), and the 35B's 99.9% point doubles while the 4B's falls to a quarter.
 - The tool's own time for a pass, one reading each: 35B 8.14 s (integer) against 7.95 s, 4B 5.62 against 4.25 s.
 - The 4B's CPU logits (one thread, 29.5 minutes, perplexity 14.9376 +- 1.14749) stay on the board as `~/kld-wiki/base-8-qwen3-4b.bin`.
+
+## 21. 32 rows as the default on the board, and 512 tokens beside 501 (`~/f16-from-32-rows`, 2026-11-27)
+
+One session on the board with the build of `2cec2e84d` (`default_threshold` 32). Build rc 0 (37 steps, without `llama-server`), the plugin rebuilt and the check program's binary naming 32. The check program passes, 0 FAIL lines, `pairchk` 2/2, and its f16 line reads "32 the default". `FLAGOS_SPACEMIT_DENSE_Q4_0=f16:64` is the arm for the default before.
+
+**`f16:64` against nothing set, three rounds in turn (`-p 16,32,48 -n 0 -r 3`, t/s).**
+
+| | `f16:64` | nothing set | nothing set against `f16:64`, round by round |
+|---|---|---|---|
+| Qwen3-0.6B pp16 | 472.91, 466.36, 475.96 | 475.34, 474.25, 473.99 | level (the integer path in both) |
+| Qwen3-0.6B pp32 | 606.82, 607.24, 598.14 | 612.61, 619.83, 618.85 | +1.0, +2.1, +3.5% |
+| Qwen3-0.6B pp48 | 653.03, 652.56, 651.65 | 725.91, 722.34, 725.06 | +11% |
+| Qwen3-4B pp16 | 82.71, 83.19, 82.64 | 83.03, 82.75, 83.39 | level |
+| Qwen3-4B pp32 | 108.53, 108.50, 108.65 | 128.11, 127.89, 128.45 | +18% |
+| Qwen3-4B pp48 | 106.17, 106.60, 106.22 | 151.07, 150.47, 151.06 | +41 to +42% |
+| 35B pp16 | 46.40, 46.10, 46.44 | 46.67, 46.03, 45.99 | level |
+| 35B pp32 | 63.06, 62.52, 63.71 | 64.24, 64.87, 64.37 | +1.9, +3.8, +1.0% |
+| 35B pp48 | 70.98, 71.07, 71.70 | 74.37, 72.01, 74.27 | +4.8, +1.3, +3.6% |
+
+- The default reads what `f16:32` read in section 19 (Qwen3-4B 126.6 to 127.2 and 150.0 to 151.0 there, the 35B 63.7 to 64.3 and 71.6 to 74.3, Qwen3-0.6B 605 to 612 and 716 to 722), and nothing is slower. The 0.6B at 32 tokens, level there, is 1 to 3.5% faster here; the two arms' ranges do not overlap in this run.
+- The 35B at 48 tokens reads 72.0 in one round of three, with an error of 0.16 inside that process, as one round did in section 19 (71.62). So it is a process that is 3% slower as a whole, not a noisy repetition; not explained.
+
+**One standard bench a model, nothing set (`-n 64 -r 3`, t/s).**
+
+| | this run | before (section 20, "after"; section 18 for the 0.6B) |
+|---|---|---|
+| 35B pp4 / pp32 / pp128 / pp501 / tg64 | 22.56 / 63.86 / 98.71 / 119.35 / 10.28 | 22.8 to 23.2 / 62.1 to 63.2 / 98.5 to 98.8 / 118.2 to 119.9 / 10.19 to 10.32 |
+| Qwen3-4B pp32 / pp128 / pp512 / tg64 | 127.96 / 212.50 / 196.65 / 11.20 | 108.6 to 108.9 / 214.1 to 216.2 / 199.5 to 204.0 / 11.19 to 11.22 |
+| Qwen3-0.6B pp32 / pp128 / pp512 / tg64 | 603.50 +- 11.60 / 965.39 / 750.77 / 58.45 | 602 to 604 / 943 to 963 / 742 to 744 / tg32 57.8 to 58.4 |
+
+Only pp32 is on another path than before (the sizes from 64 rows took FP16 already, generation and 4 tokens stay on the integer path). The rest are one reading each: the 4B's pp128 and pp512 are 1 to 2% under the earlier ranges and the 35B's pp4 is under its range by its own error (0.30), on code that did not change. The 0.6B's pp32 has an error of 11.6 in this reading, so the three rounds above are the figure for it.
+
+**512 tokens beside 501 on the 35B (`-p 501,512 -n 0 -r 3`, one process, after the run).**
+
+| | t/s | one prompt |
+|---|---|---|
+| pp501 | 118.49 +- 0.14 | 4.228 s |
+| pp512 | 113.50 +- 0.30 | 4.511 s |
+
+- 512 tokens are 4.2% slower a token than 501: the 11 more tokens cost 283 ms, 25.7 ms each where the mean token costs 8.4. Both are one graph (`llama-bench` decodes up to 512 tokens in one). One process, so the size is not established and the cause is not known: a step at 512 rows, or a slope from 501. Attention's square law cannot make it (about 0.6 ms a token more at this length, from section 19's 158 ms; an estimate).
+- pp512 is the size other projects quote, so 113.5 is the figure to quote for the 35B until this is explained. The fork was measured at 501 only; its pp512 is not known.
+
+**KLD in 48- and 32-token batches (`-b 512 -ub 48` and `-ub 32`, 8 chunks of `wiki.test.raw`, against the CPU on one thread).** Under `f16:64` every batch takes the integer path (no stats file is written); with nothing set every batch takes FP16 (the last of a chunk in 48-token batches has 32 rows).
+
+| | `f16:64` (integer) | nothing set (FP16) |
+|---|---|---|
+| 35B, 48: mean KLD | 0.006506 +- 0.000305 | 0.006497 +- 0.000381 |
+| 35B, 48: 99.9% / maximum / same top token | 0.141692 / 0.191571 / 96.912 +- 0.383% | 0.279354 / 0.333546 / 97.353 +- 0.356% |
+| 35B, 48: FP16 matmuls | 0 | 8,096, all on the pairs, 0 overflows, 655,776 waits |
+| 35B, 32: mean KLD | 0.006899 +- 0.000391 | 0.006377 +- 0.000450 |
+| 35B, 32: 99.9% / maximum / same top token | 0.245147 / 0.364111 / 97.304 +- 0.359% | 0.195795 / 0.645058 / 97.451 +- 0.349% |
+| 35B, 32: FP16 matmuls | 0 | 11,776, all on the pairs, 0 overflows, 953,856 waits |
+| Qwen3-4B, 48 and 32: mean KLD | 0.003400 +- 0.000155 | 0.001736 +- 0.000230 |
+| Qwen3-4B, 48 and 32: 99.9% / maximum / same top token | 0.091462 / 0.120833 / 97.941 +- 0.314% | 0.021535 / 0.456467 / 98.137 +- 0.299% |
+| Qwen3-4B: FP16 matmuls, 48 / 32 | 0 | 21,704 (18,928 on the pairs) / 31,552 (27,520), 0 overflows, 1,400,688 / 2,035,584 waits |
+
+- The four runs in 48-token batches print section 20's figures to the last digit (the default here against its `f16:32`, `f16:64` here against its default): the change of the constant changed no arithmetic, and the runs repeat exactly.
+- In 32-token batches, new here, the rule holds on the 35B too: 0.006377 against 0.006899 + 0.000391. The single worst token is again worse under FP16 (0.65 against 0.36) while the 99.9% point is lower this time (0.20 against 0.25); the top token agrees as often within the errors.
+- On Qwen3-4B both arms print the same figures in 48- and 32-token batches, perplexity included, though the batches differ (11 and 16 a chunk; the FP16 count rises from 21,704 to 31,552). So on that model neither path's result depends on the batch between those two sizes, to the printed digits, and FP16's is the 512-token figure of section 18 as well. The 35B's does depend on it in both arms; its expert matmuls share an activation scale between the rows of a batch, which would do that (an inference, not traced).
+- The tool's own time for a pass, one reading each, integer against FP16: 35B 8.05 against 7.76 s (48) and 8.75 against 8.61 s (32); 4B 5.63 against 4.25 s and 5.51 against 4.78 s.
+
+**The acceptance script (`--skip-server --ppl-text ~/wiki.test.raw`).** 56/56 on Qwen3-0.6B and 56/56 on Qwen3-4B.
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| perplexity, provider / CPU | 23.0355 / 23.0657 (-0.13%) | 14.9383 / 14.9376 (+0.00%) |
+| KLD against the CPU, 512-token batches | 0.002826 +- 0.000146 | 0.001736 +- 0.000230 |
+| KLD against the CPU, `-ub 1 -b 512` | 0.003130 +- 0.000102 | 0.001767 +- 0.000096 |
+| the script's `llama-bench`, pp128 / tg128, t/s | 956.91 / 56.94 | 213.62 / 11.12 |
+| the same on the CPU (8 X100 threads) | 153.51 / 27.62 | 21.00 / 5.43 |
+
+Perplexities and KLDs are section 18's to the last digit, as they should be: the script's batches are 512 tokens and 1, on neither side of the change. So the script shows that nothing else moved; the 32 to 63 rows themselves are covered by the check program (31 and 32 rows on both sides) and by the KLDs above.
+
+**So 32 rows stay the default.** Open from this run: the 4% between 501 and 512 tokens on the 35B.
