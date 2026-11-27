@@ -600,7 +600,10 @@ def server_checks(bdir, logs, model, baseline):
     # 5. the shift: D2 reused a chunk beyond the common prefix
     d2 = replies.get("D2")
     chunks = re.findall(r"reusing chunk with size [^\n]*", text)
-    if d2 is None or d_tokens is None:
+    if "cache_reuse is not supported by this context" in text:
+        # the server's own decision at start (llama_memory_can_shift is false, e.g. several positions per token)
+        info(names[4], "not applicable: the server disables --cache-reuse for this model")
+    elif d2 is None or d_tokens is None:
         report(names[4], False, f"no reply D2 or no common prefix: {failure}; {len(chunks)} 'reusing chunk' lines")
     else:
         prefix, n2 = d_tokens

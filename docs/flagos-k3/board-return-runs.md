@@ -921,3 +921,60 @@ No rebuild (the build of `2cec2e84d`). Every rc 0; `-n 0 -r 3` throughout.
 - The 4B dips at 512 as well, by 2 to 3% under the line from 501 to 528 (528 tokens are faster a token than 512), on top of its slope. Section 22 read no dip there; it had no sizes past 512. Its blocks at 512 rows are 640 KiB, not a power of two, so the cause as section 22 words it (blocks a power of two apart) is too narrow: a multiple of a smaller power of two is enough to lose some.
 
 **What stands.** The dip is real, at 512 and 1,024 rows on the 35B and smaller on the 4B, in the elementwise steps, in both backends. The cause is still an inference: the direct test is the staggered blocks, not built. On a long prompt it costs us 1 to 2%.
+
+## 24. `llama-server` rebuilt on this unit, the server checks and the TTFT harness (`~/llama-server-rebuilt`, 2026-11-27)
+
+No code change (`59a1aaea7`, documents only since the build of `2cec2e84d`). The first run of `llama-server` on this unit.
+
+**The build.**
+
+| step | result |
+|---|---|
+| `llama-server` as the board was configured | rc 0, 31 steps. `UI: downloading from b10669`, "archive verified and extracted": the fork's commit count is now 10,669, upstream has a build of that number, and its page is the old layout |
+| the base's archive (`b10375`) downloaded on the board | 3,076,825 bytes, the recorded sha256 (read again on the Mac's copy) |
+| rebuilt with it in `tools/ui/dist` | rc 0, 5 steps. `UI: using pre-built assets from /root/llama.cpp-flagos/tools/ui/dist` |
+| built once more | 1 step (the UI step looks and does nothing): no compile, no link, no download |
+
+- The failure of 2026-11-26 did not come back, and could not: it belongs to a commit count upstream has no build for (10,646 then), and the count has moved on. That it passed at 10,669 on another build's page is what item 139's cause says would happen. The cause itself stays shown on the Mac only.
+- Before the fix the board's server carried the page of upstream's build 10,669, which is not this tree's. With the archive in place the page is the base's at every commit count, and the build asks the network for nothing.
+- The block's own line for the page's name in the binary was printed on the board and is not in the copied files; the acceptance runs below were gated on it.
+
+**The acceptance script with its server checks: 62/62 on Qwen3-0.6B and on Qwen3-4B** (56 of them the checks of section 18, passing as before). The six server checks:
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| up, every layer and the KV cache on the provider, 4 slots, 1 split | 3.0 s, 29/29 | 6.0 s, 37/37 |
+| the greedy reply against `llama-completion` | 153 characters equal | 150 equal |
+| a follow-up on its cache against from scratch (KLD, limit 0.1) | 0.000392 | 0.005875 |
+| interleaved conversations from the prompt cache (KLD) | 0.000179, 0.000069 | 0.000002, 0.000005 |
+| KV shifting (`--cache-reuse`) | 40 tokens moved, `cache_n` 71 of 72 | the same |
+| a follow-up ending in 4 tokens (KLD) | 0.000073 | 0.000002 |
+| a fresh 500-token prompt to the first token (one request) | 674 ms | 2,470 ms |
+| a generated token | 24.0 ms | 95.6 ms |
+| a 12-token follow-up with the cache, and its 59 tokens from scratch | 34 and 84 ms | 166 and 371 ms |
+| a 4-token follow-up with the cache, and its 23 tokens from scratch | 25 and 51 ms | 113 and 318 ms |
+
+- The 4B's 2.47 s is inside the target of `batch-one.md` section 5 (a fresh 500-token prompt at most 4 s). The old unit's baseline was 5.21 s (2026-11-09, older code and another board, so not a like-for-like pair).
+- `llama-bench` in the same runs: 968.61 and 57.31 t/s (pp128, tg128) on the 0.6B, 214.69 and 11.16 on the 4B, as in sections 18 and 21.
+
+**The TTFT harness, `--quick`, Qwen3-0.6B: 11/11.** Client ms, p50 of 2:
+
+| tail (tokens) | depth 0 | depth 256 |
+|---|---|---|
+| 1 | 21.2 | 27.3 |
+| 4 | 26.1 | 31.9 |
+| 9, 12 | 32.2 | 42.9 |
+| 63 | | 113.4 |
+| 64 | 82.6 | 110.2 |
+| 65 | 89.5 | |
+
+- 64 generated tokens: 56.93 t/s from an empty cache, 42.74 from depth 256 (2 runs each).
+- Chat, three turns: thinking off, the first content after 98, 228 and 200 ms; thinking on, the first reasoning after 131, 130 and 138 ms.
+- `restart`: after a `kill -9` one second into a request the next server was up in 4.0 s with no "could not get" line and the same speed (55.93 against 55.89 t/s).
+- `second`: a second server beside the first came up after 63.1 s, its request was refused after 30.0 s with "Compute error." in the stream, and it answered with the first one's text once the first had stopped. The old unit did the same (65.1 s, 30.0 s).
+- `cancel`: a request closed after 0.5 s is not stopped, and the next one waited 406 and 413 ms for it. Cancel is not in the design (decided 2026-11-05).
+- Against the old unit's baseline (2026-11-08, older code, another board): depth 256 with a 12-token tail 96.3 then, 42.9 ms now; a 63-token tail 467.0 then, 113.4 now; the 1-token tail 27.1 then, 27.3 now.
+
+**Not run on this unit yet.** The harness's `control` and `alongside` (there is no `build-ime` here), the read of marked TCM blocks after a kill (no `~/tcmtest`), the harness at full size on either model, and the 35B through the server.
+
+**Before the 35B: the six checks on the Mac with a small model of its family** (Qwen3.5-0.8B, the simulated device). Five pass, with the follow-ups and the prompt cache reused (`cache_n` 50, 51, 52 and 21). KV shifting cannot: llama-server prints "cache_reuse is not supported by this context, it will be disabled" at its start, since this family gives a token several positions (`llama_kv_cache::get_can_shift`). `spacemit_check.py` now reports that check as not applicable when the server prints the line, and counts five. Whether the 35B's server prints it is an inference from the family until its run.
