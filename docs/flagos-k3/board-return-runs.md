@@ -668,3 +668,70 @@ Section 11 had the fork 16% ahead at pp128 and 27% at pp501. The fork leads nowh
 Ours is 1.4 to 2.0 times the fork at 128 and 512 tokens and 9 to 11% faster a token. The one place the fork leads is the 4B at 32 tokens (+11%), which `f16` from 32 rows passes (126.6 to 127.2).
 
 **The fork's own `test-backend-ops` against the CPU (never run before).** It did not finish: 714 cases OK, 19 FAIL, 8,793 not supported, then an abort in a kernel (`rvv_kernels.cpp:2828: GGML_ASSERT(epsilon > 0.0f)`) at the case after `SILU_BACK`, before the norms, the matmuls and attention were reached. The failures: 13 `CPY` (NaN in an f16 copy with a permuted source), 5 `SCALE` with a bias (error 0.73 to 0.75), 1 in the first test's `iq3_xxs` case. So this run says nothing on what costs the fork its KLD.
+
+## 20. The pair wait with a cache line a counter, and the threshold below 32 (`~/pair-wait-and-threshold`, 2026-11-27)
+
+One session on the board at `5c63c8547` (the code of `4ff1c2cf8`: a cache line for each tile's wait count). The plugin of section 19's build was kept before the rebuild and loaded through `GGML_FLAGOS_PROVIDER_PATH` as the "before" arm, so both plugins ran in one session. Build rc 0 (34 steps, without `llama-server`), the rebuilt plugin differs from the kept one. The check program passes with both, 0 FAIL lines, `pairchk` 2/2; the "before" run's loader line names the kept plugin.
+
+**The pair wait (`--bench-pairwait`, as section 19; ns a rendezvous, the three rounds).**
+
+| wait | before | after | spread between tiles, after |
+|---|---|---|---|
+| ours (`spacemit_pair_wait`) | 1,445.1, 1,445.2, 1,445.2 | 377.0, 368.7, 366.6 | 347 to 397 |
+| SpacemiT's barrier, copied | 109.2, 109.1, 109.2 | 109.1, 109.1, 109.1 | 0.1 |
+| SpacemiT's barrier with our two exits | 174.6, 174.7, 174.6 | 161.3, 161.1, 161.0 | 0.1 |
+
+- The cache line of section 19 was the cause on the K3 too: ours is 3.9 times faster. It is still 2.3 times SpacemiT's barrier with our exits (369 against 161), and its tiles differ by up to 50 ns where SpacemiT's are level; that rest is not explained.
+- The same kept plugin read 1,357 and 161 ns in section 19's session, 1,445 and 175 here: 6 to 8% between sessions or load paths, so the two columns' 161 and 175 are not a difference of the code.
+
+**The models before and after, three rounds in turn (t/s).**
+
+| | before | after |
+|---|---|---|
+| 35B pp4 | 23.21, 23.69, 23.52 | 23.24, 22.82, 22.96 |
+| 35B pp32 | 62.54, 63.08, 62.27 | 63.20, 62.11, 62.15 |
+| 35B pp128 | 98.58, 97.40, 96.57 | 98.81, 98.81, 98.45 |
+| 35B pp501 | 119.68, 120.19, 117.95 | 119.52, 119.87, 118.22 |
+| 35B tg64 | 10.28, 10.30, 10.24 | 10.32, 10.29, 10.19 |
+| Qwen3-4B pp32 | 108.59, 108.38, 108.40 | 108.63, 108.78, 108.92 |
+| Qwen3-4B pp128 | 216.19, 213.82, 215.64 | 216.22, 214.08, 215.70 |
+| Qwen3-4B pp512 | 200.73, 201.40, 201.66 | 199.46, 202.44, 203.97 |
+| Qwen3-4B tg64 | 11.18, 11.17, 11.17 | 11.22, 11.21, 11.19 |
+
+Seven of the nine rows' ranges overlap; the 4B's pp32 and tg64 are 0.3% higher after in every round, a size these rounds cannot tell from a plugin placed elsewhere in memory. So no speed moved by an amount three rounds can show. That is what the count predicted: 8,310 waits a 501-token graph times the 1,076 ns saved is 8.9 ms of about 4,190, 0.2%. Generation's waits (1-row matmuls, attention) are still not counted; its speed did not move either. The wait is settled as a cost: the 208 ns left to SpacemiT's would be 1.7 ms a 501-token graph.
+
+**The threshold at 20, 24 and 28 tokens, three rounds in turn (t/s).** Under `f16:32` all three prompts take the integer path; under `:24` the 24- and 28-token prompts take FP16, under `:20` and `:16` all three.
+
+| | `f16:32` (integer) | `f16:24` | `f16:20` | `f16:16` |
+|---|---|---|---|---|
+| Qwen3-0.6B pp20 | 520.05, 520.13, 519.79 | 519.99, 519.62, 519.36 (integer) | 439.20, 440.61, 442.97 | 438.05, 442.71, 437.64 |
+| Qwen3-0.6B pp24 | 554.00, 546.12, 553.03 | 468.37, 470.62, 475.20 | 491.84, 492.65, 490.72 | 492.26, 488.34, 492.95 |
+| Qwen3-0.6B pp28 | 581.28, 578.17, 586.68 | 530.50, 536.63, 532.09 | 538.95, 534.09, 532.31 | 529.08, 531.74, 535.19 |
+| Qwen3-4B pp20 | 83.00, 83.11, 83.53 | 83.39, 83.28, 83.41 (integer) | 81.65, 81.72, 82.04 | 81.85, 81.62, (85.50) |
+| Qwen3-4B pp24 | 87.07, 86.92, 87.21 | 92.95, 92.53, 92.82 | 91.91, 91.96, 92.36 | 92.99, 93.06, (100.66) |
+| Qwen3-4B pp28 | 89.72, 89.56, 89.85 | 102.82, 102.68, 102.37 | 101.48, 101.42, 101.41 | 103.24, 103.32, (105.61) |
+| 35B pp20 | 50.91, 50.83, 50.83 | 50.60, 50.57, 50.53 (integer) | 49.62, 49.41, 49.36 | 48.88, 49.39, 49.01 |
+| 35B pp24 | 53.94, 53.73, 54.08 | 53.43, 53.92, 53.69 | 53.14, 53.33, 53.32 | 53.12, 53.38, 53.12 |
+| 35B pp28 | 57.01, 57.72, 57.06 | 57.07, 57.24, 57.03 | 56.91, 57.32, 57.16 | 57.50, 57.15, 56.90 |
+
+- FP16 against the integer path: Qwen3-0.6B slower at all three sizes (-15% at 20, -10 to -15% at 24, -8% at 28); Qwen3-4B -2% at 20, +6 to +7% at 24, +13 to +15% at 28; the 35B -3% at 20, level or 1% slower at 24, level at 28.
+- So the rule for a threshold below 32 (faster at 20, 24 and 28 on all three models) is not met: only the 4B gains, the 0.6B loses up to 15%. With section 19's rows (32 tokens: 0.6B level, 4B +17%, 35B +1 to +3%) the crossover is at about 32 rows on the 0.6B, between 20 and 24 on the 4B and between 24 and 32 on the 35B. 32 is the lowest measured threshold that is slower nowhere.
+- Two oddities, neither explained and neither changing the verdict. The 0.6B at 24 tokens reads 468 to 475 when the threshold is exactly 24 and 488 to 493 under `:20` and `:16`, the same FP16 path. The 4B's third round under `:16` (in brackets) is 2 to 8% above its other two with errors of 1 to 9 t/s.
+
+**KLD in 48-token batches (`-b 512 -ub 48`, 8 chunks of `wiki.test.raw`, against the CPU on one thread).** Under the default no batch reaches 64 rows, so the default arm is the integer path (no FP16 matmul taken, no stats file); under `f16:32` every batch takes FP16 (the last of a chunk has 32 rows).
+
+| | the default (integer at 48 rows) | `f16:32` |
+|---|---|---|
+| 35B mean KLD | 0.006506 +- 0.000305 | 0.006497 +- 0.000381 |
+| 35B 99.9% / maximum | 0.141692 / 0.191571 | 0.279354 / 0.333546 |
+| 35B same top token | 96.912 +- 0.383% | 97.353 +- 0.356% |
+| 35B FP16 matmuls | 0 | 8,096, all on the pairs, 0 overflows, 655,776 waits |
+| Qwen3-4B mean KLD | 0.003400 +- 0.000155 | 0.001736 +- 0.000230 |
+| Qwen3-4B 99.9% / maximum | 0.091462 / 0.120833 | 0.021535 / 0.456467 |
+| Qwen3-4B same top token | 97.941 +- 0.314% | 98.137 +- 0.299% |
+| Qwen3-4B FP16 matmuls | 0 | 21,704 (18,928 on the pairs), 0 overflows, 1,400,688 waits |
+
+- The rule for 32 as the default (the mean under `f16:32` at most the default's mean plus its error) is met on both: 0.006497 against 0.006811 on the 35B, 0.001736 against 0.003555 on the 4B.
+- On the 4B FP16 halves the mean, and its mean and error are section 18's 512-token figures to the last digit. On the 35B the means are equal. The top token agrees a little more often under FP16 on both. The single worst token is worse under FP16 on both (0.33 against 0.19, 0.46 against 0.12), and the 35B's 99.9% point doubles while the 4B's falls to a quarter.
+- The tool's own time for a pass, one reading each: 35B 8.14 s (integer) against 7.95 s, 4B 5.62 against 4.25 s.
+- The 4B's CPU logits (one thread, 29.5 minutes, perplexity 14.9376 +- 1.14749) stay on the board as `~/kld-wiki/base-8-qwen3-4b.bin`.
