@@ -1020,3 +1020,48 @@ No rebuild (`814adb20a`: the build of `2cec2e84d` with `llama-server`; the scrip
 - Start-up: 53.1, 42.1 and 60.1 s to `/health` in the three starts that were timed.
 
 **Not run.** The harness at full size on the 35B on this unit (the 500-token and deeper cells, 20 chat turns, 512 generated tokens); `second` and `alongside`.
+
+## 26. The TTFT harness at full size on the 35B (`~/ttft-full-35b`, 2026-11-27)
+
+No rebuild (`09bca38da`, documents only since section 25). `spacemit_ttft.py --cases grid,chat,cancel,tg512,restart`, 5 repeats: **11/12**. The failure is the `cancel` case's count of cached tokens, read below as the server's handling of this model family, not as a wrong result.
+
+**The targets of `batch-one.md` section 5 (agreed on the Qwen3 models) against this run.**
+
+| target | this run | |
+|---|---|---|
+| a chat turn at depth 4096 at most 1 s | 26 tokens 926 ms; 38 tokens 1,116 ms; 110 tokens 2,107 ms | met at 26 only |
+| a fresh 500-token prompt at most 4 s | 4,447 ms (p95 4,492) | 0.45 s over |
+| 512 generated tokens from depth 4096 at least 9 t/s | 9.50 t/s | met |
+| 512 generated tokens from depth 0 | 10.17 t/s | the baseline |
+
+**The grid, client ms p50 of 5** (395 of 395 requests answered, `cache_n` and `prompt_n` as asked), with the old unit's of 2026-11-22 in brackets (item 98; older code, another board):
+
+| tail | depth 0 | 256 | 1024 | 4096 | 8192 |
+|---|---|---|---|---|---|
+| 1 | 136 (140) | 184 (191) | 185 | 194 (200) | 207 (210) |
+| 4 | 181 (183) | 241 (241) | 249 | 293 (287) | 361 (345) |
+| 12 | | 544 (543) | 576 | 712 (692) | 902 (854) |
+| 26 | | 721 (726) | 779 | 926 (935) | 1,108 (1,110) |
+| 64 | 1,010 (1,113) | 1,087 (1,190) | 1,135 | 1,448 (1,528) | 1,781 (1,865) |
+| 110 | | 1,468 (1,721) | 1,651 | 2,107 (2,341) | 2,607 (2,831) |
+| 500 | 4,447 (6,087) | | | | |
+| 2048 | 19,118 (26,136) | | | | |
+| 4095 | 42,717 (56,753) | | | | |
+
+- Long prompts are 25 to 27% shorter than on 2026-11-22, tails of 64 and 110 tokens 5 to 15%, and tails of 1 to 26 tokens are where they were: the work since then (the FP16 path from 32 rows, the router, the pairs) acts from 32 rows up.
+- 5 tokens cost 133 ms more than 4 (314 against 181 ms), the server's split of the last 4 tokens (item 98), unchanged.
+- 511, 512 and 513 tokens: 4,551, 4,518 and 4,551 ms; 575 and 576 level.
+- The 1-token tail at depth 0 read 117 ms in section 25's `--quick` run (2 repeats) and 136 here (5); not explained.
+
+**Chat, 20 turns of up to 512 tokens.**
+
+- Thinking off: the first content after 0.73 s in turn 1, then 3.9 to 10.9 s, growing with the depth (5.8 s at turn 4 with 914 tokens cached, 7.8 s at turn 10 with 4,075, 10.9 s at turn 19 with 8,853). Every turn decodes about 535 tokens: the question and the whole previous reply again (`batch-one.md` conclusion 3). This is the longest wait a user of the 35B meets in this run.
+- Thinking on: the first reasoning after 0.70 s in turn 1 and 0.89 to 1.26 s after, 20 to 25 new tokens a turn. All 20 answers ended inside the reasoning at 512 tokens, so no turn carried a reply into the next and this arm did not exercise the re-decode.
+- Outside `prompt_ms` a chat request spends 20 to 120 ms with thinking off and 110 to 400 ms with thinking on (the first event less `prompt_ms`), growing with the turns; where it goes is not measured.
+
+**Generation, 512 tokens, 10 runs each.** 10.17 t/s from depth 0, 10.06 from depth 500, 9.50 from depth 4096; level across the 512 tokens (10.23 to 10.11 by the hundred at depth 0).
+
+**`cancel`, the failing check.** A 2,048-token request at depth 4096 closed after 2.0 s; the next request waited 19.3 to 19.5 s. The server's log: "cancel task" 2.0 s in, and the slot released 19.3 s later at 5,628 tokens, 1,532 of the 2,048. So the server honours the cancel only after the `llama_decode` call in flight returns, and that call held 1,532 tokens (its `-b` is 2,048; the last 516 were held back). With `-b 512` the wait would be one 512-token batch at most, about 5 to 7 s here (inference; `batch-one.md` T10, not run).
+- What failed: the follow-up was to find 4,096 tokens cached and decode 1; it found 4,092 or 4,093 and decoded 5 or 4 (457, 319 and 312 ms). For a model whose state cannot be rolled back the server returns to a context checkpoint, and it places those 4 tokens before a prompt's end (item 98). So the answer is right and costs 4 tokens instead of 1; the harness's expectation was written for Qwen3. (The checkpoint lines are at trace level and not in the log, so the mechanism is inferred from the counts.)
+
+**`restart`, three kills (0.5, 1.0, 1.5 s into a request): 3/3.** The next server up after 68.1, 51.1 and 56.1 s, no "could not get" line, the first token after 0.68 s, 64 tokens at 10.32 to 10.43 t/s as before.

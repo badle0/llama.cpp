@@ -1019,6 +1019,7 @@ Manual checks:
 **Qwen3.6-35B-A3B through `llama-server`, 2026-11-27** (`board-return-runs.md` section 25; `progress.md` item 141). On `814adb20a`, no rebuild; the logs on the Mac: `~/k3-logs/server-checks-35b`.
 - The runner's server checks alone (`server_checks` called from a one-line `python3 -c`) **5/5**, KV shifting not applicable to this family. Up in 53.1 s; a fresh 500-token prompt to the first token 4,385 ms; a generated token 97.7 ms.
 - `spacemit_ttft.py --quick --cases grid,chat,cancel,tg512,restart` **10/10**: a 1-token tail 117.3 ms at depth 0 and 159.2 ms at depth 256; 64 generated tokens at 10.44 t/s.
+- The same cases at full size (`board-return-runs.md` section 26; `progress.md` item 142; `~/k3-logs/ttft-full-35b`) **11/12**: a fresh 500-token prompt 4,447 ms; a 26-token turn at depth 4096 926 ms; 512 generated tokens at 10.17 t/s from depth 0 and 9.50 t/s from depth 4096. The failure is `cancel`'s cached-token count (4,092 or 4,093 for 4,096), the server's checkpoint for this family.
 
 Experiment switches of the provider (environment variables; test-only unless noted; the context of each is in `plan.md`):
 
