@@ -1161,3 +1161,42 @@ The terminal's own lines (the guards, the markers, `/dev/tcm` afterwards) are no
 - **Build and check program:** rc 0, no error line, one warning in a line the change does not touch (`flagos-spacemit.cpp:482`); "all checks passed", no `FAIL:`, the state pass 33/33 cases with 21 passes and the direct calls 48/48, the sharing check beside a plain F32 matmul 3/3 (F32 max NMSE 2.56e-14).
 
 Not measured: speed. The runs carry the trace and are one each; their generation figures (8.97, 8.73 and 8.53 t/s) say nothing about `shared`. The terminal's own lines are not in the folder.
+
+## 31. The redundancy cleanup on the board (`~/redundancy-cleanup-timing`, 2026-11-28)
+
+`progress.md` items 150 to 152. One paste: the pull to `ac10d2b11` and the build of the cleanup, the check program, the code before the cleanup (`58b663ded`) built in a second checkout (`~/flagos-before-redundancy-cleanup`), 32 greedy tokens from Qwen3-4B and Qwen3.6-35B on each build, then `llama-bench -t 8 -fa 1 -p 8,512 -r 3` (`-n 128` on the 4B, `-n 64` on the 35B) on the two builds, three rounds. The first paste refused to start: its checkout name `~/flagos-before-cleanup` was taken by an earlier comparison's checkout; the retry differs in that name only.
+
+- **The build:** rc 0, 64 steps, no error line. 27 warning lines, each one the old build's at a shifted line number; GCC 15 compiled the new `flagos-spacemit-rvv-math.h` into its four users.
+- **The check program:** "all checks passed", no `FAIL:`. The loader line reads "api 2, struct_size 176, 40 kernels, 12 names by get_proc_address", the contracts "32 bound to 40 kernels", the plan probes 14/14 and 13/13, the state pass 33/33 cases with 21 passes and the direct calls 48/48, the many-row `MUL_MAT_ID` path 21/21; no `pairchk` line.
+- **The text:** the same bytes before and after on both models (347 and 364 bytes).
+- **Speed, t/s, the three rounds and their mean:**
+
+| | before (`58b663ded`) | cleanup (`ac10d2b11`) | change |
+|---|---|---|---|
+| 4B pp8 | 59.53, 59.66, 60.01 (59.73) | 59.55, 59.83, 58.92 (59.43) | -0.5% |
+| 4B pp512 | 199.85, 195.30, 195.61 (196.92) | 201.99, 195.93, 201.09 (199.67) | +1.4% |
+| 4B tg128 | 11.12, 11.14, 11.11 (11.12) | 11.12, 11.11, 11.12 (11.12) | 0 |
+| 35B pp8 | 30.22, 30.53, 30.92 (30.56) | 31.38, 31.77, 31.49 (31.55) | +3.2% |
+| 35B pp512 | 115.54, 118.62, 116.94 (117.03) | 113.93, 114.14, 114.13 (114.07) | -2.5% |
+| 35B tg64 | 10.26, 10.24, 10.25 (10.25) | 10.18, 10.19, 10.18 (10.18) | -0.7% |
+
+The 4B is level: its 512-token figure sits at about 195.5 or about 201 on either build, so a run-to-run step of 3% is the board's and not the code's. On the 35B the two arms do not overlap in any of the three tests, but **the cleanup ran second in every round**, straight after the other 35B run, so its place in the round and the code cannot be told apart; three rounds of two arms that never overlap is also weak on its own. Read in the code: nothing was added on the 35B's path. Stage 2 removes work on several tokens, stage 1 removes a copy of the tile per step and the copy of the steps on a plan hit; what moved is where the dense matmul's activations sit in the workspace (offset 0 now, after the other ops' scratch before) and the plugin's code layout. Settled by section 32: the gap was not the code.
+
+Not in the folder: the terminal's own lines (the start line, the plugin sizes, the `/dev/tcm` line afterwards).
+
+## 32. The cleanup on the 35B in rotated order (`~/redundancy-cleanup-35b-rotated`, 2026-11-28)
+
+`progress.md` item 153; closes section 31's open point. One paste, nothing pulled: stage 1 alone (`9bb915873`) built in a third checkout (`~/flagos-at-cleanup-stage1`; rc 0, 280 steps, no error line, 109 warning lines as in the build of `58b663ded`), then Qwen3.6-35B through `llama-bench -t 8 -fa 1 -p 8,512 -n 64 -r 3` on the three builds, six rounds in the six orders, so each build ran twice in each place. Every output names the commit it was built from; every error file is empty.
+
+| t/s by round, mean | before (`58b663ded`) | stage 1 (`9bb915873`) | HEAD (`ac10d2b11`) |
+|---|---|---|---|
+| pp8 | 29.71, 31.42, 30.81, 31.27, 31.63, 31.65 (31.08) | 30.35, 30.99, 31.27, 31.28, 31.24, 31.38 (31.09) | 31.42, 31.79, 31.38, 31.35, 30.97, 31.35 (31.38) |
+| pp512 | 116.82, 116.19, 113.86, 117.23, 113.02, 113.05 (115.03) | 119.24, 119.46, 112.53, 113.41, 113.43, 115.41 (115.58) | 113.47, 114.00, 114.24, 119.71, 118.79, 113.50 (115.62) |
+| tg64 | 10.34, 10.25, 10.23, 10.20, 10.24, 10.22 (10.25) | 10.25, 10.23, 10.27, 10.23, 10.28, 10.22 (10.25) | 10.24, 10.24, 10.21, 10.23, 10.30, 10.24 (10.24) |
+
+- **The cleanup costs nothing that can be measured.** Against the code before it HEAD is +0.5% at 512 tokens, 0.0% in generation and +1.0% at 8 tokens, stage 1 +0.5%, 0.0% and 0.0%; each is inside the scatter of one build.
+- **Section 31's gap was the board.** One build's 512-token figure goes from 112.5 to 119.7 t/s between runs (6%, each run's own figure ± 0.33 at most), on all three builds alike; three rounds in one order could not tell that from a 2.5% change. HEAD's generation figure, 10.18 or 10.19 in all three runs of section 31, is 10.21 to 10.30 here.
+- **By place in the round** the 512-token mean is 116.44, 115.39 and 114.39; with this scatter and six runs a place that is not established. Generation is 10.25 in each place.
+- Stage 2's saving on several tokens does not show at this size either: +1.0% at 8 tokens against runs that are 0.3 to 1.5 apart in themselves.
+
+A before/after on this board needs the orders rotated and more than three rounds before a 512-token difference under about 3% means anything. Not in the folder: the terminal's own lines.
