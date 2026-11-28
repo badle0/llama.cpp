@@ -283,7 +283,8 @@ size_t spacemit_mul_mat_id_workspace(const ggml_tensor * node) {
 // expert's rows are consecutive; the 4 rows of a group are stored interleaved for the 4-row kernel, which wants them
 // contiguous, so the tile gathers them first. The groups are dealt to the tiles as contiguous ranges. The q4_0s layout:
 // an expert's rows as its packed groups (sgroup_at) at its offset after the aligned base, a group of 8 or 4 gathered
-// first, a single packed from its row
+// first, a single packed from its row. Several tokens: every tile's grouping (and offsets) stays in its part of the
+// workspace for step 2
 bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * node) {
     const spacemit_tile & tile      = *tile_p;
     const mmid_dims       d         = mmid_dims_of(node);
@@ -407,8 +408,9 @@ bool spacemit_mul_mat_id_quantize(const spacemit_tile * tile_p, ggml_tensor * no
     return true;
 }
 
-// step 2: multiply. Every tile groups the pairs by expert (group_rows) in its own part of the workspace, from the ids
-// alone, so all tiles hold the same lists.
+// step 2: multiply. One token: every tile groups the pairs by expert (group_rows) in its own part of the workspace,
+// from the ids alone, so all tiles hold the same lists. Several tokens: each tile reads the grouping (and with sgroups
+// the offsets) that step 1 left in its part, so this step must follow step 1 on the same tiles and tile count.
 // One token: the units are (pair j, 32 columns c), numbered j * (N / 32) + c in the grouping's order and
 // dealt as contiguous ranges; each run of one pair's columns is one 1-row kernel call on the expert's rows.
 // Several tokens: the units are (active expert e, 32-column slab s), expert-major, each weighted by the expert's rows
@@ -435,7 +437,7 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     }
     const uint8_t * const qa = static_cast<const uint8_t *>(tile.workspace);
     mmid_work             w  = mmid_work_of(tile, d);
-    if (!group_rows(node->src[2], d, w.start, w.rows)) {
+    if (d.ne12 == 1 && !group_rows(node->src[2], d, w.start, w.rows)) {
         if (tile.ith == 0) {
             GGML_LOG_ERROR("FlagOS SpacemiT: MUL_MAT_ID (%s) has an id outside [0, %lld)\n", node->name,
                            (long long) d.n_as);
@@ -481,9 +483,6 @@ bool spacemit_mul_mat_id_gemm(const spacemit_tile * tile_p, ggml_tensor * node) 
     const int64_t   tcm_size   = std::max<int64_t>(0, (int64_t) tile.tcm_size - tcm_lost);
     const bool      stage      = tcm != nullptr && tcm_size >= slab_bytes;
     const int64_t   act_align  = d.sgroups ? (int64_t) d.f->group_align : 64;
-    if (d.sgroups) {
-        sgroup_offsets(d, w);
-    }
 
     // the expert at hand: its rows, read from the workspace or, once held, from TCM, and where its slabs are staged;
     // sgroups: its groups of 8, whether it has a group of 4, its single rows

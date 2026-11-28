@@ -8649,15 +8649,15 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
             ggml_backend_free(backend);
         }
 
-        // the two steps directly on 1 and on 8 tiles, with a TCM buffer of their own and without
+        // the two steps directly on 1, 3 and 8 tiles, with a TCM buffer of their own and without
         const size_t         ws = step_q->workspace_size(y);
         std::vector<uint8_t> workspace(ws);
         std::vector<uint8_t> tcm(393216);
-        std::vector<float>   d_out[4];
+        std::vector<float>   d_out[6];
         bool                 tcm_used = true;
-        for (int r = 0; r < 4 && direct; r++) {
-            const uint32_t nth    = (r % 2) == 0 ? 1u : 8u;
-            const bool     staged = r < 2;
+        for (int r = 0; r < 6 && direct; r++) {
+            const uint32_t nth    = r % 3 == 0 ? 1u : r % 3 == 1 ? 3u : 8u;
+            const bool     staged = r < 3;
             std::fill(tcm.begin(), tcm.end(), uint8_t(0));
             ggml_backend_tensor_set(y, junk.data(), 0, ggml_nbytes(y));
             for (const spacemit_plugin_kernel * step : { step_q, step_g }) {
@@ -8674,11 +8674,11 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
             }
         }
 
-        // with TCM and without, on 8 tiles and on 1: one kernel call per (group, slab) either way
+        // with TCM and without, on 1, 3 and 8 tiles: one kernel call per (group, slab) either way
         const size_t out_bytes = (size_t) n_out * sizeof(float);
         bool         same      = ok && std::memcmp(out.data(), staged_plain.data(), out_bytes) == 0 && tcm_used &&
                      (!host || std::memcmp(out.data(), staged_threads.data(), out_bytes) == 0);
-        for (int r = 0; r < 4 && direct && same; r++) {
+        for (int r = 0; r < 6 && direct && same; r++) {
             same = std::memcmp(out.data(), d_out[r].data(), out_bytes) == 0;
         }
         const double e       = ok ? nmse(out.data(), (const float *) y_ref->data, n_out) : -1.0;
@@ -8714,7 +8714,7 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
                 "rows do not fit beside the slab: %d/%d cases; with TCM%s and without TCM bit for bit%s in %d/%d; "
                 "against the CPU on one thread max NMSE %.2e (bound %.0e)%s\n",
                 n_ok, n_cases, host ? " (tiles in turn and on threads)" : "",
-                direct ? ", with the steps directly on 1 and on 8 tiles" : "", n_same, n_cases, worst,
+                direct ? ", with the steps directly on 1, 3 and 8 tiles" : "", n_same, n_cases, worst,
                 k_mul_mat_max_nmse, reference_label());
     return 0;
 }
