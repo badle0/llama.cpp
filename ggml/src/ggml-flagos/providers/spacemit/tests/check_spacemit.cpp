@@ -10403,6 +10403,9 @@ static int check_gdn(ggml_backend_dev_t dev) {
 // build_recurrent_attn, the !keep branch): the states tensor of several rows in its own context and buffer, an I32
 // index input, build_rs' zero-sized SCALE and its empty extra GET_ROWS and CPY, the reshape, the op, a CONT of the
 // attention scores (the layer's next op) and the CPY of the new state into row head.
+// The pass writes neither the row read in nor the op's state region, so an output flag on either, or on a view of
+// either, refuses it; the marked tensor (extra) must then hold the CPU's values. ggml_set_output marks a view's source
+// too, so a marked view of the scores refuses it as well; the model's scores CONT, marked and no view, does not.
 //
 // Through the device against ggml-cpu on one thread: the scores and the written row of the states within check_gdn's
 // bound, the rows the CPY does not write bit for bit the inputs, the pass counted (spacemit_state_passes_take). The
@@ -10425,7 +10428,10 @@ struct state_case {
     int64_t      S_v, H, n_tokens, n_seqs, K;
     int64_t      slots, idx, head;
     int          variant;  // 0 the model's graph, 1 a second consumer of the row read in, 2 another view of the new
-                           // state, 3 a read of the states between the two copies, 4 the CPY into another tensor
+                           // state, 3 a read of the states between the two copies, 4 the CPY into another tensor; an
+                           // existing node marked an output: 5 the row read in, 6 its reshape, 7 the op's whole result,
+                           // 8 the view of the new state, 9 the view of the attention scores (ggml_set_output marks
+                           // the op's result too)
     bool         pass;
     int64_t      zrow    = -1;     // the row build_rs' SCALE clears; -1 its zero-sized view, as a later graph has it
     int          clear   = 0;      // how that SCALE is built (state_clear)
@@ -10530,6 +10536,11 @@ struct state_graph {
                 c.variant == 2          ? ggml_cont(ctx, new_st) :
                 c.variant == 3          ? ggml_cont(ctx, persist) :
                 c.variant == 4          ? target :
+                c.variant == 5          ? rows :
+                c.variant == 6          ? state4d :
+                c.variant == 7          ? gdn :
+                c.variant == 8          ? new_st :
+                c.variant == 9          ? out :
                 c.clear == clear_reader ? ggml_cont(ctx, persist) :
                                           nullptr;
         if (extra != nullptr) {
@@ -10553,7 +10564,7 @@ struct state_graph {
             ggml_build_forward_expand(g, extra);  // between the op and the CPY: it must read the row as it was
         }
         ggml_build_forward_expand(g, cpy);
-        if (extra != nullptr && c.variant != 3 && c.clear != clear_reader) {
+        if (extra != nullptr && c.variant != 3 && c.variant < 5 && c.clear != clear_reader) {  // 5 to 9 are in g
             ggml_build_forward_expand(g, extra);
         }
         if (!ops_unallocated) {
@@ -10611,10 +10622,11 @@ struct state_graph {
         ggml_backend_tensor_set(idx, iv.data(), 0, iv.size() * sizeof(int32_t));
     }
 
-    // before a run: the states back to the case's values, the outputs to junk so a missed write shows
+    // before a run: the states back to the case's values, the row read in and the outputs to junk so a missed write
+    // shows
     void reset() const {
         ggml_backend_tensor_set(persist, persist_in.data(), 0, persist_in.size());
-        for (ggml_tensor * t : { gdn, scores, extra }) {
+        for (ggml_tensor * t : { rows, gdn, scores, extra }) {
             if (t != nullptr && t->data != nullptr) {
                 const std::vector<uint8_t> j(ggml_nbytes(t), 0xA5);
                 ggml_backend_tensor_set(t, j.data(), 0, j.size());
@@ -10693,6 +10705,14 @@ static int check_state_pass(ggml_backend_dev_t dev) {
         { "K 2",                                       16,  4,   2,   1, 2,     4,   1,    1,       0, false },
         { "a read of the states between the copies",   16,  4,   2,   1, 1,     4,   1,    1,       3, false },
         { "the CPY into another tensor",               16,  4,   2,   1, 1,     4,   1,    1,       4, false },
+        { "the row read in marked an output",          16,  4,   2,   1, 1,     4,   1,    1,       5, false },
+        { "the reshape of the row read in marked an output",
+                                                       16,  4,   2,   1, 1,     4,   1,    1,       6, false },
+        { "the op's whole result marked an output",    16,  4,   2,   1, 1,     4,   1,    1,       7, false },
+        { "the view of the new state marked an output",
+                                                       16,  4,   2,   1, 1,     4,   1,    1,       8, false },
+        { "the view of the attention scores marked an output",
+                                                       16,  4,   2,   1, 1,     4,   1,    1,       9, false },
   // a sequence's first graph: the clear folded into the step (zrow the row the CPY writes)
   // what,                                            S_v,  H, tok, seq, K, slots, idx, head, variant, pass, zrow, clear, cleared, wild
         { "a sequence's start, 1 token",               16,  4,   1,   1, 1,     4,   2,    2,       0, true,    2, clear_whole,  true  },
@@ -10989,16 +11009,17 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     std::printf("statepass GATED_DELTA_NET + GET_ROWS + CPY as the model builds them (1, 2, 33 and 501 tokens of S_v "
                 "16, S_v 128 with 16 heads at 1 and 33 tokens, the row read in the row written or not; refused: a "
                 "second consumer of the row read in, another view of the new state, 2 sequences, K 2, a read of the "
-                "states between the copies, the CPY into another tensor), and a sequence's first graph with build_rs' "
-                "clear of a whole row (1, 2, 32 and 501 tokens of S_v 16, Qwen3.6-35B's S_v 128 with 32 heads at 1 "
-                "and 32 tokens, 3 rows with the cleared row read or not, a wild old state) folding it into the step, "
-                "without the fold (a factor 0.5, half a row, two rows, the cleared row not the written one, a read of "
-                "the states before the GET_ROWS) and refused (a write of the states between the copies)%s: %d/%d "
-                "cases, %d passes by the counter; against the CPU on one thread max NMSE %.2e (bound %.0e), the rows "
-                "the CPY does not write bit for bit and the cleared rows the CPU's bytes, the step names the fold's "
-                "where it applies and no scale.f32 there; the step directly on 1, 3 and 8 tiles %d/%d; two computes "
-                "with the state carried over: %s; through the scheduler a miss, a hit by uid (no pass), the same "
-                "bytes: %s\n",
+                "states between the copies, the CPY into another tensor, an output flag on the row read in, its "
+                "reshape, the op's result, the view of the new state or the view of the scores), and a sequence's "
+                "first graph with build_rs' clear of a whole row (1, 2, 32 and 501 tokens of S_v 16, Qwen3.6-35B's S_v "
+                "128 with 32 heads at 1 and 32 tokens, 3 rows with the cleared row read or not, a wild old state) "
+                "folding it into the step, without the fold (a factor 0.5, half a row, two rows, the cleared row not "
+                "the written one, a read of the states before the GET_ROWS) and refused (a write of the states "
+                "between the copies)%s: %d/%d cases, %d passes by the counter; against the CPU on one thread max NMSE "
+                "%.2e (bound %.0e), the rows the CPY does not write bit for bit and the cleared rows the CPU's bytes, "
+                "the step names the fold's where it applies and no scale.f32 there; the step directly on 1, 3 and 8 "
+                "tiles %d/%d; two computes with the state carried over: %s; through the scheduler a miss, a hit by uid "
+                "(no pass), the same bytes: %s\n",
                 reference_label(), n_ok, n_cases, n_passed, worst_nmse, k_gdn_max_nmse, n_direct_ok, n_direct,
                 carried_ok ? "checked" : "FAILED", sched_ok ? "checked" : "FAILED");
     return 0;
@@ -11097,6 +11118,95 @@ static int check_layer(ggml_backend_dev_t dev) {
             n_shared_cases++;
         }
     }
+    // FLAGOS_SPACEMIT_QUANTIZE=shared beside a MUL_MAT of a plain F32 weight (mul_mat.f32, no IME layout) of the
+    // same input as two Q4_0 ones, in three orders: no abort, the bytes of separate, the F32 result against the CPU.
+    // Separate takes 2 + 2 + 1 steps; shared drops the second Q4_0's quantize where the two Q4_0 nodes are adjacent. In
+    // the order (Q4_0, F32, Q4_0) the F32 node becomes the held one, so the second Q4_0 does not share today
+    int    n_plain_ok = 0, n_plain_cases = 0;
+    double plain_nmse = 0.0;
+    {
+        mm_weight wa, wb;
+        uint32_t  seed = 11061;
+        REQUIRE(wa.init(dev, 512, 64, seed++) && wb.init(dev, 512, 64, seed++));
+        ggml_init_params p  = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 4, nullptr, true };
+        ggml_context *   ch = ggml_init(p);  // the input and the F32 weight, in a CPU buffer
+        ggml_context *   cd = ggml_init(p);  // the outputs, in ours
+        ggml_context *   cr = ggml_init(p);  // the CPU's F32 result
+        REQUIRE(ch != nullptr && cd != nullptr && cr != nullptr);
+        ggml_tensor * x      = ggml_new_tensor_2d(ch, GGML_TYPE_F32, 512, 4);
+        ggml_tensor * wf     = ggml_new_tensor_2d(ch, GGML_TYPE_F32, 512, 64);
+        ggml_tensor * ya     = ggml_mul_mat(cd, wa.w_dev, x);
+        ggml_tensor * yb     = ggml_mul_mat(cd, wb.w_dev, x);
+        ggml_tensor * yf     = ggml_mul_mat(cd, wf, x);
+        ggml_tensor * yf_ref = ggml_mul_mat(cr, wf, x);
+        ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ch, ggml_backend_cpu_buffer_type());
+        ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(cd, ggml_backend_dev_buffer_type(dev));
+        ggml_backend_buffer_t br = ggml_backend_alloc_ctx_tensors_from_buft(cr, ggml_backend_cpu_buffer_type());
+        REQUIRE(bh != nullptr && bd != nullptr && br != nullptr);
+        const std::vector<float> xv = random_values(512 * 4, seed++, 2.0f);
+        const std::vector<float> wv = random_values(512 * 64, seed++, 1.0f);
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(wf, wv.data(), 0, ggml_nbytes(wf));
+        ggml_cgraph * g_ref = ggml_new_graph(cr);
+        ggml_build_forward_expand(g_ref, yf_ref);
+        const bool         ref_ok = ggml_backend_graph_compute(cpu, g_ref) == GGML_STATUS_SUCCESS;
+        std::vector<float> want(64 * 4, NAN);
+        ggml_backend_tensor_get(yf_ref, want.data(), 0, ggml_nbytes(yf_ref));
+        ggml_tensor * const orders[3][3] = { { ya, yb, yf }, { ya, yf, yb }, { yf, ya, yb } };
+        const char * const  names[3]     = { "Q4_0, Q4_0, F32", "Q4_0, F32, Q4_0", "F32, Q4_0, Q4_0" };
+        for (int o = 0; o < 3; o++) {
+            ggml_cgraph * g = ggml_new_graph(cd);
+            for (ggml_tensor * y : orders[o]) {
+                ggml_build_forward_expand(g, y);
+            }
+            std::vector<float> out[2];
+            uint64_t           steps[2] = {};
+            bool               ran      = ref_ok;
+            double             e        = -1.0;
+            for (int i = 0; i < 2; i++) {
+                env_override   share("FLAGOS_SPACEMIT_QUANTIZE", i == 0 ? "separate" : "shared");
+                ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+                REQUIRE(be != nullptr);
+                for (ggml_tensor * y : { ya, yb, yf }) {  // junk, so a missed write shows
+                    const std::vector<uint8_t> j(ggml_nbytes(y), 0xA5);
+                    ggml_backend_tensor_set(y, j.data(), 0, j.size());
+                }
+                g_steps_take();
+                ran      = ggml_backend_graph_compute(be, g) == GGML_STATUS_SUCCESS && ran;
+                steps[i] = g_steps_take();
+                ggml_backend_free(be);
+                out[i].assign(3 * 64 * 4, NAN);
+                ggml_backend_tensor_get(ya, out[i].data(), 0, ggml_nbytes(ya));
+                ggml_backend_tensor_get(yb, out[i].data() + 64 * 4, 0, ggml_nbytes(yb));
+                ggml_backend_tensor_get(yf, out[i].data() + 2 * 64 * 4, 0, ggml_nbytes(yf));
+                const double ei = ran ? nmse(out[i].data() + 2 * 64 * 4, want.data(), 64 * 4) : -1.0;
+                e               = i == 0 ? ei : (ei < 0.0 || e < 0.0 ? -1.0 : std::max(e, ei));
+            }
+            const bool same     = ran && std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
+            const bool steps_ok = steps[0] == 5 && (o == 1 ? steps[1] <= steps[0] : steps[1] == 4);
+            const bool close    = e >= 0.0 && e <= k_mul_mat_max_nmse;
+            const bool ok       = same && steps_ok && close;
+            plain_nmse          = std::max(plain_nmse, e);
+            n_plain_ok += ok;
+            n_plain_cases++;
+            if (!ok) {
+                std::fprintf(stderr,
+                             "FAIL: FLAGOS_SPACEMIT_QUANTIZE=shared beside a plain F32 MUL_MAT, order %s: %s, steps "
+                             "separate %llu, shared %llu (expected 5, %s), F32 NMSE against the CPU %.3e (bound "
+                             "%.0e)\n",
+                             names[o], !ran ? "failed" : same ? "the bytes of separate" : "other bytes than separate",
+                             (unsigned long long) steps[0], (unsigned long long) steps[1], o == 1 ? "at most 5" : "4",
+                             e, k_mul_mat_max_nmse);
+                g_failures++;
+            }
+        }
+        ggml_backend_buffer_free(bh);
+        ggml_backend_buffer_free(bd);
+        ggml_backend_buffer_free(br);
+        ggml_free(ch);
+        ggml_free(cd);
+        ggml_free(cr);
+    }
     // the whole head rotated, and half of it (the rest copied)
     const double e_rope_full = rope_wide_nmse(dev, backend, cpu, 256);
     const double e_rope_half = rope_wide_nmse(dev, backend, cpu, 128);
@@ -11116,10 +11226,12 @@ static int check_layer(ggml_backend_dev_t dev) {
                 "positions, down projection Q4_0 and Q4_1, all rows; KV cache of %lld cells and mask in a CPU buffer, "
                 "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e; KV cache in our buffer "
                 "(E2) max NMSE %.2e; one launch per step identical in %d/%d cases (E3a); one quantization for Q/K/V "
-                "and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d cases, 3 steps fewer in %d/%d%s\n",
+                "and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d cases, 3 steps fewer in %d/%d; "
+                "shared beside a plain F32 MUL_MAT in 3 orders as separate, the steps as expected, F32 max NMSE %.2e: "
+                "%d/%d%s\n",
                 k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope, worst_kv, n_launch_same,
-                n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer, n_shared_cases,
-                reference_label());
+                n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer, n_shared_cases, plain_nmse, n_plain_ok,
+                n_plain_cases, reference_label());
     return 0;
 }
 

@@ -335,9 +335,14 @@ void spacemit_mm_tail_take(uint64_t * rows, uint64_t * calls, uint32_t n_tiles) 
 }
 
 // the quantize step writes only what its activations and its layout's quantizers give (the 32x32 layouts share theirs);
-// a node of the f16 path has no quantize step and writes its partials there
+// a node of the f16 path has no quantize step and writes its partials there; a weight without an IME layout has no
+// quantizers
 bool spacemit_mul_mat_same_activations(const ggml_tensor * a, const ggml_tensor * b) {
     if (spacemit_mul_mat_f16_supported(a) || spacemit_mul_mat_f16_supported(b)) {
+        return false;
+    }
+    if (spacemit_weight_layout(a->src[0]) == spacemit_layout::plain ||
+        spacemit_weight_layout(b->src[0]) == spacemit_layout::plain) {
         return false;
     }
     const ggml_tensor * xa = a->src[1];

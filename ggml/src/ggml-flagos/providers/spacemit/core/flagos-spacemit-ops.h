@@ -92,8 +92,9 @@ void     spacemit_conv_pairs_add(uint64_t n);
 // contiguous; the row read in has no other consumer than the op; of the op's output only the attention scores are read
 // elsewhere, its state region by that one CPY alone, whose destination is a whole contiguous row of the same
 // persistent tensor; nothing after the GET_ROWS but that CPY computes the tensor, and nothing between the two copies
-// reads or writes it; and all three nodes pass their contracts (spacemit_find_op), so GGML_FLAGOS_DISABLE_OPS still
-// sends them to the CPU.
+// reads or writes it; none of the row read in, the op's result, or a view of either is a requested output
+// (GGML_TENSOR_FLAG_OUTPUT; ggml_set_output marks a view's source too); and all three nodes pass their contracts
+// (spacemit_find_op), so GGML_FLAGOS_DISABLE_OPS still sends them to the CPU.
 // Then the one step gated_delta_net.f32.direct, running on the CPY node, reads the persistent row and writes the new
 // state into the CPY's destination, and the GET_ROWS and the CPY emit no steps (about 10 ms of a Qwen3.5 token on the
 // K3). The model: src/llama-graph.cpp build_rs with src/models/delta-net-base.cpp build_recurrent_attn (the !keep

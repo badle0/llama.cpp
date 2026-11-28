@@ -813,7 +813,9 @@ static bool spacemit_state_clear(const spacemit_ops & ops, ggml_backend_buffer_t
 bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t own_buft, const ggml_cgraph * g, int gi,
                          int * ri, int * ci, int * zi) {
     const ggml_tensor * gdn = g->nodes[gi];
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1) {
+    // the step writes no byte of the op's state region, so the op's result is no output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
         return false;
     }
     const ggml_tensor * v  = gdn->src[2];
@@ -843,6 +845,10 @@ bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t ow
         src->ne[3] != 1 || src->view_offs % src->nb[1] != 0) {
         return false;
     }
+    // nor does it write the row read in
+    if (((rows->flags | st->flags) & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
     const ggml_tensor * persistent = spacemit_base_of(src);
     if (persistent->op != GGML_OP_NONE || persistent->view_src != nullptr) {
         return false;
@@ -856,12 +862,14 @@ bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t ow
             rows_at = t;
             continue;
         }
-        // a node that is a view of either: it must write neither, and of the output see one region
-        if (n->view_src == rows && !ggml_op_is_empty(n->op)) {
+        // a node that is a view of either: it must write neither, see one region of the output, and be no output
+        // (ggml_set_output marks a view's source too, so an output view of the scores refuses the pass as well)
+        const bool output = (n->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+        if (n->view_src == rows && (!ggml_op_is_empty(n->op) || output)) {
             return false;
         }
         if (n->view_src == gdn &&
-            (!ggml_op_is_empty(n->op) || spacemit_state_region(n, gdn, score_bytes, state_bytes) < 0)) {
+            (!ggml_op_is_empty(n->op) || output || spacemit_state_region(n, gdn, score_bytes, state_bytes) < 0)) {
             return false;
         }
         for (int i = 0; i < GGML_MAX_SRC; i++) {
