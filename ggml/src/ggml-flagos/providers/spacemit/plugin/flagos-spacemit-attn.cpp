@@ -40,13 +40,6 @@ bool divides(int64_t d, int64_t n) {
     return d > 0 && n % d == 0;
 }
 
-// [begin, end) of n items for one tile, the way ggml-cpu splits rows over its threads (flagos-spacemit-kernels.cpp)
-void tile_range(int64_t n, const spacemit_tile & tile, int64_t & begin, int64_t & end) {
-    const int64_t per = (n + tile.nth - 1) / tile.nth;
-    begin             = std::min(n, per * tile.ith);
-    end               = std::min(n, begin + per);
-}
-
 // ops.cpp ggml_compute_forward_flash_attn_ext_f16_one_chunk (ggml-cpu @ ba360ef) for F16 K and V, rows [ir0, ir1):
 // q rounded to F16 and dotted with K in F32, online softmax, sinks at the end. flagos: V accumulated in F32, not F16
 void flash_attn_ref(const ggml_tensor * dst, int64_t ir0, int64_t ir1) {

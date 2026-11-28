@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 // The core's contract table (plan.md "S1 step 2 spec"): per contract the ggml op, the structural check (operand types,
 // shapes, modes and placement, the layout rule through the plugin's tensor_layout) and the step names in order. Every
@@ -514,31 +515,37 @@ static constexpr size_t k_n_contracts = sizeof(k_contracts) / sizeof(k_contracts
 static_assert(k_n_contracts <= sizeof(spacemit_ops::ops) / sizeof(spacemit_ops::ops[0]),
               "spacemit_ops::ops must hold every contract");
 
-// the contract names of the kernels the plugin offers, in its kernel table's order (plan.md "S1 step 1 spec" section 3)
-const char * const spacemit_required_kernels[] = {
-    "add.f32",          "mul.f32",          "rms_norm.f32",             "rope",
-    "set_rows",         "cpy.quant",        "get_rows.f32",             "get_rows.quant",
-    "swiglu.f32",       "mul_mat.quantize", "mul_mat.gemm",
-    "mul_mat.f16.products",                 "mul_mat.f16.sum",
-    "mul_mat_id.quantize",                  "mul_mat_id.gemm",          "flash_attn",
-    "flash_attn.split.partial",             "flash_attn.split.partial_paired",
-    "flash_attn.split.merge",               "flash_attn.kvh.partial",   "flash_attn.kvh.merge",
-    "scale.f32",        "cpy.f32",          "gdn.f32",
-    "silu.f32",         "sigmoid.f32",      "softplus.f32",             "l2_norm.f32",
-    "ssm_conv.f32",     "concat.f32",       "mul_mat.f32",
-    "soft_max.f32",     "argsort.f32",      "sum_rows.f32",             "clamp.f32",
-    "div.f32",          "concat.f32.tail",  "ssm_conv.f32.stashed",
-    "gated_delta_net.f32.direct",           "gated_delta_net.f32.direct.cleared",
+// the steps graph_compute puts in place of a contract's (spacemit_conv_pair, spacemit_state_pass)
+static const char * const k_pass_kernels[] = {
+    "concat.f32.tail",
+    "ssm_conv.f32.stashed",
+    "gated_delta_net.f32.direct",
+    "gated_delta_net.f32.direct.cleared",
 };
-const size_t spacemit_n_required_kernels = sizeof(spacemit_required_kernels) / sizeof(spacemit_required_kernels[0]);
 
-static bool spacemit_is_required_kernel(const char * name) {
-    for (size_t i = 0; i < spacemit_n_required_kernels; i++) {
-        if (std::strcmp(name, spacemit_required_kernels[i]) == 0) {
-            return true;
+const char * const * spacemit_required_kernels(size_t * n) {
+    static const std::vector<const char *> names = [] {
+        std::vector<const char *> v;
+        const auto add = [&v](const char * name) {
+            for (const char * have : v) {
+                if (std::strcmp(have, name) == 0) {
+                    return;
+                }
+            }
+            v.push_back(name);
+        };
+        for (const spacemit_contract & contract : k_contracts) {
+            for (uint32_t s = 0; s < contract.n_steps; s++) {
+                add(contract.steps[s]);
+            }
         }
-    }
-    return false;
+        for (const char * name : k_pass_kernels) {
+            add(name);
+        }
+        return v;
+    }();
+    *n = names.size();
+    return names.data();
 }
 
 bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std::string * detail) {
@@ -560,10 +567,6 @@ bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std
     out->n_ops = 0;
     // a step name to the plugin's entry, or nullptr with detail set
     const auto bind = [&](const char * name) -> const spacemit_plugin_kernel * {
-        if (!spacemit_is_required_kernel(name)) {
-            fail(std::string(name) + " is not a required kernel");
-            return nullptr;
-        }
         for (uint32_t k = 0; k < n_kernels; k++) {
             if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, name) == 0) {
                 return &kernels[k];
@@ -583,26 +586,17 @@ bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std
             }
         }
     }
-    out->conv_pair_concat.n_steps   = 1;
-    out->conv_pair_ssm_conv.n_steps = 1;
-    out->state_direct.n_steps       = 1;
-    out->conv_pair_concat.steps[0]   = bind("concat.f32.tail");
-    out->conv_pair_ssm_conv.steps[0] = bind("ssm_conv.f32.stashed");
-    out->state_direct.steps[0]       = bind("gated_delta_net.f32.direct");
+    out->conv_pair_concat.n_steps     = 1;
+    out->conv_pair_ssm_conv.n_steps   = 1;
+    out->state_direct.n_steps         = 1;
+    out->state_direct_cleared.n_steps = 1;
+    out->conv_pair_concat.steps[0]     = bind("concat.f32.tail");
+    out->conv_pair_ssm_conv.steps[0]   = bind("ssm_conv.f32.stashed");
+    out->state_direct.steps[0]         = bind("gated_delta_net.f32.direct");
+    out->state_direct_cleared.steps[0] = bind("gated_delta_net.f32.direct.cleared");
     if (out->conv_pair_concat.steps[0] == nullptr || out->conv_pair_ssm_conv.steps[0] == nullptr ||
-        out->state_direct.steps[0] == nullptr) {
+        out->state_direct.steps[0] == nullptr || out->state_direct_cleared.steps[0] == nullptr) {
         return false;
-    }
-    // the folding form of a state pass's step is not refused when it is missing: graph_compute then leaves the
-    // clearing SCALE its own step (spacemit_state_pass)
-    out->state_direct_cleared.n_steps  = 0;
-    out->state_direct_cleared.steps[0] = nullptr;
-    for (uint32_t k = 0; k < n_kernels; k++) {
-        if (kernels[k].name != nullptr && std::strcmp(kernels[k].name, "gated_delta_net.f32.direct.cleared") == 0) {
-            out->state_direct_cleared.steps[0] = &kernels[k];
-            out->state_direct_cleared.n_steps  = 1;
-            break;
-        }
     }
     out->table = table;
     out->n_ops = (uint32_t) k_n_contracts;

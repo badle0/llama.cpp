@@ -29,7 +29,6 @@ constexpr uint64_t SPACEMIT_DEVICE_UUID_HI    = 0x53504D544B330000ULL;  // "SPMT
 constexpr uint64_t SPACEMIT_DEVICE_UUID_LO    = 0x0000000041000002ULL;
 constexpr uint64_t SPACEMIT_MEMORY_DOMAIN_ID  = 0x53504D544B330001ULL;  // K3 DRAM, shared with the X100 cores
 constexpr size_t   SPACEMIT_BUFFER_ALIGNMENT  = 64;
-constexpr uint32_t SPACEMIT_A100_VECTOR_BITS  = 1024;
 
 // spacemit_backend_context::state_role: the node is in no state pass, or it is a pass's GET_ROWS, CPY or folded
 // clearing SCALE, whose work the pass's one step does (spacemit_state_pass)
@@ -38,8 +37,10 @@ constexpr int32_t SPACEMIT_STATE_SKIP = -2;
 
 struct spacemit_device_context {
     std::string                name;
-    std::string                description;  // from the plugin's props
-    std::string                runtime;      // from the plugin's props (the FlagOS profile)
+    std::string                description;      // from the plugin's props
+    std::string                runtime;          // from the plugin's props (the FlagOS profile)
+    std::string                target;           // from the plugin's props (the FlagOS profile)
+    uint32_t                   vector_bits = 0;  // from the plugin's props (the FlagOS profile)
     uint32_t                   n_ai_cores = 0;
     spacemit_plugin *          plugin     = nullptr;  // kept for the process lifetime, as ggml keeps its backends
     const spacemit_plugin_v1 * table      = nullptr;
@@ -61,17 +62,14 @@ struct spacemit_backend_context {
     const spacemit_plugin_v1 *        table  = nullptr;
     spacemit_plugin_stream *          stream = nullptr;
     spacemit_run_stats_attach_fn      attach = nullptr;  // test-only (E3c), nullptr when the plugin has no counters
-    // test-only (FLAGOS_SPACEMIT_QUANTIZE=shared), nullptr when the plugin does not offer the fact
-    spacemit_mul_mat_same_activations_fn same_activations = nullptr;
-    // the plugin's switch generation, in the plan cache's word (moved only by a test's switch reset); nullptr: 0
+    // the plugin's switch generation, the plan cache's word (moved only by a test's switch reset); nullptr: 0
     spacemit_switches_generation_fn   switches_generation = nullptr;
-    std::vector<spacemit_plugin_step> steps;
-    std::vector<const char *>         step_names;  // the steps' contract names, parallel to steps
+    std::vector<const spacemit_op *>  node_op;     // per node of a checked graph: its op, nullptr when not computed
     std::vector<uint8_t>              conv_role;   // per node of a checked graph: 1 a pair's CONCAT, 2 its SSM_CONV
     // per node of a checked graph: SPACEMIT_STATE_NONE or _SKIP, else the index of the CPY a state pass's step runs on
     std::vector<int32_t>              state_role;
     std::vector<uint8_t>              state_cleared;  // 1 at a pass's op when its step clears the row itself
-    spacemit_plan_cache               plan;        // the plan cache (FLAGOS_SPACEMIT_PLAN; plan.md "S1 step 3c spec")
+    spacemit_plan_cache               plan;        // the plan replayed and its key (FLAGOS_SPACEMIT_PLAN)
     void *                            workspace      = nullptr;  // shared by the tiles; grows to the largest split
     size_t                            workspace_size = 0;
     spacemit_run_stats                run_stats;  // test-only (E3c): the current graph's, with GGML_FLAGOS_STATS
@@ -228,10 +226,11 @@ bool spacemit_data_ready(const ggml_tensor * node) {
     return true;
 }
 
-// every node is checked before its graph first runs (on every graph when the cache is off, at its store in the plan
+// every node is checked before its graph first runs (on every graph when the cache is off, on every miss of the plan
 // cache otherwise) and the workspace before every launch, so a graph either runs completely or fails with nothing
-// written; a hit trusts the check made at its store under the uid, which llama.cpp keeps only while the graph is reused
-// unchanged (its tensors and their allocations kept; a rebuilt graph gets a new uid, ggml-backend.cpp:1538)
+// written; a hit trusts the check made when the plan's key was set under the uid, which llama.cpp keeps only while the
+// graph is reused unchanged (its tensors and their allocations kept; a rebuilt graph gets a new uid,
+// ggml-backend.cpp:1538)
 ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * ctx = static_cast<spacemit_backend_context *>(backend->context);
     auto * dev = static_cast<spacemit_device_context *>(backend->device->context);
@@ -240,85 +239,44 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     spacemit_op_stats_file * const op_stats = spacemit_op_stats_file::get();  // test-only (fusion-and-splitting.md §7)
     const bool                     timed    = stats != nullptr || op_stats != nullptr;
     // GGML_FLAGOS_TRACE_LAUNCH: the steps logged by name before the replay. Both it and the op counters need the
-    // steps' contract names, so both the expansion below and the plan cache's entry must carry them (an entry stored
-    // without names serves no graph that wants them, core/flagos-spacemit-plan.cpp:60-66)
+    // steps' contract names, so the expansion below must carry them (a plan expanded without names serves no graph
+    // that wants them, spacemit_plan_cache::probe)
     const bool                     trace      = spacemit_trace_launch();
     const bool                     want_names = op_stats != nullptr || trace;
-    // the plan cache (plan.md "S1 step 3c spec"): by default (FLAGOS_SPACEMIT_PLAN unset or uid-trust) the step list
-    // and the workspace sizes come from the cache on a hit, keyed by the split's uid, the node objects and the
-    // configuration word; the entry is taken before the contract check and a hit skips it, trusting the uid as CUDA
-    // and Hexagon do: a change to a node's operands or placement under a kept uid and the same objects is not seen
-    // (llama.cpp never does this: a reused graph keeps its tensors and their allocations, and the uid changes when the
-    // graph is rebuilt). The check still runs at every store, that is on every miss, and on every graph the scheduler
-    // did not stamp (uid 0, a miss). The test-only none checks and expands every graph, nothing cached
+    // the plan cache (plan.md "S1 step 3c spec"): by default (FLAGOS_SPACEMIT_PLAN unset or uid-trust) a hit replays
+    // the plan in ctx->plan as it is, keyed by the split's uid, the node objects and the configuration word; the key is
+    // taken before the contract check and a hit skips it, trusting the uid as CUDA and Hexagon do: a change to a node's
+    // operands or placement under a kept uid and the same objects is not seen (llama.cpp never does this: a reused
+    // graph keeps its tensors and their allocations, and the uid changes when the graph is rebuilt). The check still
+    // runs on every miss, and on every graph the scheduler did not stamp (uid 0, a miss). The test-only none checks and
+    // expands every graph and never sets the key
     const spacemit_plan_mode                    plan_mode = spacemit_plan_mode_get();
     const std::chrono::steady_clock::time_point start =
         timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     int64_t rows = -1, n_kv = -1;  // the counters' kind of graph: its first matmul's rows, its first attention's KV length
 
-    // a MUL_MAT quantizes its activations in step 0 and multiplies them in step 1 (spacemit_find_op). They have their
-    // own part of the workspace, after the other ops' scratch, so that the ops between two matmuls of one input leave
-    // them, and with FLAGOS_SPACEMIT_QUANTIZE=shared the second matmul runs only its step 1
-    bool share = spacemit_quantize_shared();
-    if (share && ctx->same_activations == nullptr) {  // the fact is not contract, so a plugin may not offer it (A2)
-        static std::atomic<bool> warned{ false };
-        if (!warned.exchange(true)) {
-            GGML_LOG_WARN("FlagOS SpacemiT: the plugin has no activation-sharing fact; "
-                          "FLAGOS_SPACEMIT_QUANTIZE=shared stays off\n");
-        }
-        share = false;
-    }
-    // no plan cache under FLAGOS_SPACEMIT_QUANTIZE=shared (test-only): its sharing decisions read data addresses
-    // (spacemit_overlaps), which the key does not cover
-    const bool          cached = plan_mode == spacemit_plan_mode::uid_trust && !share;
-    const ggml_tensor * held = nullptr;  // the MUL_MAT whose quantized activations that part holds
-    size_t              scratch_size = 0, act_size = 0;
-    ctx->steps.clear();
-    ctx->step_names.clear();
-    // the configuration word is the activation-sharing fact (bit 0) and, above it, the plugin's switch generation,
-    // which moves whenever a kernel switch is reset (so FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a
-    // plugin switch); a different word is a miss. The convolution pairs (spacemit_conv_pair) and the state passes
-    // (spacemit_state_pass) below are structural decisions, so the plan cache keeps them under the uid's trust
-    uint64_t word = 0;
-    if (cached) {
-        const uint64_t generation = ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
-        word = (generation << 1) | (share ? 1 : 0);
-    }
+    const bool cached = plan_mode == spacemit_plan_mode::uid_trust;
+    // the configuration word is the plugin's switch generation, which moves whenever a kernel switch is reset (so
+    // FLAGOS_SPACEMIT_ATTN reaches the key without the core reading a plugin switch); a different word is a miss. The
+    // convolution pairs (spacemit_conv_pair) and the state passes (spacemit_state_pass) below are structural decisions,
+    // so the plan cache keeps them under the uid's trust
+    const uint64_t word = cached && ctx->switches_generation != nullptr ? ctx->switches_generation() : 0;
     // the key alone, before the contract check
-    spacemit_plan_result plan = spacemit_plan_result::off;
-    if (cached) {
-        plan = ctx->plan.probe(cgraph, word, want_names, ctx->steps, ctx->step_names, scratch_size, act_size);
-    }
-    const bool trusted = plan == spacemit_plan_result::hit_uid;
-    // a checked node's steps and its part of the workspace: every graph when the cache is off (none, or
-    // FLAGOS_SPACEMIT_QUANTIZE=shared), a miss of the plan cache otherwise (expanded as the check goes, then stored)
-    // node is the step's node; what the step writes and whose workspace rule it takes is own, the same node except for
-    // a state pass, whose step runs on the CPY and needs the GATED_DELTA_NET's workspace (spacemit_state_pass)
+    const spacemit_plan_result plan = cached ? ctx->plan.probe(cgraph, word, want_names) : spacemit_plan_result::off;
+    const bool                 trusted = plan == spacemit_plan_result::hit_uid;
+    spacemit_plan_cache &      p       = ctx->plan;
+    // a checked node's steps and the workspace its op needs: every graph when the cache is off (none), a miss of the
+    // plan cache otherwise. node is the step's node; what the step writes and whose workspace rule it takes is own, the
+    // same node except for a state pass, whose step runs on the CPY and needs the GATED_DELTA_NET's workspace
+    // (spacemit_state_pass)
     const auto expand = [&](ggml_tensor * node, const spacemit_op * op, ggml_tensor * own) {
-        uint32_t first = 0;
-        if (share) {
-            if (held != nullptr && spacemit_overlaps(own, held->src[1])) {
-                held = nullptr;  // the node writes over the activations held
-            }
-            if (node->op == GGML_OP_MUL_MAT) {
-                if (held != nullptr && ctx->same_activations(held, node)) {
-                    first = 1;
-                } else {
-                    held = node;
-                }
-            }
-        }
-        for (uint32_t s = first; s < op->n_steps; s++) {
-            ctx->steps.push_back({ op->steps[s]->fn, node, 0 });
+        for (uint32_t s = 0; s < op->n_steps; s++) {
+            p.steps.push_back({ op->steps[s]->fn, node });
             if (want_names) {  // the step names, kept parallel to steps only for the counters or the trace
-                ctx->step_names.push_back(op->steps[s]->name);
+                p.names.push_back(op->steps[s]->name);
             }
         }
-        const size_t workspace = spacemit_op_workspace(op, own);
-        if (workspace != 0) {
-            size_t & size = own->op == GGML_OP_MUL_MAT ? act_size : scratch_size;
-            size          = std::max(size, workspace);
-        }
+        p.workspace_size = std::max(p.workspace_size, spacemit_op_workspace(op, own));
     };
     const int n_nodes = ggml_graph_n_nodes(cgraph);
     if (trusted) {
@@ -382,16 +340,16 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
                 ctx->state_role[i] = c;
                 ctx->state_role[r] = SPACEMIT_STATE_SKIP;
                 ctx->state_role[c] = SPACEMIT_STATE_SKIP;
-                if (z >= 0 && dev->ops.state_direct_cleared.n_steps == 1 && computed(ggml_graph_node(cgraph, z)) &&
-                    ctx->state_role[z] == SPACEMIT_STATE_NONE) {
+                if (z >= 0 && computed(ggml_graph_node(cgraph, z)) && ctx->state_role[z] == SPACEMIT_STATE_NONE) {
                     ctx->state_role[z]    = SPACEMIT_STATE_SKIP;
                     ctx->state_cleared[i] = 1;
                 }
                 n_passes++;
             }
         }
-        // the contract check, every graph but a trusted hit: a graph either runs completely or fails with nothing
-        // written
+        // the contract check, every graph but a trusted hit, before the plan is touched: a graph either runs completely
+        // or fails with nothing written, and a refused graph leaves the plan and its key as they were
+        ctx->node_op.assign((size_t) n_nodes, nullptr);
         for (int i = 0; i < n_nodes; i++) {
             ggml_tensor * node = ggml_graph_node(cgraph, i);
             // as ggml-cpu: nothing to do for empty tensors, and nodes without the compute flag are branches the graph
@@ -414,6 +372,16 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
                 GGML_LOG_ERROR("FlagOS SpacemiT: %s (%s) has an unallocated operand\n", ggml_op_desc(node), node->name);
                 return GGML_STATUS_FAILED;
             }
+            ctx->node_op[i] = op;
+        }
+        // the expansion: the key is cleared first, so it never names a plan being rebuilt
+        p.reset();
+        for (int i = 0; i < n_nodes; i++) {
+            const spacemit_op * op = ctx->node_op[i];
+            if (op == nullptr) {
+                continue;
+            }
+            ggml_tensor * node  = ggml_graph_node(cgraph, i);
             const int32_t state = ctx->state_role.empty() ? SPACEMIT_STATE_NONE : ctx->state_role[i];
             if (state == SPACEMIT_STATE_SKIP) {
                 continue;  // a state pass's GET_ROWS, CPY or folded SCALE: its one step does their work
@@ -430,12 +398,11 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         spacemit_conv_pairs_add(n_pairs);
         spacemit_state_passes_add(n_passes);
     }
-    // after the contract check; start when a trusted hit skipped it
+    // after the contract check and the expansion; start when a trusted hit skipped them
     const std::chrono::steady_clock::time_point checked =
         timed && !trusted ? std::chrono::steady_clock::now() : start;
     if (cached && !trusted) {
-        // the probe missed: the checked graph's expansion stored, without a second lookup
-        ctx->plan.store(cgraph, word, ctx->steps, ctx->step_names, scratch_size, act_size);
+        p.set_key(cgraph, word);  // the probe missed: the plan just expanded is cgraph's (no key for a uid of 0)
     }
     const std::chrono::steady_clock::time_point in_hand =
         timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -445,22 +412,19 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     if (cached) {
         spacemit_plan_counters_add(plan);
     }
-    if (ctx->steps.empty()) {
+    if (p.steps.empty()) {
         return GGML_STATUS_SUCCESS;
     }
-    const size_t act_offset     = GGML_PAD(scratch_size, 64);
-    const size_t workspace_size = act_offset + act_size;
-    for (spacemit_plugin_step & step : ctx->steps) {
-        step.workspace_offset = step.node->op == GGML_OP_MUL_MAT ? act_offset : 0;
-    }
-    if (workspace_size > ctx->workspace_size) {
+    // one workspace for all steps: each op's steps use it alone, so the largest op's need is the size
+    if (p.workspace_size > ctx->workspace_size) {
         if (ctx->workspace != nullptr) {
             ggml_aligned_free(ctx->workspace, ctx->workspace_size);
         }
-        ctx->workspace      = ggml_aligned_malloc(workspace_size);
-        ctx->workspace_size = ctx->workspace != nullptr ? workspace_size : 0;
+        ctx->workspace      = ggml_aligned_malloc(p.workspace_size);
+        ctx->workspace_size = ctx->workspace != nullptr ? p.workspace_size : 0;
         if (ctx->workspace == nullptr) {
-            GGML_LOG_ERROR("FlagOS SpacemiT: failed to allocate a %zu-byte workspace\n", workspace_size);
+            GGML_LOG_ERROR("FlagOS SpacemiT: failed to allocate a %zu-byte workspace\n", p.workspace_size);
+            p.reset();
             return GGML_STATUS_FAILED;
         }
     }
@@ -475,14 +439,14 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
     }
     const bool counted = timed && ctx->attach != nullptr;
     if (counted) {  // the counters attach to the stream for this graph only; an uncounted graph leaves them detached
-        ctx->run_stats.reset(ctx->steps.size());
+        ctx->run_stats.reset(p.steps.size());
         ctx->attach(ctx->stream, &ctx->run_stats);
     }
     // test-only: GGML_FLAGOS_SYNC_LAUNCH, one launch per step, is a flag of the replay
     const uint32_t flags   = mode == spacemit_launch_kind::per_step ? SPACEMIT_REPLAY_SYNC_LAUNCH : 0u;
-    const size_t   n_steps = ctx->steps.size();
+    const size_t   n_steps = p.steps.size();
     if (trace) {
-        spacemit_trace_steps(ctx->steps, ctx->step_names);
+        spacemit_trace_steps(p.steps, p.names);
         GGML_LOG_INFO("FlagOS SpacemiT: launch %zu steps\n", n_steps);
     }
     enum spacemit_status status = SPACEMIT_STATUS_SUCCESS;
@@ -490,13 +454,12 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
         // the trace with one launch per step: the core issues the replays itself, one step each (the same launches the
         // plugin would make under the flag), so that it names the step whose launch failed
         for (size_t i = 0; i < n_steps && status == SPACEMIT_STATUS_SUCCESS; i++) {
-            status = ctx->table->replay(ctx->stream, ctx->steps.data() + i, 1, ctx->workspace, ctx->workspace_size,
-                                        flags);
+            status = ctx->table->replay(ctx->stream, p.steps.data() + i, 1, ctx->workspace, ctx->workspace_size, flags);
             GGML_LOG_INFO("FlagOS SpacemiT: launch step %zu/%zu: %s\n", i + 1, n_steps,
                           spacemit_status_name(status));
         }
     } else {
-        status = ctx->table->replay(ctx->stream, ctx->steps.data(), static_cast<uint32_t>(n_steps), ctx->workspace,
+        status = ctx->table->replay(ctx->stream, p.steps.data(), static_cast<uint32_t>(n_steps), ctx->workspace,
                                     ctx->workspace_size, flags);
     }
     if (trace) {
@@ -513,7 +476,7 @@ ggml_status spacemit_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *
             stats->add(launch, rows, n_kv, ctx->run_stats, graph_us, plan, lookup_us, key_us);
         }
         if (op_stats != nullptr) {
-            op_stats->add(launch, rows, n_kv, ctx->steps, ctx->step_names, ctx->run_stats);
+            op_stats->add(launch, rows, n_kv, p.steps, p.names, ctx->run_stats);
         }
     }
     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
@@ -597,12 +560,10 @@ ggml_backend_t spacemit_device_init(ggml_backend_dev_t dev, const char *) {
     auto * ctx  = new spacemit_backend_context;
     ctx->table  = dctx->table;
     ctx->stream = stream;
-    // test-only (E3c, FLAGOS_SPACEMIT_QUANTIZE=shared), and the plugin's switch generation, in the plan cache's word
-    // (moved only by a test's switch reset); nullptr: 0. Neither the per-tile clock reads, the activation-sharing fact
-    // nor the switch generation is contract, so all three come by name (plan.md "S1 design" A2)
+    // test-only (E3c), and the plugin's switch generation, the plan cache's word (moved only by a test's switch reset);
+    // nullptr: 0. Neither the per-tile clock reads nor the switch generation is contract, so both come by name
+    // (plan.md "S1 design" A2)
     ctx->attach = reinterpret_cast<spacemit_run_stats_attach_fn>(dctx->table->get_proc_address("spacemit_run_stats_attach"));
-    ctx->same_activations = reinterpret_cast<spacemit_mul_mat_same_activations_fn>(
-        dctx->table->get_proc_address("spacemit_mul_mat_same_activations"));
     ctx->switches_generation = reinterpret_cast<spacemit_switches_generation_fn>(
         dctx->table->get_proc_address("spacemit_switches_generation"));
     return new ggml_backend{
@@ -682,8 +643,9 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
 
     spacemit_plugin * plugin = nullptr;
     std::string       detail;
-    const spacemit_load_result loaded = spacemit_plugin_load(nullptr, host, spacemit_required_kernels,
-                                                             spacemit_n_required_kernels, &plugin, &detail);
+    size_t                     n_required = 0;
+    const char * const *       required   = spacemit_required_kernels(&n_required);
+    const spacemit_load_result loaded     = spacemit_plugin_load(nullptr, host, required, n_required, &plugin, &detail);
     if (loaded != spacemit_load_result::ok) {
         if (loaded == spacemit_load_result::no_device) {
             // the ordinary case on a host without the AI cores
@@ -712,6 +674,13 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
         spacemit_plugin_unload(plugin);
         return false;
     }
+    // the FlagOS profile's vector width and target are the plugin's facts
+    if (props.vector_bits == 0 || props.target == nullptr) {
+        GGML_LOG_WARN("FlagOS SpacemiT: the plugin's device properties lack the vector width or the target\n");
+        table->device_close(pdev);
+        spacemit_plugin_unload(plugin);
+        return false;
+    }
 
     // the core's contracts bound to this plugin's kernels, once: a plugin whose kernels do not answer every contract
     // cannot run a graph, so it registers no device
@@ -725,6 +694,8 @@ bool spacemit_probe_impl(ggml_backend_reg_t owner_reg) {
     g_device.name                 = "FlagOS:SpacemiT:0";
     g_device.description          = props.description != nullptr ? props.description : "";
     g_device.runtime              = props.runtime != nullptr ? props.runtime : "none";
+    g_device.target               = props.target;
+    g_device.vector_bits          = props.vector_bits;
     g_device.n_ai_cores           = props.n_tiles;
     g_device.plugin               = plugin;
     g_device.table                = table;
@@ -800,14 +771,14 @@ bool spacemit_device_profile(size_t index, flagos_device_profile * profile) {
     profile->engine            = flagos_engine_kind::cpu;
     profile->features          = FLAGOS_FEATURE_SIMD | FLAGOS_FEATURE_FP16 | FLAGOS_FEATURE_INT8 |
                                  FLAGOS_FEATURE_MATRIX | FLAGOS_FEATURE_UNIFIED_MEMORY;
-    profile->vector_bits       = SPACEMIT_A100_VECTOR_BITS;
-    profile->lane_count        = SPACEMIT_A100_VECTOR_BITS / 32;
+    profile->vector_bits       = g_device.vector_bits;  // the plugin's props
+    profile->lane_count        = g_device.vector_bits / 32;
     profile->concurrency       = g_device.n_ai_cores;
     profile->memory_domain_id  = SPACEMIT_MEMORY_DOMAIN_ID;
     profile->vendor            = "SpacemiT";
     profile->architecture      = "a100";
     profile->microarchitecture = "rvv1024-ime2";
-    profile->target            = "riscv64-a100-ime2";
+    profile->target            = g_device.target.c_str();  // the plugin's props
     profile->runtime           = g_device.runtime.c_str();  // the plugin's props
     profile->aot_format        = nullptr;
     return flagos_device_profile_is_valid(profile);

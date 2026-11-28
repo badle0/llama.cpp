@@ -1,7 +1,7 @@
 // flagos-check-spacemit: checks of the SpacemiT provider through the built ggml-flagos library.
 // Usage: flagos-check-spacemit [--expect-device | --expect-none] [--full]
 //                              [--bench | --bench-attn | --bench-mm | --bench-f32 | --bench-embd | --bench-repack |
-//                               --bench-x100 | --bench-mmid | --bench-pairwait]
+//                               --bench-x100 | --bench-mmid]
 //   --expect-device  fail if the provider exposes no device (use on the K3)
 //   --expect-none    fail if it exposes one (use with FLAGOS_SPACEMIT_DISABLE=1, or on another host)
 //   --full           also check Q4_0 and Q4_1 matmuls at Qwen3-4B's shapes (up to 512 x 9728 x 2560), and the Q6_K
@@ -34,10 +34,6 @@
 //                    ([2048, 512, 256] and [512, 2048, 256], 8 ids a token): 1 token, 4 tokens of 32 experts, 4 and 8
 //                    tokens of the same 8 experts, 32 tokens of random ids, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against
 //                    the default taking turns twice; median and minimum of 60 computes (not run by --bench)
-//   --bench-pairwait of the benchmarks only the pair wait: one launch a variant on all tiles, each making 1,000,000
-//                    rendezvous with its partner, spacemit_pair_wait against SpacemiT's barrier (spine_barrier.h)
-//                    without and with our two exits, three rounds in rotated order; lines "pairwait ...", skipped on
-//                    the serial host executor (not run by --bench)
 // Without a flag, a host without the device skips the device checks. Q4_1 weights are checked as the provider stores
 // them: requantized to Q8_0.
 
@@ -255,8 +251,17 @@ static int check_registry(ggml_backend_dev_t dev, size_t global_index) {
     CHECK(info.identity.provider_id == info.provider.id);
     CHECK(info.caps.kind == flagos_provider_kind::cpu_accelerator);
     CHECK(info.caps.execution == 0);
-    CHECK(info.profile.vector_bits == 1024);
     CHECK(info.profile.concurrency > 0);
+
+    // the profile's vector width, lanes and target are the plugin's props
+    const spacemit_plugin_v1 *   table = spacemit_plugin_table(spacemit_device_plugin(dev));
+    spacemit_plugin_device *     pdev  = spacemit_device_plugin_device(dev);
+    spacemit_plugin_device_props pp    = {};
+    pp.struct_size                     = sizeof(pp);
+    REQUIRE(table != nullptr && pdev != nullptr && table->device_props(pdev, &pp) == SPACEMIT_STATUS_SUCCESS);
+    CHECK(pp.vector_bits != 0 && info.profile.vector_bits == pp.vector_bits);
+    CHECK(info.profile.lane_count == pp.vector_bits / 32);
+    CHECK(pp.target != nullptr && info.profile.target != nullptr && std::strcmp(info.profile.target, pp.target) == 0);
 
     const char * type = props.type == GGML_BACKEND_DEVICE_TYPE_GPU  ? "GPU" :
                         props.type == GGML_BACKEND_DEVICE_TYPE_IGPU ? "IGPU" :
@@ -298,10 +303,11 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     host.plugin_dir       = FLAGOS_SPACEMIT_TEST_PLUGIN_DIR;
 
     // the same library loads again: one dlopen more on an already loaded library
-    spacemit_plugin * again  = nullptr;
-    std::string       detail;
-    REQUIRE(spacemit_plugin_load(path, host, spacemit_required_kernels, spacemit_n_required_kernels, &again,
-                                 &detail) == spacemit_load_result::ok);
+    spacemit_plugin *    again      = nullptr;
+    std::string          detail;
+    size_t               n_required = 0;
+    const char * const * required   = spacemit_required_kernels(&n_required);
+    REQUIRE(spacemit_plugin_load(path, host, required, n_required, &again, &detail) == spacemit_load_result::ok);
     const spacemit_plugin_v1 * table = spacemit_plugin_table(again);
     REQUIRE(table != nullptr);
     CHECK(table->api_version == FLAGOS_SPACEMIT_PLUGIN_API_VERSION);
@@ -311,12 +317,12 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     uint32_t                       n_kernels = 0;
     const spacemit_plugin_kernel * kernels   = table->kernels(&n_kernels);
     REQUIRE(kernels != nullptr);
-    CHECK(n_kernels == spacemit_n_required_kernels);
-    for (size_t i = 0; i < spacemit_n_required_kernels; i++) {
+    CHECK(n_kernels == n_required);
+    for (size_t i = 0; i < n_required; i++) {
         bool found = false;
         for (uint32_t k = 0; k < n_kernels; k++) {
             found = found || (kernels[k].name != nullptr && kernels[k].fn != nullptr &&
-                              std::strcmp(kernels[k].name, spacemit_required_kernels[i]) == 0);
+                              std::strcmp(kernels[k].name, required[i]) == 0);
         }
         CHECK(found);
     }
@@ -324,8 +330,8 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
     // what is not contract comes by name (plan.md "S1 design" A2): every name answers, and the behaviour behind each is
     // checked where it is used
     const char * names[] = { "spacemit_steps_take", "spacemit_executors_take", "spacemit_mm_paths_take",
-                             "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_mul_mat_same_activations",
-                             "spacemit_switches_reset", "spacemit_switches_generation",
+                             "spacemit_mm_tail_take", "spacemit_run_stats_attach", "spacemit_switches_reset",
+                             "spacemit_switches_generation",
                              "spacemit_attn_paths_take", "spacemit_embd_paths_take", "spacemit_gdn_paths_take",
                              "spacemit_repack_take", "spacemit_repack_x100_take" };
     size_t       n_names = 0;
@@ -379,8 +385,7 @@ static int check_loader(ggml_backend_dev_t dev, size_t global_index) {
         spacemit_plugin *    bad = nullptr;
         std::string          why;
         const spacemit_load_result got =
-            spacemit_plugin_load(bad_path.c_str(), host, spacemit_required_kernels, spacemit_n_required_kernels, &bad,
-                                 &why);
+            spacemit_plugin_load(bad_path.c_str(), host, required, n_required, &bad, &why);
         if (got != c.want) {
             std::fprintf(stderr, "FAIL: %s gave result %d, expected %d (%s)\n", c.name, (int) got, (int) c.want,
                          why.c_str());
@@ -3938,7 +3943,6 @@ static int check_embedding(ggml_backend_dev_t dev) {
     for (int i = 0; i < 2; i++) {
         env_override         switch_off("GGML_FLAGOS_DISABLE_OPS", i == 1 ? "GET_ROWS" : nullptr);
         env_override         plan_switch("FLAGOS_SPACEMIT_PLAN", "uid-trust");
-        env_override         quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
         lookup_graph         l;
         REQUIRE(l.init(dev, t, 7));
         ggml_backend_t       both[2] = { backend, cpu };
@@ -6842,8 +6846,8 @@ static std::vector<uint8_t> q4_0_raw(int64_t k, int64_t n, const std::function<f
 // written here (the references bit for bit, the kernels within its bound) and against the CPU, the same bytes with a
 // TCM stand-in that forces several row passes and on threads, and the reference steps called directly on 1 and 3
 // tiles the model's bytes; (C2) exact cases, bit for bit in both modes, and the fp16 subnormal probes; (D) an overflow
-// fails the graph with one line, an infinite input does not; (E) unset is f16, int8 the integer path's steps; (G)
-// QUANTIZE=shared; (F) FLAGOS_SPACEMIT_F16_STATS. Kernels run only through a launch: the direct calls take the
+// fails the graph with one line, an infinite input does not; (E) unset is f16, int8 the integer path's steps; (F)
+// FLAGOS_SPACEMIT_F16_STATS. Kernels run only through a launch: the direct calls take the
 // reference steps (spacemit_mul_mat_f16_*_reference), which never run IME code, so they are safe on the test's thread
 // (an X100 core on the K3)
 static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
@@ -7659,52 +7663,6 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                    " outputs pinned apart)");
     }
 
-    // G. FLAGOS_SPACEMIT_QUANTIZE=shared (test-only) skips no f16 step: two f16 matmuls of one input give the bytes and
-    // the step count of separate
-    {
-        env_override sw(dense, "f16");
-        mm_weight    wa, wb;
-        REQUIRE(wa.init(dev, 512, 64, seed++) && wb.init(dev, 512, 64, seed++));
-        ggml_init_params p  = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
-        ggml_context *   ch = ggml_init(p);
-        ggml_context *   cd = ggml_init(p);
-        REQUIRE(ch != nullptr && cd != nullptr);
-        ggml_tensor * x  = ggml_new_tensor_2d(ch, GGML_TYPE_F32, 512, 64);
-        ggml_tensor * ya = ggml_mul_mat(cd, wa.w_dev, x);
-        ggml_tensor * yb = ggml_mul_mat(cd, wb.w_dev, x);
-        ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ch, ggml_backend_cpu_buffer_type());
-        ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(cd, buft);
-        REQUIRE(bh != nullptr && bd != nullptr);
-        const std::vector<float> xv = random_values(512 * 64, seed++, 2.0f);
-        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
-        ggml_cgraph * g = ggml_new_graph(cd);
-        ggml_build_forward_expand(g, ya);
-        ggml_build_forward_expand(g, yb);
-        std::vector<float> out[2];
-        uint64_t           steps[2] = {};
-        bool               ran      = true;
-        for (int i = 0; i < 2; i++) {
-            env_override   share("FLAGOS_SPACEMIT_QUANTIZE", i == 0 ? "separate" : "shared");
-            ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
-            REQUIRE(be != nullptr);
-            g_steps_take();
-            ran      = ggml_backend_graph_compute(be, g) == GGML_STATUS_SUCCESS && ran;
-            steps[i] = g_steps_take();
-            ggml_backend_free(be);
-            out[i].assign(2 * 64 * 64, NAN);
-            ggml_backend_tensor_get(ya, out[i].data(), 0, ggml_nbytes(ya));
-            ggml_backend_tensor_get(yb, out[i].data() + 64 * 64, 0, ggml_nbytes(yb));
-        }
-        expect(ran && steps[0] == 4 && steps[1] == 4 &&
-                   std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0,
-               "FLAGOS_SPACEMIT_QUANTIZE=shared: steps " + std::to_string(steps[1]) + " (separate " +
-                   std::to_string(steps[0]) + "), " + (ran ? "bytes compared" : "failed"));
-        ggml_backend_buffer_free(bh);
-        ggml_backend_buffer_free(bd);
-        ggml_free(ch);
-        ggml_free(cd);
-    }
-
     // F. FLAGOS_SPACEMIT_F16_STATS: appended when a backend that took f16 matmuls is freed; unset, nothing. The largest
     // values only from the references (the kernels do not scan)
     {
@@ -7790,8 +7748,7 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
                 "the same bytes, the bad value warned once, plain 8 slices and other bytes. Overflow of an activation and of a partial "
                 "sum fail with one line, on pairs in turn and on threads in under 5 s, +inf passes; unset, empty and "
                 "f16 the same bytes by the f16 steps, int8 and f16:4096 the same bytes by quantize and gemm; "
-                "QUANTIZE=shared skips no f16 step; F16_STATS appended at the backend's free, nothing unset: %d/%d in "
-                "%.1f s\n",
+                "F16_STATS appended at the backend's free, nothing unset: %d/%d in %.1f s\n",
                 mode, n_staged, small_tcm, (long long) n_equal, (long long) n_outputs, (long long) n_pinned, worst, max_nmse,
                 k_mul_mat_max_nmse, n_exact, (long long) n_rounded, subnormal[0][0].c_str(), subnormal[0][1].c_str(),
                 subnormal[0][2].c_str(), subnormal[0][3].c_str(), subnormal[1][0].c_str(), subnormal[1][1].c_str(),
@@ -8092,7 +8049,6 @@ static int check_conv_pair(ggml_backend_dev_t dev) {
     REQUIRE(k_tail != nullptr && k_stash != nullptr && k_stash->workspace_size != nullptr);
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     env_override                     plan_default("FLAGOS_SPACEMIT_PLAN", nullptr);
-    env_override                     quantize_default("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
 
     const conv_pair_case cases[] = {
   // what,                                          n,    C, n_s, kw, variant, fused
@@ -9063,7 +9019,7 @@ static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
         ggml_tensor * y = ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 64, 4),
                                           ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 10),
                                           ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 10));
-        const std::vector<spacemit_plugin_step> steps = { { step_q->fn, y, 0 }, { step_g->fn, y, 0 } };
+        const std::vector<spacemit_plugin_step> steps = { { step_q->fn, y }, { step_g->fn, y } };
         const std::vector<const char *>         names = { step_q->name, step_g->name };
         {
             spacemit_op_stats_file counters(path.c_str());
@@ -10682,7 +10638,6 @@ static int check_state_pass(ggml_backend_dev_t dev) {
     REQUIRE(k_cleared != nullptr && k_cleared->fn != nullptr && k_cleared->workspace_size != nullptr);
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     env_override                     plan_default("FLAGOS_SPACEMIT_PLAN", nullptr);
-    env_override                     quantize_default("FLAGOS_SPACEMIT_QUANTIZE", nullptr);
     // the direct calls run on the calling core: its bytes are the device's only where both run the same kernels
 #if defined(__riscv)
     const bool exact_direct = *reference_label() != '\0';
@@ -11079,134 +11034,6 @@ static int check_layer(ggml_backend_dev_t dev) {
             n_launch_cases++;
         }
     }
-    // fusion-and-splitting.md §5, candidate 6: with FLAGOS_SPACEMIT_QUANTIZE=shared, Q, V and K, and gate and up, multiply
-    // one quantization of their input: 3 steps fewer per layer, and the same bytes, in one launch and in one launch per
-    // step (where the quantized activations outlast the launches between)
-    int n_shared_same = 0, n_shared_fewer = 0, n_shared_cases = 0;
-    for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
-        for (int64_t n_tokens : { 1, 7 }) {
-            // the second column is GGML_FLAGOS_SYNC_LAUNCH: unset one launch per split, 1 one per step
-            const char * const settings[3][2] = { { "separate", nullptr }, { "shared", nullptr },
-                                                  { "shared", "1" } };
-            std::vector<float> out[3];
-            double             e[3];
-            uint64_t           steps[3];
-            for (int s = 0; s < 3; s++) {
-                env_override quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", settings[s][0]);
-                env_override launch_switch("GGML_FLAGOS_SYNC_LAUNCH", settings[s][1]);
-                g_steps_take();
-                e[s]     = layer_nmse(dev, backend, cpu, n_tokens, down, false, &out[s]);
-                steps[s] = g_steps_take();
-            }
-            bool same = e[0] >= 0.0;
-            for (int s = 1; s < 3; s++) {
-                same = same && e[s] >= 0.0 && out[s].size() == out[0].size() &&
-                       std::memcmp(out[0].data(), out[s].data(), out[0].size() * sizeof(float)) == 0;
-            }
-            const bool fewer = steps[1] + 3 == steps[0] && steps[2] == steps[1];
-            if (!same || !fewer) {
-                std::fprintf(stderr,
-                             "FAIL: layer with %lld tokens, down projection %s: FLAGOS_SPACEMIT_QUANTIZE=shared %s; "
-                             "steps separate %llu, shared %llu, shared one launch per step %llu\n",
-                             (long long) n_tokens, ggml_type_name(down),
-                             !same ? "refused, failed or differs from separate" : "has not 3 steps fewer",
-                             (unsigned long long) steps[0], (unsigned long long) steps[1], (unsigned long long) steps[2]);
-                g_failures++;
-            }
-            n_shared_same += same;
-            n_shared_fewer += fewer;
-            n_shared_cases++;
-        }
-    }
-    // FLAGOS_SPACEMIT_QUANTIZE=shared beside a MUL_MAT of a plain F32 weight (mul_mat.f32, no IME layout) of the
-    // same input as two Q4_0 ones, in three orders: no abort, the bytes of separate, the F32 result against the CPU.
-    // Separate takes 2 + 2 + 1 steps; shared drops the second Q4_0's quantize where the two Q4_0 nodes are adjacent. In
-    // the order (Q4_0, F32, Q4_0) the F32 node becomes the held one, so the second Q4_0 does not share today
-    int    n_plain_ok = 0, n_plain_cases = 0;
-    double plain_nmse = 0.0;
-    {
-        mm_weight wa, wb;
-        uint32_t  seed = 11061;
-        REQUIRE(wa.init(dev, 512, 64, seed++) && wb.init(dev, 512, 64, seed++));
-        ggml_init_params p  = { ggml_tensor_overhead() * 8 + ggml_graph_overhead() * 4, nullptr, true };
-        ggml_context *   ch = ggml_init(p);  // the input and the F32 weight, in a CPU buffer
-        ggml_context *   cd = ggml_init(p);  // the outputs, in ours
-        ggml_context *   cr = ggml_init(p);  // the CPU's F32 result
-        REQUIRE(ch != nullptr && cd != nullptr && cr != nullptr);
-        ggml_tensor * x      = ggml_new_tensor_2d(ch, GGML_TYPE_F32, 512, 4);
-        ggml_tensor * wf     = ggml_new_tensor_2d(ch, GGML_TYPE_F32, 512, 64);
-        ggml_tensor * ya     = ggml_mul_mat(cd, wa.w_dev, x);
-        ggml_tensor * yb     = ggml_mul_mat(cd, wb.w_dev, x);
-        ggml_tensor * yf     = ggml_mul_mat(cd, wf, x);
-        ggml_tensor * yf_ref = ggml_mul_mat(cr, wf, x);
-        ggml_backend_buffer_t bh = ggml_backend_alloc_ctx_tensors_from_buft(ch, ggml_backend_cpu_buffer_type());
-        ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors_from_buft(cd, ggml_backend_dev_buffer_type(dev));
-        ggml_backend_buffer_t br = ggml_backend_alloc_ctx_tensors_from_buft(cr, ggml_backend_cpu_buffer_type());
-        REQUIRE(bh != nullptr && bd != nullptr && br != nullptr);
-        const std::vector<float> xv = random_values(512 * 4, seed++, 2.0f);
-        const std::vector<float> wv = random_values(512 * 64, seed++, 1.0f);
-        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
-        ggml_backend_tensor_set(wf, wv.data(), 0, ggml_nbytes(wf));
-        ggml_cgraph * g_ref = ggml_new_graph(cr);
-        ggml_build_forward_expand(g_ref, yf_ref);
-        const bool         ref_ok = ggml_backend_graph_compute(cpu, g_ref) == GGML_STATUS_SUCCESS;
-        std::vector<float> want(64 * 4, NAN);
-        ggml_backend_tensor_get(yf_ref, want.data(), 0, ggml_nbytes(yf_ref));
-        ggml_tensor * const orders[3][3] = { { ya, yb, yf }, { ya, yf, yb }, { yf, ya, yb } };
-        const char * const  names[3]     = { "Q4_0, Q4_0, F32", "Q4_0, F32, Q4_0", "F32, Q4_0, Q4_0" };
-        for (int o = 0; o < 3; o++) {
-            ggml_cgraph * g = ggml_new_graph(cd);
-            for (ggml_tensor * y : orders[o]) {
-                ggml_build_forward_expand(g, y);
-            }
-            std::vector<float> out[2];
-            uint64_t           steps[2] = {};
-            bool               ran      = ref_ok;
-            double             e        = -1.0;
-            for (int i = 0; i < 2; i++) {
-                env_override   share("FLAGOS_SPACEMIT_QUANTIZE", i == 0 ? "separate" : "shared");
-                ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
-                REQUIRE(be != nullptr);
-                for (ggml_tensor * y : { ya, yb, yf }) {  // junk, so a missed write shows
-                    const std::vector<uint8_t> j(ggml_nbytes(y), 0xA5);
-                    ggml_backend_tensor_set(y, j.data(), 0, j.size());
-                }
-                g_steps_take();
-                ran      = ggml_backend_graph_compute(be, g) == GGML_STATUS_SUCCESS && ran;
-                steps[i] = g_steps_take();
-                ggml_backend_free(be);
-                out[i].assign(3 * 64 * 4, NAN);
-                ggml_backend_tensor_get(ya, out[i].data(), 0, ggml_nbytes(ya));
-                ggml_backend_tensor_get(yb, out[i].data() + 64 * 4, 0, ggml_nbytes(yb));
-                ggml_backend_tensor_get(yf, out[i].data() + 2 * 64 * 4, 0, ggml_nbytes(yf));
-                const double ei = ran ? nmse(out[i].data() + 2 * 64 * 4, want.data(), 64 * 4) : -1.0;
-                e               = i == 0 ? ei : (ei < 0.0 || e < 0.0 ? -1.0 : std::max(e, ei));
-            }
-            const bool same     = ran && std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
-            const bool steps_ok = steps[0] == 5 && (o == 1 ? steps[1] <= steps[0] : steps[1] == 4);
-            const bool close    = e >= 0.0 && e <= k_mul_mat_max_nmse;
-            const bool ok       = same && steps_ok && close;
-            plain_nmse          = std::max(plain_nmse, e);
-            n_plain_ok += ok;
-            n_plain_cases++;
-            if (!ok) {
-                std::fprintf(stderr,
-                             "FAIL: FLAGOS_SPACEMIT_QUANTIZE=shared beside a plain F32 MUL_MAT, order %s: %s, steps "
-                             "separate %llu, shared %llu (expected 5, %s), F32 NMSE against the CPU %.3e (bound "
-                             "%.0e)\n",
-                             names[o], !ran ? "failed" : same ? "the bytes of separate" : "other bytes than separate",
-                             (unsigned long long) steps[0], (unsigned long long) steps[1], o == 1 ? "at most 5" : "4",
-                             e, k_mul_mat_max_nmse);
-                g_failures++;
-            }
-        }
-        ggml_backend_buffer_free(bh);
-        ggml_backend_buffer_free(bd);
-        ggml_backend_buffer_free(br);
-        ggml_free(ch);
-        ggml_free(cd);
-        ggml_free(cr);
-    }
     // the whole head rotated, and half of it (the rest copied)
     const double e_rope_full = rope_wide_nmse(dev, backend, cpu, 256);
     const double e_rope_half = rope_wide_nmse(dev, backend, cpu, 128);
@@ -11225,13 +11052,9 @@ static int check_layer(ggml_backend_dev_t dev) {
     std::printf("layer    Qwen3-like layer with flash attention in one launch vs CPU (1 and 7 tokens after %d "
                 "positions, down projection Q4_0 and Q4_1, all rows; KV cache of %lld cells and mask in a CPU buffer, "
                 "weights in ours): max NMSE %.2e (bound %.0e); ROPE NEOX head 256 NMSE %.2e; KV cache in our buffer "
-                "(E2) max NMSE %.2e; one launch per step identical in %d/%d cases (E3a); one quantization for Q/K/V "
-                "and for gate/up (FLAGOS_SPACEMIT_QUANTIZE=shared) identical in %d/%d cases, 3 steps fewer in %d/%d; "
-                "shared beside a plain F32 MUL_MAT in 3 orders as separate, the steps as expected, F32 max NMSE %.2e: "
-                "%d/%d%s\n",
+                "(E2) max NMSE %.2e; one launch per step identical in %d/%d cases (E3a)%s\n",
                 k_layer_pos, (long long) k_slots, worst, k_layer_max_nmse, e_rope, worst_kv, n_launch_same,
-                n_launch_cases, n_shared_same, n_shared_cases, n_shared_fewer, n_shared_cases, plain_nmse, n_plain_ok,
-                n_plain_cases, reference_label());
+                n_launch_cases, reference_label());
     return 0;
 }
 
@@ -11367,14 +11190,14 @@ static bool plan_fake_kernel_2(const spacemit_tile *, ggml_tensor *) {
     return true;
 }
 
-// probe (j)'s second part, the key on the cache itself through probe(), on g (stamped with a uid): two stand-in steps
-// per node with an op stored with sizes 4096 and 8192 and no names, then asked with a copy of g, each case one clause
-// of the key: (1) the same uid, nodes and word: a hit with the stored sizes and steps; (2) one node pointer replaced in
-// a copy of the node array: a miss (the pointer walk); (3) one node fewer and (6) one node more (the first again): a
-// miss each (the node count; without it (6) would walk only the stored nodes and hit, and (3) would read past the
-// copy); (4) another word: a miss (the word); (5) another stamped uid with the same nodes: a miss (the uid's equality;
-// "uid not 0" is (h)'s "the view again"); (7) the same uid, nodes and word asked with the op counters' names: a miss
-// (an entry stored without names serves no graph that wants them). Returns false and reports when the cache does
+// probe (j)'s second part, the key on the cache itself through probe(), on g (stamped with a uid): a plan of two
+// stand-in steps per node with an op, workspace size 4096 and no names, keyed for g, then asked with a copy of g, each
+// case one clause of the key: (1) the same uid, nodes and word: a hit, the plan unchanged; (2) one node pointer
+// replaced in a copy of the node array: a miss (the pointer walk); (3) one node fewer and (6) one node more (the first
+// again): a miss each (the node count; without it (6) would walk only the stored nodes and hit, and (3) would read past
+// the copy); (4) another word: a miss (the word); (5) another stamped uid with the same nodes: a miss (the uid's
+// equality; "uid not 0" is (h)'s "the view again"); (7) the same uid, nodes and word asked with the op counters' names:
+// a miss (a plan expanded without names serves no graph that wants them). Returns false and reports when the cache does
 // otherwise
 static bool plan_key_probe(const ggml_cgraph * g) {
     ggml_cgraph *                     gm = const_cast<ggml_cgraph *>(g);
@@ -11385,45 +11208,40 @@ static bool plan_key_probe(const ggml_cgraph * g) {
         if (ggml_op_is_empty(node->op)) {
             continue;
         }
-        full.push_back({ plan_fake_kernel_1, node, 0 });
-        full.push_back({ plan_fake_kernel_2, node, 0 });
+        full.push_back({ plan_fake_kernel_1, node });
+        full.push_back({ plan_fake_kernel_2, node });
     }
-    const uint64_t                    word = 2;
-    std::vector<spacemit_plugin_step> steps;
-    std::vector<const char *>         names;
-    size_t                            scratch = 0, act = 0;
-    bool                              ok = !full.empty() && g->uid != 0 && n > 1;
+    const uint64_t word = 2;
+    bool           ok   = !full.empty() && g->uid != 0 && n > 1;
     if (!ok) {
         std::fprintf(stderr, "FAIL: plan key probe: the graph needs a uid and two nodes, one with an op\n");
         g_failures++;
         return false;
     }
     spacemit_plan_cache cache;
-    cache.store(g, word, full, {}, 4096, 8192);
+    cache.reset();
+    cache.steps          = full;
+    cache.workspace_size = 4096;
+    cache.set_key(g, word);
     // a copy of g whose nodes are `nodes` and whose uid is `uid`, asked through probe() with `w` (and the op counters'
-    // names when want_names); a hit hands back the stored list and sizes
+    // names when want_names); probe() leaves the plan as it is
     const auto ask = [&](const char * what, std::vector<ggml_tensor *> nodes, uint64_t uid, uint64_t w,
                          spacemit_plan_result want, bool want_names = false) {
         ggml_cgraph copy = *g;
         copy.nodes       = nodes.data();
         copy.n_nodes     = static_cast<int>(nodes.size());
         copy.uid         = uid;
-        scratch = act = 0;
-        steps.clear();
-        names.clear();
-        const spacemit_plan_result got  = cache.probe(&copy, w, want_names, steps, names, scratch, act);
-        bool                       good = got == want;
-        if (got != spacemit_plan_result::miss) {
-            good = good && scratch == 4096 && act == 8192 && steps.size() == full.size();
-            for (size_t j = 0; good && j < steps.size(); j++) {
-                good = steps[j].fn == full[j].fn && steps[j].node == full[j].node;
-            }
+        const spacemit_plan_result got  = cache.probe(&copy, w, want_names);
+        bool                       good = got == want && cache.workspace_size == 4096 && cache.names.empty() &&
+                    cache.steps.size() == full.size();
+        for (size_t j = 0; good && j < cache.steps.size(); j++) {
+            good = cache.steps[j].fn == full[j].fn && cache.steps[j].node == full[j].node;
         }
         if (!good) {
             std::fprintf(stderr,
-                         "FAIL: plan key probe, %s: probe gave %d (1 a hit by uid, 2 a miss), expected %d; sizes %zu "
-                         "and %zu, %zu steps\n",
-                         what, (int) got, (int) want, scratch, act, steps.size());
+                         "FAIL: plan key probe, %s: probe gave %d (1 a hit by uid, 2 a miss), expected %d; workspace "
+                         "%zu, %zu steps\n",
+                         what, (int) got, (int) want, cache.workspace_size, cache.steps.size());
             g_failures++;
         }
         ok = ok && good;
@@ -11462,12 +11280,10 @@ static bool plan_key_probe(const ggml_cgraph * g) {
 // probe(), seven cases, under uid-trust); (o) a node unflagged after the store: one MUL_MAT of the first layer's
 // object loses GGML_TENSOR_FLAG_COMPUTE, so under none the check's filter skips it (2 steps fewer) and under uid-trust
 // the hit runs the stored steps (as many as before): the hit skips the check; (m) the first layer's own object with
-// another uid, the entry its own: a miss by the uid alone; (k) under FLAGOS_SPACEMIT_QUANTIZE=shared no cache, so a
-// layer graph twice counts nothing; (i) under none every counter stays 0; (n), made once before the settings and
-// counted in each line: the switch unset gives uid-trust (the default), none gives none, and the old uid falls to
-// uid-trust with one warning. Every output against the CPU, the layers'
-// against each other byte for byte, and every output of uid-trust against none's byte for byte. 15 probes under none,
-// 14 under uid-trust
+// another uid, the entry its own: a miss by the uid alone; (i) under none every counter stays 0; (n), made once
+// before the settings and counted in each line: the switch unset gives uid-trust (the default), none gives none, and
+// the old uid falls to uid-trust with one warning. Every output against the CPU, the layers' against each other byte
+// for byte, and every output of uid-trust against none's byte for byte. 14 probes under none, 13 under uid-trust
 static int check_plan(ggml_backend_dev_t dev) {
     ggml_backend_t cpu = cpu_init();
     REQUIRE(cpu != nullptr);
@@ -11513,7 +11329,6 @@ static int check_plan(ggml_backend_dev_t dev) {
 
     for (const char * setting : { "none", "uid-trust" }) {
         env_override   plan_switch("FLAGOS_SPACEMIT_PLAN", setting);
-        env_override   quantize_switch("FLAGOS_SPACEMIT_QUANTIZE", nullptr);  // separate; (k) sets shared itself
         const bool     on      = std::strcmp(setting, "none") != 0;  // uid-trust: the cache on, a hit trusted
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         REQUIRE(backend != nullptr);
@@ -11775,16 +11590,6 @@ static int check_plan(ggml_backend_dev_t dev) {
                   ran && same_bytes(out_m, out_a) && as_none("m", out_m));
         }
 
-        // (k) FLAGOS_SPACEMIT_QUANTIZE=shared: no plan cache, so a layer graph twice counts nothing
-        {
-            env_override       shared("FLAGOS_SPACEMIT_QUANTIZE", "shared");
-            std::vector<float> out_k, out_k2;
-            ran = a.run(backend, out_k);
-            cnt = expect("(k) shared, first", 0, 0);
-            ran = ran && a.run(backend, out_k2);
-            cnt = expect("(k) shared, second", 0, 0) && cnt;
-            probe("(k)", cnt, ran && same_bytes(out_k, out_a) && same_bytes(out_k2, out_a) && as_none("k", out_k2));
-        }
         take();
 
         // (i) none: nothing counted
@@ -11801,9 +11606,9 @@ static int check_plan(ggml_backend_dev_t dev) {
         std::printf("plan     FLAGOS_SPACEMIT_PLAN=%s: probes %d/%d passed (a same object twice, b same structure as "
                     "new objects, c RoPE base changed, d 7 tokens, e a stamped uid on other objects, f "
                     "FLAGOS_SPACEMIT_ATTN flipped, l the same value set again, g replay after a larger graph, h a graph "
-                    "view, j a refusal%s, o a node unflagged after the store, m another uid on the same objects, k no "
-                    "cache under QUANTIZE=shared%s, n the default uid-trust); %d graphs: %llu hits by uid, %llu "
-                    "misses; %s; layer NMSE %.2e (bound %.0e), attention NMSE %.2e (bound %.0e)\n",
+                    "view, j a refusal%s, o a node unflagged after the store, m another uid on the same objects%s, "
+                    "n the default uid-trust); %d graphs: %llu hits by uid, %llu misses; %s; layer NMSE %.2e (bound "
+                    "%.0e), attention NMSE %.2e (bound %.0e)\n",
                     setting, n_passed, n_probes, on ? " after the entry and the key alone (seven cases)" : "",
                     on ? "" : ", i no counter moved", n_graphs, (unsigned long long) total.hits_uid,
                     (unsigned long long) total.misses,
@@ -11971,7 +11776,7 @@ static bool check_op_stats_first() {
     ggml_tensor *                           a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_tensor *                           x     = ggml_scale(ctx, a, 2.0f);
     ggml_tensor *                           y     = ggml_add(ctx, x, a);
-    const std::vector<spacemit_plugin_step> steps = { { plan_fake_kernel_1, x, 0 }, { plan_fake_kernel_2, y, 0 } };
+    const std::vector<spacemit_plugin_step> steps = { { plan_fake_kernel_1, x }, { plan_fake_kernel_2, y } };
     const std::vector<const char *>         names = { "scale", "add" };
     const size_t                            n     = steps.size();
     const uint32_t                          tiles = 2;
@@ -13765,151 +13570,6 @@ static int bench_mmid(ggml_backend_dev_t dev) {
     return 0;
 }
 
-// the pair-wait launches (spacemit_pairwait_launch) on a stream of the plugin device the core opened: a backend alive
-// would share its executor and core grant. Made where no backend is alive, so the stream makes the one executor (1
-// created, else a FAIL), which reads FLAGOS_SPACEMIT_TEST_THREADS then; the launches' steps are taken off the counter
-struct pairwait_stream {
-    const spacemit_plugin_v1 *  table  = nullptr;
-    spacemit_plugin_stream *    stream = nullptr;
-    spacemit_pairwait_launch_fn launch = nullptr;
-
-    bool init(ggml_backend_dev_t dev) {
-        table                         = spacemit_plugin_table(spacemit_device_plugin(dev));
-        spacemit_plugin_device * pdev = spacemit_device_plugin_device(dev);
-        launch = table != nullptr ? reinterpret_cast<spacemit_pairwait_launch_fn>(
-                                        table->get_proc_address("spacemit_pairwait_launch")) :
-                                    nullptr;
-        if (pdev == nullptr || launch == nullptr) {
-            std::fprintf(stderr, "FAIL: pairwait: no plugin device or no spacemit_pairwait_launch\n");
-            g_failures++;
-            return false;
-        }
-        g_executors_take();
-        const bool     made = table->stream_create(pdev, device_tiles(dev), &stream) == SPACEMIT_STATUS_SUCCESS;
-        const uint64_t own  = g_executors_take();
-        if (!made || own != 1) {
-            std::fprintf(stderr, "FAIL: pairwait: stream %s, %llu executors created (1 expected: no backend alive)\n",
-                         made ? "made" : "not made", (unsigned long long) own);
-            g_failures++;
-            return false;
-        }
-        return true;
-    }
-
-    ~pairwait_stream() {
-        if (stream != nullptr) {
-            table->stream_destroy(stream);
-        }
-        g_steps_take();
-    }
-};
-
-static const char * const k_pairwait_names[3] = { "ours", "spine", "spine+exit" };
-
-// the pair-wait launches of --bench-pairwait, small: with the tiles at the same time (the AI cores, the host's threads)
-// every variant makes its 10,000 rendezvous on every tile; on the serial executor every variant returns at once. On
-// the AI cores spine, which has no exit, is left to --bench-pairwait: a launch gone wrong would hang this check
-static int check_pairwait(ggml_backend_dev_t dev, bool host) {
-    constexpr uint32_t n     = 10000;
-    const uint32_t     tiles = device_tiles(dev);
-    int                n_checks = 0, n_ok = 0;
-    for (const char * threads : { "0", "1" }) {
-        if (!host && threads[0] == '1') {
-            break;  // the AI cores: one pass
-        }
-        env_override    on_threads("FLAGOS_SPACEMIT_TEST_THREADS", threads);
-        const bool      concurrent = !host || threads[0] == '1';
-        pairwait_stream s;
-        if (!s.init(dev)) {
-            continue;
-        }
-        for (uint32_t v = 0; v < 3; v++) {
-            if (!host && v == SPACEMIT_PAIRWAIT_SPINE) {
-                continue;
-            }
-            spacemit_pairwait_result r   = {};
-            const bool               ran = s.launch(s.stream, v, n, &r);
-            bool ok = ran && r.n_tiles == tiles && r.concurrent == concurrent && r.executor != nullptr;
-            for (uint32_t t = 0; t < r.n_tiles; t++) {
-                ok = ok && r.waits[t] == (concurrent ? n : 0);
-            }
-            n_checks++;
-            n_ok += ok;
-            if (!ok) {
-                std::fprintf(stderr, "FAIL: pairwait %s, %s: %s, %u tiles, concurrent %d, tile 0 %u waits\n",
-                             k_pairwait_names[v], r.executor != nullptr ? r.executor : "?", ran ? "ran" : "failed",
-                             r.n_tiles, (int) r.concurrent, r.waits[0]);
-                g_failures++;
-            }
-        }
-    }
-    std::printf("pairchk  %s, 10000 rendezvous a tile%s: %d/%d\n",
-                host ? "ours, spine and spine+exit" : "ours and spine+exit", host ? " on threads, none in turn" : "",
-                n_ok, n_checks);
-    return 0;
-}
-
-// --bench-pairwait: what a pair rendezvous costs on the device's tiles. A launch a variant on all tiles, each tile
-// making n rendezvous with tile ith ^ 1 back to back after 1,000 untimed, timing its own loop: ours
-// (spacemit_pair_wait), spine (SpacemiT's barrier, ggml-cpu/spacemit/spine_barrier.h, no exit) and spine+exit (the
-// same with our two exits). Three rounds, the order rotated each round; a round's figure the mean over the tiles of
-// tile ns / n, a variant's the median of its rounds. Skipped where the tiles run in turn (the serial host executor)
-static int bench_pairwait(ggml_backend_dev_t dev) {
-    constexpr uint32_t n        = 1000000;
-    constexpr int      n_rounds = 3;
-    pairwait_stream    s;
-    if (!s.init(dev)) {
-        return 1;
-    }
-    spacemit_pairwait_result probe = {};
-    REQUIRE(s.launch(s.stream, SPACEMIT_PAIRWAIT_OURS, 1000, &probe));
-    std::printf("pairwait: %u tiles, pause in ours: %s (__riscv_zihintpause), executor %s\n", probe.n_tiles,
-                probe.pause_in_ours ? "yes" : "no", probe.executor);
-    if (!probe.concurrent) {
-        std::printf("pairwait: skipped, the tiles run in turn\n");
-        return 0;
-    }
-    std::vector<double> rounds[3];
-    for (int round = 0; round < n_rounds; round++) {
-        for (int j = 0; j < 3; j++) {
-            const int                v   = (round + j) % 3;
-            spacemit_pairwait_result r   = {};
-            const bool               ran = s.launch(s.stream, (uint32_t) v, n, &r);
-            bool                     all = ran && r.n_tiles > 0;
-            std::vector<double>      per;
-            for (uint32_t t = 0; t < r.n_tiles; t++) {
-                all = all && r.waits[t] == n;
-                per.push_back((double) r.ns[t] / n);
-            }
-            if (!all) {
-                std::fprintf(stderr, "FAIL: pairwait round %d %s: %s, tile 0 made %u of %u waits\n", round + 1,
-                             k_pairwait_names[v], ran ? "ran" : "the launch failed", r.waits[0], n);
-                g_failures++;
-                continue;
-            }
-            std::sort(per.begin(), per.end());
-            double mean = 0;
-            for (double x : per) {
-                mean += x / per.size();
-            }
-            const double median = (per[(per.size() - 1) / 2] + per[per.size() / 2]) / 2;
-            std::printf("pairwait round %d %s: %.1f ns a wait (tiles min %.1f, median %.1f, max %.1f), %u waits a "
-                        "tile\n",
-                        round + 1, k_pairwait_names[v], mean, per.front(), median, per.back(), n);
-            rounds[v].push_back(mean);
-        }
-    }
-    for (int v = 0; v < 3; v++) {
-        std::vector<double> & m = rounds[v];
-        if (!m.empty()) {
-            std::sort(m.begin(), m.end());
-            std::printf("pairwait %s: median of %zu rounds %.1f ns a wait\n", k_pairwait_names[v], m.size(),
-                        (m[(m.size() - 1) / 2] + m[m.size() / 2]) / 2);
-        }
-    }
-    return 0;
-}
-
 int main(int argc, char ** argv) {
     bool expect_device = false;
     bool expect_none   = false;
@@ -13922,7 +13582,6 @@ int main(int argc, char ** argv) {
     bool run_repack    = false;
     bool run_x100      = false;
     bool run_mmid      = false;
-    bool run_pairwait  = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--expect-device") == 0) {
             expect_device = true;
@@ -13946,13 +13605,10 @@ int main(int argc, char ** argv) {
             run_x100 = true;
         } else if (std::strcmp(argv[i], "--bench-mmid") == 0) {
             run_mmid = true;
-        } else if (std::strcmp(argv[i], "--bench-pairwait") == 0) {
-            run_pairwait = true;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--expect-device | --expect-none] [--full] [--bench | --bench-attn | --bench-mm | "
-                         "--bench-f32 | --bench-embd | --bench-repack | --bench-x100 | --bench-mmid | "
-                         "--bench-pairwait]\n"
+                         "--bench-f32 | --bench-embd | --bench-repack | --bench-x100 | --bench-mmid]\n"
                          "  --bench-attn: flash attention only\n"
                          "  --bench-f32: the F32 matmul only\n"
                          "  --bench-embd: the token embedding lookup only, ggml's dequantizers against an F32 copy\n"
@@ -13960,8 +13616,7 @@ int main(int argc, char ** argv) {
                          "  --bench-x100: the 1-row matmul beside readers on the X100 cores, and split between the "
                          "provider and the CPU backend\n"
                          "  --bench-mmid: one MUL_MAT_ID node of Q4_0 experts, FLAGOS_SPACEMIT_EXPERT_Q4_0=plain against "
-                         "the default\n"
-                         "  --bench-pairwait: the pair wait against SpacemiT's barrier, without and with our exits\n",
+                         "the default\n",
                          argv[0]);
             return 2;
         }
@@ -14015,7 +13670,7 @@ int main(int argc, char ** argv) {
         check_router_q8(dev) != 0 || check_mul_mat_f16(dev, host) != 0 || check_conv_pair(dev) != 0 || check_moe_ops(dev) != 0 ||
         check_flash_attn(dev, host) != 0 ||
         check_layer(dev) != 0 || check_plan(dev) != 0 || check_diagnostics(dev) != 0 ||
-        check_pairwait(dev, host) != 0 || check_shared_stream(dev, host) != 0) {
+        check_shared_stream(dev, host) != 0) {
         return 1;
     }
     if (run_bench ? bench(dev) != 0 :
@@ -14023,7 +13678,7 @@ int main(int argc, char ** argv) {
                         (run_mm && bench_mm(dev) != 0) || (run_f32 && bench_mm_f32(dev) != 0) ||
                         (run_embd && bench_embd(dev) != 0) ||
                         (run_repack && bench_repack(dev, !host) != 0) || (run_x100 && bench_x100(dev) != 0) ||
-                        (run_mmid && bench_mmid(dev) != 0) || (run_pairwait && bench_pairwait(dev) != 0)) {
+                        (run_mmid && bench_mmid(dev) != 0)) {
         return 1;
     }
     if (g_failures != 0) {

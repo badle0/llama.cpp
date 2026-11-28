@@ -50,14 +50,6 @@ int64_t gdn_chunk_floats(int64_t D) {
     return D * D + 7 * CS * D + 3 * CS * CS + 4 * CS;
 }
 
-// [begin, end) of n items for one tile, the way ggml-cpu splits rows over its threads (a copy of
-// flagos-spacemit-kernels.cpp's file-local helper, kept here so this file stands alone)
-void tile_range(int64_t n, const spacemit_tile & tile, int64_t & begin, int64_t & end) {
-    const int64_t per = (n + tile.nth - 1) / tile.nth;
-    begin             = std::min(n, per * tile.ith);
-    end               = std::min(n, begin + per);
-}
-
 // the node's facts: the state side, the heads, the tokens, the sequences and the snapshot slots
 struct gdn_shape {
     int64_t S_v      = 0;

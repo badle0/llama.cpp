@@ -1,5 +1,6 @@
-// Fake plugin for the loader's negative matrix (plan.md "S1 step 1 spec" §7): a complete table whose api_version is 2,
-// so the loader must answer bad_version. C11, built by tests.cmake.
+// Fake plugin for the loader's negative matrix (plan.md "S1 step 1 spec" section 7): a complete table whose api_version
+// is the one before FLAGOS_SPACEMIT_PLUGIN_API_VERSION, as an older plugin library has, so the loader must answer
+// bad_version. C11, built by tests.cmake.
 
 #include "flagos-spacemit-plugin.h"
 
@@ -169,7 +170,7 @@ static void * fake_get_proc_address(const char * name) {
 }
 
 static const spacemit_plugin_v1 fake_table = {
-    /* .api_version        = */ 2,  // the fault: the core accepts FLAGOS_SPACEMIT_PLUGIN_API_VERSION only
+    /* .api_version        = */ FLAGOS_SPACEMIT_PLUGIN_API_VERSION - 1,  // the fault: the core accepts its own only
     /* .struct_size        = */ sizeof(spacemit_plugin_v1),
     /* .device_count       = */ fake_device_count,
     /* .device_open        = */ fake_device_open,

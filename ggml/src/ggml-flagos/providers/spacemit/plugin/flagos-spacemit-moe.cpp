@@ -10,13 +10,13 @@
 //
 // The RVV variants are SpacemiT's ggml-spacemit (branch mtmd-backend @ ddfb41ddc, ggml/src/ggml-spacemit/rvv_kernels.cpp):
 // forward_soft_max_plain_f32 (4467-4545) with rvv_softmax_exp_inplace_f32 (232-245), reduce_sum_f32m2_vlen1024
-// (136-140) and rvv_expf_approx_f32m2 (143-180); forward_sum_rows<float> (3128-3208); the F32 DIV paths of
-// forward_binary (2907-3126). Changes, each marked "flagos": the row range comes from the tile; SOFT_MAX takes the
-// maximum of the scaled row (the fork scaled the source's maximum, wrong for a negative scale); SUM_ROWS accumulates
-// tail-undisturbed (_tu), since its last pass of fewer than VLMAX elements left the other lanes undefined and the
-// reduction reads every lane. ARGSORT and CLAMP have no RVV body in the fork (scalar_kernels.cpp: std::sort, and a
-// clamp by std::min and std::max, which keeps a NaN where ggml-cpu's macros give the upper bound), so the references
-// run there too.
+// (136-140) and rvv_expf_approx_f32m2 (143-180), the last three in flagos-spacemit-rvv-math.h; forward_sum_rows<float>
+// (3128-3208); the F32 DIV paths of forward_binary (2907-3126). Changes, each marked "flagos": the row range comes from
+// the tile; SOFT_MAX takes the maximum of the scaled row (the fork scaled the source's maximum, wrong for a negative
+// scale); SUM_ROWS accumulates tail-undisturbed (_tu), since its last pass of fewer than VLMAX elements left the other
+// lanes undefined and the reduction reads every lane. ARGSORT and CLAMP have no RVV body in the fork
+// (scalar_kernels.cpp: std::sort, and a clamp by std::min and std::max, which keeps a NaN where ggml-cpu's macros give
+// the upper bound), so the references run there too.
 
 #include "flagos-spacemit-moe.h"
 
@@ -24,6 +24,8 @@
 
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 #    include <riscv_vector.h>
+
+#    include "flagos-spacemit-rvv-math.h"  // the exp, sum and softmax helpers
 #endif
 
 #include "ggml-impl.h"
@@ -33,14 +35,6 @@
 #include <cstring>
 
 namespace {
-
-// [begin, end) of n items for one tile, the way ggml-cpu splits rows over its threads (a copy of
-// flagos-spacemit-kernels.cpp's file-local helper, kept here so this file stands alone)
-void tile_range(int64_t n, const spacemit_tile & tile, int64_t & begin, int64_t & end) {
-    const int64_t per = (n + tile.nth - 1) / tile.nth;
-    begin             = std::min(n, per * tile.ith);
-    end               = std::min(n, begin + per);
-}
 
 // row ir of a tensor with ne[1..3] rows, as ggml-cpu numbers them
 void row_index(int64_t ir, const ggml_tensor * t, int64_t & i1, int64_t & i2, int64_t & i3) {
@@ -199,60 +193,6 @@ void div_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
 }
 
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
-
-inline float reduce_sum_f32m2_vlen1024(vfloat32m2_t v, size_t vl) {
-    vfloat32m1_t s_v = __riscv_vfmv_v_f_f32m1(0.0f, 1);
-    s_v              = __riscv_vfredusum_vs_f32m2_f32m1(v, s_v, vl);
-    return __riscv_vfmv_f_s_f32m1_f32(s_v);
-}
-
-// Adapted from ggml_v_expf_m2 in vec.h. This is accurate enough for softmax.
-inline vfloat32m2_t rvv_expf_approx_f32m2(vfloat32m2_t x, size_t vl) {
-    const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
-    const vfloat32m2_t z = __riscv_vfmacc_vf_f32m2(r, 0x1.715476p+0f, x, vl);
-    const vfloat32m2_t n = __riscv_vfsub_vv_f32m2(z, r, vl);
-    const vfloat32m2_t b =
-        __riscv_vfnmsac_vf_f32m2(__riscv_vfnmsac_vf_f32m2(x, 0x1.62e4p-1f, n, vl), 0x1.7f7d1cp-20f, n, vl);
-    const vuint32m2_t  e = __riscv_vsll_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(z), 23, vl);
-    const vfloat32m2_t k = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(e, 0x3f800000, vl));
-    const vbool16_t    c = __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 126.0f, vl);
-    const vfloat32m2_t u = __riscv_vfmul_vv_f32m2(b, b, vl);
-    const vfloat32m2_t j = __riscv_vfmacc_vv_f32m2(
-        __riscv_vfmul_vf_f32m2(b, 0x1.ffffecp-1f, vl),
-        __riscv_vfmacc_vv_f32m2(
-            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.fffdb6p-2f, vl), 0x1.555e66p-3f, b, vl),
-            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.573e2ep-5f, vl), 0x1.0e4020p-7f, b, vl), u, vl),
-        u, vl);
-
-    if (!__riscv_vcpop_m_b16(c, vl)) {
-        return __riscv_vfmacc_vv_f32m2(k, j, k, vl);
-    }
-
-    const vbool16_t    dm = __riscv_vmfle_vf_f32m2_b16(n, 0.0f, vl);
-    const vuint32m2_t  d  = __riscv_vmerge_vxm_u32m2(__riscv_vmv_v_x_u32m2(0, vl), 0x82000000, dm, vl);
-    const vfloat32m2_t s1 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(d, 0x7f000000, vl));
-    const vfloat32m2_t s2 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vsub_vv_u32m2(e, d, vl));
-    const vfloat32m2_t r1 =
-        __riscv_vmerge_vvm_f32m2(__riscv_vfmacc_vv_f32m2(k, k, j, vl),
-                                 __riscv_vfmul_vv_f32m2(__riscv_vfmacc_vv_f32m2(s2, s2, j, vl), s1, vl), c, vl);
-    return __riscv_vmerge_vvm_f32m2(r1, __riscv_vfmul_vv_f32m2(s1, s1, vl),
-                                    __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 192.0f, vl), vl);
-}
-
-inline float rvv_softmax_exp_inplace_f32(float * dst, int64_t n, float max_value) {
-    float row_sum = 0.0f;
-    while (n > 0) {
-        const size_t vl = __riscv_vsetvl_e32m2(n);
-        vfloat32m2_t v  = __riscv_vle32_v_f32m2(dst, vl);
-        v               = __riscv_vfsub_vf_f32m2(v, max_value, vl);
-        v               = rvv_expf_approx_f32m2(v, vl);
-        __riscv_vse32_v_f32m2(dst, v, vl);
-        row_sum += reduce_sum_f32m2_vlen1024(v, vl);
-        dst += vl;
-        n -= vl;
-    }
-    return row_sum;
-}
 
 // forward_soft_max_plain_f32
 void soft_max_f32_rvv(const spacemit_tile & tile, ggml_tensor * op) {

@@ -1150,3 +1150,14 @@ Step 3 of phase 1 (`plan.md` "The move out of tree"; `progress.md` item 147). On
 - **The check program passes as before.** `--expect-device`, "all checks passed", no `FAIL:`, 290 lines both times; the two outputs differ in one line, the device's free memory (30.3 and 30.4 GiB). It no longer imports `ggml_backend_cpu_init`: the CPU backend comes through ggml's registry. Common's four checks pass before and after.
 
 The terminal's own lines (the guards, the markers, `/dev/tcm` afterwards) are not in the folder. Not run here: the dynamic-loading build (Mac only so far; phase 3 runs it on the board), any model. Phase 1 is done; phase 2 is the newest release as the base.
+
+## 30. The two correctness fixes on the board (`~/fix-output-flags-and-sharing`, 2026-11-28)
+
+`progress.md` items 148 and 149. One paste: Qwen3.6-35B through `llama-completion` (5 prompt tokens, 8 generated, `GGML_FLAGOS_TRACE_LAUNCH=1`) under `FLAGOS_SPACEMIT_QUANTIZE=separate` and `shared` on the build of `81043db50`; the pull, the build and the check program; the same two runs again.
+
+- **Before the fix `shared` aborted on the real model**, rc 134, "MUL_MAT weight without an IME layout" (`flagos-spacemit-ime.cpp:100`) while the first graph was planned, no step launched. Until this run that was read from the code only: the 35B has 900 `mul_mat.f32` steps in these 9 graphs.
+- **After it `shared` runs:** rc 0, no abort line, the text of `separate` byte for byte, 1,773 quantize steps for 2,619 (94 fewer a graph) and the same 2,619 multiplies.
+- **The state pass is taken as before:** 270 `gated_delta_net.f32.direct` steps in both `separate` runs (60 of them the cleared form), no `gdn.f32`; the 22,794 step lines of the two runs are the same line for line, and so is the text.
+- **Build and check program:** rc 0, no error line, one warning in a line the change does not touch (`flagos-spacemit.cpp:482`); "all checks passed", no `FAIL:`, the state pass 33/33 cases with 21 passes and the direct calls 48/48, the sharing check beside a plain F32 matmul 3/3 (F32 max NMSE 2.56e-14).
+
+Not measured: speed. The runs carry the trace and are one each; their generation figures (8.97, 8.73 and 8.53 t/s) say nothing about `shared`. The terminal's own lines are not in the folder.

@@ -4,6 +4,7 @@
 # the same session, the modes interleaved in every repetition. Experiments:
 #   base the baseline: only ref and ops, where every op's time per token or batch is measured on the defaults (§7.1)
 #   q6   one quantization for Q, K and V and one for gate and up (§5, #6): FLAGOS_SPACEMIT_QUANTIZE=shared
+#        (the switch was removed 2026-11-28; this mode needs the code as of 58b663ded)
 # The matmul-path modes of §7.3 (split, mm, pb, fit, fit-staged, fit-mixed, tail, fs-tail) ran until the default
 # fit,staged was decided (2026-10-25); they were removed 2026-11-02 with their switches (in git history, cad674fda).
 #

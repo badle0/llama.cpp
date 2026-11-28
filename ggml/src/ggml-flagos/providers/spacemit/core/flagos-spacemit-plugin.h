@@ -23,7 +23,7 @@
 #endif
 
 // the core accepts exactly this version (the loader's check, as ggml's backend loader checks its API version)
-#define FLAGOS_SPACEMIT_PLUGIN_API_VERSION 1
+#define FLAGOS_SPACEMIT_PLUGIN_API_VERSION 2
 
 typedef struct spacemit_plugin_device spacemit_plugin_device;  // opaque to the core
 typedef struct spacemit_plugin_stream spacemit_plugin_stream;
@@ -51,9 +51,9 @@ typedef struct {
 typedef struct {
     uint32_t     struct_size;
     uint32_t     n_tiles;
-    uint32_t     vector_bits;
+    uint32_t     vector_bits;  // the profile's; the core refuses a device with 0
     size_t       tcm_bytes_per_tile;
-    const char * target;
+    const char * target;  // the profile's; the core refuses a device with NULL
     const char * runtime;
     const char * description;
 } spacemit_plugin_device_props;
@@ -84,11 +84,10 @@ typedef struct {
     size_t (*workspace_size)(const struct ggml_tensor * node);  // bytes of shared workspace, or NULL for none
 } spacemit_plugin_kernel;
 
-// one step of a captured split: the kernel, the node it runs on, and where its part of the workspace starts
+// one step of a captured split: the kernel and the node it runs on; every step gets the whole workspace
 typedef struct {
     spacemit_step_fn     fn;
     struct ggml_tensor * node;
-    size_t               workspace_offset;
 } spacemit_plugin_step;
 
 // flags of replay()
@@ -114,9 +113,6 @@ typedef void (*spacemit_gdn_paths_take_fn)(uint64_t * reference, uint64_t * fuse
                                            uint64_t * tcm);
 typedef void (*spacemit_mm_tail_take_fn)(uint64_t * rows, uint64_t * calls, uint32_t n_tiles);
 typedef void (*spacemit_run_stats_attach_fn)(spacemit_plugin_stream * stream, struct spacemit_run_stats * stats);
-// test-only (FLAGOS_SPACEMIT_QUANTIZE=shared): whether MUL_MAT b quantizes the same activations into the same layout
-// as MUL_MAT a, so that b can multiply what a's quantize step wrote
-typedef bool (*spacemit_mul_mat_same_activations_fn)(const struct ggml_tensor * a, const struct ggml_tensor * b);
 // test-only: the weight repacks since the last take that ran on several ranges (threads or X100 tiles), and the most
 // ranges one of them used
 typedef void (*spacemit_repack_take_fn)(uint64_t * threaded, uint64_t * max_ranges);
@@ -129,26 +125,6 @@ typedef void (*spacemit_switches_reset_fn)(void);
 // test-only: the kernel switches' generation, which every reset moves; the core's plan cache keys on it (its
 // configuration word, plan.md "S1 step 3 spec"), so a switch that changes the step list cannot reuse a cached plan
 typedef uint32_t (*spacemit_switches_generation_fn)(void);
-
-// test-only (flagos-check-spacemit --bench-pairwait): the pair rendezvous of one launch, tile by tile
-enum {
-    SPACEMIT_PAIRWAIT_OURS = 0,    // spacemit_pair_wait
-    SPACEMIT_PAIRWAIT_SPINE,       // SpacemiT's barrier (ggml-cpu/spacemit/spine_barrier.h), no exit
-    SPACEMIT_PAIRWAIT_SPINE_EXIT,  // the same with spacemit_pair_wait's two exits
-};
-#define SPACEMIT_PAIRWAIT_MAX_TILES 64
-typedef struct {
-    uint32_t     n_tiles;
-    bool         concurrent;     // false: the tiles ran in turn, so no tile made a rendezvous
-    bool         pause_in_ours;  // spacemit_pair_wait's spin has the pause hint (__riscv_zihintpause)
-    const char * executor;       // the executor's name
-    uint64_t     ns[SPACEMIT_PAIRWAIT_MAX_TILES];     // per tile: its timed loop
-    uint32_t     waits[SPACEMIT_PAIRWAIT_MAX_TILES];  // per tile: the timed rendezvous it made
-} spacemit_pairwait_result;
-// one launch on the stream's executor in which every tile makes n timed rendezvous with tile ith ^ 1 by the variant,
-// after 1,000 untimed in a step before; false if the launch failed (a wait gave up)
-typedef bool (*spacemit_pairwait_launch_fn)(spacemit_plugin_stream * stream, uint32_t variant, uint32_t n,
-                                            spacemit_pairwait_result * out);
 
 typedef struct {
     uint32_t api_version;  // the mentor's fields (flagos-provider.h:66-67)

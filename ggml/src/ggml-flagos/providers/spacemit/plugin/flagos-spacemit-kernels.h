@@ -2,6 +2,7 @@
 
 #include "../core/flagos-spacemit-ops.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 
@@ -31,6 +32,13 @@ T spacemit_cached_switch(std::atomic<T> & value, std::atomic<uint32_t> & seen, P
         seen.store(generation, std::memory_order_release);
     }
     return value.load(std::memory_order_relaxed);
+}
+
+// [begin, end) of n items for one tile, the way ggml-cpu splits rows over its threads
+inline void tile_range(int64_t n, const spacemit_tile & tile, int64_t & begin, int64_t & end) {
+    const int64_t per = (n + tile.nth - 1) / tile.nth;
+    begin             = std::min(n, per * tile.ith);
+    end               = std::min(n, begin + per);
 }
 
 bool spacemit_kernel_add_f32(const spacemit_tile * tile, ggml_tensor * dst);

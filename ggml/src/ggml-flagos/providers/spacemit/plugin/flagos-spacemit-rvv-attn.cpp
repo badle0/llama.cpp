@@ -9,7 +9,8 @@
 // rvv_pack_scaled_f16_as_f32, rvv_pack_scaled_f32_as_f32 (237-306), rvv_transposed_s16_mn_to_nm (390-470),
 // rvv_qk_dot_tile_f16_x1/x4, rvv_pv_accumulate_f16_x1/x4, rvv_pv_accumulate (472-620), memcpy2d
 // (1115-1119); kernels flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow (650-911) and _m1 (913-1009),
-// forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16 (1121-1303) as forward_one_chunk.
+// forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16 (1121-1303) as forward_one_chunk. reduce_sum_f32m2_vlen1024,
+// rvv_expf_approx_f32m2 and rvv_softmax_exp_inplace_f32 are in flagos-spacemit-rvv-math.h, shared with other files.
 // forward_tiled is ggml-spacemit's version of the tiled kernel (spacemit-com/llama.cpp 4e782bc,
 // ggml/src/ggml-spacemit/rvv_kernels.cpp:1306-1641, with its rvv_qk_dot_tile, 582-598), which stops each query row at
 // its last unmasked column of every KV tile; it replaced the in-tree one (1305-1628), whose check of every mask value
@@ -66,6 +67,8 @@
 #        pragma GCC diagnostic ignored "-Wcast-qual"
 #    endif
 
+#    include "flagos-spacemit-rvv-math.h"  // the exp, sum and softmax helpers
+
 namespace spacemit_rvv_attn {
 
 namespace {
@@ -105,45 +108,6 @@ static inline float reduce_sum_f32m4_vlen1024(vfloat32m4_t v, size_t vl) {
     return __riscv_vfmv_f_s_f32m1_f32(s_v);
 }
 
-static inline float reduce_sum_f32m2_vlen1024(vfloat32m2_t v, size_t vl) {
-    vfloat32m1_t s_v = __riscv_vfmv_v_f_f32m1(0.0f, 1);
-    s_v              = __riscv_vfredusum_vs_f32m2_f32m1(v, s_v, vl);
-    return __riscv_vfmv_f_s_f32m1_f32(s_v);
-}
-
-// Adapted from ggml_v_expf_m2 in vec.h. This is accurate enough for softmax.
-static inline vfloat32m2_t rvv_expf_approx_f32m2(vfloat32m2_t x, size_t vl) {
-    const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
-    const vfloat32m2_t z = __riscv_vfmacc_vf_f32m2(r, 0x1.715476p+0f, x, vl);
-    const vfloat32m2_t n = __riscv_vfsub_vv_f32m2(z, r, vl);
-    const vfloat32m2_t b =
-        __riscv_vfnmsac_vf_f32m2(__riscv_vfnmsac_vf_f32m2(x, 0x1.62e4p-1f, n, vl), 0x1.7f7d1cp-20f, n, vl);
-    const vuint32m2_t  e = __riscv_vsll_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(z), 23, vl);
-    const vfloat32m2_t k = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(e, 0x3f800000, vl));
-    const vbool16_t    c = __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 126.0f, vl);
-    const vfloat32m2_t u = __riscv_vfmul_vv_f32m2(b, b, vl);
-    const vfloat32m2_t j = __riscv_vfmacc_vv_f32m2(
-        __riscv_vfmul_vf_f32m2(b, 0x1.ffffecp-1f, vl),
-        __riscv_vfmacc_vv_f32m2(
-            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.fffdb6p-2f, vl), 0x1.555e66p-3f, b, vl),
-            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.573e2ep-5f, vl), 0x1.0e4020p-7f, b, vl), u, vl),
-        u, vl);
-
-    if (!__riscv_vcpop_m_b16(c, vl)) {
-        return __riscv_vfmacc_vv_f32m2(k, j, k, vl);
-    }
-
-    const vbool16_t    dm = __riscv_vmfle_vf_f32m2_b16(n, 0.0f, vl);
-    const vuint32m2_t  d  = __riscv_vmerge_vxm_u32m2(__riscv_vmv_v_x_u32m2(0, vl), 0x82000000, dm, vl);
-    const vfloat32m2_t s1 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(d, 0x7f000000, vl));
-    const vfloat32m2_t s2 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vsub_vv_u32m2(e, d, vl));
-    const vfloat32m2_t r1 =
-        __riscv_vmerge_vvm_f32m2(__riscv_vfmacc_vv_f32m2(k, k, j, vl),
-                                 __riscv_vfmul_vv_f32m2(__riscv_vfmacc_vv_f32m2(s2, s2, j, vl), s1, vl), c, vl);
-    return __riscv_vmerge_vvm_f32m2(r1, __riscv_vfmul_vv_f32m2(s1, s1, vl),
-                                    __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 192.0f, vl), vl);
-}
-
 static inline vfloat32m2_t rvv_tanh_approx_f32m2(vfloat32m2_t x, size_t vl) {
     const vfloat32m2_t abs_x       = __riscv_vfabs_v_f32m2(x, vl);
     const vfloat32m2_t neg_2_abs   = __riscv_vfmul_vf_f32m2(abs_x, -2.0f, vl);
@@ -170,21 +134,6 @@ static void rvv_softcap_tanh_inplace_f32(float * dst, int64_t dst_stride, int64_
             remaining -= vl;
         }
     }
-}
-
-static inline float rvv_softmax_exp_inplace_f32(float * dst, int64_t n, float max_value) {
-    float row_sum = 0.0f;
-    while (n > 0) {
-        const size_t vl = __riscv_vsetvl_e32m2(n);
-        vfloat32m2_t v  = __riscv_vle32_v_f32m2(dst, vl);
-        v               = __riscv_vfsub_vf_f32m2(v, max_value, vl);
-        v               = rvv_expf_approx_f32m2(v, vl);
-        __riscv_vse32_v_f32m2(dst, v, vl);
-        row_sum += reduce_sum_f32m2_vlen1024(v, vl);
-        dst += vl;
-        n -= vl;
-    }
-    return row_sum;
 }
 
 static inline float rvv_add_max_inplace_f32(float * dst, const float * src, int64_t n) {

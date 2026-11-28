@@ -3581,7 +3581,7 @@ llama-perplexity is not in the run: it decodes four sequences at once, which the
 **As built (2026-11-20; by a coder; the diff read, the build, the check programs and the board block's dry run rerun by me; Mac only).** As specified, with these points settled in the code:
 - The fold's factor must be +0.0: by -0.0 the multiply would flip signs the CPU's does not, and `-0.0 == 0.0` in C, so the check reads the sign.
 - The fold needs the clearing node to be the only writer admitted, and no reader of the tensor between it and the pass's `GET_ROWS`; from there to the `CPY` the pass's own check holds.
-- `gated_delta_net.f32.direct.cleared` is a required kernel, so the plugin's list and the core's agree; the core still binds it softly and uses the fold only when it is there. The five loader test plugins name it too.
+- `gated_delta_net.f32.direct.cleared` is a required kernel, so the plugin's list and the core's agree; the core still binds it softly and uses the fold only when it is there. The five loader test plugins name it too. *(Since 2026-11-28, item 150: bound like every other kernel; the soft bind could not be reached through the loader.)*
 - `FLAGOS_SPACEMIT_STATE` is `direct`, `later` or `copy`; the plan cache's configuration word carries all three (bits 2 and 3).
 - The kernel entry clears with the tile range `gdn_tile_run` uses (the heads), then runs it; plain C++, so the reference setting runs it too.
 

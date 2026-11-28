@@ -40,13 +40,6 @@ void spacemit_switches_reset() {
 
 namespace {
 
-// [begin, end) of n items for one tile, the way ggml-cpu splits rows over its threads
-void tile_range(int64_t n, const spacemit_tile & tile, int64_t & begin, int64_t & end) {
-    const int64_t per = (n + tile.nth - 1) / tile.nth;
-    begin             = std::min(n, per * tile.ith);
-    end               = std::min(n, begin + per);
-}
-
 //
 // portable references: the arithmetic of ggml-cpu (ggml/src/ggml-cpu @ ba360ef), split over tiles
 //

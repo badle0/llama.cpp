@@ -43,17 +43,15 @@ struct spacemit_ops {
     uint32_t                   n_ops = 0;
     // not contracts: the steps of a convolution pair (spacemit_conv_pair), concat.f32.tail for its CONCAT and
     // ssm_conv.f32.stashed for its SSM_CONV, one step each, and a state pass's one step (spacemit_state_pass), in its
-    // two forms. The folding one is optional: n_steps 0 when the plugin does not offer it, and the pass keeps
-    // state_direct with the clearing SCALE as its own step
+    // two forms: state_direct, and state_direct_cleared where the pass folds the clearing SCALE in
     spacemit_op                conv_pair_concat;
     spacemit_op                conv_pair_ssm_conv;
     spacemit_op                state_direct;
     spacemit_op                state_direct_cleared;
 };
 
-// binds every contract's step names to table->kernels(); false, with detail naming the step, when a name is missing
-// (the loader refuses such a plugin first; this is the core's own guard) or when a contract names a kernel that
-// spacemit_required_kernels does not list (the two lists must agree)
+// binds every contract's step names and the passes' to table->kernels(); false, with detail naming the step, when a
+// name is missing (the loader refuses such a plugin first; this is the core's own guard)
 bool spacemit_ops_bind(const spacemit_plugin_v1 * table, spacemit_ops * out, std::string * detail);
 
 // the op for a node, or nullptr when the provider does not handle exactly this op, type, shape and placement: the
@@ -116,7 +114,6 @@ bool spacemit_state_pass(const spacemit_ops & ops, ggml_backend_buffer_type_t ow
 uint64_t spacemit_state_passes_take();
 void     spacemit_state_passes_add(uint64_t n);
 
-// the kernels the core's contracts name; the loader refuses a plugin whose kernels() misses one (plan.md "S1 design"
-// §6), and spacemit_ops_bind refuses a contract that names a kernel this list does not carry
-extern const char * const spacemit_required_kernels[];
-extern const size_t       spacemit_n_required_kernels;
+// the kernels spacemit_ops_bind binds, each name once: every step of the contracts, then the passes' steps; *n their
+// count. The loader refuses a plugin whose kernels() misses one (plan.md "S1 design" section 6)
+const char * const * spacemit_required_kernels(size_t * n);

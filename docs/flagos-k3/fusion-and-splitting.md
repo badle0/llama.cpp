@@ -361,6 +361,8 @@ tables counts processes, because the hash holds kernel addresses, which differ f
 
 ### 7.2 Rank 1, candidate #6: one quantization for Q/K/V and for gate/up (prepared 2026-10-21; user request)
 
+*Removed 2026-11-28 (the user's decision; `progress.md` item 150): the switch was never made the default and no K3 result for it is in the log. This section, and the `q6` mode of `scripts/fusion-experiments.sh`, need the code as of `58b663ded`.*
+
 What it does. `FLAGOS_SPACEMIT_QUANTIZE=shared` (test-only until adopted; read at every graph; `separate` is the default)
 makes `graph_compute` leave out a `MUL_MAT`'s quantize step when the matmul that last quantized took the same activations
 (same data, shape and strides) into the same layout (`spacemit_mul_mat_same_activations`, `flagos-spacemit-ime.cpp`),

@@ -6,8 +6,7 @@
 #include <cstdint>
 #include <memory>
 
-// a step is spacemit_plugin_step (the C interface): the kernel, its node and where its part of the shared workspace
-// starts
+// a step is spacemit_plugin_step (the C interface): the kernel and its node
 
 // what a run takes from the stream (the backend context) it runs for; both test-only
 struct spacemit_run_options {
@@ -30,12 +29,8 @@ class spacemit_executor {
 // spine-runtime executor on the AI cores; without spine-runtime (non-riscv64 builds) a serial stand-in for tests
 std::unique_ptr<spacemit_executor> spacemit_executor_create(uint32_t n_cores);
 
-// test-only: the steps the executors have launched since the last call (flagos-check-spacemit counts the quantize steps
-// that FLAGOS_SPACEMIT_QUANTIZE=shared leaves out)
+// test-only: the steps the executors have launched since the last call
 uint64_t spacemit_steps_take();
 
 // test-only: the executors created since the last call
 uint64_t spacemit_executors_take();
-
-// test-only (spacemit_pairwait_launch_fn): the pair-wait benchmark's launch on executor
-bool spacemit_pairwait_run(spacemit_executor & executor, uint32_t variant, uint32_t n, spacemit_pairwait_result * out);

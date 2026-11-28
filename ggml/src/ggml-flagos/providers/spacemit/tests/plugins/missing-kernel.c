@@ -1,5 +1,5 @@
-// Fake plugin for the loader's negative matrix (plan.md "S1 step 1 spec" section 7): a complete table offering 18 of the 19
-// kernels (mul_mat.gemm left out), so the loader must answer missing_kernel. C11, built by tests.cmake.
+// Fake plugin for the loader's negative matrix (plan.md "S1 step 1 spec" section 7): a complete table whose kernels
+// lack mul_mat.gemm, so the loader must answer missing_kernel. C11, built by tests.cmake.
 
 #include "flagos-spacemit-plugin.h"
 

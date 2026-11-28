@@ -245,21 +245,6 @@ spacemit_launch_kind spacemit_launch_mode() {
     return on ? spacemit_launch_kind::per_step : spacemit_launch_kind::per_split;
 }
 
-bool spacemit_quantize_shared() {
-    const char * v = std::getenv("FLAGOS_SPACEMIT_QUANTIZE");
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "separate") == 0) {
-        return false;
-    }
-    if (std::strcmp(v, "shared") == 0) {
-        return true;
-    }
-    static std::atomic<bool> warned{ false };
-    if (!warned.exchange(true)) {
-        GGML_LOG_WARN("%s: FLAGOS_SPACEMIT_QUANTIZE=%s: unknown setting ignored\n", __func__, v);
-    }
-    return false;
-}
-
 bool spacemit_op_disabled(enum ggml_op op) {
     if (!g_ops_parsed.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_diag_mutex);
@@ -296,12 +281,6 @@ void spacemit_trace_steps(const std::vector<spacemit_plugin_step> & steps, const
                       src0 != nullptr && src0->name[0] != '\0' ? src0->name : "-",
                       src0 != nullptr ? ggml_type_name(src0->type) : "-");
     }
-}
-
-bool spacemit_overlaps(const ggml_tensor * node, const ggml_tensor * t) {
-    const char * a = static_cast<const char *>(node->data);
-    const char * b = static_cast<const char *>(t->data);
-    return a < b + ggml_nbytes(t) && b < a + ggml_nbytes(node);
 }
 
 //

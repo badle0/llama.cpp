@@ -4,6 +4,8 @@
 
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 #    include <riscv_vector.h>
+
+#    include "flagos-spacemit-rvv-math.h"  // rvv_expf_approx_f32m2
 #endif
 
 #include "ggml-impl.h"
@@ -32,13 +34,6 @@
 #endif
 
 namespace {
-
-// [begin, end) of n items for one tile, as flagos-spacemit-kernels.cpp splits them (ggml-cpu's row split)
-void tile_range(int64_t n, const spacemit_tile & tile, int64_t & begin, int64_t & end) {
-    const int64_t per = (n + tile.nth - 1) / tile.nth;
-    begin             = std::min(n, per * tile.ith);
-    end               = std::min(n, begin + per);
-}
 
 // one element, as ggml-cpu computes it: SILU is vec.h's ggml_silu_f32 (the scalar tail of ggml_vec_silu_f32, whose
 // vector part uses an exp approximation on some platforms), SIGMOID and SOFTPLUS are unary-ops.cpp's op_sigmoid and
@@ -321,41 +316,6 @@ void mul_mat_f32_ref(const spacemit_tile & tile, ggml_tensor * dst) {
 
 #if defined(GGML_FLAGOS_SPACEMIT_RVV)
 
-// SpacemiT's rvv_expf_approx_f32m2, copied; the same operations as ggml-cpu's ggml_v_expf_m2 (vec.h), ARM's optimized
-// routine: n = round(x / ln2) by the 0x1.8p23 shifter, b = x - n ln2 in two fused steps, exp(b) - 1 by a degree-5
-// polynomial, 2^n built in the exponent bits; |n| > 126 scales in two steps, |n| > 192 gives inf or 0
-vfloat32m2_t rvv_expf_f32m2(vfloat32m2_t x, size_t vl) {
-    const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
-    const vfloat32m2_t z = __riscv_vfmacc_vf_f32m2(r, 0x1.715476p+0f, x, vl);
-    const vfloat32m2_t n = __riscv_vfsub_vv_f32m2(z, r, vl);
-    const vfloat32m2_t b =
-        __riscv_vfnmsac_vf_f32m2(__riscv_vfnmsac_vf_f32m2(x, 0x1.62e4p-1f, n, vl), 0x1.7f7d1cp-20f, n, vl);
-    const vuint32m2_t  e = __riscv_vsll_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(z), 23, vl);
-    const vfloat32m2_t k = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(e, 0x3f800000, vl));
-    const vbool16_t    c = __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 126.0f, vl);
-    const vfloat32m2_t u = __riscv_vfmul_vv_f32m2(b, b, vl);
-    const vfloat32m2_t j = __riscv_vfmacc_vv_f32m2(
-        __riscv_vfmul_vf_f32m2(b, 0x1.ffffecp-1f, vl),
-        __riscv_vfmacc_vv_f32m2(
-            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.fffdb6p-2f, vl), 0x1.555e66p-3f, b, vl),
-            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.573e2ep-5f, vl), 0x1.0e4020p-7f, b, vl), u, vl),
-        u, vl);
-
-    if (!__riscv_vcpop_m_b16(c, vl)) {
-        return __riscv_vfmacc_vv_f32m2(k, j, k, vl);
-    }
-
-    const vbool16_t    dm = __riscv_vmfle_vf_f32m2_b16(n, 0.0f, vl);
-    const vuint32m2_t  d  = __riscv_vmerge_vxm_u32m2(__riscv_vmv_v_x_u32m2(0, vl), 0x82000000, dm, vl);
-    const vfloat32m2_t s1 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(d, 0x7f000000, vl));
-    const vfloat32m2_t s2 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vsub_vv_u32m2(e, d, vl));
-    const vfloat32m2_t r1 =
-        __riscv_vmerge_vvm_f32m2(__riscv_vfmacc_vv_f32m2(k, k, j, vl),
-                                 __riscv_vfmul_vv_f32m2(__riscv_vfmacc_vv_f32m2(s2, s2, j, vl), s1, vl), c, vl);
-    return __riscv_vmerge_vvm_f32m2(r1, __riscv_vfmul_vv_f32m2(s1, s1, vl),
-                                    __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 192.0f, vl), vl);
-}
-
 // SpacemiT's rvv_log1pf_01_f32m2, copied: log1p(t) for t in [0, 1] by the Cephes logf polynomial, the rounding of 1 + t
 // added back as a first-order correction
 vfloat32m2_t rvv_log1pf_01_f32m2(vfloat32m2_t t, size_t vl) {
@@ -387,7 +347,7 @@ vfloat32m2_t rvv_log1pf_01_f32m2(vfloat32m2_t t, size_t vl) {
 // SpacemiT's forward_unary_silu_f32 and its DEFINE_UNARY_F32_RVV bodies for SIGMOID and SOFTPLUS, one vector each
 struct rvv_silu {
     static vfloat32m2_t apply(vfloat32m2_t x, size_t vl) {
-        const vfloat32m2_t exp_neg = rvv_expf_f32m2(__riscv_vfneg_v_f32m2(x, vl), vl);
+        const vfloat32m2_t exp_neg = rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(x, vl), vl);
         return __riscv_vfdiv_vv_f32m2(x, __riscv_vfadd_vf_f32m2(exp_neg, 1.0f, vl), vl);
     }
 };
@@ -396,7 +356,7 @@ struct rvv_sigmoid {
     static vfloat32m2_t apply(vfloat32m2_t v, size_t vl) {
         return __riscv_vfdiv_vv_f32m2(
             __riscv_vfmv_v_f_f32m2(1.0f, vl),
-            __riscv_vfadd_vf_f32m2(rvv_expf_f32m2(__riscv_vfneg_v_f32m2(v, vl), vl), 1.0f, vl), vl);
+            __riscv_vfadd_vf_f32m2(rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(v, vl), vl), 1.0f, vl), vl);
     }
 };
 
@@ -405,7 +365,7 @@ struct rvv_softplus {
     static vfloat32m2_t apply(vfloat32m2_t v, size_t vl) {
         return __riscv_vfadd_vv_f32m2(
             __riscv_vfmax_vf_f32m2(v, 0.0f, vl),
-            rvv_log1pf_01_f32m2(rvv_expf_f32m2(__riscv_vfneg_v_f32m2(__riscv_vfabs_v_f32m2(v, vl), vl), vl), vl), vl);
+            rvv_log1pf_01_f32m2(rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(__riscv_vfabs_v_f32m2(v, vl), vl), vl), vl), vl);
     }
 };
 

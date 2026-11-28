@@ -44,10 +44,6 @@ enum class spacemit_launch_kind {
 // the same way (flagos-denglin.cpp:371). Read at every graph, so a benchmark can switch
 spacemit_launch_kind spacemit_launch_mode();
 
-// test-only until adopted (fusion-and-splitting.md §5, candidate 6): FLAGOS_SPACEMIT_QUANTIZE=shared leaves out a
-// MUL_MAT's quantize step when the matmul that last quantized took the same activations into the same layout
-bool spacemit_quantize_shared();
-
 // GGML_FLAGOS_DISABLE_OPS=<op>[,<op>...]: whether this ggml op is named there, so spacemit_find_op refuses it and the
 // scheduler leaves it on the CPU. The list is parsed once (an unknown name is reported once and ignored)
 bool spacemit_op_disabled(enum ggml_op op);
@@ -59,17 +55,14 @@ bool spacemit_trace_launch();
 // names must be parallel to steps (graph_compute fills it when the trace or the op counters are on) or empty
 void spacemit_trace_steps(const std::vector<spacemit_plugin_step> & steps, const std::vector<const char *> & names);
 
-// whether node's output overlaps t's data
-bool spacemit_overlaps(const ggml_tensor * node, const ggml_tensor * t);
-
 // test-only (structural-experiments.md E3c): GGML_FLAGOS_STATS=<file> counts, per kind of graph (launch mode, rows of
 // its first matmul, KV length class of its first attention: 0 below 1024, 1024 below 4096, else 4096), the graphs,
 // steps and launches and the time spent in graph_compute, in the launches as the host waits for them, in the kernels
 // (summed over the tiles; per step the slowest tile, "busy") and at the barriers (summed over the tiles), and the plan
 // cache's answers (FLAGOS_SPACEMIT_PLAN: hits by uid, misses) with the time to the step list in hand (plan_lookup_us,
-// the check and the expansion included on a miss and under none) and from after the check (plan_key_us: on a miss the
-// store; on a hit, which skips the check, equal to plan_lookup_us). When the process ends it appends one JSON line per
-// kind to <file>, or to stderr when the value is - or 1. The switch is read once
+// the check and the expansion included on a miss and under none) and from after the check and the expansion
+// (plan_key_us: on a miss setting the key; on a hit, which skips both, equal to plan_lookup_us). When the process ends
+// it appends one JSON line per kind to <file>, or to stderr when the value is - or 1. The switch is read once
 class spacemit_stats_file {
   public:
     // nullptr when the switch is not set
@@ -77,8 +70,8 @@ class spacemit_stats_file {
 
     // plan, lookup_us, key_us: the plan cache's answer for this graph (FLAGOS_SPACEMIT_PLAN), the time from the top of
     // graph_compute to the step list in hand (the check and the expansion on a miss and under none) and the time from
-    // after the contract check to it (the check expands as it goes, so on a miss the store and under none about 0; on
-    // a hit, which skips the check, from the top, as lookup_us)
+    // after the contract check and the expansion to it (on a miss setting the key, under none about 0; on a hit, which
+    // skips both, from the top, as lookup_us)
     void add(const char * launch, int64_t rows, int64_t n_kv, const spacemit_run_stats & run, double graph_us,
              spacemit_plan_result plan, double lookup_us, double key_us);
 
