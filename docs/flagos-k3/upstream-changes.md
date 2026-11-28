@@ -64,6 +64,7 @@ Last checked 2026-10-28 after U1 and U2 were reverted and M1's function deleted:
 - Where: one `#include` line each in `flagos-graph-plan.cpp`, `flagos-provider.cpp`, `tests/check_graph_plan.cpp`, `tests/check_provider.cpp` and `tests/check_registry.cpp`, two in `flagos-registry.cpp`; 7 lines.
 - What: `"../ggml-impl.h"`, `"../ggml-backend-impl.h"` and `"../../ggml-impl.h"`, `"../../ggml-backend-impl.h"` become `"ggml-impl.h"` and `"ggml-backend-impl.h"`. Every target that compiles these files already has `ggml/src` on its include path, so the plain names resolve to the same files; outside llama.cpp's tree the relative ones would not.
 - Verified 2026-11-28 on the Mac: `objdump -d` of every object of `ggml-flagos`, the plugin and the checks identical before and after (37 objects). The AMD and Denglin sources and `tests/check_amd*.cpp` keep their relative paths: they stay behind.
+- Verified 2026-11-28 on the K3 too (`board-return-runs.md` section 29): 43 objects, only `check_spacemit.cpp.o` differs.
 - Status: for the mentor to take, so his copy and the moved one stay alike (`plan.md` "The move out of tree", step 11).
 
 ## Fork-only tooling (new files, no upstream file changed)
