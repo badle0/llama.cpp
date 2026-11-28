@@ -156,10 +156,21 @@ if (GGML_FLAGOS_AMD)
     endif()
 endif()
 
-if (GGML_FLAGOS_SPACEMIT AND NOT GGML_BACKEND_DL)
-    add_executable(flagos-check-spacemit EXCLUDE_FROM_ALL providers/spacemit/tests/check_spacemit.cpp)
-    target_include_directories(flagos-check-spacemit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(flagos-check-spacemit PRIVATE ggml ggml-flagos Threads::Threads)
+if (GGML_FLAGOS_SPACEMIT)
+    if (GGML_BACKEND_DL)
+        # ggml-flagos and ggml-cpu are modules here: the core is compiled in, as Common's checks do, and the program
+        # loads the CPU module by its path; the core finds the plugin beside this executable
+        add_executable(flagos-check-spacemit EXCLUDE_FROM_ALL providers/spacemit/tests/check_spacemit.cpp ${FLAGOS_SOURCES})
+        target_include_directories(flagos-check-spacemit PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
+        target_compile_definitions(flagos-check-spacemit PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS}
+            FLAGOS_SPACEMIT_CPU_MODULE="$<TARGET_FILE:ggml-cpu>")
+        target_link_libraries(flagos-check-spacemit PRIVATE ggml ${FLAGOS_PRIVATE_LIBRARIES} Threads::Threads)
+        add_dependencies(flagos-check-spacemit ggml-cpu flagos-provider-spacemit)
+    else()
+        add_executable(flagos-check-spacemit EXCLUDE_FROM_ALL providers/spacemit/tests/check_spacemit.cpp)
+        target_link_libraries(flagos-check-spacemit PRIVATE ggml ggml-flagos Threads::Threads)
+    endif()
+    target_include_directories(flagos-check-spacemit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
     include(providers/spacemit/tests.cmake)
 endif()
 

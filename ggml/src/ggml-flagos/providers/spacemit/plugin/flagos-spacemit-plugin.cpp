@@ -17,7 +17,7 @@
 #include "../core/flagos-spacemit-ops.h"
 #include "flagos-spacemit-weights.h"
 
-#include "../../../../ggml-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <cerrno>

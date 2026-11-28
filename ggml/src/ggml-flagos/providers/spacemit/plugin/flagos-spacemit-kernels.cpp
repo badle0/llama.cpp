@@ -6,7 +6,7 @@
 #    include <riscv_vector.h>
 #endif
 
-#include "../../../../ggml-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

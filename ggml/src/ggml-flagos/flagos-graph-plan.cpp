@@ -1,6 +1,6 @@
 #include "flagos-graph-plan.h"
 
-#include "../ggml-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <cstring>

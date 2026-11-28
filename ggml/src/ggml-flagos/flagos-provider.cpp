@@ -1,6 +1,6 @@
 #include "flagos-provider.h"
 
-#include "../ggml-backend-impl.h"
+#include "ggml-backend-impl.h"
 
 bool flagos_provider_is_valid(const flagos_provider_v1 * provider) {
     return provider != nullptr &&

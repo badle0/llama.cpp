@@ -9,8 +9,8 @@
 #include "flagos-spacemit-plan.h"
 #include "flagos-spacemit-stats.h"  // spacemit_run_stats (test-only, E3c)
 
-#include "../../../../ggml-backend-impl.h"
-#include "../../../../ggml-impl.h"
+#include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

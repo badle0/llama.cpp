@@ -5,7 +5,7 @@
 #include "flagos-spacemit-kernels.h"      // spacemit_cached_switch, spacemit_use_reference
 #include "flagos-spacemit-weights.h"      // spacemit_weight_layout
 
-#include "../../../../ggml-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

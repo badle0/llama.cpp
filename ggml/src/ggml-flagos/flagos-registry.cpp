@@ -2,8 +2,8 @@
 #include "flagos-provider.h"
 #include "flagos-registry.h"
 
-#include "../ggml-backend-impl.h"
-#include "../ggml-impl.h"
+#include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 
 #include <atomic>
 #include <cstring>

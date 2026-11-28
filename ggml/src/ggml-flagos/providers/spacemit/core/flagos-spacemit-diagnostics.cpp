@@ -4,7 +4,7 @@
 
 #include "flagos-spacemit-diagnostics.h"
 
-#include "../../../../ggml-impl.h"  // GGML_LOG_*, ggml_nrows
+#include "ggml-impl.h"  // GGML_LOG_*, ggml_nrows
 
 #include <algorithm>
 #include <atomic>

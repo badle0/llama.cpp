@@ -1,6 +1,6 @@
 #include "flagos-spacemit-x100.h"
 
-#include "../../../../ggml-impl.h"
+#include "ggml-impl.h"
 
 #if defined(GGML_FLAGOS_SPACEMIT_SPERT)
 

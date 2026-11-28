@@ -2,7 +2,7 @@
 
 #include "flagos-spacemit-plan.h"
 
-#include "../../../../ggml-impl.h"  // ggml_cgraph: uid, n_nodes, nodes
+#include "ggml-impl.h"  // ggml_cgraph: uid, n_nodes, nodes
 
 #include <algorithm>
 #include <atomic>

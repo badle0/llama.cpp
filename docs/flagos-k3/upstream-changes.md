@@ -57,6 +57,14 @@ Last checked 2026-10-28 after U1 and U2 were reverted and M1's function deleted:
 
 - Where: `ggml/src/ggml-flagos/CMakeLists.txt:42-44` (includes `providers/spacemit/provider.cmake`), `:46` (the "no provider" message also checks the option), `:54-56` (includes `providers/spacemit/plugin.cmake`), `:159-164` (target `flagos-check-spacemit`: not built by default, builds without `GGML_BACKEND_DL` only; `:163` includes `providers/spacemit/tests.cmake`).
 - Commits: `4389005` (M1); `72e0666` (M2c.2) links the check program with `Threads::Threads`, for the 8 threads that quantize the output head's reference weights; S1 step 1 adds `:160`, one line, so the fake plugins of the loader's negative matrix (`providers/spacemit/tests/plugins/`) are built beside the check program and their directory reaches it as a compile definition. Everything that line adds lives in the provider's own `tests.cmake`. S2 step 1 adds `:54-56`, right after the `ggml-flagos` target and with the other providers' idiom, so the K3 plugin is its own library; everything those lines add lives in the provider's own `plugin.cmake`.
+- 2026-11-28 (the move out of tree, phase 1): the target is built with `GGML_BACKEND_DL` too. There it compiles `${FLAGOS_SOURCES}` in, as Common's checks do, links `ggml`, loads the CPU module by the path CMake gives it (`FLAGOS_SPACEMIT_CPU_MODULE`) and depends on `ggml-cpu` and the plugin; the static branch links what it did. Both get `ggml/src` on the include path. The block is now `:159-175`.
+
+### M4. Plain names for ggml's private headers in Common (the move out of tree, phase 1)
+
+- Where: one `#include` line each in `flagos-graph-plan.cpp`, `flagos-provider.cpp`, `tests/check_graph_plan.cpp`, `tests/check_provider.cpp` and `tests/check_registry.cpp`, two in `flagos-registry.cpp`; 7 lines.
+- What: `"../ggml-impl.h"`, `"../ggml-backend-impl.h"` and `"../../ggml-impl.h"`, `"../../ggml-backend-impl.h"` become `"ggml-impl.h"` and `"ggml-backend-impl.h"`. Every target that compiles these files already has `ggml/src` on its include path, so the plain names resolve to the same files; outside llama.cpp's tree the relative ones would not.
+- Verified 2026-11-28 on the Mac: `objdump -d` of every object of `ggml-flagos`, the plugin and the checks identical before and after (37 objects). The AMD and Denglin sources and `tests/check_amd*.cpp` keep their relative paths: they stay behind.
+- Status: for the mentor to take, so his copy and the moved one stay alike (`plan.md` "The move out of tree", step 11).
 
 ## Fork-only tooling (new files, no upstream file changed)
 

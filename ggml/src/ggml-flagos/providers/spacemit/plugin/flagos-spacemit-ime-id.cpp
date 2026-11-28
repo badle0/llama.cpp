@@ -4,7 +4,7 @@
 #include "flagos-spacemit-ime-kernels.h"
 #include "flagos-spacemit-kernels.h"
 
-#include "../../../../ggml-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>

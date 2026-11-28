@@ -2,7 +2,7 @@
 #include "flagos-registry.h"
 #include "ggml-flagos.h"
 
-#include "../../ggml-backend-impl.h"
+#include "ggml-backend-impl.h"
 
 #include <cstdlib>
 #include <cstdio>

@@ -2,7 +2,7 @@
 
 #include "flagos-spacemit-diagnostics.h"  // spacemit_op_disabled (GGML_FLAGOS_DISABLE_OPS)
 
-#include "../../../../ggml-impl.h"
+#include "ggml-impl.h"
 
 #include <atomic>
 #include <cmath>

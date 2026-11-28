@@ -46,9 +46,9 @@
 #include "ggml-cpu.h"
 #include "ggml-flagos.h"
 #include "ggml.h"
-#include "../ggml-impl.h"  // ggml_cgraph's uid and ggml_graph_view (the plan cache's probes)
+#include "ggml-impl.h"  // ggml_cgraph's uid and ggml_graph_view (the plan cache's probes)
 #define GGML_COMMON_DECL_CPP
-#include "../ggml-common.h"  // block_q6_K (the edge blocks of the Q6_K lookup)
+#include "ggml-common.h"  // block_q6_K (the edge blocks of the Q6_K lookup)
 #include "providers/spacemit/core/flagos-spacemit-diagnostics.h"  // the diagnostics under the deck's names (S1 step 5)
 #include "providers/spacemit/core/flagos-spacemit-loader.h"  // the plugin loader and its results (S1 step 1)
 #include "providers/spacemit/core/flagos-spacemit-plan.h"    // the plan cache's counters (S1 step 3)
@@ -181,6 +181,46 @@ class env_override {
     std::string saved;
     bool        had = false;
 };
+
+// the CPU backend through ggml's registry, as test-backend-ops reaches it, so the program links no CPU backend. With
+// GGML_BACKEND_DL the CPU module is loaded once by its path (not ggml_backend_load_all(): it would also load a second
+// libggml-flagos); a static build has it registered. The first call comes after main's ggml_backend_flagos_reg()
+static ggml_backend_dev_t cpu_dev() {
+    static ggml_backend_dev_t dev = [] {
+#ifdef FLAGOS_SPACEMIT_CPU_MODULE
+        if (ggml_backend_load(FLAGOS_SPACEMIT_CPU_MODULE) == nullptr) {
+            std::fprintf(stderr, "FAIL: cannot load the CPU backend module %s\n", FLAGOS_SPACEMIT_CPU_MODULE);
+            return (ggml_backend_dev_t) nullptr;
+        }
+#endif
+        ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (d == nullptr) {
+            std::fprintf(stderr, "FAIL: no CPU device in ggml's registry\n");
+        }
+        return d;
+    }();
+    return dev;
+}
+
+static void * cpu_proc(const char * name) {
+    ggml_backend_dev_t dev = cpu_dev();
+    return dev != nullptr ? ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), name) : nullptr;
+}
+
+static ggml_backend_t cpu_init() {
+    ggml_backend_dev_t dev = cpu_dev();
+    return dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+}
+
+static void cpu_set_n_threads(ggml_backend_t cpu, int n_threads) {
+    auto fn = reinterpret_cast<ggml_backend_set_n_threads_t>(cpu_proc("ggml_backend_set_n_threads"));
+    if (fn == nullptr) {
+        std::fprintf(stderr, "FAIL: the CPU backend gives no ggml_backend_set_n_threads\n");
+        g_failures++;
+        return;
+    }
+    fn(cpu, n_threads);
+}
 
 // ", reference kernels" when GGML_FLAGOS_KERNEL_VARIANTS=0 asks for them (flagos-spacemit-kernels.cpp), else ""
 static const char * reference_label() {
@@ -1441,9 +1481,9 @@ static int check_mul_mat(ggml_backend_dev_t dev, bool full) {
     // the IME int8 kernels against the CPU: Q4_0 at 32 rows and up would take the f16 path (check_mul_mat_f16's)
     env_override   dense("FLAGOS_SPACEMIT_DENSE_Q4_0", "int8");
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     // the output heads also at 128 rows with --full: a batch that needs every token's logits (perplexity, KLD)
     const std::vector<int64_t> head_rows = full ? std::vector<int64_t>{ 1, 7, 128 } : std::vector<int64_t>{ 1, 7 };
@@ -1555,9 +1595,9 @@ static ggml_backend_t tcm_backend(ggml_backend_dev_t dev, const char * threads) 
 // which reads the weights straight from DRAM with the same kernel. The shapes give a pair whose odd tile has one slab
 // fewer (480 and 1056 columns) and a long row
 static int check_gemv(ggml_backend_dev_t dev, bool host) {
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     struct shape { ggml_type type; int64_t k, n; };
     const shape shapes[] = {
@@ -2069,9 +2109,9 @@ static int check_flash_attn(ggml_backend_dev_t dev, bool host) {
     ggml_free(ctx);
 
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     struct attn_case { const char * what; attn_shape s; float q_scale = 4.0f; };
     const attn_case cases[] = {
@@ -3418,7 +3458,7 @@ static int bad_index_runs(ggml_backend_dev_t dev, ggml_backend_t backend) {
 
 static int check_rows(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
 
     double worst_get = 0.0, worst_set = 0.0;
@@ -3823,7 +3863,7 @@ struct lookup_graph {
 
 static int check_embedding(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
     REQUIRE(g_embd_paths_take != nullptr);
 
@@ -4231,9 +4271,9 @@ static double shift_sched_nmse(ggml_backend_dev_t dev, ggml_backend_t backend, g
 // V stays unclaimed (check_flash_attn)
 static int check_cache_ops(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);
+    cpu_set_n_threads(cpu, 1);
 
     const std::array<int64_t, 4> cache_ne = { 1024, 256, 1, 1 };
     double                       worst_set = 0.0, worst_cpy = 0.0, worst_rope = 0.0, rope_max_abs = 0.0;
@@ -4564,9 +4604,9 @@ static state_op_result state_op_run(ggml_backend_dev_t dev, ggml_backend_t backe
 
 static int check_state_ops(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);
+    cpu_set_n_threads(cpu, 1);
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -5158,9 +5198,9 @@ static moe_op_result moe_op_run(ggml_backend_dev_t dev, ggml_backend_t backend, 
 static int check_moe_ops(ggml_backend_dev_t dev) {
     env_override router_f32("FLAGOS_SPACEMIT_ROUTER", "f32");  // the F32 matmul path: its weights carry the router's name
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -5852,7 +5892,7 @@ static std::string mm_f32_what(const mm_f32_shape & s) {
 static int check_seq_ops(ggml_backend_dev_t dev) {
     env_override router_f32("FLAGOS_SPACEMIT_ROUTER", "f32");  // the F32 matmul path: its weights carry the router's name
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
     // SSM_CONV: the reference is ggml-cpu's bytes; the RVV kernel's fused taps are not (K3 2026-11-14: NMSE 2.7e-15,
     // 3.3e-07 of max(1, |y|) against the ggml-cpu GCC built), so on the K3 it gets a rounding bound
@@ -5861,7 +5901,7 @@ static int check_seq_ops(ggml_backend_dev_t dev) {
 #else
     const seq_bound k_ssm_conv = k_seq_exact;
 #endif
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -6567,9 +6607,9 @@ static int check_router_q8(ggml_backend_dev_t dev) {
 
     // C. MUL_MAT: y = W x with x in a CPU buffer and y in ours, through be (nullptr: the CPU backend, y in a CPU
     // buffer); got is the contract spacemit_find_op chose
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
     const auto mm = [&](ggml_backend_t be, ggml_tensor * w, const std::vector<float> & xv, int64_t m,
                         std::vector<float> & out, const spacemit_op ** got) {
         ggml_init_params p  = { ggml_tensor_overhead() * 2 + ggml_graph_overhead(), nullptr, true };
@@ -6980,9 +7020,9 @@ static int check_mul_mat_f16(ggml_backend_dev_t dev, bool host) {
         }
     }
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
 
     // C. the arithmetic on the plain route. Each shape's x, its CPU result and its model once; then the default
     // backend, a TCM stand-in of 98304 bytes (at K 2048 160 rows a pass, 4 passes at 501 rows; at K 4096 64 rows), the
@@ -8005,9 +8045,9 @@ struct conv_pair_graph {
 
 static int check_conv_pair(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md section 6, item 28)
     // check_seq_ops' SSM_CONV bound with the RVV kernels, for every kernel: a compiler may contract the stashed
     // kernel's multiply and add, the RVV port fuses its taps
     const seq_bound bound = { 1e-12, 1e-6 };
@@ -8442,9 +8482,9 @@ static int check_mul_mat_id_q4_1_min(ggml_backend_dev_t dev, bool direct, ggml_b
 static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
     // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions
     const bool     direct = host || *reference_label() != '\0';
-    ggml_backend_t cpu    = ggml_backend_cpu_init();
+    ggml_backend_t cpu    = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -8515,9 +8555,9 @@ static int check_mul_mat_id_q4_1(ggml_backend_dev_t dev, bool host) {
 static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
     // the direct calls run on the calling core: on the K3 that is an X100 core, which has no IME instructions
     const bool     direct = host || *reference_label() != '\0';
-    ggml_backend_t cpu    = ggml_backend_cpu_init();
+    ggml_backend_t cpu    = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -8732,9 +8772,9 @@ static int check_mul_mat_id_groups(ggml_backend_dev_t dev, bool host) {
 // op counters
 static int check_mul_mat_id_queue(ggml_backend_dev_t dev, bool host) {
     const bool     direct = host || *reference_label() != '\0';
-    ggml_backend_t cpu    = ggml_backend_cpu_init();
+    ggml_backend_t cpu    = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);
+    cpu_set_n_threads(cpu, 1);
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -9159,9 +9199,9 @@ struct q40s_node {
 // direct calls run on the calling core, so on the K3 only with the reference kernels
 static int check_mul_mat_id_q4_0s(ggml_backend_dev_t dev, bool host) {
     const bool     direct = host || *reference_label() != '\0';
-    ggml_backend_t cpu    = ggml_backend_cpu_init();
+    ggml_backend_t cpu    = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -9623,9 +9663,9 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
     // they run there only with the reference kernels
     const bool direct = host || *reference_label() != '\0';
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
     const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
@@ -10014,9 +10054,9 @@ static int check_mul_mat_id(ggml_backend_dev_t dev, bool host, bool full) {
 
 static int check_gdn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -10605,9 +10645,9 @@ static bool same_bytes(const std::vector<float> & a, const std::vector<float> & 
 
 static int check_state_pass(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md item 28)
 
     const spacemit_plugin_v1 * table = spacemit_plugin_table(spacemit_device_plugin(dev));
     REQUIRE(table != nullptr);
@@ -10966,9 +11006,9 @@ static int check_state_pass(ggml_backend_dev_t dev) {
 
 static int check_layer(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
 
     double worst = 0.0;
     for (ggml_type down : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1 }) {
@@ -11317,9 +11357,9 @@ static bool plan_key_probe(const ggml_cgraph * g) {
 // against each other byte for byte, and every output of uid-trust against none's byte for byte. 15 probes under none,
 // 14 under uid-trust
 static int check_plan(ggml_backend_dev_t dev) {
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = cpu_init();
     REQUIRE(cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
+    cpu_set_n_threads(cpu, 1);  // a correctness reference: single-threaded (PROJECT.md §6, item 28)
     constexpr uint64_t k_uid = 0x504c414e00000001ULL;  // "PLAN", stamped as the scheduler stamps a split's graph
     std::map<std::string, std::vector<float>> none_outputs;  // none's outputs by name, the reference of the others
 
@@ -11981,9 +12021,9 @@ static int check_diagnostics(ggml_backend_dev_t dev) {
     // CPU and splits the layer around it, and the layer's output stays within the layer bound of the run that keeps it
     // on the provider (the CPU's vectorized SiLU is not the reference kernel's expf, so the bytes differ)
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 1);
+    cpu_set_n_threads(cpu, 1);
     bool   sched_ok = false;
     int    splits[2] = { 0, 0 };
     double e_sched   = -1.0;
@@ -12593,9 +12633,9 @@ static int bench_mm_f32(ggml_backend_dev_t dev) {
 // few tokens FLAGOS_SPACEMIT_ATTN_KVH=off against the default (below)
 static int bench_attn(ggml_backend_dev_t dev) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu     = ggml_backend_cpu_init();
+    ggml_backend_t cpu     = cpu_init();
     REQUIRE(backend != nullptr && cpu != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu, 8);
+    cpu_set_n_threads(cpu, 8);
     struct attn_bench { int64_t n_kv, n_tokens; int iterations; };
     for (const attn_bench & b : { attn_bench{ 256, 1, 30 }, { 512, 1, 25 }, { 1024, 1, 20 }, { 4096, 1, 10 },
                                   { 8192, 1, 5 }, { 128, 128, 10 }, { 4096, 128, 2 }, { 512, 512, 4 },
@@ -12879,8 +12919,8 @@ static int bench(ggml_backend_dev_t dev) {
     ggml_build_forward_expand(cg, ggml_add(cpu_ctx, ca, cb));
     ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors_from_buft(cpu_ctx, ggml_backend_cpu_buffer_type());
     ggml_backend_buffer_clear(cbuf, 0);
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(cpu, 8);
+    ggml_backend_t cpu = cpu_init();
+    cpu_set_n_threads(cpu, 8);
     const double t_cpu = time_us([&] { ggml_backend_graph_compute(cpu, cg); }, 10);
     std::printf("bench    cpu        16M-float ADD %.2f GB/s (8 X100 threads)\n", big_bytes / t_cpu / 1000.0);
     ggml_backend_free(cpu);
@@ -12899,9 +12939,9 @@ static int bench(ggml_backend_dev_t dev) {
     // ggml-cpu's Q4_1 matmul under 8 threads is where question 8's fault strikes (build.md section 7, the eighth
     // dump), and no check reads the figure
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu8    = ggml_backend_cpu_init();
+    ggml_backend_t cpu8    = cpu_init();
     REQUIRE(backend != nullptr && cpu8 != nullptr);
-    ggml_backend_cpu_set_n_threads(cpu8, 8);
+    cpu_set_n_threads(cpu8, 8);
     struct bench_shape { ggml_type type; int64_t k, n; std::vector<int64_t> rows; };
     const std::vector<int64_t> ffn_rows = { 1, 4, 16, 64, 128 };
     for (const bench_shape & s : { bench_shape{ GGML_TYPE_Q4_0, 2560, 9728, ffn_rows },
@@ -13252,10 +13292,8 @@ static bool x100_cpu_uses_ai_cores() {
 #if defined(GGML_USE_CPU_RISCV64_SPACEMIT)
     return true;
 #else
-    ggml_backend_reg_t reg = ggml_backend_cpu_reg();
-    auto get = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"));
-    ggml_backend_buffer_type_t * b = get != nullptr ? get(ggml_backend_reg_dev_get(reg, 0)) : nullptr;
+    auto get = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(cpu_proc("ggml_backend_dev_get_extra_bufts"));
+    ggml_backend_buffer_type_t * b = get != nullptr ? get(cpu_dev()) : nullptr;
     for (; b != nullptr && *b != nullptr; b++) {
         if (std::strcmp(ggml_backend_buft_name(*b), "CPU_RISCV64_SPACEMIT") == 0) {
             return true;
@@ -13298,19 +13336,26 @@ static int bench_x100(ggml_backend_dev_t dev) {
         backend = ggml_backend_dev_init(dev, nullptr);
     }
     REQUIRE(backend != nullptr);
-    const bool part2 = !x100_cpu_uses_ai_cores();
-    if (!part2) {
+    const auto pool_new  = reinterpret_cast<decltype(&ggml_threadpool_new)>(cpu_proc("ggml_threadpool_new"));
+    const auto pool_free = reinterpret_cast<decltype(&ggml_threadpool_free)>(cpu_proc("ggml_threadpool_free"));
+    const auto pool_set  = reinterpret_cast<decltype(&ggml_backend_cpu_set_threadpool)>(
+        cpu_proc("ggml_backend_cpu_set_threadpool"));
+    const bool has_pool = pool_new != nullptr && pool_free != nullptr && pool_set != nullptr;
+    const bool part2    = has_pool && !x100_cpu_uses_ai_cores();
+    if (!has_pool) {
+        std::printf("x100bench: the CPU backend gives no threadpool in this build, part 2 not run\n");
+    } else if (!part2) {
         std::printf("x100bench: the CPU backend uses the AI cores in this build, part 2 skipped\n");
     }
     ggml_backend_t           cpu[2] = { nullptr, nullptr };
     ggml_threadpool *        pool[2] = { nullptr, nullptr };
     for (int i = 0; part2 && i < 2; i++) {
         ggml_threadpool_params tp = ggml_threadpool_params_default(cs[i]);
-        cpu[i]                    = ggml_backend_cpu_init();
-        pool[i]                   = ggml_threadpool_new(&tp);
+        cpu[i]                    = cpu_init();
+        pool[i]                   = pool_new(&tp);
         REQUIRE(cpu[i] != nullptr && pool[i] != nullptr);
-        ggml_backend_cpu_set_n_threads(cpu[i], cs[i]);
-        ggml_backend_cpu_set_threadpool(cpu[i], pool[i]);
+        cpu_set_n_threads(cpu[i], cs[i]);
+        pool_set(cpu[i], pool[i]);
     }
     x100_buffer rbuf((size_t) (small ? 64 : 1024) << 20);
     REQUIRE(rbuf.p != nullptr);
@@ -13447,7 +13492,7 @@ static int bench_x100(ggml_backend_dev_t dev) {
     for (int i = 0; i < 2; i++) {
         if (cpu[i] != nullptr) {
             ggml_backend_free(cpu[i]);
-            ggml_threadpool_free(pool[i]);
+            pool_free(pool[i]);
         }
     }
     ggml_backend_free(backend);
